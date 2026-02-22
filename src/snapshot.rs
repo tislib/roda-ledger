@@ -5,6 +5,7 @@ use crossbeam_skiplist::SkipMap;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::thread::yield_now;
 
 pub struct Snapshot<Data, BalanceData>
 where
@@ -42,12 +43,12 @@ where
 
     pub fn tick(&self) {
         let current_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-        for _ in 0..1_000_000 {
+        for _ in 0..1_000 {
             let next_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
             if next_step > current_step {
                 return;
             }
-            spin_loop();
+            yield_now();
         }
     }
 

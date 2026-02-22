@@ -205,7 +205,7 @@ mod tests {
         for i in 1..=num_accounts as u64 {
             wallet.deposit(i, i, 1000);
         }
-        wallet.tick(num_accounts as i32);
+        wallet.tick(1);
 
         // Random-ish transfers
         let mut tx_id = num_accounts as u64 + 1;
@@ -220,7 +220,7 @@ mod tests {
         }
         
         let total_txs = tx_id - 1;
-        wallet.tick(total_txs as i32);
+        wallet.tick(1);
 
         // Check total balance (should be preserved)
         let mut total_balance = 0;
