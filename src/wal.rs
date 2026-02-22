@@ -70,12 +70,12 @@ where
 
     pub fn tick(&mut self) {
         let current_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            spin_loop();
+        for _ in 0..1_000_000 {
             let next_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
             if next_step > current_step {
-                break;
+                return;
             }
+            spin_loop();
         }
     }
 
@@ -108,7 +108,6 @@ where
     pub fn run(&mut self) {
         loop {
             self.process_single();
-            self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -157,6 +156,7 @@ where
         if file.write_all(bytes).and_then(|_| file.flush()).is_ok() {
             // Success! Reset retry timer and move to outbound
             self.last_retry = None;
+            let processed_count = self.buffer.len();
             for tx in self.buffer.drain(..) {
                 let mut tx = tx;
                 loop {
@@ -169,6 +169,7 @@ where
                     }
                 }
             }
+            self.step.fetch_add(processed_count as u64, std::sync::atomic::Ordering::Relaxed);
         } else {
             self.last_retry = Some(Instant::now());
         }

@@ -105,6 +105,7 @@ mod tests {
     #[test]
     fn test_ledger_point_in_time() {
         let mut ledger = Ledger::<MockTransactionData, MockBalance>::new(10, None);
+        ledger.start();
 
         // Submit transaction with ID 1 (assigned by sequencer)
         ledger.submit(Transaction::new(0, MockTransactionData(100)));

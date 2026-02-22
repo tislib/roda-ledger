@@ -63,12 +63,20 @@ impl TransactionDataType for WalletTransaction {
             WalletTransaction::WITHDRAW => {
                 let mut balance = ctx.get_balance(self.account_id);
 
+                if self.amount > balance.balance {
+                    return Err("Insufficient funds for withdrawal".to_string());
+                }
+
                 balance.balance -= self.amount;
                 ctx.update_balance(self.account_id, balance);
 
                 Ok(())
             }
             WalletTransaction::TRANSFER => {
+                if self.account_id == self.to_account_id {
+                    return Ok(());
+                }
+
                 let mut from_balance = ctx.get_balance(self.account_id);
                 let mut to_balance = ctx.get_balance(self.to_account_id);
 

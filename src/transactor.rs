@@ -46,12 +46,12 @@ where
     // wait for at least one step to complete before returning
     pub fn tick(&mut self) {
         let current_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            spin_loop();
+        for _ in 0..1_000_000 {
             let next_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
             if next_step > current_step {
-                break;
+                return;
             }
+            spin_loop();
         }
     }
 
@@ -98,8 +98,8 @@ where
                     }
                 }
             }
+            self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
