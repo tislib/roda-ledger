@@ -7,3 +7,4 @@ mod snapshot_store;
 mod replay;
 mod transaction;
 mod balance;
+pub mod wallet;
