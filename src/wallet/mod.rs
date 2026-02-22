@@ -1,3 +1,3 @@
-mod balance;
-mod transaction;
-mod wallet;
+pub mod balance;
+pub mod transaction;
+pub mod wallet;

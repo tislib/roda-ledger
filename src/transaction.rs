@@ -41,9 +41,9 @@ where
     BalanceData: BalanceDataType,
     Data: TransactionDataType<BalanceData = BalanceData>,
 {
-    pub fn new(id: u64, data: Data) -> Self {
+    pub fn new(data: Data) -> Self {
         Self {
-            id,
+            id: 0,
             data,
             _balance_data: Default::default(),
         }
@@ -106,7 +106,7 @@ mod tests {
             }
         }
 
-        let tr1 = Transaction::new(0, SimpleTransactionDataType(0));
+        let tr1 = Transaction::new(SimpleTransactionDataType(0));
 
         let mut ctx = SimpleTransactionExecutionContext;
 

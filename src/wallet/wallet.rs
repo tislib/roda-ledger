@@ -14,22 +14,22 @@ impl Wallet {
         }
     }
 
-    pub fn deposit(&mut self, id: u64, account_id: u64, amount: u64) {
+    pub fn deposit(&mut self, account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::deposit(account_id, amount);
-        let tx = Transaction::new(id, tx_data);
-        self.ledger.submit(tx);
+        let tx = Transaction::new(tx_data);
+        self.ledger.submit(tx)
     }
 
-    pub fn withdraw(&mut self, id: u64, account_id: u64, amount: u64) {
+    pub fn withdraw(&mut self, account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::withdraw(account_id, amount);
-        let tx = Transaction::new(id, tx_data);
-        self.ledger.submit(tx);
+        let tx = Transaction::new(tx_data);
+        self.ledger.submit(tx)
     }
 
-    pub fn transfer(&mut self, id: u64, from_account_id: u64, to_account_id: u64, amount: u64) {
+    pub fn transfer(&mut self, from_account_id: u64, to_account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::transfer(from_account_id, to_account_id, amount);
-        let tx = Transaction::new(id, tx_data);
-        self.ledger.submit(tx);
+        let tx = Transaction::new(tx_data);
+        self.ledger.submit(tx)
     }
 
     pub fn get_balance(&self, account_id: u64) -> WalletBalance {
@@ -53,7 +53,7 @@ mod tests {
     fn test_wallet_deposit() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
+        wallet.deposit(1, 100);
         wallet.tick(1);
 
         let balance = wallet.get_balance(1);
@@ -64,8 +64,8 @@ mod tests {
     fn test_wallet_withdraw() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
-        wallet.withdraw(2, 1, 50);
+        wallet.deposit(1, 100);
+        wallet.withdraw(1, 50);
         wallet.tick(2);
 
         let balance = wallet.get_balance(1);
@@ -76,10 +76,10 @@ mod tests {
     fn test_wallet_transfer() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
-        wallet.deposit(2, 2, 50);
+        wallet.deposit(1, 100);
+        wallet.deposit(2, 50);
 
-        wallet.transfer(3, 1, 2, 30);
+        wallet.transfer(1, 2, 30);
         wallet.tick(3);
 
         let balance1 = wallet.get_balance(1);
@@ -93,9 +93,9 @@ mod tests {
     fn test_wallet_insufficient_funds_withdraw() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
-        wallet.withdraw(2, 1, 150); // Should fail
-        wallet.deposit(3, 1, 50); // This should still work if transactor is alive
+        wallet.deposit(1, 100);
+        wallet.withdraw(1, 150); // Should fail
+        wallet.deposit(1, 50); // This should still work if transactor is alive
         wallet.tick(3);
 
         let balance = wallet.get_balance(1);
@@ -106,10 +106,10 @@ mod tests {
     fn test_wallet_insufficient_funds_transfer() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
-        wallet.deposit(2, 2, 50);
+        wallet.deposit(1, 100);
+        wallet.deposit(2, 50);
 
-        wallet.transfer(3, 1, 2, 150); // Should fail
+        wallet.transfer(1, 2, 150); // Should fail
         wallet.tick(3);
 
         let balance1 = wallet.get_balance(1);
@@ -125,12 +125,12 @@ mod tests {
         wallet.start();
         
         for i in 1..=10 {
-            wallet.deposit(i, i, 1000);
+            wallet.deposit(i as u64, 1000);
         }
         wallet.tick(10);
 
         for i in 1..10 {
-            wallet.transfer(10 + i, i, i + 1, 100);
+            wallet.transfer(i as u64, (i + 1) as u64, 100);
         }
         wallet.tick(9);
 
@@ -145,10 +145,10 @@ mod tests {
     fn test_wallet_zero_amount() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
-        wallet.deposit(2, 1, 0);
-        wallet.withdraw(3, 1, 0);
-        wallet.transfer(4, 1, 2, 0);
+        wallet.deposit(1, 100);
+        wallet.deposit(1, 0);
+        wallet.withdraw(1, 0);
+        wallet.transfer(1, 2, 0);
         wallet.tick(4);
 
         assert_eq!(wallet.get_balance(1).balance, 100);
@@ -159,8 +159,8 @@ mod tests {
     fn test_wallet_transfer_to_self() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100);
-        wallet.transfer(2, 1, 1, 30); // Transfer to self
+        wallet.deposit(1, 100);
+        wallet.transfer(1, 1, 30); // Transfer to self
         wallet.tick(2);
 
         let balance = wallet.get_balance(1);
@@ -171,9 +171,9 @@ mod tests {
     fn test_wallet_point_in_time() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.deposit(1, 1, 100); // Internal ID 1
-        wallet.deposit(2, 1, 50);  // Internal ID 2
-        wallet.withdraw(3, 1, 30); // Internal ID 3
+        wallet.deposit(1, 100); // Internal ID 1
+        wallet.deposit(1, 50);  // Internal ID 2
+        wallet.withdraw(1, 30); // Internal ID 3
         wallet.tick(3);
 
         assert_eq!(wallet.ledger.get_balance_at(1, 1).unwrap().balance, 100);
@@ -185,8 +185,8 @@ mod tests {
     fn test_wallet_non_existent_account() {
         let mut wallet = Wallet::new(10);
         wallet.start();
-        wallet.withdraw(1, 999, 100); // Withdraw from non-existent account
-        wallet.transfer(2, 998, 1, 100); // Transfer from non-existent account
+        wallet.withdraw(999, 100); // Withdraw from non-existent account
+        wallet.transfer(998, 1, 100); // Transfer from non-existent account
         wallet.tick(2);
 
         assert_eq!(wallet.get_balance(999).balance, 0);
@@ -203,23 +203,21 @@ mod tests {
 
         // Initial deposits
         for i in 1..=num_accounts as u64 {
-            wallet.deposit(i, i, 1000);
+            wallet.deposit(i, 1000);
         }
         wallet.tick(1);
 
         // Random-ish transfers
-        let mut tx_id = num_accounts as u64 + 1;
+        let mut last_tx_id = 0;
         for _ in 0..transactions_per_account {
             for i in 1..=num_accounts as u64 {
                 let to = (i % num_accounts as u64) + 1;
                 if i != to {
-                    wallet.transfer(tx_id, i, to, 10);
-                    tx_id += 1;
+                    last_tx_id = wallet.transfer(i, to, 10);
                 }
             }
         }
         
-        let total_txs = tx_id - 1;
         wallet.tick(1);
 
         // Check total balance (should be preserved)

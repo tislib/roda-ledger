@@ -25,7 +25,7 @@ where
         }
     }
 
-    pub fn submit(&self, mut transaction: Transaction<Data, BalanceData>) {
+    pub fn submit(&self, mut transaction: Transaction<Data, BalanceData>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         transaction.id = id;
 
@@ -33,5 +33,7 @@ where
             transaction = t;
             // busy loop
         }
+        
+        return transaction.id
     }
 }

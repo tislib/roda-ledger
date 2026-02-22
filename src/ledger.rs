@@ -41,8 +41,8 @@ where
         }
     }
 
-    pub fn submit(&self, transaction: Transaction<Data, BalanceData>) {
-        self.sequencer.submit(transaction);
+    pub fn submit(&self, transaction: Transaction<Data, BalanceData>) -> u64 {
+        self.sequencer.submit(transaction)
     }
 
     pub(crate) fn get_balance(&self, account_id: u64) -> BalanceData {
@@ -108,11 +108,11 @@ mod tests {
         ledger.start();
 
         // Submit transaction with ID 1 (assigned by sequencer)
-        ledger.submit(Transaction::new(0, MockTransactionData(100)));
+        ledger.submit(Transaction::new(MockTransactionData(100)));
         ledger.tick(1);
 
         // Submit transaction with ID 2
-        ledger.submit(Transaction::new(0, MockTransactionData(50)));
+        ledger.submit(Transaction::new(MockTransactionData(50)));
         ledger.tick(1);
 
         // Final balance should be 150
