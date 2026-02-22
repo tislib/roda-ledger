@@ -9,3 +9,5 @@ license = "Apache-2.0"
 keywords = ["lock-free", "hft", "concurrency", "pipeline", "low-latency"]
 categories = ["concurrency", "data-structures"]
 
+[dependencies]
+crossbeam-queue = "0.3.12"
