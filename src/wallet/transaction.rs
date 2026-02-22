@@ -1,20 +1,47 @@
 use crate::transaction::{TransactionDataType, TransactionExecutionContext};
 use crate::wallet::balance::WalletBalance;
+use bytemuck::{Pod, Zeroable};
 
-pub enum WalletTransaction {
-    Deposit {
-        account_id: u64,
-        amount: u64,
-    },
-    Withdraw {
-        account_id: u64,
-        amount: u64,
-    },
-    Transfer {
-        from_account_id: u64,
-        to_account_id: u64,
-        amount: u64,
-    },
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
+pub struct WalletTransaction {
+    pub tag: u64,
+    pub account_id: u64,
+    pub to_account_id: u64,
+    pub amount: u64,
+}
+
+impl WalletTransaction {
+    pub const DEPOSIT: u64 = 0;
+    pub const WITHDRAW: u64 = 1;
+    pub const TRANSFER: u64 = 2;
+
+    pub fn deposit(account_id: u64, amount: u64) -> Self {
+        Self {
+            tag: Self::DEPOSIT,
+            account_id,
+            to_account_id: 0,
+            amount,
+        }
+    }
+
+    pub fn withdraw(account_id: u64, amount: u64) -> Self {
+        Self {
+            tag: Self::WITHDRAW,
+            account_id,
+            to_account_id: 0,
+            amount,
+        }
+    }
+
+    pub fn transfer(from_account_id: u64, to_account_id: u64, amount: u64) -> Self {
+        Self {
+            tag: Self::TRANSFER,
+            account_id: from_account_id,
+            to_account_id,
+            amount,
+        }
+    }
 }
 
 impl TransactionDataType for WalletTransaction {
@@ -22,45 +49,42 @@ impl TransactionDataType for WalletTransaction {
 
     fn process(
         &self,
-        ctx: &impl TransactionExecutionContext<Self::BalanceData>,
+        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
     ) -> Result<(), String> {
-        match self {
-            WalletTransaction::Deposit { account_id, amount } => {
-                let mut balance = ctx.get_balance(*account_id)?;
+        match self.tag {
+            WalletTransaction::DEPOSIT => {
+                let mut balance = ctx.get_balance(self.account_id);
 
-                balance.balance += amount;
-                ctx.update_balance(*account_id, balance)?;
-
-                Ok(())
-            }
-            WalletTransaction::Withdraw { account_id, amount } => {
-                let mut balance = ctx.get_balance(*account_id)?;
-
-                balance.balance -= amount;
-                ctx.update_balance(*account_id, balance)?;
+                balance.balance += self.amount;
+                ctx.update_balance(self.account_id, balance);
 
                 Ok(())
             }
-            WalletTransaction::Transfer {
-                from_account_id,
-                to_account_id,
-                amount,
-            } => {
-                let mut from_balance = ctx.get_balance(*from_account_id)?;
-                let mut to_balance = ctx.get_balance(*to_account_id)?;
+            WalletTransaction::WITHDRAW => {
+                let mut balance = ctx.get_balance(self.account_id);
 
-                if *amount > from_balance.balance {
+                balance.balance -= self.amount;
+                ctx.update_balance(self.account_id, balance);
+
+                Ok(())
+            }
+            WalletTransaction::TRANSFER => {
+                let mut from_balance = ctx.get_balance(self.account_id);
+                let mut to_balance = ctx.get_balance(self.to_account_id);
+
+                if self.amount > from_balance.balance {
                     return Err("Insufficient funds for transfer".to_string());
                 }
 
-                from_balance.balance -= amount;
-                to_balance.balance += amount;
+                from_balance.balance -= self.amount;
+                to_balance.balance += self.amount;
 
-                ctx.update_balance(*from_account_id, from_balance)?;
-                ctx.update_balance(*to_account_id, to_balance)?;
+                ctx.update_balance(self.account_id, from_balance);
+                ctx.update_balance(self.to_account_id, to_balance);
 
                 Ok(())
             }
+            _ => Err(format!("Unknown transaction tag: {}", self.tag)),
         }
     }
 }

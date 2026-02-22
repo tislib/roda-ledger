@@ -1,18 +1,21 @@
 use crate::balance::BalanceDataType;
+use bytemuck::{Pod, Zeroable};
 
 pub trait TransactionExecutionContext<BalanceData: BalanceDataType> {
-    fn get_balance(&self, account_id: u64) -> Result<BalanceData, String>;
-    fn update_balance(&self, account_id: u64, balance: BalanceData) -> Result<(), String>;
+    fn get_balance(&self, account_id: u64) -> BalanceData;
+    fn update_balance(&mut self, account_id: u64, balance: BalanceData);
 }
 
-pub trait TransactionDataType: Send {
+pub trait TransactionDataType: Pod + Zeroable + Copy + Send + Sync {
     type BalanceData: BalanceDataType;
     fn process(
         &self,
-        ctx: &impl TransactionExecutionContext<Self::BalanceData>,
+        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
     ) -> Result<(), String>;
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct Transaction<
     Data: TransactionDataType<BalanceData = BalanceData>,
     BalanceData: BalanceDataType,
@@ -21,6 +24,17 @@ pub struct Transaction<
     data: Data,
     _balance_data: std::marker::PhantomData<BalanceData>,
 }
+
+unsafe impl<Data, BalanceData> Pod for Transaction<Data, BalanceData>
+where
+    Data: TransactionDataType<BalanceData = BalanceData>,
+    BalanceData: BalanceDataType,
+{}
+unsafe impl<Data, BalanceData> Zeroable for Transaction<Data, BalanceData>
+where
+    Data: TransactionDataType<BalanceData = BalanceData>,
+    BalanceData: BalanceDataType,
+{}
 
 impl<Data, BalanceData> Transaction<Data, BalanceData>
 where
@@ -37,7 +51,7 @@ where
 
     pub fn process(
         &self,
-        ctx: &impl TransactionExecutionContext<BalanceData>,
+        ctx: &mut impl TransactionExecutionContext<BalanceData>,
     ) -> Result<(), String> {
         // Now this works because the compiler knows:
         // ctx's balance == BalanceData == Data::BalanceData
@@ -49,26 +63,30 @@ where
 mod tests {
     use crate::balance::BalanceDataType;
     use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
+    use bytemuck::{Pod, Zeroable};
 
     #[test]
     fn it_works() {
+        #[repr(transparent)]
+        #[derive(Copy, Clone, Debug, Default, Pod, Zeroable, PartialEq)]
         struct SimpleBalanceDataType(u64);
         struct SimpleTransactionExecutionContext;
+        #[repr(transparent)]
+        #[derive(Copy, Clone, Debug, Default, Pod, Zeroable, PartialEq)]
         struct SimpleTransactionDataType(u64);
 
         impl BalanceDataType for SimpleBalanceDataType {}
 
         impl TransactionExecutionContext<SimpleBalanceDataType> for SimpleTransactionExecutionContext {
-            fn get_balance(&self, _account_id: u64) -> Result<SimpleBalanceDataType, String> {
-                Ok(SimpleBalanceDataType(123))
+            fn get_balance(&self, _account_id: u64) -> SimpleBalanceDataType {
+                SimpleBalanceDataType(123)
             }
 
             fn update_balance(
-                &self,
+                &mut self,
                 _account_id: u64,
                 _balance: SimpleBalanceDataType,
-            ) -> Result<(), String> {
-                Ok(())
+            ) {
             }
         }
 
@@ -77,11 +95,12 @@ mod tests {
 
             fn process(
                 &self,
-                ctx: &impl TransactionExecutionContext<SimpleBalanceDataType>,
+                ctx: &mut impl TransactionExecutionContext<SimpleBalanceDataType>,
             ) -> Result<(), String> {
-                let mut balance = ctx.get_balance(0).unwrap();
+                let mut balance = ctx.get_balance(0);
 
                 balance.0 = 123;
+                ctx.update_balance(0, balance);
 
                 Ok(())
             }
@@ -89,8 +108,8 @@ mod tests {
 
         let tr1 = Transaction::new(0, SimpleTransactionDataType(0));
 
-        let ctx = SimpleTransactionExecutionContext;
+        let mut ctx = SimpleTransactionExecutionContext;
 
-        tr1.process(&ctx).unwrap();
+        tr1.process(&mut ctx).unwrap();
     }
 }
