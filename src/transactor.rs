@@ -4,7 +4,6 @@ use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::thread::yield_now;
 
 pub struct Transactor<Data, BalanceData>
 where
@@ -14,6 +13,7 @@ where
     inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
     outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
     step: Arc<AtomicU64>,
+    rejected_count: Arc<AtomicU64>,
 }
 
 pub struct TransactorRunner<Data, BalanceData>
@@ -25,6 +25,7 @@ where
     outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
     execution_context: LedgerTransactionExecutionContext<BalanceData>,
     pub step: Arc<AtomicU64>,
+    pub rejected_count: Arc<AtomicU64>,
 }
 
 impl<Data, BalanceData> Transactor<Data, BalanceData>
@@ -40,19 +41,17 @@ where
             inbound,
             outbound,
             step: Arc::new(Default::default()),
+            rejected_count: Arc::new(Default::default()),
         }
     }
 
-    // wait for at least one step to complete before returning
-    pub fn tick(&mut self) {
-        let current_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-        for _ in 0..1_000 {
-            let next_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-            if next_step > current_step {
-                return;
-            }
-            yield_now();
-        }
+    pub fn step(&self) -> u64 {
+        self.step.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn start(&self) {
@@ -63,6 +62,7 @@ where
                 balances: Default::default(),
             },
             step: self.step.clone(),
+            rejected_count: self.rejected_count.clone(),
         };
         std::thread::Builder::new()
             .name("transactor".to_string())
@@ -87,6 +87,9 @@ where
                     while let Err(returned_tx) = self.outbound.push(transaction) {
                         transaction = returned_tx;
                     }
+                } else {
+                    self.rejected_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

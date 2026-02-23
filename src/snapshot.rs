@@ -4,7 +4,6 @@ use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::thread::yield_now;
 
 pub struct Snapshot<Data, BalanceData>
 where
@@ -40,17 +39,6 @@ where
         }
     }
 
-    pub fn tick(&self) {
-        let current_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-        for _ in 0..1_000 {
-            let next_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-            if next_step > current_step {
-                return;
-            }
-            yield_now();
-        }
-    }
-
     pub fn start(&self) {
         let runner = SnapshotRunner {
             inbound: self.inbound.clone(),
@@ -66,7 +54,7 @@ where
             .unwrap();
     }
 
-    pub fn get_step(&self) -> u64 {
+    pub fn step(&self) -> u64 {
         self.step.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -79,21 +67,6 @@ where
             }
         }
         BalanceData::default()
-    }
-
-    pub fn get_balance_at(
-        &self,
-        account_id: u64,
-        transaction_id: u64,
-    ) -> Result<BalanceData, String> {
-        // actual_tid <= transaction_id  =>  !actual_tid >= !transaction_id
-        if let Some(entry) = self.balances.range((account_id, !transaction_id)..).next() {
-            let (acc_id, _tid) = *entry.key();
-            if acc_id == account_id {
-                return Ok(*entry.value());
-            }
-        }
-        Err("No history for this account before this transaction ID".to_string())
     }
 }
 

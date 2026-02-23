@@ -6,7 +6,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::thread::yield_now;
 use std::time::{Duration, Instant};
 
 pub struct Wal<Data, BalanceData>
@@ -60,23 +59,16 @@ where
         }
     }
 
+    pub fn step(&self) -> u64 {
+        self.step.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn start(&self) {
         let mut runner = self.create_runner();
         std::thread::Builder::new()
             .name("wal".to_string())
             .spawn(move || runner.run())
             .unwrap();
-    }
-
-    pub fn tick(&mut self) {
-        let current_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-        for _ in 0..1_000 {
-            let next_step = self.step.load(std::sync::atomic::Ordering::Relaxed);
-            if next_step > current_step {
-                return;
-            }
-            yield_now();
-        }
     }
 
     fn create_runner(&self) -> WalRunner<Data, BalanceData> {

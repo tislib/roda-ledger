@@ -7,31 +7,36 @@ use crate::wallet::balance::WalletBalance;
 use crate::wallet::transaction::WalletTransaction;
 
 pub struct Wallet {
-    pub ledger: Ledger<WalletTransaction, WalletBalance>,
+    ledger: Ledger<WalletTransaction, WalletBalance>,
+    op_count: u64,
 }
 
 impl Wallet {
     pub fn new(capacity: usize) -> Self {
         Self {
             ledger: Ledger::new(capacity, None),
+            op_count: 0,
         }
     }
 
     pub fn deposit(&mut self, account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::deposit(account_id, amount);
         let tx = Transaction::new(tx_data);
+        self.op_count += 1;
         self.ledger.submit(tx)
     }
 
     pub fn withdraw(&mut self, account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::withdraw(account_id, amount);
         let tx = Transaction::new(tx_data);
+        self.op_count += 1;
         self.ledger.submit(tx)
     }
 
     pub fn transfer(&mut self, from_account_id: u64, to_account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::transfer(from_account_id, to_account_id, amount);
         let tx = Transaction::new(tx_data);
+        self.op_count += 1;
         self.ledger.submit(tx)
     }
 
@@ -39,8 +44,8 @@ impl Wallet {
         self.ledger.get_balance(account_id)
     }
 
-    pub fn tick(&mut self, tick_count: i32) {
-        self.ledger.tick(tick_count);
+    pub fn wait_pending_operations(&mut self) {
+        self.ledger.tick(self.op_count);
     }
 
     pub fn start(&mut self) {
@@ -57,7 +62,7 @@ mod tests {
         let mut wallet = Wallet::new(10);
         wallet.start();
         wallet.deposit(1, 100);
-        wallet.tick(1);
+        wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
         assert_eq!(balance.balance, 100);
@@ -69,7 +74,7 @@ mod tests {
         wallet.start();
         wallet.deposit(1, 100);
         wallet.withdraw(1, 50);
-        wallet.tick(2);
+        wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
         assert_eq!(balance.balance, 50);
@@ -83,7 +88,7 @@ mod tests {
         wallet.deposit(2, 50);
 
         wallet.transfer(1, 2, 30);
-        wallet.tick(3);
+        wallet.wait_pending_operations();
 
         let balance1 = wallet.get_balance(1);
         let balance2 = wallet.get_balance(2);
@@ -99,7 +104,7 @@ mod tests {
         wallet.deposit(1, 100);
         wallet.withdraw(1, 150); // Should fail
         wallet.deposit(1, 50); // This should still work if transactor is alive
-        wallet.tick(3);
+        wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
         assert_eq!(balance.balance, 150); // 100 + 50
@@ -113,7 +118,7 @@ mod tests {
         wallet.deposit(2, 50);
 
         wallet.transfer(1, 2, 150); // Should fail
-        wallet.tick(3);
+        wallet.wait_pending_operations();
 
         let balance1 = wallet.get_balance(1);
         let balance2 = wallet.get_balance(2);
@@ -130,12 +135,11 @@ mod tests {
         for i in 1..=10 {
             wallet.deposit(i as u64, 1000);
         }
-        wallet.tick(10);
 
         for i in 1..10 {
             wallet.transfer(i as u64, (i + 1) as u64, 100);
         }
-        wallet.tick(9);
+        wallet.wait_pending_operations();
 
         assert_eq!(wallet.get_balance(1).balance, 900);
         for i in 2..10 {
@@ -152,7 +156,7 @@ mod tests {
         wallet.deposit(1, 0);
         wallet.withdraw(1, 0);
         wallet.transfer(1, 2, 0);
-        wallet.tick(4);
+        wallet.wait_pending_operations();
 
         assert_eq!(wallet.get_balance(1).balance, 100);
         assert_eq!(wallet.get_balance(2).balance, 0);
@@ -164,24 +168,10 @@ mod tests {
         wallet.start();
         wallet.deposit(1, 100);
         wallet.transfer(1, 1, 30); // Transfer to self
-        wallet.tick(2);
+        wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
         assert_eq!(balance.balance, 100); // Should remain 100
-    }
-
-    #[test]
-    fn test_wallet_point_in_time() {
-        let mut wallet = Wallet::new(10);
-        wallet.start();
-        wallet.deposit(1, 100); // Internal ID 1
-        wallet.deposit(1, 50); // Internal ID 2
-        wallet.withdraw(1, 30); // Internal ID 3
-        wallet.tick(3);
-
-        assert_eq!(wallet.ledger.get_balance_at(1, 1).unwrap().balance, 100);
-        assert_eq!(wallet.ledger.get_balance_at(1, 2).unwrap().balance, 150);
-        assert_eq!(wallet.ledger.get_balance_at(1, 3).unwrap().balance, 120);
     }
 
     #[test]
@@ -190,7 +180,7 @@ mod tests {
         wallet.start();
         wallet.withdraw(999, 100); // Withdraw from non-existent account
         wallet.transfer(998, 1, 100); // Transfer from non-existent account
-        wallet.tick(2);
+        wallet.wait_pending_operations();
 
         assert_eq!(wallet.get_balance(999).balance, 0);
         assert_eq!(wallet.get_balance(998).balance, 0);
@@ -208,7 +198,6 @@ mod tests {
         for i in 1..=num_accounts as u64 {
             wallet.deposit(i, 1000);
         }
-        wallet.tick(1);
 
         // Random-ish transfers
         for _ in 0..transactions_per_account {
@@ -220,7 +209,7 @@ mod tests {
             }
         }
 
-        wallet.tick(1);
+        wallet.wait_pending_operations();
 
         // Check total balance (should be preserved)
         let mut total_balance = 0;

@@ -6,6 +6,7 @@ use crate::transactor::Transactor;
 use crate::wal::Wal;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
+use std::thread::yield_now;
 
 pub struct Ledger<Data, BalanceData>
 where
@@ -39,11 +40,6 @@ where
         }
     }
 
-    #[inline(always)]
-    pub fn get_step(&self) -> u64 {
-        self.snapshot.get_step()
-    }
-
     pub fn submit(&self, transaction: Transaction<Data, BalanceData>) -> u64 {
         self.sequencer.submit(transaction)
     }
@@ -52,19 +48,23 @@ where
         self.snapshot.get_balance(account_id)
     }
 
-    pub fn get_balance_at(
-        &self,
-        account_id: u64,
-        transaction_id: u64,
-    ) -> Result<BalanceData, String> {
-        self.snapshot.get_balance_at(account_id, transaction_id)
-    }
+    pub(crate) fn tick(&mut self, tick_count: u64) {
+        for _ in 0..1_000_000 {
+            let rejected_count = self.transactor.rejected_count();
 
-    pub(crate) fn tick(&mut self, tick_count: i32) {
-        for _ in 0..tick_count {
-            self.transactor.tick();
-            self.wal.tick();
-            self.snapshot.tick();
+            let mut target_step = tick_count;
+            if rejected_count > tick_count {
+                return;
+            }
+            target_step -= rejected_count;
+
+            if self.transactor.step() >= target_step
+                && self.wal.step() >= target_step
+                && self.snapshot.step() >= target_step
+            {
+                return;
+            }
+            yield_now();
         }
     }
 
@@ -72,62 +72,5 @@ where
         self.transactor.start();
         self.wal.start();
         self.snapshot.start();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use crate::balance::BalanceDataType;
-    use crate::transaction::{TransactionDataType, TransactionExecutionContext};
-    use bytemuck::{Pod, Zeroable};
-
-    #[repr(transparent)]
-    #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable, Default)]
-    struct MockBalance(u64);
-    impl BalanceDataType for MockBalance {}
-
-    #[repr(transparent)]
-    #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
-    struct MockTransactionData(u64);
-    impl TransactionDataType for MockTransactionData {
-        type BalanceData = MockBalance;
-        fn process(
-            &self,
-            ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-        ) -> Result<(), String> {
-            let balance = ctx.get_balance(1);
-            ctx.update_balance(1, MockBalance(balance.0 + self.0));
-            Ok(())
-        }
-    }
-
-    use crate::ledger::Ledger;
-    use crate::transaction::Transaction;
-
-    #[test]
-    fn test_ledger_point_in_time() {
-        let mut ledger = Ledger::<MockTransactionData, MockBalance>::new(10, None);
-        ledger.start();
-
-        // Submit transaction with ID 1 (assigned by sequencer)
-        ledger.submit(Transaction::new(MockTransactionData(100)));
-        ledger.tick(1);
-
-        // Submit transaction with ID 2
-        ledger.submit(Transaction::new(MockTransactionData(50)));
-        ledger.tick(1);
-
-        // Final balance should be 150
-        assert_eq!(ledger.get_balance(1).0, 150);
-
-        // Balance at transaction ID 1 should be 100
-        assert_eq!(ledger.get_balance_at(1, 1).unwrap().0, 100);
-
-        // Balance at transaction ID 2 should be 150
-        assert_eq!(ledger.get_balance_at(1, 2).unwrap().0, 150);
-
-        // Balance before transaction ID 1 should fail
-        assert!(ledger.get_balance_at(1, 0).is_err());
     }
 }
