@@ -2,7 +2,6 @@ use crate::balance::BalanceDataType;
 use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
-use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::thread::yield_now;
@@ -79,27 +78,18 @@ where
 {
     pub fn run(&mut self) {
         loop {
-            self.process_single();
-        }
-    }
+            if let Some(transaction) = self.inbound.pop() {
+                let ctx = &mut self.execution_context;
+                let result = transaction.process(ctx);
 
-    fn process_single(&mut self) {
-        if let Some(transaction) = self.inbound.pop() {
-            let ctx = &mut self.execution_context;
-            let result = transaction.process(ctx);
-
-            if result.is_ok() {
-                let mut transaction = transaction;
-                loop {
-                    let is_pushed = self.outbound.push(transaction);
-                    if is_pushed.is_ok() {
-                        break;
-                    } else {
-                        transaction = is_pushed.unwrap_err();
+                if result.is_ok() {
+                    let mut transaction = transaction;
+                    while let Err(returned_tx) = self.outbound.push(transaction) {
+                        transaction = returned_tx;
                     }
                 }
+                self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -112,10 +102,7 @@ impl<BalanceData: BalanceDataType> TransactionExecutionContext<BalanceData>
     for LedgerTransactionExecutionContext<BalanceData>
 {
     fn get_balance(&self, account_id: u64) -> BalanceData {
-        self.balances
-            .get(&account_id)
-            .cloned()
-            .unwrap_or_default()
+        self.balances.get(&account_id).cloned().unwrap_or_default()
     }
 
     fn update_balance(&mut self, account_id: u64, balance: BalanceData) {

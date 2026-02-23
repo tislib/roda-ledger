@@ -2,7 +2,6 @@ use crate::balance::BalanceDataType;
 use crate::transaction::{Transaction, TransactionDataType};
 use crossbeam_queue::ArrayQueue;
 use std::fs::{File, OpenOptions};
-use std::hint::spin_loop;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,19 +106,6 @@ where
     Data: TransactionDataType<BalanceData = BalanceData>,
 {
     pub fn run(&mut self) {
-        loop {
-            self.process_single();
-        }
-    }
-
-    fn process_single(&mut self) {
-        // Check if we should retry
-        if let Some(last) = self.last_retry {
-            if Instant::now().duration_since(last) < Duration::from_secs(1) {
-                return;
-            }
-        }
-
         // Try to open file if not open
         if self.file.is_none() {
             if let Ok(file) = OpenOptions::new()
@@ -134,46 +120,57 @@ where
             }
         }
 
-        // Fill buffer if empty
-        if self.buffer.is_empty() {
-            let count = self.inbound.len().min(self.buffer.capacity());
-            if count == 0 {
-                return;
+        loop {
+            // Check if we should retry
+            if self
+                .last_retry
+                .is_some_and(|last| Instant::now().duration_since(last) < Duration::from_secs(1))
+            {
+                continue;
             }
-            for _ in 0..count {
-                if let Some(tx) = self.inbound.pop() {
-                    self.buffer.push(tx);
+
+            // Fill buffer if empty
+            if self.buffer.is_empty() {
+                let count = self.inbound.len().min(self.buffer.capacity());
+                if count == 0 {
+                    continue;
                 }
-            }
-        }
-
-        if self.buffer.is_empty() {
-            return;
-        }
-
-        // Try to write buffer
-        let bytes = bytemuck::cast_slice::<Transaction<Data, BalanceData>, u8>(&self.buffer);
-        let file = self.file.as_mut().unwrap();
-        if file.write_all(bytes).and_then(|_| file.flush()).is_ok() {
-            // Success! Reset retry timer and move to outbound
-            self.last_retry = None;
-            let processed_count = self.buffer.len();
-            for tx in self.buffer.drain(..) {
-                let mut tx = tx;
-                loop {
-                    match self.outbound.push(tx) {
-                        Ok(_) => break,
-                        Err(returned_tx) => {
-                            tx = returned_tx;
-                            std::thread::yield_now();
-                        }
+                for _ in 0..count {
+                    if let Some(tx) = self.inbound.pop() {
+                        self.buffer.push(tx);
                     }
                 }
             }
-            self.step.fetch_add(processed_count as u64, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.last_retry = Some(Instant::now());
+
+            if self.buffer.is_empty() {
+                continue;
+            }
+
+            // Try to write buffer
+            let bytes = bytemuck::cast_slice::<Transaction<Data, BalanceData>, u8>(&self.buffer);
+            let file = self.file.as_mut().unwrap();
+            if file.write_all(bytes).and_then(|_| file.flush()).is_ok() {
+                // Success! Reset retry timer and move to outbound
+                self.last_retry = None;
+                let processed_count = self.buffer.len();
+                for tx in self.buffer.drain(..) {
+                    let mut tx = tx;
+                    loop {
+                        match self.outbound.push(tx) {
+                            Ok(_) => break,
+                            Err(returned_tx) => {
+                                tx = returned_tx;
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+                self.step
+                    .fetch_add(processed_count as u64, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.last_retry = Some(Instant::now());
+            }
+            // If write failed, buffer remains full and will be retried in next tick (after 1s)
         }
-        // If write failed, buffer remains full and will be retried in next tick (after 1s)
     }
 }

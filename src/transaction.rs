@@ -29,12 +29,14 @@ unsafe impl<Data, BalanceData> Pod for Transaction<Data, BalanceData>
 where
     Data: TransactionDataType<BalanceData = BalanceData>,
     BalanceData: BalanceDataType,
-{}
+{
+}
 unsafe impl<Data, BalanceData> Zeroable for Transaction<Data, BalanceData>
 where
     Data: TransactionDataType<BalanceData = BalanceData>,
     BalanceData: BalanceDataType,
-{}
+{
+}
 
 impl<Data, BalanceData> Transaction<Data, BalanceData>
 where
@@ -82,12 +84,7 @@ mod tests {
                 SimpleBalanceDataType(123)
             }
 
-            fn update_balance(
-                &mut self,
-                _account_id: u64,
-                _balance: SimpleBalanceDataType,
-            ) {
-            }
+            fn update_balance(&mut self, _account_id: u64, _balance: SimpleBalanceDataType) {}
         }
 
         impl TransactionDataType for SimpleTransactionDataType {

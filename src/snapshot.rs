@@ -2,7 +2,6 @@ use crate::balance::BalanceDataType;
 use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
-use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::thread::yield_now;
@@ -67,23 +66,31 @@ where
             .unwrap();
     }
 
+    pub fn get_step(&self) -> u64 {
+        self.step.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn get_balance(&self, account_id: u64) -> BalanceData {
         // With flipped tid, the first entry for account_id is the latest one
         if let Some(entry) = self.balances.range((account_id, 0)..).next() {
             let (acc_id, _tid) = *entry.key();
             if acc_id == account_id {
-                return entry.value().clone();
+                return *entry.value();
             }
         }
         BalanceData::default()
     }
 
-    pub fn get_balance_at(&self, account_id: u64, transaction_id: u64) -> Result<BalanceData, String> {
+    pub fn get_balance_at(
+        &self,
+        account_id: u64,
+        transaction_id: u64,
+    ) -> Result<BalanceData, String> {
         // actual_tid <= transaction_id  =>  !actual_tid >= !transaction_id
         if let Some(entry) = self.balances.range((account_id, !transaction_id)..).next() {
             let (acc_id, _tid) = *entry.key();
             if acc_id == account_id {
-                return Ok(entry.value().clone());
+                return Ok(*entry.value());
             }
         }
         Err("No history for this account before this transaction ID".to_string())
@@ -128,13 +135,14 @@ impl<BalanceData: BalanceDataType> TransactionExecutionContext<BalanceData>
         if let Some(entry) = self.balances.range((account_id, 0)..).next() {
             let (acc_id, _tid) = *entry.key();
             if acc_id == account_id {
-                return entry.value().clone();
+                return *entry.value();
             }
         }
         BalanceData::default()
     }
 
     fn update_balance(&mut self, account_id: u64, balance: BalanceData) {
-        self.balances.insert((account_id, !self.transaction_id), balance);
+        self.balances
+            .insert((account_id, !self.transaction_id), balance);
     }
 }

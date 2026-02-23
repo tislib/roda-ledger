@@ -16,7 +16,6 @@ where
     transactor: Transactor<Data, BalanceData>,
     wal: Wal<Data, BalanceData>,
     snapshot: Snapshot<Data, BalanceData>,
-    thread_join_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl<Data, BalanceData> Ledger<Data, BalanceData>
@@ -37,8 +36,12 @@ where
                 ledger_folder,
             ),
             snapshot: Snapshot::new(wal_snapshot_queue),
-            thread_join_handles: vec![],
         }
+    }
+
+    #[inline(always)]
+    pub fn get_step(&self) -> u64 {
+        self.snapshot.get_step()
     }
 
     pub fn submit(&self, transaction: Transaction<Data, BalanceData>) -> u64 {

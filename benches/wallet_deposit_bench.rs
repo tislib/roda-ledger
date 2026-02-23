@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use roda_ledger::wallet::wallet::Wallet;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use roda_ledger::wallet::Wallet;
 use std::fs;
 
 fn wallet_deposit_bench(c: &mut Criterion) {
