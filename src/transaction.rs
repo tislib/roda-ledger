@@ -20,7 +20,8 @@ pub struct Transaction<
     Data: TransactionDataType<BalanceData = BalanceData>,
     BalanceData: BalanceDataType,
 > {
-    pub(crate) id: u64,
+    pub id: u64,
+    pub wal_location: u64,
     data: Data,
     _balance_data: std::marker::PhantomData<BalanceData>,
 }
@@ -46,6 +47,7 @@ where
     pub fn new(data: Data) -> Self {
         Self {
             id: 0,
+            wal_location: 0,
             data,
             _balance_data: Default::default(),
         }
@@ -58,6 +60,53 @@ where
         // Now this works because the compiler knows:
         // ctx's balance == BalanceData == Data::BalanceData
         self.data.process(ctx)
+    }
+}
+
+#[derive(Default, Debug)]
+pub enum TransactionStatus {
+    #[default]
+    Pending,
+    Error(String),
+    Computed,   // By Transactor
+    Committed,  // Written to WAL
+    OnSnapshot, // Balances are reflected from the snapshot
+}
+
+impl TransactionStatus {
+    pub fn is_committed(&self) -> bool {
+        match self {
+            Self::Pending => false,
+            Self::Error(_) => false,
+            Self::Computed => false,
+            Self::Committed => true,
+            Self::OnSnapshot => true,
+        }
+    }
+
+    pub fn balance_ready(&self) -> bool {
+        match self {
+            Self::Pending => false,
+            Self::Error(_) => false,
+            Self::Computed => false,
+            Self::Committed => false,
+            Self::OnSnapshot => true,
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        !self.is_err()
+    }
+
+    pub fn is_err(&self) -> bool {
+        matches!(self, Self::Error(_))
+    }
+
+    pub fn error_reason(&self) -> String {
+        match self {
+            Self::Error(reason) => reason.clone(),
+            _ => unreachable!(),
+        }
     }
 }
 

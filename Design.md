@@ -23,18 +23,25 @@ The deterministic heart of the system.
 The durability layer.
 - **Persistence:** Responsible for writing transactions to the Write-Ahead Log (WAL).
 - **Commit Index:** Marks the transaction as "Durable" once it has been successfully flushed to disk.
-- **Finality:** Only when the WAL Storer confirms a write is the transaction considered fully committed in the system lifecycle.
+- **Finality:** Once the WAL Storer confirms a write, the transaction is considered persistent and ready for the Snapshot stage.
+
+### D. Core 3: The Snapshotter (The Archiver)
+The state management layer.
+- **State Materialization:** Periodically materializes the in-memory state into persistent snapshots.
+- **Log Truncation:** Provides the necessary state to allow for WAL truncation (in future versions) and significantly speeds up crash recovery.
+- **Checkpointing:** Coordinates with the Transactor and WAL Storer to ensure snapshots are taken at consistent transaction boundaries.
 
 ## 2. Communication: ArrayQueue Interconnects
 Stages are linked by bounded, pre-allocated **ArrayQueues**.
 - **SPSC Pattern:** Typically operates as Single-Producer/Single-Consumer between cores to minimize atomic contention.
-- **Backpressure:** The bounded nature of the queues provides natural backpressure; if the WAL Storer slows down, the Transactor and Sequencer will eventually throttle, preventing memory exhaustion.
+- **Backpressure:** The bounded nature of the queues provides natural backpressure; if any stage (e.g., WAL Storer or Snapshotter) slows down, the previous stages (Transactor, Sequencer) will eventually throttle, preventing memory exhaustion.
 
 
-## 3. Logical View: Dual-Index Tracking
+## 3. Logical View: Multi-Index Tracking
 The system maintains a clear separation of progress:
-- **Compute Index:** Updated immediately after Core 1 processes a transaction. This reflects the "current" state for the next incoming transaction.
-- **Commit Index:** Updated only after Core 2 confirms disk persistence. This is the "safe" state used for crash recovery.
+- **Compute Index:** Updated immediately after Core 1 (Transactor) processes a transaction.
+- **Commit Index:** Updated after Core 2 (WAL Storer) confirms disk persistence.
+- **Snapshot Index:** Updated after Core 3 (Snapshotter) processes the transaction and it becomes part of the potential next snapshot.
 
 
 ## 4. Hardware Optimization

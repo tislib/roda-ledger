@@ -38,4 +38,8 @@ where
 
         transaction.id
     }
+
+    pub(crate) fn set_next_id(&self, next_id: u64) {
+        self.next_id.store(next_id, Ordering::Relaxed);
+    }
 }

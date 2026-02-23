@@ -1,10 +1,10 @@
-mod balance;
-mod ledger;
+pub mod balance;
+pub mod ledger;
 mod replay;
 mod sequencer;
-mod snapshot;
+pub mod snapshot;
 mod snapshot_store;
-mod transaction;
-mod transactor;
-mod wal;
+pub mod transaction;
+pub mod transactor;
+pub mod wal;
 pub mod wallet;

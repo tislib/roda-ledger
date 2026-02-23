@@ -13,10 +13,23 @@ categories = ["concurrency", "data-structures"]
 crossbeam-queue = "0.3.12"
 crossbeam-skiplist = "0.1"
 bytemuck = { version = "1.21.0", features = ["derive"] }
+arc-swap = "1"
 
 [dev-dependencies]
 criterion = "0.5"
 
 [[bench]]
 name = "wallet_deposit_bench"
+harness = false
+
+[[bench]]
+name = "wallet_bench"
+harness = false
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "transactor_bench"
 harness = false

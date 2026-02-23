@@ -1,9 +1,11 @@
 use crate::balance::BalanceDataType;
 use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use crossbeam_queue::ArrayQueue;
+use crossbeam_skiplist::SkipMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 pub struct Transactor<Data, BalanceData>
 where
@@ -12,8 +14,10 @@ where
 {
     inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
     outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-    step: Arc<AtomicU64>,
-    rejected_count: Arc<AtomicU64>,
+    last_processed_transaction_id: Arc<AtomicU64>,
+    rejected_transactions: Arc<SkipMap<u64, String>>,
+    balances: HashMap<u64, BalanceData>,
+    running: Arc<AtomicBool>,
 }
 
 pub struct TransactorRunner<Data, BalanceData>
@@ -24,8 +28,9 @@ where
     inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
     outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
     execution_context: LedgerTransactionExecutionContext<BalanceData>,
-    pub step: Arc<AtomicU64>,
-    pub rejected_count: Arc<AtomicU64>,
+    last_processed_transaction_id: Arc<AtomicU64>,
+    rejected_transactions: Arc<SkipMap<u64, String>>,
+    running: Arc<AtomicBool>,
 }
 
 impl<Data, BalanceData> Transactor<Data, BalanceData>
@@ -36,38 +41,68 @@ where
     pub fn new(
         inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
         outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+        running: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inbound,
             outbound,
-            step: Arc::new(Default::default()),
-            rejected_count: Arc::new(Default::default()),
+            last_processed_transaction_id: Arc::new(Default::default()),
+            rejected_transactions: Arc::new(Default::default()),
+            balances: HashMap::new(),
+            running,
         }
     }
 
-    pub fn step(&self) -> u64 {
-        self.step.load(std::sync::atomic::Ordering::Relaxed)
+    pub fn load_balances(&mut self, balances: Vec<(u64, BalanceData)>) {
+        for (account_id, balance) in balances {
+            self.balances.insert(account_id, balance);
+        }
     }
 
-    pub fn rejected_count(&self) -> u64 {
-        self.rejected_count
+    pub fn reprocess_transaction(&mut self, transaction: Transaction<Data, BalanceData>) {
+        let mut ctx = LedgerTransactionExecutionContext {
+            balances: std::mem::take(&mut self.balances),
+        };
+        let result = transaction.process(&mut ctx);
+        if let Err(reason) = result {
+            self.rejected_transactions
+                .insert(transaction.id, reason.to_string());
+        }
+        self.last_processed_transaction_id
+            .store(transaction.id, std::sync::atomic::Ordering::Relaxed);
+        self.balances = ctx.balances;
+    }
+
+    pub fn last_processed_transaction_id(&self) -> u64 {
+        self.last_processed_transaction_id
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn start(&self) {
+    pub fn rejected_count(&self) -> usize {
+        self.rejected_transactions.len()
+    }
+
+    pub fn transaction_rejection_reason(&self, transaction_id: u64) -> Option<String> {
+        self.rejected_transactions
+            .get(&transaction_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn start(&mut self) -> JoinHandle<()> {
         let mut runner = TransactorRunner {
             inbound: self.inbound.clone(),
             outbound: self.outbound.clone(),
             execution_context: LedgerTransactionExecutionContext {
-                balances: Default::default(),
+                balances: std::mem::take(&mut self.balances),
             },
-            step: self.step.clone(),
-            rejected_count: self.rejected_count.clone(),
+            last_processed_transaction_id: self.last_processed_transaction_id.clone(),
+            rejected_transactions: self.rejected_transactions.clone(),
+            running: self.running.clone(),
         };
         std::thread::Builder::new()
             .name("transactor".to_string())
             .spawn(move || runner.run())
-            .unwrap();
+            .unwrap()
     }
 }
 
@@ -77,21 +112,26 @@ where
     Data: TransactionDataType<BalanceData = BalanceData>,
 {
     pub fn run(&mut self) {
-        loop {
+        while self.running.load(Ordering::Relaxed) {
             if let Some(transaction) = self.inbound.pop() {
                 let ctx = &mut self.execution_context;
                 let result = transaction.process(ctx);
 
-                if result.is_ok() {
+                if let Some(err) = result.err() {
+                    self.rejected_transactions.insert(transaction.id, err);
+                } else {
                     let mut transaction = transaction;
                     while let Err(returned_tx) = self.outbound.push(transaction) {
                         transaction = returned_tx;
+                        if !self.running.load(Ordering::Relaxed) {
+                            return;
+                        }
                     }
-                } else {
-                    self.rejected_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.last_processed_transaction_id
+                    .store(transaction.id, Ordering::Relaxed);
+            } else {
+                std::thread::yield_now();
             }
         }
     }
