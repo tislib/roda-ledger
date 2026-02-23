@@ -2,8 +2,6 @@
 
 Roda-Ledger is built on a "Core-Per-Stage" model, utilizing asynchronous pipelining and lock-free ArrayQueues to eliminate thread contention and maximize mechanical sympathy.
 
-<img src="process_diagram.svg" width="800"/>
-
 ## 1. Pipeline Stages
 
 ### A. Core 0: The Sequencer
@@ -42,8 +40,3 @@ The system maintains a clear separation of progress:
 - **Compute Index:** Updated immediately after Core 1 (Transactor) processes a transaction.
 - **Commit Index:** Updated after Core 2 (WAL Storer) confirms disk persistence.
 - **Snapshot Index:** Updated after Core 3 (Snapshotter) processes the transaction and it becomes part of the potential next snapshot.
-
-
-## 4. Hardware Optimization
-- **Core Pinning:** Each stage is affinitized to a specific physical core to prevent L1 cache trashing.
-- **Memory Ordering:** Utilizes `Ordering::Acquire` and `Ordering::Release` to synchronize the transfer of transaction ownership between cores without full pipeline flushes.
