@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{JoinHandle, yield_now};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LedgerConfig {
     pub capacity: usize,
     pub location: Option<String>,

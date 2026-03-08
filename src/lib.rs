@@ -4,6 +4,8 @@ mod replay;
 mod sequencer;
 pub mod snapshot;
 mod snapshot_store;
+pub mod server;
+pub mod client;
 pub mod transaction;
 pub mod transactor;
 pub mod wal;
