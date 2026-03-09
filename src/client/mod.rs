@@ -11,6 +11,7 @@ where
     Data: TransactionDataType<BalanceData = BalanceData>,
 {
     addr: String,
+    stream: Option<TcpStream>,
     buf: Vec<u8>,
     _phantom: PhantomData<(Data, BalanceData)>,
 }
@@ -26,13 +27,19 @@ where
             .max(std::mem::size_of::<GetBalanceResponse<BalanceData>>());
         Self {
             addr,
+            stream: None,
             buf: vec![0u8; max_size],
             _phantom: PhantomData,
         }
     }
 
     pub async fn register_transaction(&mut self, data: Data) -> Result<u64, Box<dyn std::error::Error>> {
-        let mut stream = TcpStream::connect(&self.addr).await?;
+        if self.stream.is_none() {
+            let stream = TcpStream::connect(&self.addr).await?;
+            stream.set_nodelay(true)?;
+            self.stream = Some(stream);
+        }
+        let stream = self.stream.as_mut().unwrap();
         
         let header = ProtocolHeader { op_kind: OperationKind::REGISTER_TRANSACTION };
         stream.write_all(bytemuck::bytes_of(&header)).await?;
@@ -41,14 +48,20 @@ where
         stream.write_all(bytemuck::bytes_of(&request)).await?;
         
         let size = std::mem::size_of::<RegisterTransactionResponse>();
-        stream.read_exact(&mut self.buf[..size]).await?;
+        let buf = &mut self.buf[..size];
+        self.stream.as_mut().unwrap().read_exact(buf).await?;
         let response: &RegisterTransactionResponse = bytemuck::from_bytes(&self.buf[..size]);
         
         Ok(response.transaction_id)
     }
 
     pub async fn get_status(&mut self, transaction_id: u64) -> Result<TransactionStatus, Box<dyn std::error::Error>> {
-        let mut stream = TcpStream::connect(&self.addr).await?;
+        if self.stream.is_none() {
+            let stream = TcpStream::connect(&self.addr).await?;
+            stream.set_nodelay(true)?;
+            self.stream = Some(stream);
+        }
+        let stream = self.stream.as_mut().unwrap();
         
         let header = ProtocolHeader { op_kind: OperationKind::GET_STATUS };
         stream.write_all(bytemuck::bytes_of(&header)).await?;
@@ -57,7 +70,8 @@ where
         stream.write_all(bytemuck::bytes_of(&request)).await?;
         
         let size = size_of::<GetStatusResponse>();
-        stream.read_exact(&mut self.buf[..size]).await?;
+        let buf = &mut self.buf[..size];
+        self.stream.as_mut().unwrap().read_exact(buf).await?;
         let response: &GetStatusResponse = bytemuck::from_bytes(&self.buf[..size]);
         
         let status = match response.status {
@@ -73,7 +87,12 @@ where
     }
 
     pub async fn get_balance(&mut self, account_id: u64) -> Result<BalanceData, Box<dyn std::error::Error>> {
-        let mut stream = TcpStream::connect(&self.addr).await?;
+        if self.stream.is_none() {
+            let stream = TcpStream::connect(&self.addr).await?;
+            stream.set_nodelay(true)?;
+            self.stream = Some(stream);
+        }
+        let stream = self.stream.as_mut().unwrap();
         
         let header = ProtocolHeader { op_kind: OperationKind::GET_BALANCE };
         stream.write_all(bytemuck::bytes_of(&header)).await?;
@@ -82,7 +101,8 @@ where
         stream.write_all(bytemuck::bytes_of(&request)).await?;
         
         let size = size_of::<GetBalanceResponse<BalanceData>>();
-        stream.read_exact(&mut self.buf[..size]).await?;
+        let buf = &mut self.buf[..size];
+        self.stream.as_mut().unwrap().read_exact(buf).await?;
         let response: &GetBalanceResponse<BalanceData> = bytemuck::from_bytes(&self.buf[..size]);
         
         Ok(response.balance)

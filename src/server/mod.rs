@@ -54,7 +54,9 @@ where
         println!("Server listening on {}", self.config.addr);
 
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (socket, _) = listener.accept().await?;
+            socket.set_nodelay(true)?;
+            let mut socket = socket;
             let ledger = self.ledger.clone();
 
             tokio::spawn(async move {
