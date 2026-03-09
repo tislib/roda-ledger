@@ -91,6 +91,65 @@ fn wallet_server_bench(c: &mut Criterion) {
     });
 
     group.finish();
+
+    for batch_size in [10, 100] {
+        let mut batch_group = c.benchmark_group("wallet_server_batch");
+        batch_group.throughput(Throughput::Elements(batch_size));
+        batch_group.measurement_time(Duration::from_secs(10));
+
+        batch_group.bench_function(format!("deposit_{}", batch_size), |b| {
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(addr.clone())));
+            let i = i.clone();
+            b.to_async(&rt).iter(|| {
+                let client = client.clone();
+                let i = i.clone();
+                async move {
+                    let mut txs = Vec::with_capacity(batch_size as usize);
+                    for _ in 0..batch_size {
+                        let idx = i.fetch_add(1, Ordering::Relaxed);
+                        txs.push(WalletTransaction::deposit(idx % batch_size, 100));
+                    }
+                    client.lock().await.register_transactions_batch(txs).await.unwrap();
+                }
+            });
+        });
+
+        batch_group.bench_function(format!("transfer_{}", batch_size), |b| {
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(addr.clone())));
+            let i = i.clone();
+            b.to_async(&rt).iter(|| {
+                let client = client.clone();
+                let i = i.clone();
+                async move {
+                    let mut txs = Vec::with_capacity(batch_size as usize);
+                    for _ in 0..batch_size {
+                        let idx = i.fetch_add(1, Ordering::Relaxed);
+                        txs.push(WalletTransaction::transfer(idx % batch_size, (idx + 1) % batch_size, 10));
+                    }
+                    client.lock().await.register_transactions_batch(txs).await.unwrap();
+                }
+            });
+        });
+
+        batch_group.bench_function(format!("get_balance_{}", batch_size), |b| {
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(addr.clone())));
+            let i = i.clone();
+            b.to_async(&rt).iter(|| {
+                let client = client.clone();
+                let i = i.clone();
+                async move {
+                    let mut ids = Vec::with_capacity(batch_size as usize);
+                    for _ in 0..batch_size {
+                        let idx = i.fetch_add(1, Ordering::Relaxed);
+                        ids.push(idx % batch_size);
+                    }
+                    client.lock().await.get_balances_batch(ids).await.unwrap();
+                }
+            });
+        });
+
+        batch_group.finish();
+    }
 }
 
 criterion_group!(benches, wallet_server_bench);

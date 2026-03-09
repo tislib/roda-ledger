@@ -10,3 +10,4 @@ pub mod transaction;
 pub mod transactor;
 pub mod wal;
 pub mod wallet;
+pub mod protocol;

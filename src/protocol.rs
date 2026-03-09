@@ -10,12 +10,27 @@ impl OperationKind {
     pub const REGISTER_TRANSACTION: Self = Self(0);
     pub const GET_STATUS: Self = Self(1);
     pub const GET_BALANCE: Self = Self(2);
+    pub const BATCH: Self = Self(3);
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ProtocolHeader {
     pub op_kind: OperationKind,
+    pub _padding: [u8; 3],
+    pub length: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BatchRequest {
+    pub batch_size: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BatchResponse {
+    pub batch_size: u32,
 }
 
 #[repr(C, packed)]

@@ -1,9 +1,7 @@
-pub mod protocol;
-
 use crate::ledger::{Ledger, LedgerConfig};
 use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
 use crate::balance::BalanceDataType;
-use crate::server::protocol::*;
+use crate::protocol::*;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -60,44 +58,91 @@ where
             let ledger = self.ledger.clone();
 
             tokio::spawn(async move {
-                let max_req_size = std::mem::size_of::<RegisterTransactionRequest<Data>>()
-                    .max(std::mem::size_of::<GetStatusRequest>())
-                    .max(std::mem::size_of::<GetBalanceRequest>());
-                let mut buf = vec![0u8; max_req_size];
+                let mut buffer = Vec::with_capacity(8192);
+                let mut read_buf = [0u8; 4096];
+                let mut batch_responses = Vec::new();
+                let mut in_batch = 0u32;
 
                 loop {
-                    let mut header_buf = [0u8; std::mem::size_of::<ProtocolHeader>()];
-                    if let Err(e) = socket.read_exact(&mut header_buf).await {
-                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                            eprintln!("Failed to read header from socket: {}", e);
+                    // 1. Ensure we have at least a header
+                    while buffer.len() < std::mem::size_of::<ProtocolHeader>() {
+                        match socket.read(&mut read_buf).await {
+                            Ok(0) => return, // EOF
+                            Ok(n) => buffer.extend_from_slice(&read_buf[..n]),
+                            Err(e) => {
+                                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                                    eprintln!("Failed to read from socket: {}", e);
+                                }
+                                return;
+                            }
                         }
-                        break;
                     }
 
-                    let header: &ProtocolHeader = bytemuck::from_bytes(&header_buf);
+                    // 2. Parse header
+                    let header_size = std::mem::size_of::<ProtocolHeader>();
+                    let header: ProtocolHeader = *bytemuck::from_bytes(&buffer[..header_size]);
+                    let payload_size = header.length as usize;
+
+                    // 3. Ensure we have the full payload
+                    while buffer.len() < header_size + payload_size {
+                        match socket.read(&mut read_buf).await {
+                            Ok(0) => {
+                                eprintln!("Unexpected EOF reading payload");
+                                return;
+                            }
+                            Ok(n) => buffer.extend_from_slice(&read_buf[..n]),
+                            Err(e) => {
+                                eprintln!("Failed to read from socket: {}", e);
+                                return;
+                            }
+                        }
+                    }
+
+                    // 4. Process frame
+                    let payload = &buffer[header_size..header_size + payload_size];
+                    let mut consumed_payload = payload_size;
+
                     match header.op_kind {
                         OperationKind::REGISTER_TRANSACTION => {
-                            let size = std::mem::size_of::<RegisterTransactionRequest<Data>>();
-                            if let Err(e) = socket.read_exact(&mut buf[..size]).await {
-                                eprintln!("Failed to read RegisterTransactionRequest: {}", e);
-                                break;
-                            }
-                            let request: &RegisterTransactionRequest<Data> = bytemuck::from_bytes(&buf[..size]);
+                            let request: &RegisterTransactionRequest<Data> = bytemuck::from_bytes(payload);
                             let tx_id = ledger.submit(Transaction::new(request.data));
 
                             let response = RegisterTransactionResponse { transaction_id: tx_id };
-                            if let Err(e) = socket.write_all(bytemuck::bytes_of(&response)).await {
-                                eprintln!("Failed to write RegisterTransactionResponse: {}", e);
-                                break;
+                            let resp_header = ProtocolHeader {
+                                op_kind: OperationKind::REGISTER_TRANSACTION,
+                                _padding: [0; 3],
+                                length: std::mem::size_of::<RegisterTransactionResponse>() as u32,
+                            };
+                            
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                            
+                            if in_batch > 0 {
+                                in_batch -= 1;
+                                if in_batch == 0 {
+                                    // Update the BATCH header length to include all responses
+                                    let header_size = std::mem::size_of::<ProtocolHeader>();
+                                    if batch_responses.len() >= header_size {
+                                        let total_payload_size = (batch_responses.len() - header_size) as u32;
+                                        batch_responses[4..8].copy_from_slice(&total_payload_size.to_ne_bytes());
+                                    }
+
+                                    if let Err(e) = socket.write_all(&batch_responses).await {
+                                        eprintln!("Failed to write batch responses: {}", e);
+                                        break;
+                                    }
+                                    batch_responses.clear();
+                                }
+                            } else {
+                                if let Err(e) = socket.write_all(&batch_responses).await {
+                                    eprintln!("Failed to write RegisterTransactionResponse: {}", e);
+                                    break;
+                                }
+                                batch_responses.clear();
                             }
                         }
                         OperationKind::GET_STATUS => {
-                            let size = std::mem::size_of::<GetStatusRequest>();
-                            if let Err(e) = socket.read_exact(&mut buf[..size]).await {
-                                eprintln!("Failed to read GetStatusRequest: {}", e);
-                                break;
-                            }
-                            let request: &GetStatusRequest = bytemuck::from_bytes(&buf[..size]);
+                            let request: &GetStatusRequest = bytemuck::from_bytes(payload);
                             let status = ledger.get_transaction_status(request.transaction_id);
 
                             let status_u8 = match status {
@@ -109,32 +154,108 @@ where
                             };
 
                             let response = GetStatusResponse { status: status_u8 };
-                            if let Err(e) = socket.write_all(bytemuck::bytes_of(&response)).await {
-                                eprintln!("Failed to write GetStatusResponse: {}", e);
-                                break;
+                            let resp_header = ProtocolHeader {
+                                op_kind: OperationKind::GET_STATUS,
+                                _padding: [0; 3],
+                                length: std::mem::size_of::<GetStatusResponse>() as u32,
+                            };
+                            
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                            
+                            if in_batch > 0 {
+                                in_batch -= 1;
+                                if in_batch == 0 {
+                                    // Update the BATCH header length to include all responses
+                                    let header_size = std::mem::size_of::<ProtocolHeader>();
+                                    if batch_responses.len() >= header_size {
+                                        let total_payload_size = (batch_responses.len() - header_size) as u32;
+                                        batch_responses[4..8].copy_from_slice(&total_payload_size.to_ne_bytes());
+                                    }
+
+                                    if let Err(e) = socket.write_all(&batch_responses).await {
+                                        eprintln!("Failed to write batch responses: {}", e);
+                                        break;
+                                    }
+                                    batch_responses.clear();
+                                }
+                            } else {
+                                if let Err(e) = socket.write_all(&batch_responses).await {
+                                    eprintln!("Failed to write GetStatusResponse: {}", e);
+                                    break;
+                                }
+                                batch_responses.clear();
                             }
                         }
                         OperationKind::GET_BALANCE => {
-                            let size = std::mem::size_of::<GetBalanceRequest>();
-                            if let Err(e) = socket.read_exact(&mut buf[..size]).await {
-                                eprintln!("Failed to read GetBalanceRequest: {}", e);
-                                break;
-                            }
-                            let request: &GetBalanceRequest = bytemuck::from_bytes(&buf[..size]);
+                            let request: &GetBalanceRequest = bytemuck::from_bytes(payload);
                             let balance = ledger.get_balance(request.account_id);
 
                             let response = GetBalanceResponse { balance };
-                            let response_bytes = bytemuck::bytes_of(&response);
-                            if let Err(e) = socket.write_all(response_bytes).await {
-                                eprintln!("Failed to write GetBalanceResponse: {}", e);
-                                break;
+                            let resp_header = ProtocolHeader {
+                                op_kind: OperationKind::GET_BALANCE,
+                                _padding: [0; 3],
+                                length: std::mem::size_of::<GetBalanceResponse<BalanceData>>() as u32,
+                            };
+                            
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                            
+                            if in_batch > 0 {
+                                in_batch -= 1;
+                                if in_batch == 0 {
+                                    // Update the BATCH header length to include all responses
+                                    let header_size = std::mem::size_of::<ProtocolHeader>();
+                                    if batch_responses.len() >= header_size {
+                                        let total_payload_size = (batch_responses.len() - header_size) as u32;
+                                        batch_responses[4..8].copy_from_slice(&total_payload_size.to_ne_bytes());
+                                    }
+
+                                    if let Err(e) = socket.write_all(&batch_responses).await {
+                                        eprintln!("Failed to write batch responses: {}", e);
+                                        break;
+                                    }
+                                    batch_responses.clear();
+                                }
+                            } else {
+                                if let Err(e) = socket.write_all(&batch_responses).await {
+                                    eprintln!("Failed to write GetBalanceResponse: {}", e);
+                                    break;
+                                }
+                                batch_responses.clear();
                             }
+                        }
+                        OperationKind::BATCH => {
+                            let request: &BatchRequest = bytemuck::from_bytes(&payload[..std::mem::size_of::<BatchRequest>()]);
+                            in_batch = request.batch_size;
+
+                            let response = BatchResponse { batch_size: in_batch };
+                            let resp_header = ProtocolHeader {
+                                op_kind: OperationKind::BATCH,
+                                _padding: [0; 3],
+                                length: std::mem::size_of::<BatchResponse>() as u32,
+                            };
+                            
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
+                            batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                            
+                            if in_batch == 0 {
+                                if let Err(e) = socket.write_all(&batch_responses).await {
+                                    eprintln!("Failed to write BatchResponse: {}", e);
+                                    break;
+                                }
+                                batch_responses.clear();
+                            }
+                            consumed_payload = std::mem::size_of::<BatchRequest>();
                         }
                         _ => {
                             eprintln!("Unknown operation kind: {:?}", header.op_kind);
                             break;
                         }
                     }
+
+                    // 5. Remove processed frame from buffer
+                    buffer.drain(..header_size + consumed_payload);
                 }
             });
         }
