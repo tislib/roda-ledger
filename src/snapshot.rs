@@ -387,8 +387,9 @@ where
         let final_path = location.join("snapshot.bin");
 
         let mut file = std::fs::File::create(&tmp_path)?;
-        
-        let mut buffer = Vec::with_capacity(32 + balances.len() * (8 + std::mem::size_of::<BalanceData>()));
+
+        let mut buffer =
+            Vec::with_capacity(32 + balances.len() * (8 + std::mem::size_of::<BalanceData>()));
 
         // Write snapshot header: checkpoint_id, last_transaction_id, last_wal_position (each u64)
         let cp = self.checkpoint.load();
@@ -400,7 +401,7 @@ where
             buffer.extend_from_slice(&account_id.to_le_bytes());
             buffer.extend_from_slice(bytemuck::bytes_of(&balance));
         }
-        
+
         file.write_all(&buffer)?;
         file.sync_all()?;
         std::fs::rename(tmp_path, final_path)?;

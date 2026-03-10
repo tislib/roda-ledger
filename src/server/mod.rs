@@ -1,7 +1,7 @@
-use crate::ledger::{Ledger, LedgerConfig};
-use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
 use crate::balance::BalanceDataType;
+use crate::ledger::{Ledger, LedgerConfig};
 use crate::protocol::*;
+use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -104,27 +104,32 @@ where
 
                     match header.op_kind {
                         OperationKind::REGISTER_TRANSACTION => {
-                            let request: &RegisterTransactionRequest<Data> = bytemuck::from_bytes(payload);
+                            let request: &RegisterTransactionRequest<Data> =
+                                bytemuck::from_bytes(payload);
                             let tx_id = ledger.submit(Transaction::new(request.data));
 
-                            let response = RegisterTransactionResponse { transaction_id: tx_id };
+                            let response = RegisterTransactionResponse {
+                                transaction_id: tx_id,
+                            };
                             let resp_header = ProtocolHeader {
                                 op_kind: OperationKind::REGISTER_TRANSACTION,
                                 _padding: [0; 3],
                                 length: std::mem::size_of::<RegisterTransactionResponse>() as u32,
                             };
-                            
+
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
-                            
+
                             if in_batch > 0 {
                                 in_batch -= 1;
                                 if in_batch == 0 {
                                     // Update the BATCH header length to include all responses
                                     let header_size = std::mem::size_of::<ProtocolHeader>();
                                     if batch_responses.len() >= header_size {
-                                        let total_payload_size = (batch_responses.len() - header_size) as u32;
-                                        batch_responses[4..8].copy_from_slice(&total_payload_size.to_ne_bytes());
+                                        let total_payload_size =
+                                            (batch_responses.len() - header_size) as u32;
+                                        batch_responses[4..8]
+                                            .copy_from_slice(&total_payload_size.to_ne_bytes());
                                     }
 
                                     if let Err(e) = socket.write_all(&batch_responses).await {
@@ -159,18 +164,20 @@ where
                                 _padding: [0; 3],
                                 length: std::mem::size_of::<GetStatusResponse>() as u32,
                             };
-                            
+
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
-                            
+
                             if in_batch > 0 {
                                 in_batch -= 1;
                                 if in_batch == 0 {
                                     // Update the BATCH header length to include all responses
                                     let header_size = std::mem::size_of::<ProtocolHeader>();
                                     if batch_responses.len() >= header_size {
-                                        let total_payload_size = (batch_responses.len() - header_size) as u32;
-                                        batch_responses[4..8].copy_from_slice(&total_payload_size.to_ne_bytes());
+                                        let total_payload_size =
+                                            (batch_responses.len() - header_size) as u32;
+                                        batch_responses[4..8]
+                                            .copy_from_slice(&total_payload_size.to_ne_bytes());
                                     }
 
                                     if let Err(e) = socket.write_all(&batch_responses).await {
@@ -195,20 +202,23 @@ where
                             let resp_header = ProtocolHeader {
                                 op_kind: OperationKind::GET_BALANCE,
                                 _padding: [0; 3],
-                                length: std::mem::size_of::<GetBalanceResponse<BalanceData>>() as u32,
+                                length: std::mem::size_of::<GetBalanceResponse<BalanceData>>()
+                                    as u32,
                             };
-                            
+
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
-                            
+
                             if in_batch > 0 {
                                 in_batch -= 1;
                                 if in_batch == 0 {
                                     // Update the BATCH header length to include all responses
                                     let header_size = std::mem::size_of::<ProtocolHeader>();
                                     if batch_responses.len() >= header_size {
-                                        let total_payload_size = (batch_responses.len() - header_size) as u32;
-                                        batch_responses[4..8].copy_from_slice(&total_payload_size.to_ne_bytes());
+                                        let total_payload_size =
+                                            (batch_responses.len() - header_size) as u32;
+                                        batch_responses[4..8]
+                                            .copy_from_slice(&total_payload_size.to_ne_bytes());
                                     }
 
                                     if let Err(e) = socket.write_all(&batch_responses).await {
@@ -226,19 +236,23 @@ where
                             }
                         }
                         OperationKind::BATCH => {
-                            let request: &BatchRequest = bytemuck::from_bytes(&payload[..std::mem::size_of::<BatchRequest>()]);
+                            let request: &BatchRequest = bytemuck::from_bytes(
+                                &payload[..std::mem::size_of::<BatchRequest>()],
+                            );
                             in_batch = request.batch_size;
 
-                            let response = BatchResponse { batch_size: in_batch };
+                            let response = BatchResponse {
+                                batch_size: in_batch,
+                            };
                             let resp_header = ProtocolHeader {
                                 op_kind: OperationKind::BATCH,
                                 _padding: [0; 3],
                                 length: std::mem::size_of::<BatchResponse>() as u32,
                             };
-                            
+
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
                             batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
-                            
+
                             if in_batch == 0 {
                                 if let Err(e) = socket.write_all(&batch_responses).await {
                                     eprintln!("Failed to write BatchResponse: {}", e);
