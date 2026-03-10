@@ -72,6 +72,12 @@ impl Wallet {
         }
     }
 
+    pub fn submit(&mut self, transaction: Transaction<WalletTransaction, WalletBalance>) -> u64 {
+        let transaction_id = self.ledger.submit(transaction);
+        self.last_transaction_id = transaction_id;
+        transaction_id
+    }
+
     pub fn deposit(&mut self, account_id: u64, amount: u64) -> u64 {
         let tx_data = WalletTransaction::deposit(account_id, amount);
         let tx = Transaction::new(tx_data);

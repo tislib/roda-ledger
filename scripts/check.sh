@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
 # Ensure we're in the project root
 cd "$(dirname "$0")/.."
