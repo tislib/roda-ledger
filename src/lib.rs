@@ -7,6 +7,7 @@ mod sequencer;
 pub mod server;
 pub mod snapshot;
 mod snapshot_store;
+pub mod testing;
 pub mod transaction;
 pub mod transactor;
 pub mod wal;

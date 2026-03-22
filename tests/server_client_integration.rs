@@ -14,7 +14,7 @@ async fn test_server_client_integration() {
         worker_threads: 1,
         ledger_config: LedgerConfig {
             in_memory: true,
-            capacity: 1024,
+            queue_size: 1024,
             ..Default::default()
         },
     };

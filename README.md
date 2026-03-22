@@ -163,6 +163,16 @@ Roda-Ledger is highly optimized for throughput and latency. Below are the result
 
 *Benchmarks performed using Criterion.rs with persistence enabled (WAL active).*
 
+## Stress Testing Performance
+
+The system has been extensively stress-tested across various scenarios. Below are some highlights:
+
+- **Maximum Throughput:** Reached up to **1.5 Million TPS** during the WAL Growth and Spike scenarios.
+- **Ultra-Low Latency:** Achieved as low as **37ns** mean latency during mixed workload loads.
+- **Sustained Performance:** Maintains a steady **100K TPS** with nanosecond-level latency over time.
+
+For detailed reports and more scenarios, see the [Stress Testing Reports](reporting/README.md).
+
 ## Getting Started
 
 Add Roda-Ledger to your `Cargo.toml`:

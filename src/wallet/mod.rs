@@ -60,7 +60,7 @@ impl Wallet {
         };
 
         let ledger_config = LedgerConfig {
-            capacity: config.capacity,
+            queue_size: config.capacity,
             location: resolved_location.clone(),
             in_memory: config.in_memory,
             snapshot_interval: config.snapshot_interval,
