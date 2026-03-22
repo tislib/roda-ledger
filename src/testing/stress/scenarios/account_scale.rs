@@ -8,25 +8,23 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub struct SustainLoadScenario {
+pub struct AccountScaleScenario {
     pub duration: Duration,
-    pub rate: u64,
-    pub accounts: u64,
+    pub max_accounts: u64,
 }
 
-impl SustainLoadScenario {
-    pub fn new(duration: Duration, rate: u64, accounts: u64) -> Self {
+impl AccountScaleScenario {
+    pub fn new(duration: Duration, max_accounts: u64) -> Self {
         Self {
             duration,
-            rate,
-            accounts,
+            max_accounts,
         }
     }
 }
 
-impl Scenario for SustainLoadScenario {
+impl Scenario for AccountScaleScenario {
     fn name(&self) -> String {
-        "sustain_load".to_string()
+        "account_scale".to_string()
     }
 
     fn duration(&self) -> Duration {
@@ -35,19 +33,21 @@ impl Scenario for SustainLoadScenario {
 
     fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
-        let accounts: Vec<u64> = (0..self.accounts).collect();
-        workload = workload.with_accounts(accounts.clone());
+        let max_accounts = self.max_accounts;
+        let duration = self.duration;
 
-        let config = RunConfig {
-            limit: Limit::Duration(self.duration),
-            power: Power::Rate(self.rate),
-        };
-
-        // Run workload in a separate thread
         let workload_handle = std::thread::spawn(move || {
+            let config = RunConfig {
+                limit: Limit::Duration(duration),
+                power: Power::Full,
+            };
+
             let _ = workload.run(
                 config,
-                move |idx| WalletTransaction::deposit(accounts[idx as usize % accounts.len()], 100),
+                |idx| {
+                    let account_id = idx % max_accounts;
+                    WalletTransaction::deposit(account_id, 100)
+                },
             );
         });
 

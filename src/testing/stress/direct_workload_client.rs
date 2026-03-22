@@ -32,7 +32,7 @@ where
         config: RunConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let all_accounts = self.all_accounts.clone();
-        self.run_internal(config, move |idx| {
+        self.run(config, move |idx| {
             let account_id = selector.select(idx, &all_accounts);
             WalletTransaction::deposit(account_id, amount)
         })
@@ -46,7 +46,7 @@ where
         config: RunConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let all_accounts = self.all_accounts.clone();
-        self.run_internal(config, move |idx| {
+        self.run(config, move |idx| {
             let from = from_selector.select(idx, &all_accounts);
             let to = to_selector.select(idx + 1, &all_accounts);
             WalletTransaction::transfer(from, to, amount)

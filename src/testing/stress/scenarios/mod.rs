@@ -1,2 +1,11 @@
 pub mod sustain_load;
+pub mod load_ramp;
+pub mod peak;
+pub mod spike;
+pub mod spike_recovery;
+pub mod account_scale;
+pub mod mixed_workload;
+pub mod hot_account_contention;
+pub mod snapshot_impact;
+pub mod wal_growth;
 pub mod scenario;

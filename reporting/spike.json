@@ -1,0 +1,91 @@
+{
+  "scenario_name": "spike",
+  "duration": {
+    "secs": 1,
+    "nanos": 157066458
+  },
+  "metrics_over_time": [
+    {
+      "timestamp": {
+        "secs": 1,
+        "nanos": 157058833
+      },
+      "tx_per_sec": {
+        "compute": 2211437.1926712785,
+        "commit": 2211437.1926712785,
+        "snapshot": 2210959.462351665
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 684
+      },
+      "cpu_usage": 360.29788,
+      "memory_usage": 24756224
+    }
+  ],
+  "latencies": {
+    "count": 209,
+    "min": 83,
+    "max": 1458,
+    "mean": 684.799043062201,
+    "p50": 625,
+    "p90": 1041,
+    "p99": 1167,
+    "p999": 1458,
+    "p9999": 1458,
+    "seq_id": 209000
+  },
+  "tx_per_sec": {
+    "compute": 1948329.7475381487,
+    "commit": 1948329.7475381487,
+    "snapshot": 1948329.7475381487
+  },
+  "cpu_usage": 10.62597,
+  "memory_usage": 24756224,
+  "latency_history": [
+    {
+      "secs": 0,
+      "nanos": 679
+    },
+    {
+      "secs": 0,
+      "nanos": 723
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    }
+  ]
+}

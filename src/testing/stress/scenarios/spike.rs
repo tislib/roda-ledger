@@ -8,25 +8,23 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub struct SustainLoadScenario {
+pub struct SpikeScenario {
     pub duration: Duration,
-    pub rate: u64,
     pub accounts: u64,
 }
 
-impl SustainLoadScenario {
-    pub fn new(duration: Duration, rate: u64, accounts: u64) -> Self {
+impl SpikeScenario {
+    pub fn new(duration: Duration, accounts: u64) -> Self {
         Self {
             duration,
-            rate,
             accounts,
         }
     }
 }
 
-impl Scenario for SustainLoadScenario {
+impl Scenario for SpikeScenario {
     fn name(&self) -> String {
-        "sustain_load".to_string()
+        "spike".to_string()
     }
 
     fn duration(&self) -> Duration {
@@ -40,10 +38,9 @@ impl Scenario for SustainLoadScenario {
 
         let config = RunConfig {
             limit: Limit::Duration(self.duration),
-            power: Power::Rate(self.rate),
+            power: Power::Full,
         };
 
-        // Run workload in a separate thread
         let workload_handle = std::thread::spawn(move || {
             let _ = workload.run(
                 config,

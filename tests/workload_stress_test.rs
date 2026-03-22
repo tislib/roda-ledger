@@ -58,9 +58,13 @@ fn test_workload_transfer_spike_direct() {
     workload.deposit(AccountSelector::All, 1000, config_dep).expect("Initial deposit failed");
 
     // Then run spike transfer
-    workload.spike(|_| {
+    let config = RunConfig {
+        limit: Limit::Duration(Duration::from_millis(500)),
+        power: Power::Full,
+    };
+    workload.run(config, |_| {
         WalletTransaction::transfer(1001, 1002, 10)
-    }, Duration::from_millis(500)).expect("Spike failed");
+    }).expect("Spike failed");
 }
 
 #[test]
@@ -78,9 +82,31 @@ fn test_workload_peak_load_direct() {
     let client = DirectWorkloadClient::new(ledger.clone());
     let mut workload = Workload::new(client).with_accounts((2000..2010).collect());
     
-    workload.peak(|_| {
-        WalletTransaction::deposit(2005, 1)
-    }, Duration::from_secs(1), 100).expect("Peak failed");
+    use std::time::Instant;
+    let start_time = Instant::now();
+    let duration = Duration::from_secs(1);
+    let peak_rate = 100u64;
+    let interval = Duration::from_millis(100);
+    let total_ticks = duration.as_secs_f64() / interval.as_secs_f64();
+    let mut total_count = 0;
+
+    for i in 0..(total_ticks as u64) {
+        if start_time.elapsed() >= duration { break; }
+        let progress = i as f64 / total_ticks;
+        let current_rate = if progress < 0.5 {
+            (progress * 2.0 * peak_rate as f64) as u64
+        } else {
+            ((1.0 - progress) * 2.0 * peak_rate as f64) as u64
+        };
+
+        let config = RunConfig {
+            limit: Limit::Duration(interval),
+            power: Power::Rate(current_rate.max(1)),
+        };
+
+        let (_, count) = workload.run_step(config, |_| WalletTransaction::deposit(2005, 1), total_count).expect("Step failed");
+        total_count += count;
+    }
 }
 
 #[test]

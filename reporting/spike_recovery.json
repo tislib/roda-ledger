@@ -1,0 +1,511 @@
+{
+  "scenario_name": "spike_recovery",
+  "duration": {
+    "secs": 21,
+    "nanos": 642374333
+  },
+  "metrics_over_time": [
+    {
+      "timestamp": {
+        "secs": 1,
+        "nanos": 160719292
+      },
+      "tx_per_sec": {
+        "compute": 2209016.079446849,
+        "commit": 2207008.3321873993,
+        "snapshot": 2206905.395926539
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 672
+      },
+      "cpu_usage": 356.41205,
+      "memory_usage": 24805376
+    },
+    {
+      "timestamp": {
+        "secs": 2,
+        "nanos": 175333875
+      },
+      "tx_per_sec": {
+        "compute": 204878.20877427928,
+        "commit": 204878.20877427928,
+        "snapshot": 204726.42669611945
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 673
+      },
+      "cpu_usage": 408.6928,
+      "memory_usage": 24838144
+    },
+    {
+      "timestamp": {
+        "secs": 3,
+        "nanos": 192421583
+      },
+      "tx_per_sec": {
+        "compute": 204379.93037811122,
+        "commit": 204379.93037811122,
+        "snapshot": 204005.33084823677
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 659
+      },
+      "cpu_usage": 408.51062,
+      "memory_usage": 24838144
+    },
+    {
+      "timestamp": {
+        "secs": 4,
+        "nanos": 206407167
+      },
+      "tx_per_sec": {
+        "compute": 204399.70840797448,
+        "commit": 205005.24074430164,
+        "snapshot": 205374.08291659213
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 634
+      },
+      "cpu_usage": 405.84302,
+      "memory_usage": 24182784
+    },
+    {
+      "timestamp": {
+        "secs": 5,
+        "nanos": 225932500
+      },
+      "tx_per_sec": {
+        "compute": 203171.30039431926,
+        "commit": 202886.85390398744,
+        "snapshot": 202300.3056239239
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 622
+      },
+      "cpu_usage": 405.04532,
+      "memory_usage": 24182784
+    },
+    {
+      "timestamp": {
+        "secs": 6,
+        "nanos": 242690792
+      },
+      "tx_per_sec": {
+        "compute": 200736.56688450254,
+        "commit": 200417.90619037917,
+        "snapshot": 200658.86875229343
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 613
+      },
+      "cpu_usage": 406.73123,
+      "memory_usage": 24166400
+    },
+    {
+      "timestamp": {
+        "secs": 7,
+        "nanos": 260496375
+      },
+      "tx_per_sec": {
+        "compute": 192384.72615912292,
+        "commit": 193168.76686937766,
+        "snapshot": 192802.2917002987
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 603
+      },
+      "cpu_usage": 408.90652,
+      "memory_usage": 24166400
+    },
+    {
+      "timestamp": {
+        "secs": 8,
+        "nanos": 278837625
+      },
+      "tx_per_sec": {
+        "compute": 192845.13991046388,
+        "commit": 192061.51197282932,
+        "snapshot": 193028.7720211627
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 598
+      },
+      "cpu_usage": 407.56442,
+      "memory_usage": 24182784
+    },
+    {
+      "timestamp": {
+        "secs": 9,
+        "nanos": 296926958
+      },
+      "tx_per_sec": {
+        "compute": 193114.8973752627,
+        "commit": 193114.8973752627,
+        "snapshot": 192861.4812196494
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 597
+      },
+      "cpu_usage": 409.89948,
+      "memory_usage": 24215552
+    },
+    {
+      "timestamp": {
+        "secs": 10,
+        "nanos": 315511500
+      },
+      "tx_per_sec": {
+        "compute": 194026.39927319743,
+        "commit": 194026.39927319743,
+        "snapshot": 193946.87703822975
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 589
+      },
+      "cpu_usage": 407.3685,
+      "memory_usage": 24215552
+    },
+    {
+      "timestamp": {
+        "secs": 11,
+        "nanos": 330023667
+      },
+      "tx_per_sec": {
+        "compute": 71363.5065988129,
+        "commit": 73382.21488918112,
+        "snapshot": 73723.26619214372
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 589
+      },
+      "cpu_usage": 339.41232,
+      "memory_usage": 24215552
+    },
+    {
+      "timestamp": {
+        "secs": 12,
+        "nanos": 342671292
+      },
+      "tx_per_sec": {
+        "compute": 10000.527489065227,
+        "commit": 9999.539977710525,
+        "snapshot": 9999.539977710525
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 587
+      },
+      "cpu_usage": 308.19946,
+      "memory_usage": 24215552
+    },
+    {
+      "timestamp": {
+        "secs": 13,
+        "nanos": 356281750
+      },
+      "tx_per_sec": {
+        "compute": 9999.91326042089,
+        "commit": 10000.89983434161,
+        "snapshot": 10000.89983434161
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 585
+      },
+      "cpu_usage": 298.40897,
+      "memory_usage": 24215552
+    },
+    {
+      "timestamp": {
+        "secs": 14,
+        "nanos": 369544917
+      },
+      "tx_per_sec": {
+        "compute": 9999.39304907963,
+        "commit": 9999.39304907963,
+        "snapshot": 9999.39304907963
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 582
+      },
+      "cpu_usage": 308.21292,
+      "memory_usage": 24231936
+    },
+    {
+      "timestamp": {
+        "secs": 15,
+        "nanos": 381330708
+      },
+      "tx_per_sec": {
+        "compute": 10000.15113887252,
+        "commit": 10000.15113887252,
+        "snapshot": 10000.15113887252
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 580
+      },
+      "cpu_usage": 307.65576,
+      "memory_usage": 24248320
+    },
+    {
+      "timestamp": {
+        "secs": 16,
+        "nanos": 394129417
+      },
+      "tx_per_sec": {
+        "compute": 10000.030855150495,
+        "commit": 10000.030855150495,
+        "snapshot": 10000.030855150495
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 578
+      },
+      "cpu_usage": 305.40533,
+      "memory_usage": 24248320
+    },
+    {
+      "timestamp": {
+        "secs": 17,
+        "nanos": 406924792
+      },
+      "tx_per_sec": {
+        "compute": 10000.053485673116,
+        "commit": 10000.053485673116,
+        "snapshot": 10000.053485673116
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 576
+      },
+      "cpu_usage": 308.24225,
+      "memory_usage": 24248320
+    },
+    {
+      "timestamp": {
+        "secs": 18,
+        "nanos": 420366333
+      },
+      "tx_per_sec": {
+        "compute": 10000.601091876382,
+        "commit": 10000.601091876382,
+        "snapshot": 9999.614352745462
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 574
+      },
+      "cpu_usage": 307.79602,
+      "memory_usage": 24248320
+    },
+    {
+      "timestamp": {
+        "secs": 19,
+        "nanos": 615938208
+      },
+      "tx_per_sec": {
+        "compute": 9999.41381102625,
+        "commit": 9999.41381102625,
+        "snapshot": 10000.25023208949
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 573
+      },
+      "cpu_usage": 208.07936,
+      "memory_usage": 24051712
+    },
+    {
+      "timestamp": {
+        "secs": 20,
+        "nanos": 626318542
+      },
+      "tx_per_sec": {
+        "compute": 10000.214444424353,
+        "commit": 10000.214444424353,
+        "snapshot": 10000.214444424353
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 572
+      },
+      "cpu_usage": 239.64082,
+      "memory_usage": 24068096
+    },
+    {
+      "timestamp": {
+        "secs": 21,
+        "nanos": 642360625
+      },
+      "tx_per_sec": {
+        "compute": 5094.289506671554,
+        "commit": 5094.289506671554,
+        "snapshot": 5094.289506671554
+      },
+      "mean_latency": {
+        "secs": 0,
+        "nanos": 571
+      },
+      "cpu_usage": 303.95337,
+      "memory_usage": 24084480
+    }
+  ],
+  "latencies": {
+    "count": 2199,
+    "min": 41,
+    "max": 5251,
+    "mean": 571.4020009095045,
+    "p50": 541,
+    "p90": 833,
+    "p99": 1125,
+    "p999": 4167,
+    "p9999": 5251,
+    "seq_id": 2199000
+  },
+  "tx_per_sec": {
+    "compute": 196120.53348176417,
+    "commit": 196120.53348176417,
+    "snapshot": 196120.53348176417
+  },
+  "cpu_usage": 9.276666,
+  "memory_usage": 24100864,
+  "latency_history": [
+    {
+      "secs": 0,
+      "nanos": 666
+    },
+    {
+      "secs": 0,
+      "nanos": 690
+    },
+    {
+      "secs": 0,
+      "nanos": 636
+    },
+    {
+      "secs": 0,
+      "nanos": 561
+    },
+    {
+      "secs": 0,
+      "nanos": 586
+    },
+    {
+      "secs": 0,
+      "nanos": 571
+    },
+    {
+      "secs": 0,
+      "nanos": 533
+    },
+    {
+      "secs": 0,
+      "nanos": 552
+    },
+    {
+      "secs": 0,
+      "nanos": 600
+    },
+    {
+      "secs": 0,
+      "nanos": 520
+    },
+    {
+      "secs": 0,
+      "nanos": 556
+    },
+    {
+      "secs": 0,
+      "nanos": 162
+    },
+    {
+      "secs": 0,
+      "nanos": 162
+    },
+    {
+      "secs": 0,
+      "nanos": 162
+    },
+    {
+      "secs": 0,
+      "nanos": 145
+    },
+    {
+      "secs": 0,
+      "nanos": 154
+    },
+    {
+      "secs": 0,
+      "nanos": 158
+    },
+    {
+      "secs": 0,
+      "nanos": 133
+    },
+    {
+      "secs": 0,
+      "nanos": 212
+    },
+    {
+      "secs": 0,
+      "nanos": 366
+    },
+    {
+      "secs": 0,
+      "nanos": 245
+    },
+    {
+      "secs": 0,
+      "nanos": 375
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    },
+    {
+      "secs": 0,
+      "nanos": 0
+    }
+  ]
+}

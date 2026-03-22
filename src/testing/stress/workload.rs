@@ -99,103 +99,28 @@ where
         self
     }
 
-    pub fn sustain_load<F>(
-        &mut self,
-        operation: F,
-        duration: Duration,
-        rate: u64,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        F: Fn(u64) -> WalletTransaction + Send + 'static,
-    {
-        let config = RunConfig {
-            limit: Limit::Duration(duration),
-            power: Power::Rate(rate),
-        };
-        self.run_internal(config, operation)
-    }
 
-    pub fn peak<F>(
-        &mut self,
-        operation: F,
-        duration: Duration,
-        peak_rate: u64,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        F: Fn(u64) -> WalletTransaction + Send + Sync + 'static,
-    {
-        let start_time = Instant::now();
-        let interval = Duration::from_millis(100); // Update rate every 100ms
-        let total_ticks = duration.as_secs_f64() / interval.as_secs_f64();
-
-        let operation = Arc::new(operation);
-        let mut total_count = 0;
-
-        for i in 0..(total_ticks as u64) {
-            let elapsed = start_time.elapsed();
-            if elapsed >= duration {
-                break;
-            }
-
-            // Linear ramp-up and ramp-down
-            let progress = i as f64 / total_ticks;
-            let current_rate = if progress < 0.5 {
-                (progress * 2.0 * peak_rate as f64) as u64
-            } else {
-                ((1.0 - progress) * 2.0 * peak_rate as f64) as u64
-            };
-
-            let config = RunConfig {
-                limit: Limit::Duration(interval),
-                power: Power::Rate(current_rate.max(1)),
-            };
-
-            let op = Arc::clone(&operation);
-            let offset = total_count;
-            let (res, count) = self.run_internal_with_offset(config, move |idx| op(idx), offset)?;
-            total_count += count;
-            if res.is_err() {
-                return res.map(|_| ());
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn spike<F>(
-        &mut self,
-        operation: F,
-        duration: Duration,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        F: Fn(u64) -> WalletTransaction + Send + 'static,
-    {
-        let config = RunConfig {
-            limit: Limit::Duration(duration),
-            power: Power::Full,
-        };
-        self.run_internal(config, operation)
-    }
-
-    pub fn run_internal<F>(
+    /// Runs a workload with the given configuration and operation generator.
+    pub fn run<F>(
         &mut self,
         config: RunConfig,
         operation_gen: F,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
-        F: Fn(u64) -> WalletTransaction + Send + 'static,
+        F: FnMut(u64) -> WalletTransaction + Send,
     {
-        self.run_internal_with_offset(config, operation_gen, 0).map(|_| ())
+        self.run_step(config, operation_gen, 0).map(|_| ())
     }
 
-    pub fn run_internal_with_offset<F>(
+    /// Runs a single step of a workload, allowing for offset management in sequences.
+    pub fn run_step<F>(
         &mut self,
         config: RunConfig,
-        operation_gen: F,
+        mut operation_gen: F,
         offset: u64,
     ) -> Result<(Result<(), Box<dyn std::error::Error>>, u64), Box<dyn std::error::Error>>
     where
-        F: Fn(u64) -> WalletTransaction + Send + 'static,
+        F: FnMut(u64) -> WalletTransaction + Send,
     {
         let start_time = Instant::now();
         let mut count = 0;
