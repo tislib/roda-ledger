@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "A zero-copy, lock-free multi-threaded stage engine for ultra-low latency pipelines."
 authors = ["Taleh Ibrahimli"]
-repository = "https://github.com/tislib/roda-state"
+repository = "https://github.com/tislib/roda-ledger"
 license = "Apache-2.0"
-keywords = ["lock-free", "hft", "concurrency", "pipeline", "low-latency"]
-categories = ["concurrency", "data-structures"]
+keywords = ["lock-free", "ledger", "concurrency", "pipeline", "low-latency"]
+categories = ["concurrency", "data-structures", "ledger"]
 
 [dependencies]
 crossbeam-queue = "0.3.12"
