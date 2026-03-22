@@ -33,7 +33,11 @@ impl Scenario for SustainLoadScenario {
         self.duration
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let accounts: Vec<u64> = (0..self.accounts).collect();
         workload = workload.with_accounts(accounts.clone());
@@ -45,10 +49,9 @@ impl Scenario for SustainLoadScenario {
 
         // Run workload in a separate thread
         let workload_handle = std::thread::spawn(move || {
-            let _ = workload.run(
-                config,
-                move |idx| WalletTransaction::deposit(accounts[idx as usize % accounts.len()], 100),
-            );
+            let _ = workload.run(config, move |idx| {
+                WalletTransaction::deposit(accounts[idx as usize % accounts.len()], 100)
+            });
         });
 
         Ok(workload_handle)

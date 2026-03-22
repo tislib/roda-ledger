@@ -15,10 +15,7 @@ pub struct HotAccountContentionScenario {
 
 impl HotAccountContentionScenario {
     pub fn new(duration: Duration, accounts: u64) -> Self {
-        Self {
-            duration,
-            accounts,
-        }
+        Self { duration, accounts }
     }
 }
 
@@ -31,7 +28,11 @@ impl Scenario for HotAccountContentionScenario {
         self.duration
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let accounts: Vec<u64> = (0..self.accounts).collect();
         workload = workload.with_accounts(accounts.clone());
@@ -45,21 +46,26 @@ impl Scenario for HotAccountContentionScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(
-                config,
-                |idx| {
-                    let hot_account_idx = 0;
-                    let other_account_idx = (1 + (idx % (accounts_ref.len() as u64 - 1))) as usize;
-                    
-                    if idx % 2 == 0 {
-                        // All transfers TO the hot account
-                        WalletTransaction::transfer(accounts_ref[other_account_idx], accounts_ref[hot_account_idx], 1)
-                    } else {
-                        // All transfers FROM the hot account
-                        WalletTransaction::transfer(accounts_ref[hot_account_idx], accounts_ref[other_account_idx], 1)
-                    }
-                },
-            );
+            let _ = workload.run(config, |idx| {
+                let hot_account_idx = 0;
+                let other_account_idx = (1 + (idx % (accounts_ref.len() as u64 - 1))) as usize;
+
+                if idx % 2 == 0 {
+                    // All transfers TO the hot account
+                    WalletTransaction::transfer(
+                        accounts_ref[other_account_idx],
+                        accounts_ref[hot_account_idx],
+                        1,
+                    )
+                } else {
+                    // All transfers FROM the hot account
+                    WalletTransaction::transfer(
+                        accounts_ref[hot_account_idx],
+                        accounts_ref[other_account_idx],
+                        1,
+                    )
+                }
+            });
         });
 
         Ok(workload_handle)

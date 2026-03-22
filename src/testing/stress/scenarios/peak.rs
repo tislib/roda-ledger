@@ -33,7 +33,11 @@ impl Scenario for PeakScenario {
         self.duration
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let accounts: Vec<u64> = (0..self.accounts).collect();
         workload = workload.with_accounts(accounts.clone());
@@ -67,12 +71,19 @@ impl Scenario for PeakScenario {
                 };
 
                 let accounts_ref = &accounts;
-                let (res, count) = workload.run_step(
-                    config,
-                    move |idx| WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100),
-                    total_count,
-                ).unwrap();
-                
+                let (res, count) = workload
+                    .run_step(
+                        config,
+                        move |idx| {
+                            WalletTransaction::deposit(
+                                accounts_ref[idx as usize % accounts_ref.len()],
+                                100,
+                            )
+                        },
+                        total_count,
+                    )
+                    .unwrap();
+
                 total_count += count;
                 if res.is_err() {
                     break;

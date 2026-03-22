@@ -1,14 +1,14 @@
 pub mod balance;
 pub mod client;
 pub mod ledger;
+pub mod protocol;
 mod replay;
 mod sequencer;
 pub mod server;
 pub mod snapshot;
 mod snapshot_store;
+pub mod testing;
 pub mod transaction;
 pub mod transactor;
 pub mod wal;
 pub mod wallet;
-pub mod testing;
-pub mod protocol;

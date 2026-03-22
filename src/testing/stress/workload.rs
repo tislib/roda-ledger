@@ -2,8 +2,13 @@ use crate::testing::reporting::WorkloadMetrics;
 use crate::transaction::Transaction;
 use crate::wallet::balance::WalletBalance;
 use crate::wallet::transaction::WalletTransaction;
+use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+pub type DynError = Box<dyn Error>;
+pub type StepOutcome = Result<(), DynError>;
+pub type RunStepResult = Result<(StepOutcome, u64), DynError>;
 
 pub enum AccountSelector {
     Single(u64),
@@ -99,7 +104,6 @@ where
         self
     }
 
-
     /// Runs a workload with the given configuration and operation generator.
     pub fn run<F>(
         &mut self,
@@ -118,7 +122,7 @@ where
         config: RunConfig,
         mut operation_gen: F,
         offset: u64,
-    ) -> Result<(Result<(), Box<dyn std::error::Error>>, u64), Box<dyn std::error::Error>>
+    ) -> RunStepResult
     where
         F: FnMut(u64) -> WalletTransaction + Send,
     {
@@ -126,60 +130,58 @@ where
         let mut count = 0;
 
         match config.power {
-            Power::Full => {
-                loop {
-                    if let Limit::Count(limit_count) = config.limit {
-                        if count >= limit_count {
-                            break;
-                        }
-                    }
-                    if let Limit::Duration(limit_duration) = config.limit {
-                        if start_time.elapsed() >= limit_duration {
-                            break;
-                        }
-                    }
-
-                    let tx_data = operation_gen(offset + count);
-                    let tx = Transaction::new(tx_data);
-                    
-                    let start = Instant::now();
-                    self.client.submit(tx);
-                    let elapsed = start.elapsed();
-                    
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record(elapsed);
-                    }
-                    
-                    count += 1;
+            Power::Full => loop {
+                if let Limit::Count(limit_count) = config.limit
+                    && count >= limit_count
+                {
+                    break;
                 }
-            }
+                if let Limit::Duration(limit_duration) = config.limit
+                    && start_time.elapsed() >= limit_duration
+                {
+                    break;
+                }
+
+                let tx_data = operation_gen(offset + count);
+                let tx = Transaction::new(tx_data);
+
+                let start = Instant::now();
+                self.client.submit(tx);
+                let elapsed = start.elapsed();
+
+                if let Some(metrics) = &self.metrics {
+                    metrics.record(elapsed);
+                }
+
+                count += 1;
+            },
             Power::Rate(rate) => {
                 let interval = Duration::from_secs_f64(1.0 / rate as f64);
                 let mut next_tick = start_time;
 
                 loop {
-                    if let Limit::Count(limit_count) = config.limit {
-                        if count >= limit_count {
-                            break;
-                        }
+                    if let Limit::Count(limit_count) = config.limit
+                        && count >= limit_count
+                    {
+                        break;
                     }
-                    if let Limit::Duration(limit_duration) = config.limit {
-                        if start_time.elapsed() >= limit_duration {
-                            break;
-                        }
+                    if let Limit::Duration(limit_duration) = config.limit
+                        && start_time.elapsed() >= limit_duration
+                    {
+                        break;
                     }
 
                     let tx_data = operation_gen(offset + count);
                     let tx = Transaction::new(tx_data);
-                    
+
                     let start = Instant::now();
                     self.client.submit(tx);
                     let elapsed = start.elapsed();
-                    
+
                     if let Some(metrics) = &self.metrics {
                         metrics.record(elapsed);
                     }
-                    
+
                     count += 1;
 
                     next_tick += interval;

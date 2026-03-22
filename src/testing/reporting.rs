@@ -1,17 +1,17 @@
-use std::time::{Duration, Instant};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use crate::ledger::Ledger;
+use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
+use crate::wallet::balance::WalletBalance;
+use crate::wallet::transaction::WalletTransaction;
 use arc_swap::ArcSwap;
-use sysinfo::{Pid, System};
+use roda_latency_tracker::latency_measurer::{LatencyMeasurer, LatencyStats as RodaLatencyStats};
 use serde::Serialize;
 use std::fs::{File, create_dir_all};
 use std::io::Write;
-use crate::ledger::Ledger;
-use crate::wallet::transaction::WalletTransaction;
-use crate::wallet::balance::WalletBalance;
-use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
-use roda_latency_tracker::latency_measurer::{LatencyMeasurer, LatencyStats as RodaLatencyStats};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use sysinfo::{Pid, System};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct LatencyStats {
@@ -90,25 +90,54 @@ impl MdReporting {
 
         output.push_str("## Summary\n");
         output.push_str(&format!("- **Total Duration:** {:?}\n", result.duration));
-        output.push_str(&format!("- **Average TPS (Compute):** {:.2}\n", result.tx_per_sec.compute));
-        output.push_str(&format!("- **Average TPS (Commit):**  {:.2}\n", result.tx_per_sec.commit));
-        output.push_str(&format!("- **Average TPS (Snapshot):** {:.2}\n\n", result.tx_per_sec.snapshot));
+        output.push_str(&format!(
+            "- **Average TPS (Compute):** {:.2}\n",
+            result.tx_per_sec.compute
+        ));
+        output.push_str(&format!(
+            "- **Average TPS (Commit):**  {:.2}\n",
+            result.tx_per_sec.commit
+        ));
+        output.push_str(&format!(
+            "- **Average TPS (Snapshot):** {:.2}\n\n",
+            result.tx_per_sec.snapshot
+        ));
 
         output.push_str("## Latencies\n");
-        output.push_str(&format!("- **Mean:** {:?}\n", Duration::from_nanos(result.latencies.mean as u64)));
-        output.push_str(&format!("- **P50:**  {:?}\n", Duration::from_nanos(result.latencies.p50)));
-        output.push_str(&format!("- **P99:**  {:?}\n", Duration::from_nanos(result.latencies.p99)));
-        output.push_str(&format!("- **P999:** {:?}\n", Duration::from_nanos(result.latencies.p999)));
-        output.push_str(&format!("- **P9999:** {:?}\n", Duration::from_nanos(result.latencies.p9999)));
+        output.push_str(&format!(
+            "- **Mean:** {:?}\n",
+            Duration::from_nanos(result.latencies.mean as u64)
+        ));
+        output.push_str(&format!(
+            "- **P50:**  {:?}\n",
+            Duration::from_nanos(result.latencies.p50)
+        ));
+        output.push_str(&format!(
+            "- **P99:**  {:?}\n",
+            Duration::from_nanos(result.latencies.p99)
+        ));
+        output.push_str(&format!(
+            "- **P999:** {:?}\n",
+            Duration::from_nanos(result.latencies.p999)
+        ));
+        output.push_str(&format!(
+            "- **P9999:** {:?}\n",
+            Duration::from_nanos(result.latencies.p9999)
+        ));
         output.push_str(&format!("- **SeqId:** {}\n\n", result.latencies.seq_id));
 
         output.push_str("## System Usage (Current)\n");
         output.push_str(&format!("- **CPU Usage:**    {:.2}%\n", result.cpu_usage));
-        output.push_str(&format!("- **Memory Usage:** {:.2} MB\n\n", result.memory_usage as f64 / 1024.0 / 1024.0));
+        output.push_str(&format!(
+            "- **Memory Usage:** {:.2} MB\n\n",
+            result.memory_usage as f64 / 1024.0 / 1024.0
+        ));
 
         output.push_str("## Metrics over time (every 1s)\n\n");
-        output.push_str("| Time (s) | Compute TPS | Mean Latency | CPU Usage (%) | Memory (MB) |\n");
-        output.push_str("|----------|-------------|--------------|---------------|-------------|\n");
+        output
+            .push_str("| Time (s) | Compute TPS | Mean Latency | CPU Usage (%) | Memory (MB) |\n");
+        output
+            .push_str("|----------|-------------|--------------|---------------|-------------|\n");
         for m in &result.metrics_over_time {
             output.push_str(&format!(
                 "| {:8.1} | {:11.2} | {:12?} | {:13.2} | {:11.2} |\n",
@@ -169,7 +198,8 @@ impl Reporter {
         std::thread::sleep(Duration::from_millis(100));
         sys.refresh_all();
         let pid = Pid::from(std::process::id() as usize);
-        let md_reporting = MdReporting::new(&scenario_name).expect("Failed to create markdown reporting");
+        let md_reporting =
+            MdReporting::new(&scenario_name).expect("Failed to create markdown reporting");
 
         Self {
             scenario_name,
@@ -332,7 +362,7 @@ impl WorkloadMetrics {
 
     pub fn record(&self, elapsed: Duration) {
         let stepping = self.stepping.fetch_add(1, Ordering::Relaxed) + 1;
-        if stepping % self.sample_size != 0 {
+        if !stepping.is_multiple_of(self.sample_size) {
             return;
         }
 

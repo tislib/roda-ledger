@@ -15,10 +15,7 @@ pub struct MixedWorkloadScenario {
 
 impl MixedWorkloadScenario {
     pub fn new(duration: Duration, accounts: u64) -> Self {
-        Self {
-            duration,
-            accounts,
-        }
+        Self { duration, accounts }
     }
 }
 
@@ -31,7 +28,11 @@ impl Scenario for MixedWorkloadScenario {
         self.duration
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let accounts: Vec<u64> = (0..self.accounts).collect();
         workload = workload.with_accounts(accounts.clone());
@@ -45,24 +46,21 @@ impl Scenario for MixedWorkloadScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(
-                config,
-                |idx| {
-                    let from_idx = (idx % accounts_ref.len() as u64) as usize;
-                    let to_idx = ((idx + 1) % accounts_ref.len() as u64) as usize;
-                    
-                    if idx % 10 < 7 {
-                        // 70% deposits
-                        WalletTransaction::deposit(accounts_ref[from_idx], 100)
-                    } else if idx % 10 < 9 {
-                        // 20% transfers
-                        WalletTransaction::transfer(accounts_ref[from_idx], accounts_ref[to_idx], 50)
-                    } else {
-                        // 10% withdrawals
-                        WalletTransaction::withdraw(accounts_ref[from_idx], 10)
-                    }
-                },
-            );
+            let _ = workload.run(config, |idx| {
+                let from_idx = (idx % accounts_ref.len() as u64) as usize;
+                let to_idx = ((idx + 1) % accounts_ref.len() as u64) as usize;
+
+                if idx % 10 < 7 {
+                    // 70% deposits
+                    WalletTransaction::deposit(accounts_ref[from_idx], 100)
+                } else if idx % 10 < 9 {
+                    // 20% transfers
+                    WalletTransaction::transfer(accounts_ref[from_idx], accounts_ref[to_idx], 50)
+                } else {
+                    // 10% withdrawals
+                    WalletTransaction::withdraw(accounts_ref[from_idx], 10)
+                }
+            });
         });
 
         Ok(workload_handle)

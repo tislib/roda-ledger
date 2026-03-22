@@ -31,7 +31,11 @@ impl Scenario for AccountScaleScenario {
         self.duration
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let max_accounts = self.max_accounts;
         let duration = self.duration;
@@ -42,13 +46,10 @@ impl Scenario for AccountScaleScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(
-                config,
-                |idx| {
-                    let account_id = idx % max_accounts;
-                    WalletTransaction::deposit(account_id, 100)
-                },
-            );
+            let _ = workload.run(config, |idx| {
+                let account_id = idx % max_accounts;
+                WalletTransaction::deposit(account_id, 100)
+            });
         });
 
         Ok(workload_handle)

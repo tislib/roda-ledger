@@ -10,7 +10,11 @@ pub trait Scenario {
     fn name(&self) -> String;
     fn duration(&self) -> Duration;
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>>;
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>>;
 
     fn run(&self) -> Result<RunResult, Box<dyn Error>> {
         let wal_path = std::path::Path::new("data/wal.bin");

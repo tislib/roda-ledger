@@ -16,10 +16,7 @@ pub struct SnapshotImpactScenario {
 
 impl SnapshotImpactScenario {
     pub fn new(duration: Duration, accounts: u64) -> Self {
-        Self {
-            duration,
-            accounts,
-        }
+        Self { duration, accounts }
     }
 }
 
@@ -43,7 +40,7 @@ impl Scenario for SnapshotImpactScenario {
             snapshot_interval: Duration::from_secs(1),
             ..Default::default()
         };
-        
+
         let mut ledger = Ledger::new(config);
         ledger.start();
         let ledger = Arc::new(ledger);
@@ -61,7 +58,11 @@ impl Scenario for SnapshotImpactScenario {
         Ok(reporter.finish())
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let accounts: Vec<u64> = (0..self.accounts).collect();
         workload = workload.with_accounts(accounts.clone());
@@ -75,12 +76,9 @@ impl Scenario for SnapshotImpactScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(
-                config,
-                |idx| {
-                    WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100)
-                },
-            );
+            let _ = workload.run(config, |idx| {
+                WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100)
+            });
         });
 
         Ok(workload_handle)

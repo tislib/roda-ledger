@@ -15,10 +15,7 @@ pub struct SpikeRecoveryScenario {
 
 impl SpikeRecoveryScenario {
     pub fn new(duration: Duration, accounts: u64) -> Self {
-        Self {
-            duration,
-            accounts,
-        }
+        Self { duration, accounts }
     }
 }
 
@@ -31,7 +28,11 @@ impl Scenario for SpikeRecoveryScenario {
         self.duration
     }
 
-    fn execute(&self, client: DirectWorkloadClient, metrics: Arc<WorkloadMetrics>) -> Result<JoinHandle<()>, Box<dyn Error>> {
+    fn execute(
+        &self,
+        client: DirectWorkloadClient,
+        metrics: Arc<WorkloadMetrics>,
+    ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
         let accounts: Vec<u64> = (0..self.accounts).collect();
         workload = workload.with_accounts(accounts.clone());
@@ -41,20 +42,29 @@ impl Scenario for SpikeRecoveryScenario {
 
         let workload_handle = std::thread::spawn(move || {
             let half_duration = duration / 2;
-            
+
             // Spike phase: Full power
             let spike_config = RunConfig {
                 limit: Limit::Duration(half_duration),
                 power: Power::Full,
             };
-            
-            let (res, count) = workload.run_step(
-                spike_config,
-                |idx| WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100),
-                0,
-            ).unwrap();
-            
-            if res.is_err() { return; }
+
+            let (res, count) = workload
+                .run_step(
+                    spike_config,
+                    |idx| {
+                        WalletTransaction::deposit(
+                            accounts_ref[idx as usize % accounts_ref.len()],
+                            100,
+                        )
+                    },
+                    0,
+                )
+                .unwrap();
+
+            if res.is_err() {
+                return;
+            }
 
             // Recovery phase: Moderate rate
             let recovery_config = RunConfig {
@@ -64,7 +74,9 @@ impl Scenario for SpikeRecoveryScenario {
 
             let _ = workload.run_step(
                 recovery_config,
-                |idx| WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100),
+                |idx| {
+                    WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100)
+                },
                 count,
             );
         });

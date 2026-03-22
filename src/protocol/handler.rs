@@ -9,6 +9,12 @@ pub struct ProtocolHandler {
     batch_responses: Vec<u8>,
 }
 
+impl Default for ProtocolHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProtocolHandler {
     pub fn new() -> Self {
         Self {
@@ -68,18 +74,23 @@ impl ProtocolHandler {
         match header.op_kind {
             OperationKind::REGISTER_TRANSACTION => {
                 let req_size = std::mem::size_of::<RegisterTransactionRequest<Data>>();
-                let request: &RegisterTransactionRequest<Data> = bytemuck::from_bytes(&payload[..req_size]);
+                let request: &RegisterTransactionRequest<Data> =
+                    bytemuck::from_bytes(&payload[..req_size]);
                 let tx_id = ledger.submit(Transaction::new(request.data));
 
-                let response = RegisterTransactionResponse { transaction_id: tx_id };
+                let response = RegisterTransactionResponse {
+                    transaction_id: tx_id,
+                };
                 let resp_header = ProtocolHeader {
                     op_kind: OperationKind::REGISTER_TRANSACTION,
                     _padding: [0; 3],
                     length: std::mem::size_of::<RegisterTransactionResponse>() as u32,
                 };
 
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&resp_header));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&response));
                 (self.check_batch_completion(), header.length as usize)
             }
             OperationKind::GET_STATUS => {
@@ -102,8 +113,10 @@ impl ProtocolHandler {
                     length: std::mem::size_of::<GetStatusResponse>() as u32,
                 };
 
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&resp_header));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&response));
                 (self.check_batch_completion(), header.length as usize)
             }
             OperationKind::GET_BALANCE => {
@@ -118,8 +131,10 @@ impl ProtocolHandler {
                     length: std::mem::size_of::<GetBalanceResponse<BalanceData>>() as u32,
                 };
 
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&resp_header));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&response));
                 (self.check_batch_completion(), header.length as usize)
             }
             OperationKind::BATCH => {
@@ -127,15 +142,19 @@ impl ProtocolHandler {
                 let request: &BatchRequest = bytemuck::from_bytes(&payload[..req_size]);
                 self.in_batch = request.batch_size;
 
-                let response = BatchResponse { batch_size: self.in_batch };
+                let response = BatchResponse {
+                    batch_size: self.in_batch,
+                };
                 let resp_header = ProtocolHeader {
                     op_kind: OperationKind::BATCH,
                     _padding: [0; 3],
                     length: std::mem::size_of::<BatchResponse>() as u32,
                 };
 
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&resp_header));
-                self.batch_responses.extend_from_slice(bytemuck::bytes_of(&response));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&resp_header));
+                self.batch_responses
+                    .extend_from_slice(bytemuck::bytes_of(&response));
 
                 let resp = if self.in_batch == 0 {
                     Some(std::mem::take(&mut self.batch_responses))

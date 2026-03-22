@@ -64,11 +64,11 @@ where
                         Ok(0) => break,
                         Ok(n) => {
                             let responses = handler.handle_bytes(&buffer[..n], &ledger);
-                            if !responses.is_empty() {
-                                if let Err(e) = socket.write_all(&responses).await {
-                                    eprintln!("Failed to write to socket: {}", e);
-                                    break;
-                                }
+                            if !responses.is_empty()
+                                && let Err(e) = socket.write_all(&responses).await
+                            {
+                                eprintln!("Failed to write to socket: {}", e);
+                                break;
                             }
                         }
                         Err(e) => {

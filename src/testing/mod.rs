@@ -1,2 +1,2 @@
-pub mod stress;
 pub mod reporting;
+pub mod stress;
