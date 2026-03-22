@@ -20,7 +20,7 @@ fn main() {
     let scenarios: Vec<Box<dyn Scenario>> = vec![
         Box::new(LoadRampScenario::new(Duration::from_secs(21), 0, 1_000_000, 100_000)),
         Box::new(PeakScenario::new(Duration::from_secs(21), 10_000_000, 100_000)),
-        Box::new(SpikeScenario::new(Duration::from_secs(1), 100_000)),
+        Box::new(SpikeScenario::new(Duration::from_secs(21), 100_000)),
         Box::new(SpikeRecoveryScenario::new(Duration::from_secs(21), 100_000)),
         Box::new(AccountScaleScenario::new(Duration::from_secs(21), 10_000_000)),
         Box::new(MixedWorkloadScenario::new(Duration::from_secs(21), 100_000)),
