@@ -11,7 +11,7 @@ use std::thread::{JoinHandle, yield_now};
 
 #[derive(Clone, Debug)]
 pub struct LedgerConfig {
-    pub capacity: usize,
+    pub queue_size: usize,
     pub location: Option<String>,
     pub in_memory: bool,
     pub snapshot_interval: std::time::Duration,
@@ -20,7 +20,7 @@ pub struct LedgerConfig {
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
-            capacity: 1024,
+            queue_size: 1024,
             location: None,
             in_memory: false,
             snapshot_interval: std::time::Duration::from_secs(600),
@@ -47,9 +47,9 @@ where
     Data: TransactionDataType<BalanceData = BalanceData>,
 {
     pub fn new(config: LedgerConfig) -> Self {
-        let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.capacity));
-        let transactor_wal_queue = Arc::new(ArrayQueue::new(config.capacity));
-        let wal_snapshot_queue = Arc::new(ArrayQueue::new(config.capacity));
+        let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
+        let transactor_wal_queue = Arc::new(ArrayQueue::new(config.queue_size));
+        let wal_snapshot_queue = Arc::new(ArrayQueue::new(config.queue_size));
         let running = Arc::new(AtomicBool::new(true));
 
         Self {
@@ -98,6 +98,18 @@ where
         } else {
             TransactionStatus::OnSnapshot
         }
+    }
+
+    pub fn last_computed_id(&self) -> u64 {
+        self.transactor.last_processed_transaction_id()
+    }
+
+    pub fn last_committed_id(&self) -> u64 {
+        self.wal.last_processed_transaction_id()
+    }
+
+    pub fn last_snapshot_id(&self) -> u64 {
+        self.snapshot.last_processed_transaction_id()
     }
 
     pub fn wait_for_transaction(&mut self, transaction_id: u64) {

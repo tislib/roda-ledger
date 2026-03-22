@@ -11,7 +11,7 @@ use std::time::Duration;
 fn test_workload_deposit_sustain() {
     let ledger_config = LedgerConfig {
         in_memory: true,
-        capacity: 1024,
+        queue_size: 1024,
         ..Default::default()
     };
 
@@ -39,7 +39,7 @@ fn test_workload_deposit_sustain() {
 fn test_workload_transfer_spike_direct() {
     let ledger_config = LedgerConfig {
         in_memory: true,
-        capacity: 1024,
+        queue_size: 1024,
         ..Default::default()
     };
 
@@ -67,7 +67,7 @@ fn test_workload_transfer_spike_direct() {
 fn test_workload_peak_load_direct() {
     let ledger_config = LedgerConfig {
         in_memory: true,
-        capacity: 1024,
+        queue_size: 1024,
         ..Default::default()
     };
 
@@ -87,7 +87,7 @@ fn test_workload_peak_load_direct() {
 fn test_workload_range_selector_direct() {
     let ledger_config = LedgerConfig {
         in_memory: true,
-        capacity: 1024,
+        queue_size: 1024,
         ..Default::default()
     };
 

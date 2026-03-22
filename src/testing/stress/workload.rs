@@ -1,3 +1,4 @@
+use crate::testing::reporting::WorkloadMetrics;
 use crate::transaction::Transaction;
 use crate::wallet::balance::WalletBalance;
 use crate::wallet::transaction::WalletTransaction;
@@ -73,6 +74,7 @@ where
 {
     pub client: C,
     pub all_accounts: Vec<u64>,
+    pub metrics: Option<Arc<WorkloadMetrics>>,
 }
 
 impl<C> Workload<C>
@@ -83,7 +85,13 @@ where
         Self {
             client,
             all_accounts: Vec::new(),
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<WorkloadMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn with_accounts(mut self, accounts: Vec<u64>) -> Self {
@@ -208,7 +216,15 @@ where
 
                     let tx_data = operation_gen(offset + count);
                     let tx = Transaction::new(tx_data);
+                    
+                    let start = Instant::now();
                     self.client.submit(tx);
+                    let elapsed = start.elapsed();
+                    
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record(elapsed);
+                    }
+                    
                     count += 1;
                 }
             }
@@ -230,7 +246,15 @@ where
 
                     let tx_data = operation_gen(offset + count);
                     let tx = Transaction::new(tx_data);
+                    
+                    let start = Instant::now();
                     self.client.submit(tx);
+                    let elapsed = start.elapsed();
+                    
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record(elapsed);
+                    }
+                    
                     count += 1;
 
                     next_tick += interval;
