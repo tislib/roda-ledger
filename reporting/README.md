@@ -15,16 +15,16 @@ Stress testing aims to:
 
 | Scenario | Duration | TPS | Mean | p99 | p999 | Notes |
 |----------|----------|-----|------|-----|------|-------|
-| **Sustain Load** | 21s | 100K | 103ns | 380ns | 490ns | Performance stabilizes as the system warms up. |
-| **WAL Growth** | 21s | 1.5M | 43ns | 160ns | 210ns | Zero throughput impact as the Write-Ahead Log grows. |
-| **Snapshot Impact** | 21s | 1.4M | 40ns | 50ns | 100ns | Background snapshotting has negligible latency impact. |
+| **Sustain Load** | 1200s | 100K | 173ns | 520ns | 650ns | Performance stabilizes as the system warms up. |
+| **WAL Growth** | 600s | 1.3M | 316ns | 670ns | 2.09µs | Zero throughput impact as the Write-Ahead Log grows. |
+| **Snapshot Impact** | 600s | 1.4M | 351ns | 660ns | 1.85µs | Background snapshotting has negligible latency impact. |
 | **Spike** | 21s | 1.5M | 45ns | 140ns | 200ns | Handles massive transaction bursts without queue build-up. |
 | **Spike Recovery** | 120s | 1.3M | 46ns | 160ns | 350ns | Rapid recovery and queue drainage after a load spike. |
 | **Peak Load** | 120s | 1.3M | 4.3µs | 280ns | 632µs | Maintains high capacity during sustained peak loads. |
 | **Load Ramp** | 120s | Gradual | 149ns | 410ns | 600ns | Linear scaling with predictable latency as volume increases. |
-| **Mixed Workload** | 21s | 1.3M | 37ns | 40ns | 230ns | Optimal handling of diverse transaction types. |
-| **Hot Account Contention** | 21s | 1.4M | 46ns | 420ns | 590ns | Minimal performance impact from high-traffic account access. |
-| **Account Scale** | 21s | 1.3M | 514ns | 440ns | 241µs | Maintains performance as the total number of accounts grows. |
+| **Mixed Workload** | 600s | 1.3M | 284ns | 550ns | 1.37µs | Optimal handling of diverse transaction types. |
+| **Hot Account Contention** | 600s | 1.3M | 310ns | 590ns | 1.5µs | Minimal performance impact from high-traffic account access. |
+| **Account Scale** | 600s | 1.3M | 423ns | 490ns | 1.45µs | Maintains performance as the total number of accounts grows. |
 
 ## Test Scenarios
 
