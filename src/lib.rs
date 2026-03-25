@@ -1,3 +1,4 @@
+pub mod entities;
 pub mod balance;
 pub mod client;
 pub mod ledger;
