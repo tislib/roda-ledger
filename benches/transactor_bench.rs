@@ -18,6 +18,7 @@ impl TransactionDataType for BenchData {
         &self,
         ctx: &mut TransactionExecutionContext<'_>,
     ) {
+        ctx.credit(0, self.amount);
         ctx.debit(1, self.amount);
     }
 }

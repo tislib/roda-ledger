@@ -57,7 +57,11 @@ impl<Data: TransactionDataType> Transactor<Data> {
                 self.pending_entries = m.entry_count;
             }
             WalEntry::Entry(e) => {
-                let mut balance = self.balances.get(&e.account_id).cloned().unwrap_or_default();
+                let mut balance = self
+                    .balances
+                    .get(&e.account_id)
+                    .cloned()
+                    .unwrap_or_default();
                 match e.kind {
                     EntryKind::Credit => {
                         balance = balance.saturating_sub(e.amount as i64);
@@ -73,7 +77,8 @@ impl<Data: TransactionDataType> Transactor<Data> {
             }
         }
         if self.pending_entries == 0 {
-            self.last_processed_transaction_id.store(tx_id, Ordering::Relaxed);
+            self.last_processed_transaction_id
+                .store(tx_id, Ordering::Relaxed);
         }
     }
 
@@ -106,44 +111,45 @@ impl<Data: TransactionDataType> Transactor<Data> {
 
 impl<Data: TransactionDataType> TransactorRunner<Data> {
     pub fn run(&mut self) {
+        let mut entries = Vec::with_capacity(16);
+
         while self.running.load(Ordering::Relaxed) {
             if let Some(transaction) = self.inbound.pop() {
-                let mut ctx = TransactionExecutionContext::new(&self.balances);
-                transaction.process(&mut ctx);
+                let fail_reason;
+                let entries_tmp;
 
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                {
+                    let mut ctx = TransactionExecutionContext {
+                        balances: &mut self.balances,
+                        entries,
+                        fail_reason: FailReason::NONE,
+                    };
 
-                let mut fail_reason = ctx.fail_reason();
-                let mut entries = ctx.entries;
+                    transaction.process(&mut ctx);
 
-                if fail_reason.is_success() {
-                    // Check zero-sum invariant
-                    let mut sum_credits: u128 = 0;
-                    let mut sum_debits: u128 = 0;
+                    fail_reason = ctx.verify();
 
-                    for entry in &mut entries {
-                        entry.tx_id = transaction.id;
-                        match entry.kind {
-                            EntryKind::Credit => sum_credits += entry.amount as u128,
-                            EntryKind::Debit => sum_debits += entry.amount as u128,
+                    if fail_reason.is_success() {
+                        ctx.commit();
+                        // Update entries with tx_id
+                        for entry in &mut ctx.entries {
+                            entry.tx_id = transaction.id;
                         }
+                    } else {
+                        ctx.rollback();
                     }
 
-                    if sum_credits != sum_debits {
-                        fail_reason = FailReason::ZERO_SUM_VIOLATION;
-                    }
+                    entries_tmp = ctx.entries;
                 }
 
                 if fail_reason.is_failure() {
-                    self.rejected_transactions.insert(transaction.id, fail_reason);
+                    self.rejected_transactions
+                        .insert(transaction.id, fail_reason);
 
                     // Send only metadata for failed transactions
                     let metadata = TxMetadata {
                         tx_id: transaction.id,
-                        timestamp,
+                        timestamp: 0, // will be written by the WAL
                         user_ref: transaction.data.user_ref(),
                         entry_count: 0,
                         fail_reason,
@@ -156,18 +162,12 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                         }
                     }
                 } else {
-                    // Transaction is successful
-                    // Apply local balance changes to main balances
-                    for (account_id, balance) in ctx.local_balances {
-                        self.balances.insert(account_id, balance);
-                    }
-
                     // Push metadata FIRST so consumers know the entry_count
                     let metadata = TxMetadata {
                         tx_id: transaction.id,
-                        timestamp,
+                        timestamp: 0, // will be written by the WAL
                         user_ref: transaction.data.user_ref(),
-                        entry_count: entries.len() as u8,
+                        entry_count: entries_tmp.len() as u8,
                         fail_reason: FailReason::NONE,
                         _pad: [0; 6],
                     };
@@ -178,8 +178,8 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                         }
                     }
 
-                    // Then push entries
-                    for entry in entries.iter() {
+                    // Then push entries 
+                    for entry in entries_tmp.iter() {
                         while let Err(_) = self.outbound.push(WalEntry::Entry(*entry)) {
                             if !self.running.load(Ordering::Relaxed) {
                                 return;
@@ -189,10 +189,13 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                 }
                 self.last_processed_transaction_id
                     .store(transaction.id, Ordering::Relaxed);
+
+                // Recover buffers for next transaction
+                entries = entries_tmp;
+                entries.clear();
             } else {
                 std::thread::yield_now();
             }
         }
     }
 }
-

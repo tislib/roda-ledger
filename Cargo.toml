@@ -40,5 +40,9 @@ name = "transactor_bench"
 harness = false
 
 [[bench]]
+name = "snapshot_bench"
+harness = false
+
+[[bench]]
 name = "wallet_server_bench"
 harness = false

@@ -279,11 +279,12 @@ impl Snapshot {
 impl SnapshotRunner {
     pub fn run(&mut self) {
         let mut last_transaction_id = 0;
-        let last_wal_position = 0;
+        let mut last_wal_position = self.checkpoint.load().last_wal_position;
 
         while self.running.load(Ordering::Relaxed) {
             if let Some(wal_entry) = self.inbound.pop() {
                 last_transaction_id = wal_entry.tx_id();
+                last_wal_position += 33; // Each entry is 33 bytes (1 kind + 32 struct)
 
                 match wal_entry {
                     WalEntry::Metadata(m) => {

@@ -4,37 +4,31 @@ use bytemuck::{Pod, Zeroable};
 use crate::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
 
 pub struct TransactionExecutionContext<'a> {
-    pub(crate) balances: &'a HashMap<u64, Balance>,
-    pub(crate) local_balances: HashMap<u64, Balance>,
+    pub(crate) balances: &'a mut HashMap<u64, Balance>,
     pub(crate) entries: Vec<TxEntry>,
     pub(crate) fail_reason: FailReason,
 }
 
 impl<'a> TransactionExecutionContext<'a> {
-    pub fn new(balances: &'a HashMap<u64, Balance>) -> Self {
+    pub fn new(balances: &'a mut HashMap<u64, Balance>) -> Self {
         Self {
             balances,
-            local_balances: HashMap::new(),
             entries: Vec::new(),
             fail_reason: FailReason::NONE,
         }
     }
 
     pub fn get_balance(&self, account_id: u64) -> Balance {
-        self.local_balances
-            .get(&account_id)
-            .cloned()
-            .or_else(|| self.balances.get(&account_id).cloned())
-            .unwrap_or_default()
+        self.balances.get(&account_id).cloned().unwrap_or_default()
     }
 
     pub fn credit(&mut self, account_id: u64, amount: u64) {
         if self.fail_reason.is_failure() {
             return;
         }
-        let balance = self.get_balance(account_id);
-        let new_balance = balance.saturating_sub(amount as i64);
-        self.local_balances.insert(account_id, new_balance);
+        let mut balance = self.get_balance(account_id);
+        balance = balance.saturating_sub(amount as i64);
+        self.balances.insert(account_id, balance);
         self.entries.push(TxEntry {
             tx_id: 0,
             account_id,
@@ -48,9 +42,9 @@ impl<'a> TransactionExecutionContext<'a> {
         if self.fail_reason.is_failure() {
             return;
         }
-        let balance = self.get_balance(account_id);
-        let new_balance = balance.saturating_add(amount as i64);
-        self.local_balances.insert(account_id, new_balance);
+        let mut balance = self.get_balance(account_id);
+        balance = balance.saturating_add(amount as i64);
+        self.balances.insert(account_id, balance);
         self.entries.push(TxEntry {
             tx_id: 0,
             account_id,
@@ -74,6 +68,52 @@ impl<'a> TransactionExecutionContext<'a> {
 
     pub fn fail_reason(&self) -> FailReason {
         self.fail_reason
+    }
+
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.fail_reason = FailReason::NONE;
+    }
+
+    pub(crate) fn verify(&mut self) -> FailReason {
+        if self.fail_reason.is_failure() {
+            return self.fail_reason;
+        }
+
+        let mut sum_credits: u128 = 0;
+        let mut sum_debits: u128 = 0;
+
+        for entry in &self.entries {
+            match entry.kind {
+                EntryKind::Credit => sum_credits += entry.amount as u128,
+                EntryKind::Debit => sum_debits += entry.amount as u128,
+            }
+        }
+
+        if sum_credits != sum_debits {
+            self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
+        }
+
+        self.fail_reason
+    }
+
+    pub(crate) fn commit(&mut self) {
+        // Balances are already updated directly
+    }
+
+    pub(crate) fn rollback(&mut self) {
+        // Revert entries into balances
+        for entry in self.entries.iter().rev() {
+            let balance = self.balances.entry(entry.account_id).or_default();
+            match entry.kind {
+                EntryKind::Credit => {
+                    *balance = balance.saturating_add(entry.amount as i64);
+                }
+                EntryKind::Debit => {
+                    *balance = balance.saturating_sub(entry.amount as i64);
+                }
+            }
+        }
     }
 }
 
@@ -174,8 +214,8 @@ mod tests {
 
         let tr1 = Transaction::new(SimpleTransactionDataType(0));
 
-        let balances = HashMap::new();
-        let mut ctx = TransactionExecutionContext::new(&balances);
+        let mut balances = HashMap::new();
+        let mut ctx = TransactionExecutionContext::new(&mut balances);
 
         tr1.process(&mut ctx);
     }

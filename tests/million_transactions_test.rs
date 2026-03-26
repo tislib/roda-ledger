@@ -21,4 +21,7 @@ fn million_deposits_final_balance() {
 
     let balance = wallet.get_balance(1);
     assert_eq!(balance, total_txs as i64);
+
+    let system_balance = wallet.get_balance(0);
+    assert_eq!(system_balance, -(total_txs as i64));
 }
