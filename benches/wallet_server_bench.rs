@@ -2,7 +2,6 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use roda_ledger::client::Client;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::wallet::balance::WalletBalance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +23,7 @@ fn wallet_server_bench(c: &mut Criterion) {
             ..Default::default()
         },
     };
-    let server = Server::<WalletTransaction, WalletBalance>::new(server_config);
+    let server = Server::<WalletTransaction>::new(server_config);
     rt.spawn(async move {
         if let Err(e) = server.run_async().await {
             eprintln!("Server error: {}", e);
@@ -40,9 +39,7 @@ fn wallet_server_bench(c: &mut Criterion) {
     let i = Arc::new(AtomicU64::new(0));
 
     group.bench_function("deposit", |b| {
-        let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(
-            addr.clone(),
-        )));
+        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
         let i = i.clone();
         b.to_async(&rt).iter(|| {
             let client = client.clone();
@@ -60,9 +57,7 @@ fn wallet_server_bench(c: &mut Criterion) {
     });
 
     group.bench_function("transfer", |b| {
-        let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(
-            addr.clone(),
-        )));
+        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
 
         // Pre-fill some balances
         {
@@ -99,9 +94,7 @@ fn wallet_server_bench(c: &mut Criterion) {
     });
 
     group.bench_function("get_balance", |b| {
-        let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(
-            addr.clone(),
-        )));
+        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
         let i = i.clone();
         b.to_async(&rt).iter(|| {
             let client = client.clone();
@@ -121,9 +114,7 @@ fn wallet_server_bench(c: &mut Criterion) {
         batch_group.measurement_time(Duration::from_secs(10));
 
         batch_group.bench_function(format!("deposit_{}", batch_size), |b| {
-            let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(
-                addr.clone(),
-            )));
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
             let i = i.clone();
             b.to_async(&rt).iter(|| {
                 let client = client.clone();
@@ -145,9 +136,7 @@ fn wallet_server_bench(c: &mut Criterion) {
         });
 
         batch_group.bench_function(format!("transfer_{}", batch_size), |b| {
-            let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(
-                addr.clone(),
-            )));
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
             let i = i.clone();
             b.to_async(&rt).iter(|| {
                 let client = client.clone();
@@ -173,9 +162,7 @@ fn wallet_server_bench(c: &mut Criterion) {
         });
 
         batch_group.bench_function(format!("get_balance_{}", batch_size), |b| {
-            let client = Arc::new(Mutex::new(Client::<WalletTransaction, WalletBalance>::new(
-                addr.clone(),
-            )));
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
             let i = i.clone();
             b.to_async(&rt).iter(|| {
                 let client = client.clone();

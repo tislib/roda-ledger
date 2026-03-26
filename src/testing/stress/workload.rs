@@ -1,6 +1,5 @@
 use crate::testing::reporting::WorkloadMetrics;
 use crate::transaction::Transaction;
-use crate::wallet::balance::WalletBalance;
 use crate::wallet::transaction::WalletTransaction;
 use std::error::Error;
 use std::sync::Arc;
@@ -68,7 +67,7 @@ pub struct RunConfig {
 }
 
 pub trait WorkloadClient: Send + Sync {
-    fn submit(&self, tx: Transaction<WalletTransaction, WalletBalance>);
+    fn submit(&self, tx: Transaction<WalletTransaction>);
 }
 
 /// Workload is designed to be deterministic and reproducible. It uses round-robin

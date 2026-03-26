@@ -1,4 +1,5 @@
-use crate::balance::BalanceDataType;
+use crate::balance::Balance;
+use crate::entities::{EntryKind, FailReason, TxMetadata, WalEntry};
 use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
@@ -7,40 +8,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-pub struct Transactor<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
-    inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-    outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+pub struct Transactor<Data: TransactionDataType> {
+    inbound: Arc<ArrayQueue<Transaction<Data>>>,
+    outbound: Arc<ArrayQueue<WalEntry>>,
     last_processed_transaction_id: Arc<AtomicU64>,
-    rejected_transactions: Arc<SkipMap<u64, String>>,
-    balances: HashMap<u64, BalanceData>,
+    rejected_transactions: Arc<SkipMap<u64, FailReason>>,
+    balances: HashMap<u64, Balance>,
+    pending_entries: u8,
     running: Arc<AtomicBool>,
 }
 
-pub struct TransactorRunner<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
-    inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-    outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-    execution_context: LedgerTransactionExecutionContext<BalanceData>,
+pub struct TransactorRunner<Data: TransactionDataType> {
+    inbound: Arc<ArrayQueue<Transaction<Data>>>,
+    outbound: Arc<ArrayQueue<WalEntry>>,
+    balances: HashMap<u64, Balance>,
     last_processed_transaction_id: Arc<AtomicU64>,
-    rejected_transactions: Arc<SkipMap<u64, String>>,
+    rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     running: Arc<AtomicBool>,
 }
 
-impl<Data, BalanceData> Transactor<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> Transactor<Data> {
     pub fn new(
-        inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-        outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+        inbound: Arc<ArrayQueue<Transaction<Data>>>,
+        outbound: Arc<ArrayQueue<WalEntry>>,
         running: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -49,28 +39,47 @@ where
             last_processed_transaction_id: Arc::new(Default::default()),
             rejected_transactions: Arc::new(Default::default()),
             balances: HashMap::new(),
+            pending_entries: 0,
             running,
         }
     }
 
-    pub fn load_balances(&mut self, balances: Vec<(u64, BalanceData)>) {
+    pub fn load_balances(&mut self, balances: Vec<(u64, Balance)>) {
         for (account_id, balance) in balances {
             self.balances.insert(account_id, balance);
         }
     }
 
-    pub fn reprocess_transaction(&mut self, transaction: Transaction<Data, BalanceData>) {
-        let mut ctx = LedgerTransactionExecutionContext {
-            balances: std::mem::take(&mut self.balances),
-        };
-        let result = transaction.process(&mut ctx);
-        if let Err(reason) = result {
-            self.rejected_transactions
-                .insert(transaction.id, reason.to_string());
+    pub fn apply_wal_entry(&mut self, wal_entry: WalEntry) {
+        let tx_id = wal_entry.tx_id();
+        match wal_entry {
+            WalEntry::Metadata(m) => {
+                self.pending_entries = m.entry_count;
+            }
+            WalEntry::Entry(e) => {
+                let mut balance = self
+                    .balances
+                    .get(&e.account_id)
+                    .cloned()
+                    .unwrap_or_default();
+                match e.kind {
+                    EntryKind::Credit => {
+                        balance = balance.saturating_sub(e.amount as i64);
+                    }
+                    EntryKind::Debit => {
+                        balance = balance.saturating_add(e.amount as i64);
+                    }
+                }
+                self.balances.insert(e.account_id, balance);
+                if self.pending_entries > 0 {
+                    self.pending_entries -= 1;
+                }
+            }
         }
-        self.last_processed_transaction_id
-            .store(transaction.id, std::sync::atomic::Ordering::Relaxed);
-        self.balances = ctx.balances;
+        if self.pending_entries == 0 {
+            self.last_processed_transaction_id
+                .store(tx_id, Ordering::Relaxed);
+        }
     }
 
     pub fn last_processed_transaction_id(&self) -> u64 {
@@ -78,23 +87,17 @@ where
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn rejected_count(&self) -> usize {
-        self.rejected_transactions.len()
-    }
-
-    pub fn transaction_rejection_reason(&self, transaction_id: u64) -> Option<String> {
+    pub fn transaction_rejection_reason(&self, transaction_id: u64) -> Option<FailReason> {
         self.rejected_transactions
             .get(&transaction_id)
-            .map(|entry| entry.value().clone())
+            .map(|entry| *entry.value())
     }
 
     pub fn start(&mut self) -> JoinHandle<()> {
         let mut runner = TransactorRunner {
             inbound: self.inbound.clone(),
             outbound: self.outbound.clone(),
-            execution_context: LedgerTransactionExecutionContext {
-                balances: std::mem::take(&mut self.balances),
-            },
+            balances: std::mem::take(&mut self.balances),
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
             rejected_transactions: self.rejected_transactions.clone(),
             running: self.running.clone(),
@@ -106,49 +109,93 @@ where
     }
 }
 
-impl<Data, BalanceData> TransactorRunner<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> TransactorRunner<Data> {
     pub fn run(&mut self) {
+        let mut entries = Vec::with_capacity(16);
+
         while self.running.load(Ordering::Relaxed) {
             if let Some(transaction) = self.inbound.pop() {
-                let ctx = &mut self.execution_context;
-                let result = transaction.process(ctx);
+                let fail_reason;
+                let entries_tmp;
 
-                if let Some(err) = result.err() {
-                    self.rejected_transactions.insert(transaction.id, err);
-                } else {
-                    let mut transaction = transaction;
-                    while let Err(returned_tx) = self.outbound.push(transaction) {
-                        transaction = returned_tx;
+                {
+                    let mut ctx = TransactionExecutionContext {
+                        balances: &mut self.balances,
+                        entries,
+                        fail_reason: FailReason::NONE,
+                    };
+
+                    transaction.process(&mut ctx);
+
+                    fail_reason = ctx.verify();
+
+                    if fail_reason.is_success() {
+                        ctx.commit();
+                        // Update entries with tx_id
+                        for entry in &mut ctx.entries {
+                            entry.tx_id = transaction.id;
+                        }
+                    } else {
+                        ctx.rollback();
+                    }
+
+                    entries_tmp = ctx.entries;
+                }
+
+                if fail_reason.is_failure() {
+                    self.rejected_transactions
+                        .insert(transaction.id, fail_reason);
+
+                    // Send only metadata for failed transactions
+                    let metadata = TxMetadata {
+                        tx_id: transaction.id,
+                        timestamp: 0, // will be written by the WAL
+                        user_ref: transaction.data.user_ref(),
+                        entry_count: 0,
+                        fail_reason,
+                        _pad: [0; 6],
+                    };
+
+                    while self.outbound.push(WalEntry::Metadata(metadata)).is_err() {
                         if !self.running.load(Ordering::Relaxed) {
                             return;
+                        }
+                    }
+                } else {
+                    // Push metadata FIRST so consumers know the entry_count
+                    let metadata = TxMetadata {
+                        tx_id: transaction.id,
+                        timestamp: 0, // will be written by the WAL
+                        user_ref: transaction.data.user_ref(),
+                        entry_count: entries_tmp.len() as u8,
+                        fail_reason: FailReason::NONE,
+                        _pad: [0; 6],
+                    };
+
+                    while self.outbound.push(WalEntry::Metadata(metadata)).is_err() {
+                        if !self.running.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+
+                    // Then push entries
+                    for entry in entries_tmp.iter() {
+                        while self.outbound.push(WalEntry::Entry(*entry)).is_err() {
+                            if !self.running.load(Ordering::Relaxed) {
+                                return;
+                            }
                         }
                     }
                 }
                 self.last_processed_transaction_id
                     .store(transaction.id, Ordering::Relaxed);
+
+                // Recover buffers for next transaction
+                entries = entries_tmp;
+                entries.clear();
             } else {
                 std::thread::yield_now();
             }
         }
-    }
-}
-
-pub struct LedgerTransactionExecutionContext<BalanceData: BalanceDataType> {
-    balances: HashMap<u64, BalanceData>,
-}
-
-impl<BalanceData: BalanceDataType> TransactionExecutionContext<BalanceData>
-    for LedgerTransactionExecutionContext<BalanceData>
-{
-    fn get_balance(&self, account_id: u64) -> BalanceData {
-        self.balances.get(&account_id).cloned().unwrap_or_default()
-    }
-
-    fn update_balance(&mut self, account_id: u64, balance: BalanceData) {
-        self.balances.insert(account_id, balance);
     }
 }

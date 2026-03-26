@@ -1,65 +1,146 @@
-use crate::balance::BalanceDataType;
+use crate::balance::Balance;
+use crate::entities::{EntryKind, FailReason, TxEntry};
 use bytemuck::{Pod, Zeroable};
+use std::collections::HashMap;
 
-pub trait TransactionExecutionContext<BalanceData: BalanceDataType> {
-    fn get_balance(&self, account_id: u64) -> BalanceData;
-    fn update_balance(&mut self, account_id: u64, balance: BalanceData);
+pub struct TransactionExecutionContext<'a> {
+    pub(crate) balances: &'a mut HashMap<u64, Balance>,
+    pub(crate) entries: Vec<TxEntry>,
+    pub(crate) fail_reason: FailReason,
+}
+
+impl<'a> TransactionExecutionContext<'a> {
+    pub fn new(balances: &'a mut HashMap<u64, Balance>) -> Self {
+        Self {
+            balances,
+            entries: Vec::new(),
+            fail_reason: FailReason::NONE,
+        }
+    }
+
+    pub fn get_balance(&self, account_id: u64) -> Balance {
+        self.balances.get(&account_id).cloned().unwrap_or_default()
+    }
+
+    pub fn credit(&mut self, account_id: u64, amount: u64) {
+        if self.fail_reason.is_failure() {
+            return;
+        }
+        let mut balance = self.get_balance(account_id);
+        balance = balance.saturating_sub(amount as i64);
+        self.balances.insert(account_id, balance);
+        self.entries.push(TxEntry {
+            tx_id: 0,
+            account_id,
+            amount,
+            kind: EntryKind::Credit,
+            _pad: [0; 7],
+        });
+    }
+
+    pub fn debit(&mut self, account_id: u64, amount: u64) {
+        if self.fail_reason.is_failure() {
+            return;
+        }
+        let mut balance = self.get_balance(account_id);
+        balance = balance.saturating_add(amount as i64);
+        self.balances.insert(account_id, balance);
+        self.entries.push(TxEntry {
+            tx_id: 0,
+            account_id,
+            amount,
+            kind: EntryKind::Debit,
+            _pad: [0; 7],
+        });
+    }
+
+    pub fn fail(&mut self, reason: FailReason) {
+        self.fail_reason = reason;
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.fail_reason.is_failure()
+    }
+
+    pub fn entries(&self) -> &Vec<TxEntry> {
+        &self.entries
+    }
+
+    pub fn fail_reason(&self) -> FailReason {
+        self.fail_reason
+    }
+
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.fail_reason = FailReason::NONE;
+    }
+
+    pub(crate) fn verify(&mut self) -> FailReason {
+        if self.fail_reason.is_failure() {
+            return self.fail_reason;
+        }
+
+        let mut sum_credits: u128 = 0;
+        let mut sum_debits: u128 = 0;
+
+        for entry in &self.entries {
+            match entry.kind {
+                EntryKind::Credit => sum_credits += entry.amount as u128,
+                EntryKind::Debit => sum_debits += entry.amount as u128,
+            }
+        }
+
+        if sum_credits != sum_debits {
+            self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
+        }
+
+        self.fail_reason
+    }
+
+    pub(crate) fn commit(&mut self) {
+        // Balances are already updated directly
+    }
+
+    pub(crate) fn rollback(&mut self) {
+        // Revert entries into balances
+        for entry in self.entries.iter().rev() {
+            let balance = self.balances.entry(entry.account_id).or_default();
+            match entry.kind {
+                EntryKind::Credit => {
+                    *balance = balance.saturating_add(entry.amount as i64);
+                }
+                EntryKind::Debit => {
+                    *balance = balance.saturating_sub(entry.amount as i64);
+                }
+            }
+        }
+    }
 }
 
 pub trait TransactionDataType: Pod + Zeroable + Copy + Send + Sync {
-    type BalanceData: BalanceDataType;
-    fn process(
-        &self,
-        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-    ) -> Result<(), String>;
+    fn process(&self, ctx: &mut TransactionExecutionContext<'_>);
+    fn user_ref(&self) -> u64 {
+        0
+    }
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
-pub struct Transaction<
-    Data: TransactionDataType<BalanceData = BalanceData>,
-    BalanceData: BalanceDataType,
-> {
+pub struct Transaction<Data: TransactionDataType> {
     pub id: u64,
-    pub wal_location: u64,
-    data: Data,
-    _balance_data: std::marker::PhantomData<BalanceData>,
+    pub data: Data,
 }
 
-unsafe impl<Data, BalanceData> Pod for Transaction<Data, BalanceData>
-where
-    Data: TransactionDataType<BalanceData = BalanceData>,
-    BalanceData: BalanceDataType,
-{
-}
-unsafe impl<Data, BalanceData> Zeroable for Transaction<Data, BalanceData>
-where
-    Data: TransactionDataType<BalanceData = BalanceData>,
-    BalanceData: BalanceDataType,
-{
-}
+unsafe impl<Data: TransactionDataType> Pod for Transaction<Data> {}
+unsafe impl<Data: TransactionDataType> Zeroable for Transaction<Data> {}
 
-impl<Data, BalanceData> Transaction<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> Transaction<Data> {
     pub fn new(data: Data) -> Self {
-        Self {
-            id: 0,
-            wal_location: 0,
-            data,
-            _balance_data: Default::default(),
-        }
+        Self { id: 0, data }
     }
 
-    pub fn process(
-        &self,
-        ctx: &mut impl TransactionExecutionContext<BalanceData>,
-    ) -> Result<(), String> {
-        // Now this works because the compiler knows:
-        // ctx's balance == BalanceData == Data::BalanceData
-        self.data.process(ctx)
+    pub fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
+        self.data.process(ctx);
     }
 }
 
@@ -67,7 +148,7 @@ where
 pub enum TransactionStatus {
     #[default]
     Pending,
-    Error(String),
+    Error(FailReason),
     Computed,   // By Transactor
     Committed,  // Written to WAL
     OnSnapshot, // Balances are reflected from the snapshot
@@ -102,9 +183,9 @@ impl TransactionStatus {
         matches!(self, Self::Error(_))
     }
 
-    pub fn error_reason(&self) -> String {
+    pub fn error_reason(&self) -> FailReason {
         match self {
-            Self::Error(reason) => reason.clone(),
+            Self::Error(reason) => *reason,
             _ => unreachable!(),
         }
     }
@@ -112,50 +193,28 @@ impl TransactionStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::balance::BalanceDataType;
     use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
     use bytemuck::{Pod, Zeroable};
+    use std::collections::HashMap;
 
     #[test]
     fn it_works() {
         #[repr(transparent)]
         #[derive(Copy, Clone, Debug, Default, Pod, Zeroable, PartialEq)]
-        struct SimpleBalanceDataType(u64);
-        struct SimpleTransactionExecutionContext;
-        #[repr(transparent)]
-        #[derive(Copy, Clone, Debug, Default, Pod, Zeroable, PartialEq)]
         struct SimpleTransactionDataType(u64);
 
-        impl BalanceDataType for SimpleBalanceDataType {}
-
-        impl TransactionExecutionContext<SimpleBalanceDataType> for SimpleTransactionExecutionContext {
-            fn get_balance(&self, _account_id: u64) -> SimpleBalanceDataType {
-                SimpleBalanceDataType(123)
-            }
-
-            fn update_balance(&mut self, _account_id: u64, _balance: SimpleBalanceDataType) {}
-        }
-
         impl TransactionDataType for SimpleTransactionDataType {
-            type BalanceData = SimpleBalanceDataType;
-
-            fn process(
-                &self,
-                ctx: &mut impl TransactionExecutionContext<SimpleBalanceDataType>,
-            ) -> Result<(), String> {
-                let mut balance = ctx.get_balance(0);
-
-                balance.0 = 123;
-                ctx.update_balance(0, balance);
-
-                Ok(())
+            fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
+                ctx.credit(0, 100);
+                ctx.debit(1, 100);
             }
         }
 
         let tr1 = Transaction::new(SimpleTransactionDataType(0));
 
-        let mut ctx = SimpleTransactionExecutionContext;
+        let mut balances = HashMap::new();
+        let mut ctx = TransactionExecutionContext::new(&mut balances);
 
-        tr1.process(&mut ctx).unwrap();
+        tr1.process(&mut ctx);
     }
 }

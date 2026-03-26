@@ -49,8 +49,7 @@ let config = LedgerConfig {
 };
 
 // Data: Your transaction data type
-// BalanceData: Your balance data type
-let mut ledger = Ledger::<Data, BalanceData>::new(config);
+let mut ledger = Ledger::<Data>::new(config);
 ledger.start();
 
 // Submit a transaction
@@ -83,8 +82,8 @@ let tx_id2 = wallet.transfer(1, 2, 500);           // Transfer $500 from account
 wallet.wait_pending_operations();
 
 // Retrieve account balances
-let balance1 = wallet.get_balance(1).balance;      // Result: 500
-let balance2 = wallet.get_balance(2).balance;      // Result: 500
+let balance1 = wallet.get_balance(1);              // Result: 500
+let balance2 = wallet.get_balance(2);              // Result: 500
 
 // Check transaction status
 let status = wallet.get_transaction_status(tx_id2);
@@ -102,16 +101,8 @@ execute any deterministic logic you require.
 
 ```rust
 use roda_ledger::transaction::{TransactionDataType, TransactionExecutionContext};
-use roda_ledger::balance::BalanceDataType;
+use roda_ledger::entities::{FailReason, TxEntry};
 use bytemuck::{Pod, Zeroable};
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
-pub struct MyBalance {
-    pub amount: u64,
-}
-
-impl BalanceDataType for MyBalance {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
@@ -121,16 +112,14 @@ pub struct MyTransaction {
 }
 
 impl TransactionDataType for MyTransaction {
-    type BalanceData = MyBalance;
-
     fn process(
         &self,
-        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-    ) -> Result<(), String> {
+        ctx: &mut impl TransactionExecutionContext,
+    ) -> (FailReason, Vec<TxEntry>) {
         let mut balance = ctx.get_balance(self.account_id);
-        balance.amount += self.amount;
+        balance += self.amount;
         ctx.update_balance(self.account_id, balance);
-        Ok(())
+        (FailReason::NONE, Vec::new())
     }
 }
 ```

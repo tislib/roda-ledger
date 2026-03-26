@@ -5,7 +5,7 @@ fn main() {
     // We'll use in-memory mode for this example to avoid creating files.
     let config = WalletConfig {
         in_memory: true,
-        capacity: 1024,
+        queue_size: 1024,
         ..Default::default()
     };
 
@@ -33,8 +33,8 @@ fn main() {
     let balance_a = wallet.get_balance(account_a);
     let balance_b = wallet.get_balance(account_b);
 
-    println!("Account {} balance: ${}", account_a, balance_a.balance);
-    println!("Account {} balance: ${}", account_b, balance_b.balance);
+    println!("Account {} balance: ${}", account_a, balance_a);
+    println!("Account {} balance: ${}", account_b, balance_b);
 
     // 5. Inspect transaction status
     let status = wallet.get_transaction_status(tx_id);

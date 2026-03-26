@@ -1,4 +1,4 @@
-use crate::balance::BalanceDataType;
+use crate::balance::Balance;
 use crate::transaction::TransactionDataType;
 use bytemuck::{Pod, Zeroable};
 
@@ -76,9 +76,6 @@ pub struct GetBalanceRequest {
 
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
-pub struct GetBalanceResponse<BalanceData>
-where
-    BalanceData: BalanceDataType,
-{
-    pub balance: BalanceData,
+pub struct GetBalanceResponse {
+    pub balance: Balance,
 }

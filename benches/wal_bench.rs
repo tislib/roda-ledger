@@ -1,7 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
-use roda_ledger::balance::BalanceDataType;
-use roda_ledger::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
+use roda_ledger::transaction::{TransactionDataType, TransactionExecutionContext};
 use roda_ledger::wal::Wal;
 use std::fs;
 use std::sync::Arc;
@@ -10,24 +9,12 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-struct BenchBalance(u64);
-impl BalanceDataType for BenchBalance {}
-
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
 struct BenchData {
     amount: u64,
 }
 
 impl TransactionDataType for BenchData {
-    type BalanceData = BenchBalance;
-
-    fn process(
-        &self,
-        _ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
+    fn process(&self, _ctx: &mut TransactionExecutionContext<'_>) {}
 }
 
 fn wal_bench(c: &mut Criterion) {
@@ -49,7 +36,7 @@ fn wal_bench(c: &mut Criterion) {
         let outbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
         let running = Arc::new(AtomicBool::new(true));
 
-        let wal = Wal::<BenchData, BenchBalance>::new(
+        let wal = Wal::new(
             inbound.clone(),
             outbound.clone(),
             if in_memory { None } else { Some(&path) },
@@ -64,9 +51,18 @@ fn wal_bench(c: &mut Criterion) {
             b.iter(|| {
                 for _ in 0..batch_size {
                     current_id += 1;
-                    let mut tx = Transaction::new(BenchData { amount: 100 });
-                    tx.id = current_id;
-                    while inbound.push(tx).is_err() {
+                    let metadata = roda_ledger::entities::TxMetadata {
+                        tx_id: current_id,
+                        timestamp: 0,
+                        user_ref: 0,
+                        entry_count: 0,
+                        fail_reason: roda_ledger::entities::FailReason::NONE,
+                        _pad: [0; 6],
+                    };
+                    while inbound
+                        .push(roda_ledger::entities::WalEntry::Metadata(metadata))
+                        .is_err()
+                    {
                         std::thread::yield_now();
                     }
                 }

@@ -1,4 +1,3 @@
-use crate::balance::BalanceDataType;
 use crate::ledger::Ledger;
 use crate::protocol::*;
 use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
@@ -24,15 +23,11 @@ impl ProtocolHandler {
         }
     }
 
-    pub fn handle_bytes<Data, BalanceData>(
+    pub fn handle_bytes<Data: TransactionDataType>(
         &mut self,
         data: &[u8],
-        ledger: &Ledger<Data, BalanceData>,
-    ) -> Vec<u8>
-    where
-        BalanceData: BalanceDataType,
-        Data: TransactionDataType<BalanceData = BalanceData>,
-    {
+        ledger: &Ledger<Data>,
+    ) -> Vec<u8> {
         self.buffer.extend_from_slice(data);
         let mut all_responses = Vec::new();
 
@@ -61,16 +56,12 @@ impl ProtocolHandler {
         all_responses
     }
 
-    fn process_frame<Data, BalanceData>(
+    fn process_frame<Data: TransactionDataType>(
         &mut self,
         header: ProtocolHeader,
         payload: &[u8],
-        ledger: &Ledger<Data, BalanceData>,
-    ) -> (Option<Vec<u8>>, usize)
-    where
-        BalanceData: BalanceDataType,
-        Data: TransactionDataType<BalanceData = BalanceData>,
-    {
+        ledger: &Ledger<Data>,
+    ) -> (Option<Vec<u8>>, usize) {
         match header.op_kind {
             OperationKind::REGISTER_TRANSACTION => {
                 let req_size = std::mem::size_of::<RegisterTransactionRequest<Data>>();
@@ -128,7 +119,7 @@ impl ProtocolHandler {
                 let resp_header = ProtocolHeader {
                     op_kind: OperationKind::GET_BALANCE,
                     _padding: [0; 3],
-                    length: std::mem::size_of::<GetBalanceResponse<BalanceData>>() as u32,
+                    length: std::mem::size_of::<GetBalanceResponse>() as u32,
                 };
 
                 self.batch_responses

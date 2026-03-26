@@ -1,7 +1,6 @@
 use roda_ledger::client::Client;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::wallet::balance::WalletBalance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::time::Duration;
 
@@ -21,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 2. Start the Server in a background task
-    let server = Server::<WalletTransaction, WalletBalance>::new(server_config);
+    let server = Server::<WalletTransaction>::new(server_config);
 
     let _server_handle = std::thread::spawn(move || {
         if let Err(e) = server.run() {
@@ -33,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 3. Connect as a client using our new Client implementation
-    let mut client = Client::<WalletTransaction, WalletBalance>::new(addr);
+    let mut client = Client::<WalletTransaction>::new(addr);
     println!("Client initialized");
 
     let account_id = 1001;
@@ -70,8 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let balance_1 = client.get_balance(account_id).await?;
     let balance_2 = client.get_balance(to_account_id).await?;
 
-    println!("Account {} balance: {}", account_id, balance_1.balance);
-    println!("Account {} balance: {}", to_account_id, balance_2.balance);
+    println!("Account {} balance: {}", account_id, balance_1);
+    println!("Account {} balance: {}", to_account_id, balance_2);
 
     println!("Example finished.");
     Ok(())

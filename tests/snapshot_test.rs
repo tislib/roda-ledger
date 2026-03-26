@@ -42,8 +42,8 @@ fn test_snapshot_creation() {
 
     assert_eq!(
         buffer.len(),
-        24 + 32,
-        "Snapshot should contain header (24 bytes) and two 16-byte entries"
+        24 + 16 * 3,
+        "Snapshot should contain header (24 bytes) and three 16-byte entries"
     );
 
     // Verify header exists and wal_position stored
@@ -56,11 +56,15 @@ fn test_snapshot_creation() {
     );
 
     // Verify first snapshot contents
-    let acc1_id_first = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
-    let acc1_bal_first = u64::from_le_bytes(buffer[32..40].try_into().unwrap());
-    let acc2_id_first = u64::from_le_bytes(buffer[40..48].try_into().unwrap());
-    let acc2_bal_first = u64::from_le_bytes(buffer[48..56].try_into().unwrap());
+    // Entries are sorted by account_id. 0 (system), 1, 2.
+    let acc0_id_first = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+    let _acc0_bal_first = i64::from_le_bytes(buffer[32..40].try_into().unwrap());
+    let acc1_id_first = u64::from_le_bytes(buffer[40..48].try_into().unwrap());
+    let acc1_bal_first = i64::from_le_bytes(buffer[48..56].try_into().unwrap());
+    let acc2_id_first = u64::from_le_bytes(buffer[56..64].try_into().unwrap());
+    let acc2_bal_first = i64::from_le_bytes(buffer[64..72].try_into().unwrap());
 
+    assert_eq!(acc0_id_first, 0);
     assert_eq!(acc1_id_first, 1);
     assert_eq!(acc1_bal_first, 100);
     assert_eq!(acc2_id_first, 2);
@@ -77,7 +81,7 @@ fn test_snapshot_creation() {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).unwrap();
 
-    assert_eq!(buffer.len(), 24 + 32);
+    assert_eq!(buffer.len(), 24 + 16 * 3);
 
     // Check header again and ensure wal_position increased
     let _checkpoint_id = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
@@ -90,12 +94,17 @@ fn test_snapshot_creation() {
 
     // Check balances for accounts
     // Entries are sorted by account_id.
-    let acc1_id = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
-    let acc1_bal = u64::from_le_bytes(buffer[32..40].try_into().unwrap());
+    let acc0_id = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+    let acc0_bal = i64::from_le_bytes(buffer[32..40].try_into().unwrap());
 
-    let acc2_id = u64::from_le_bytes(buffer[40..48].try_into().unwrap());
-    let acc2_bal = u64::from_le_bytes(buffer[48..56].try_into().unwrap());
+    let acc1_id = u64::from_le_bytes(buffer[40..48].try_into().unwrap());
+    let acc1_bal = i64::from_le_bytes(buffer[48..56].try_into().unwrap());
 
+    let acc2_id = u64::from_le_bytes(buffer[56..64].try_into().unwrap());
+    let acc2_bal = i64::from_le_bytes(buffer[64..72].try_into().unwrap());
+
+    assert_eq!(acc0_id, 0);
+    assert_eq!(acc0_bal, -350); // -100 - 200 - 50
     assert_eq!(acc1_id, 1);
     assert_eq!(acc1_bal, 150);
     assert_eq!(acc2_id, 2);

@@ -1,22 +1,21 @@
 use crate::ledger::Ledger;
 use crate::testing::stress::workload::{AccountSelector, RunConfig, Workload, WorkloadClient};
 use crate::transaction::Transaction;
-use crate::wallet::balance::WalletBalance;
 use crate::wallet::transaction::WalletTransaction;
 use std::sync::Arc;
 
 pub struct DirectWorkloadClient {
-    ledger: Arc<Ledger<WalletTransaction, WalletBalance>>,
+    ledger: Arc<Ledger<WalletTransaction>>,
 }
 
 impl DirectWorkloadClient {
-    pub fn new(ledger: Arc<Ledger<WalletTransaction, WalletBalance>>) -> Self {
+    pub fn new(ledger: Arc<Ledger<WalletTransaction>>) -> Self {
         Self { ledger }
     }
 }
 
 impl WorkloadClient for DirectWorkloadClient {
-    fn submit(&self, tx: Transaction<WalletTransaction, WalletBalance>) {
+    fn submit(&self, tx: Transaction<WalletTransaction>) {
         self.ledger.submit(tx);
     }
 }

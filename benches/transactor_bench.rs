@@ -1,6 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
-use roda_ledger::balance::BalanceDataType;
 use roda_ledger::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use roda_ledger::transactor::Transactor;
 use std::sync::Arc;
@@ -9,25 +8,14 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-struct BenchBalance(u64);
-impl BalanceDataType for BenchBalance {}
-
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
 struct BenchData {
     amount: u64,
 }
 
 impl TransactionDataType for BenchData {
-    type BalanceData = BenchBalance;
-
-    fn process(
-        &self,
-        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-    ) -> Result<(), String> {
-        let bal = ctx.get_balance(1);
-        ctx.update_balance(1, BenchBalance(bal.0 + self.amount));
-        Ok(())
+    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
+        ctx.credit(0, self.amount);
+        ctx.debit(1, self.amount);
     }
 }
 
@@ -42,11 +30,8 @@ fn transactor_bench(c: &mut Criterion) {
     let outbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
     let running = Arc::new(AtomicBool::new(true));
 
-    let mut transactor = Transactor::<BenchData, BenchBalance>::new(
-        inbound.clone(),
-        outbound.clone(),
-        running.clone(),
-    );
+    let mut transactor =
+        Transactor::<BenchData>::new(inbound.clone(), outbound.clone(), running.clone());
 
     let handle = transactor.start();
     let mut current_id = 0;

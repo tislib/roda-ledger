@@ -1,5 +1,6 @@
 pub mod balance;
 pub mod client;
+pub mod entities;
 pub mod ledger;
 pub mod protocol;
 mod replay;

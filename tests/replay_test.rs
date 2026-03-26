@@ -30,8 +30,8 @@ fn test_replay_functionality() {
         std::thread::sleep(Duration::from_millis(500));
 
         // Check balances before "crash"
-        assert_eq!(wallet.get_balance(1).balance, 100);
-        assert_eq!(wallet.get_balance(2).balance, 200);
+        assert_eq!(wallet.get_balance(1), 100);
+        assert_eq!(wallet.get_balance(2), 200);
 
         // Phase 2: Create some more state that won't be in the snapshot, but will be in WAL
         // We set a long snapshot interval for the next phase, but we can't easily change it.
@@ -56,8 +56,8 @@ fn test_replay_functionality() {
         wallet.transfer(2, 1, 30);
         wallet.wait_pending_operations();
 
-        assert_eq!(wallet.get_balance(1).balance, 180);
-        assert_eq!(wallet.get_balance(2).balance, 170);
+        assert_eq!(wallet.get_balance(1), 180);
+        assert_eq!(wallet.get_balance(2), 170);
 
         // Wait for WAL flush but no snapshot
         std::thread::sleep(Duration::from_millis(200));
@@ -82,13 +82,13 @@ fn test_replay_functionality() {
         // Check balances after replay
         // Account 1: 100 (snapshot) + 50 (WAL) + 30 (WAL) = 180
         // Account 2: 200 (snapshot) - 30 (WAL) = 170
-        assert_eq!(wallet.get_balance(1).balance, 180);
-        assert_eq!(wallet.get_balance(2).balance, 170);
+        assert_eq!(wallet.get_balance(1), 180);
+        assert_eq!(wallet.get_balance(2), 170);
 
         // Further transactions should work correctly
         wallet.deposit(1, 20);
         wallet.wait_pending_operations();
-        assert_eq!(wallet.get_balance(1).balance, 200);
+        assert_eq!(wallet.get_balance(1), 200);
     }
 
     // Cleanup
