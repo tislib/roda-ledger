@@ -1,14 +1,13 @@
-pub mod balance;
 pub mod transaction;
 
 use crate::ledger::{Ledger, LedgerConfig};
 use crate::transaction::{Transaction, TransactionStatus};
-use crate::wallet::balance::WalletBalance;
 use crate::wallet::transaction::WalletTransaction;
+use crate::balance::Balance;
 
 #[derive(Clone)]
 pub struct WalletConfig {
-    pub capacity: usize,
+    pub queue_size: usize,
     pub location: Option<String>,
     pub in_memory: bool,
     pub snapshot_interval: std::time::Duration,
@@ -17,7 +16,7 @@ pub struct WalletConfig {
 impl Default for WalletConfig {
     fn default() -> Self {
         Self {
-            capacity: 1024,
+            queue_size: 1024,
             location: None,
             in_memory: false,
             snapshot_interval: std::time::Duration::from_secs(600),
@@ -26,7 +25,7 @@ impl Default for WalletConfig {
 }
 
 pub struct Wallet {
-    ledger: Ledger<WalletTransaction, WalletBalance>,
+    ledger: Ledger<WalletTransaction>,
     last_transaction_id: u64,
     location: Option<String>,
 }
@@ -34,7 +33,7 @@ pub struct Wallet {
 impl Wallet {
     pub fn new(capacity: usize) -> Self {
         Self::new_with_config(WalletConfig {
-            capacity,
+            queue_size: capacity,
             ..Default::default()
         })
     }
@@ -60,7 +59,7 @@ impl Wallet {
         };
 
         let ledger_config = LedgerConfig {
-            queue_size: config.capacity,
+            queue_size: config.queue_size,
             location: resolved_location.clone(),
             in_memory: config.in_memory,
             snapshot_interval: config.snapshot_interval,
@@ -72,7 +71,7 @@ impl Wallet {
         }
     }
 
-    pub fn submit(&mut self, transaction: Transaction<WalletTransaction, WalletBalance>) -> u64 {
+    pub fn submit(&mut self, transaction: Transaction<WalletTransaction>) -> u64 {
         let transaction_id = self.ledger.submit(transaction);
         self.last_transaction_id = transaction_id;
         transaction_id
@@ -102,7 +101,7 @@ impl Wallet {
         transaction_id
     }
 
-    pub fn get_balance(&self, account_id: u64) -> WalletBalance {
+    pub fn get_balance(&self, account_id: u64) -> Balance {
         self.ledger.get_balance(account_id)
     }
 
@@ -151,7 +150,7 @@ mod tests {
 
         // Create a second wallet pointing to the same location to test persistence
         let mut wallet2 = Wallet::new_with_config(WalletConfig {
-            capacity: 10,
+            queue_size: 10,
             location: location.clone(),
             in_memory: false,
             ..Default::default()
@@ -159,7 +158,7 @@ mod tests {
         wallet2.start();
 
         // Balance should persist
-        assert_eq!(wallet2.get_balance(1).balance, 150);
+        assert_eq!(wallet2.get_balance(1), 150);
 
         // Cleanup
         wallet2.destroy();
@@ -173,7 +172,7 @@ mod tests {
         wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
-        assert_eq!(balance.balance, 100);
+        assert_eq!(balance, 100);
 
         wallet.destroy();
     }
@@ -187,7 +186,7 @@ mod tests {
         wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
-        assert_eq!(balance.balance, 50);
+        assert_eq!(balance, 50);
 
         wallet.destroy();
     }
@@ -205,8 +204,8 @@ mod tests {
         let balance1 = wallet.get_balance(1);
         let balance2 = wallet.get_balance(2);
 
-        assert_eq!(balance1.balance, 70);
-        assert_eq!(balance2.balance, 80);
+        assert_eq!(balance1, 70);
+        assert_eq!(balance2, 80);
 
         wallet.destroy();
     }
@@ -221,7 +220,7 @@ mod tests {
         wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
-        assert_eq!(balance.balance, 150); // 100 + 50
+        assert_eq!(balance, 150); // 100 + 50
 
         let failed_transaction_status = wallet.get_transaction_status(failed_transaction_id);
 
@@ -243,8 +242,8 @@ mod tests {
         let balance1 = wallet.get_balance(1);
         let balance2 = wallet.get_balance(2);
 
-        assert_eq!(balance1.balance, 100);
-        assert_eq!(balance2.balance, 50);
+        assert_eq!(balance1, 100);
+        assert_eq!(balance2, 50);
 
         let failed_transaction_status = wallet.get_transaction_status(failed_transaction_id);
         assert!(failed_transaction_status.is_err());
@@ -266,11 +265,11 @@ mod tests {
         }
         wallet.wait_pending_operations();
 
-        assert_eq!(wallet.get_balance(1).balance, 900);
+        assert_eq!(wallet.get_balance(1), 900);
         for i in 2..10 {
-            assert_eq!(wallet.get_balance(i).balance, 1000); // Received 100, sent 100
+            assert_eq!(wallet.get_balance(i), 1000); // Received 100, sent 100
         }
-        assert_eq!(wallet.get_balance(10).balance, 1100);
+        assert_eq!(wallet.get_balance(10), 1100);
 
         wallet.destroy();
     }
@@ -285,8 +284,8 @@ mod tests {
         wallet.transfer(1, 2, 0);
         wallet.wait_pending_operations();
 
-        assert_eq!(wallet.get_balance(1).balance, 100);
-        assert_eq!(wallet.get_balance(2).balance, 0);
+        assert_eq!(wallet.get_balance(1), 100);
+        assert_eq!(wallet.get_balance(2), 0);
 
         wallet.destroy();
     }
@@ -314,7 +313,7 @@ mod tests {
         wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
-        assert_eq!(balance.balance, 100); // Should remain 100
+        assert_eq!(balance, 100); // Should remain 100
 
         wallet.destroy();
     }
@@ -327,9 +326,9 @@ mod tests {
         wallet.transfer(998, 1, 100); // Transfer from non-existent account
         wallet.wait_pending_operations();
 
-        assert_eq!(wallet.get_balance(999).balance, 0);
-        assert_eq!(wallet.get_balance(998).balance, 0);
-        assert_eq!(wallet.get_balance(1).balance, 0);
+        assert_eq!(wallet.get_balance(999), 0);
+        assert_eq!(wallet.get_balance(998), 0);
+        assert_eq!(wallet.get_balance(1), 0);
 
         wallet.destroy();
     }
@@ -361,9 +360,9 @@ mod tests {
         // Check total balance (should be preserved)
         let mut total_balance = 0;
         for i in 1..=num_accounts as u64 {
-            total_balance += wallet.get_balance(i).balance;
+            total_balance += wallet.get_balance(i);
         }
-        assert_eq!(total_balance, num_accounts as u64 * 1000);
+        assert_eq!(total_balance, (num_accounts as u64 * 1000) as i64);
 
         wallet.destroy();
     }
@@ -371,7 +370,7 @@ mod tests {
     #[test]
     fn test_wallet_in_memory() {
         let mut wallet = Wallet::new_with_config(WalletConfig {
-            capacity: 10,
+            queue_size: 10,
             in_memory: true,
             ..Default::default()
         });
@@ -380,7 +379,7 @@ mod tests {
         wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
-        assert_eq!(balance.balance, 100);
+        assert_eq!(balance, 100);
 
         // Verify no "data" folder or "wal.bin" was created in current directory if it didn't exist
         // But since other tests might have created it, it's hard to verify here without a temp dir.
@@ -392,7 +391,7 @@ mod tests {
     fn test_wallet_custom_location() {
         let temp_dir = "temp_ledger_test";
         let mut wallet = Wallet::new_with_config(WalletConfig {
-            capacity: 10,
+            queue_size: 10,
             location: Some(temp_dir.to_string()),
             in_memory: false,
             ..Default::default()
@@ -402,7 +401,7 @@ mod tests {
         wallet.wait_pending_operations();
 
         let balance = wallet.get_balance(1);
-        assert_eq!(balance.balance, 100);
+        assert_eq!(balance, 100);
 
         // Verify file exists
         let wal_path = std::path::Path::new(temp_dir).join("wal.bin");

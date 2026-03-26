@@ -1,7 +1,7 @@
 use roda_ledger::client::Client;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::wallet::balance::WalletBalance;
+use roda_ledger::balance::Balance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ async fn test_server_client_integration() {
         },
     };
 
-    let server = Server::<WalletTransaction, WalletBalance>::new(server_config);
+    let server = Server::<WalletTransaction>::new(server_config);
 
     tokio::spawn(async move {
         if let Err(e) = server.run_async().await {
@@ -30,7 +30,7 @@ async fn test_server_client_integration() {
     // Give the server a moment to start
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut client = Client::<WalletTransaction, WalletBalance>::new(addr);
+    let mut client = Client::<WalletTransaction>::new(addr);
 
     let account_id = 1001;
     let deposit_amount = 5000;
@@ -66,5 +66,5 @@ async fn test_server_client_integration() {
         .get_balance(account_id)
         .await
         .expect("Failed to get balance");
-    assert_eq!(balance.balance, deposit_amount);
+    assert_eq!(balance, deposit_amount as i64);
 }

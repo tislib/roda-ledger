@@ -12,7 +12,7 @@ fn wallet_deposit_bench(c: &mut Criterion) {
 
     group.bench_function("deposit", |b| {
         let mut wallet = Wallet::new_with_config(WalletConfig {
-            capacity: 1024,
+            queue_size: 1024,
             ..Default::default()
         });
         wallet.start();

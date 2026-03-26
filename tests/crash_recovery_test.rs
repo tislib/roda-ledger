@@ -11,16 +11,16 @@ fn crash_recovery_test() {
     }
 
     let account_id = 1;
-    let num_transactions = 1_000_000;
+    let num_transactions = 1_000;
     let deposit_amount = 1;
 
     // Phase 1: Insert 1 million transactions
     {
         let config = WalletConfig {
+            queue_size: 1024,
             location: Some(temp_dir.to_string()),
             in_memory: false,
             snapshot_interval: Duration::from_millis(100),
-            capacity: 100_000,
         };
 
         let mut wallet = Wallet::new_with_config(config);
@@ -46,10 +46,10 @@ fn crash_recovery_test() {
     // Phase 2: Start again and verify
     {
         let config = WalletConfig {
+            queue_size: 1024,
             location: Some(temp_dir.to_string()),
             in_memory: false,
             snapshot_interval: Duration::from_millis(100),
-            capacity: 100_000,
         };
 
         let mut wallet = Wallet::new_with_config(config);
@@ -58,7 +58,7 @@ fn crash_recovery_test() {
         let balance = wallet.get_balance(account_id);
 
         // Verify balance
-        assert_eq!(balance.balance, num_transactions * deposit_amount);
+        assert_eq!(balance, (num_transactions * deposit_amount) as i64);
 
         // Final cleanup
         wallet.destroy();

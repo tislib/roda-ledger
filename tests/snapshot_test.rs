@@ -42,7 +42,7 @@ fn test_snapshot_creation() {
 
     assert_eq!(
         buffer.len(),
-        24 + 32,
+        24 + 16 * 3,
         "Snapshot should contain header (24 bytes) and two 16-byte entries"
     );
 

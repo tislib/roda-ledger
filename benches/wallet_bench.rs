@@ -11,7 +11,7 @@ fn wallet_bench(c: &mut Criterion) {
     group.bench_function("deposit", |b| {
         let mut wallet = Wallet::new_with_config(WalletConfig {
             in_memory: false,
-            capacity: 1024,
+            queue_size: 1024,
             ..Default::default()
         });
         wallet.start();
@@ -27,7 +27,7 @@ fn wallet_bench(c: &mut Criterion) {
     group.bench_function("transfer", |b| {
         let mut wallet = Wallet::new_with_config(WalletConfig {
             in_memory: false,
-            capacity: 1024,
+            queue_size: 1024,
             ..Default::default()
         });
         wallet.start();

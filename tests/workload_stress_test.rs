@@ -2,7 +2,7 @@ use roda_ledger::ledger::Ledger;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::testing::stress::direct_workload_client::DirectWorkloadClient;
 use roda_ledger::testing::stress::workload::{AccountSelector, Limit, Power, RunConfig, Workload};
-use roda_ledger::wallet::balance::WalletBalance;
+use roda_ledger::balance::Balance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ fn test_workload_deposit_sustain() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction, WalletBalance>::new(ledger_config);
+    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -34,7 +34,7 @@ fn test_workload_deposit_sustain() {
     // Wait for processing
     std::thread::sleep(Duration::from_millis(100));
     let balance = ledger.get_balance(1001);
-    assert_eq!(balance.balance, 1000);
+    assert_eq!(balance, 1000);
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn test_workload_transfer_spike_direct() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction, WalletBalance>::new(ledger_config);
+    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -79,7 +79,7 @@ fn test_workload_peak_load_direct() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction, WalletBalance>::new(ledger_config);
+    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -125,7 +125,7 @@ fn test_workload_range_selector_direct() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction, WalletBalance>::new(ledger_config);
+    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 

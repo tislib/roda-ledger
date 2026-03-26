@@ -1,25 +1,16 @@
-use crate::balance::BalanceDataType;
 use crate::transaction::{Transaction, TransactionDataType};
 use crossbeam_queue::ArrayQueue;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub struct Sequencer<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+pub struct Sequencer<Data: TransactionDataType> {
     next_id: AtomicU64,
-    outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+    outbound: Arc<ArrayQueue<Transaction<Data>>>,
 }
 
-impl<Data, BalanceData> Sequencer<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
-    pub fn new(outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>) -> Self {
+impl<Data: TransactionDataType> Sequencer<Data> {
+    pub fn new(outbound: Arc<ArrayQueue<Transaction<Data>>>) -> Self {
         Self {
             next_id: AtomicU64::new(1),
             outbound,
@@ -27,7 +18,7 @@ where
     }
 
     #[inline(always)]
-    pub fn submit(&self, mut transaction: Transaction<Data, BalanceData>) -> u64 {
+    pub fn submit(&self, mut transaction: Transaction<Data>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         transaction.id = id;
 

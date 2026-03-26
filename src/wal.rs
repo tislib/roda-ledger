@@ -1,51 +1,40 @@
-use crate::balance::BalanceDataType;
-use crate::transaction::{Transaction, TransactionDataType};
+use crate::entities::{TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use crossbeam_queue::ArrayQueue;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-pub struct Wal<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
-    inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-    outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+pub struct Wal {
+    inbound: Arc<ArrayQueue<WalEntry>>,
+    outbound: Arc<ArrayQueue<WalEntry>>,
     file_path: Option<PathBuf>,
     last_processed_transaction_id: Arc<AtomicU64>,
     in_memory: bool,
     running: Arc<AtomicBool>,
 }
 
-pub struct WalRunner<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
-    inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-    outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+pub struct WalRunner {
+    inbound: Arc<ArrayQueue<WalEntry>>,
+    outbound: Arc<ArrayQueue<WalEntry>>,
     file: Option<File>,
     file_path: Option<PathBuf>,
-    buffer: Vec<Transaction<Data, BalanceData>>,
+    buffer: Vec<WalEntry>,
+    write_buffer: Vec<u8>,
     last_retry: Option<Instant>,
     last_processed_transaction_id: Arc<AtomicU64>,
     current_offset: u64,
+    pending_entries: u8,
     running: Arc<AtomicBool>,
 }
 
-impl<Data, BalanceData> Wal<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl Wal {
     pub fn new(
-        inbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
-        outbound: Arc<ArrayQueue<Transaction<Data, BalanceData>>>,
+        inbound: Arc<ArrayQueue<WalEntry>>,
+        outbound: Arc<ArrayQueue<WalEntry>>,
         ledger_folder: Option<&str>,
         in_memory: bool,
         running: Arc<AtomicBool>,
@@ -76,7 +65,7 @@ where
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn get_records(&self, offset: u64) -> Vec<Transaction<Data, BalanceData>> {
+    pub fn get_records(&self, offset: u64) -> Vec<WalEntry> {
         if self.in_memory || self.file_path.is_none() {
             return Vec::new();
         }
@@ -90,18 +79,63 @@ where
             return Vec::new();
         }
 
+        let mut reader = std::io::BufReader::with_capacity(128 * 1024, file);
         let mut records = Vec::new();
-        let tx_size = std::mem::size_of::<Transaction<Data, BalanceData>>();
-        let mut buf = vec![0u8; tx_size];
 
         loop {
-            match file.read_exact(&mut buf) {
-                Ok(_) => {
-                    let tx: Transaction<Data, BalanceData> = *bytemuck::from_bytes(&buf);
-                    records.push(tx);
+            let (kind, size) = {
+                let buffer = match reader.fill_buf() {
+                    Ok(b) => {
+                        if b.is_empty() {
+                            break;
+                        }
+                        b
+                    }
+                    Err(_) => break,
+                };
+
+                let kind = buffer[0];
+                let size = match kind {
+                    k if k == WalEntryKind::TxMetadata as u8 => 32,
+                    k if k == WalEntryKind::TxEntry as u8 => 32,
+                    _ => break,
+                };
+
+                if buffer.len() < 1 + size {
+                    // Not enough data for full record in buffer, need to read more
+                    // We'll fall back to read_exact for this record
+                    (kind, Some(size))
+                } else {
+                    // We have the full record in buffer
+                    let record_data = &buffer[1..1 + size];
+                    if kind == WalEntryKind::TxMetadata as u8 {
+                        let metadata: TxMetadata = bytemuck::pod_read_unaligned(record_data);
+                        records.push(WalEntry::Metadata(metadata));
+                    } else {
+                        let entry: TxEntry = bytemuck::pod_read_unaligned(record_data);
+                        records.push(WalEntry::Entry(entry));
+                    }
+                    reader.consume(1 + size);
+                    continue;
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(_) => break,
+            };
+
+            // Fallback for when record spans across BufReader's internal buffer
+            if let Some(size) = size {
+                let mut full_record = vec![0u8; 1 + size];
+                if reader.read_exact(&mut full_record).is_err() {
+                    break;
+                }
+                let record_data = &full_record[1..];
+                if kind == WalEntryKind::TxMetadata as u8 {
+                    let metadata: TxMetadata = bytemuck::pod_read_unaligned(record_data);
+                    records.push(WalEntry::Metadata(metadata));
+                } else {
+                    let entry: TxEntry = bytemuck::pod_read_unaligned(record_data);
+                    records.push(WalEntry::Entry(entry));
+                }
+            } else {
+                break;
             }
         }
         records
@@ -127,7 +161,7 @@ where
             .unwrap()
     }
 
-    fn create_runner(&self) -> WalRunner<Data, BalanceData> {
+    fn create_runner(&self) -> WalRunner {
         let mut current_offset = 0;
         let file = if self.in_memory {
             None
@@ -144,7 +178,7 @@ where
             file
         };
 
-        let buffer_capacity = (128 * 1024) / std::mem::size_of::<Transaction<Data, BalanceData>>();
+        let buffer_capacity = (128 * 1024) / std::mem::size_of::<WalEntry>();
 
         WalRunner {
             inbound: self.inbound.clone(),
@@ -152,19 +186,17 @@ where
             file,
             file_path: self.file_path.clone(),
             buffer: Vec::with_capacity(buffer_capacity.max(1)),
+            write_buffer: Vec::with_capacity(buffer_capacity.max(1) * 33),
             last_retry: None,
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
             current_offset,
+            pending_entries: 0,
             running: self.running.clone(),
         }
     }
 }
 
-impl<Data, BalanceData> WalRunner<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl WalRunner {
     pub fn run(&mut self) {
         // Try to open file if not open
         if self.file.is_none() {
@@ -210,27 +242,50 @@ where
                 continue;
             }
 
-            let tx_size = std::mem::size_of::<Transaction<Data, BalanceData>>() as u64;
-            for (i, tx) in self.buffer.iter_mut().enumerate() {
-                tx.wal_location = self.current_offset + (i as u64 * tx_size);
+            // Prepare data in write buffer
+            self.write_buffer.clear();
+            for entry in &self.buffer {
+                self.write_buffer.push(entry.kind() as u8);
+                match entry {
+                    WalEntry::Metadata(m) => {
+                        self.write_buffer.extend_from_slice(bytemuck::bytes_of(m))
+                    }
+                    WalEntry::Entry(e) => self.write_buffer.extend_from_slice(bytemuck::bytes_of(e)),
+                }
             }
 
             // Try to write buffer
-            let success = {
-                let bytes =
-                    bytemuck::cast_slice::<Transaction<Data, BalanceData>, u8>(&self.buffer);
-                let file = self.file.as_mut().unwrap();
-                file.write_all(bytes).and_then(|_| file.flush()).is_ok()
+            let success = if let Some(ref mut file) = self.file {
+                match file.write_all(&self.write_buffer) {
+                    Ok(_) => file.flush().is_ok(),
+                    Err(_) => false,
+                }
+            } else {
+                false
             };
 
             if success {
                 // Success! Reset retry timer and move to outbound
                 self.last_retry = None;
-                let processed_count = self.buffer.len();
-                self.current_offset += processed_count as u64 * tx_size;
-                let mut local_last_processed_transaction_id = 0;
+                self.current_offset += self.write_buffer.len() as u64;
+
+                let mut local_last_id = self.last_processed_transaction_id.load(Ordering::Relaxed);
 
                 for tx in self.buffer.drain(..) {
+                    let tx_id = tx.tx_id();
+                    match tx {
+                        WalEntry::Metadata(m) => self.pending_entries = m.entry_count,
+                        WalEntry::Entry(_) => {
+                            if self.pending_entries > 0 {
+                                self.pending_entries -= 1;
+                            }
+                        }
+                    }
+
+                    if self.pending_entries == 0 {
+                        local_last_id = tx_id;
+                    }
+
                     let mut tx = tx;
                     loop {
                         match self.outbound.push(tx) {
@@ -238,16 +293,15 @@ where
                             Err(returned_tx) => {
                                 tx = returned_tx;
                                 if !self.running.load(Ordering::Relaxed) {
+                                    self.last_processed_transaction_id.store(local_last_id, Ordering::Relaxed);
                                     return;
                                 }
                                 std::thread::yield_now();
                             }
                         }
                     }
-                    local_last_processed_transaction_id = tx.id;
                 }
-                self.last_processed_transaction_id
-                    .store(local_last_processed_transaction_id, Ordering::Relaxed);
+                self.last_processed_transaction_id.store(local_last_id, Ordering::Relaxed);
             } else {
                 self.last_retry = Some(Instant::now());
             }
@@ -258,6 +312,16 @@ where
     pub fn run_in_memory(&mut self) {
         while self.running.load(Ordering::Relaxed) {
             if let Some(tx) = self.inbound.pop() {
+                let tx_id = tx.tx_id();
+                match tx {
+                    WalEntry::Metadata(m) => self.pending_entries = m.entry_count,
+                    WalEntry::Entry(_) => {
+                        if self.pending_entries > 0 {
+                            self.pending_entries -= 1;
+                        }
+                    }
+                }
+
                 let mut tx = tx;
                 loop {
                     match self.outbound.push(tx) {
@@ -265,14 +329,18 @@ where
                         Err(returned_tx) => {
                             tx = returned_tx;
                             if !self.running.load(Ordering::Relaxed) {
+                                if self.pending_entries == 0 {
+                                    self.last_processed_transaction_id.store(tx_id, Ordering::Relaxed);
+                                }
                                 return;
                             }
                             std::thread::yield_now();
                         }
                     }
                 }
-                self.last_processed_transaction_id
-                    .store(tx.id, Ordering::Relaxed);
+                if self.pending_entries == 0 {
+                    self.last_processed_transaction_id.store(tx_id, Ordering::Relaxed);
+                }
             } else {
                 std::thread::yield_now();
             }

@@ -1,16 +1,11 @@
 use bytemuck::{Pod, Zeroable};
-use roda_ledger::balance::BalanceDataType;
+use roda_ledger::balance::Balance;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
+use roda_ledger::entities::{FailReason, TxEntry};
 
-// 1. Define your custom balance type
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
-pub struct InventoryBalance {
-    pub item_count: u64,
-}
-
-impl BalanceDataType for InventoryBalance {}
+// 1. Balance is now non-generic u64 everywhere.
+// You can still wrap it in your own logic inside transaction processing.
 
 // 2. Define your custom transaction type
 #[repr(C)]
@@ -21,26 +16,15 @@ pub struct InventoryAdjust {
 }
 
 impl TransactionDataType for InventoryAdjust {
-    type BalanceData = InventoryBalance;
-
     fn process(
         &self,
-        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-    ) -> Result<(), String> {
-        let mut balance = ctx.get_balance(self.item_id);
-
-        if self.delta < 0 && balance.item_count < self.delta.unsigned_abs() {
-            return Err("Insufficient inventory".to_string());
-        }
-
+        ctx: &mut TransactionExecutionContext<'_>,
+    ) {
         if self.delta < 0 {
-            balance.item_count -= self.delta.unsigned_abs();
+            ctx.credit(self.item_id, self.delta.unsigned_abs());
         } else {
-            balance.item_count += self.delta as u64;
+            ctx.debit(self.item_id, self.delta as u64);
         }
-
-        ctx.update_balance(self.item_id, balance);
-        Ok(())
     }
 }
 
@@ -51,7 +35,7 @@ fn main() {
     };
 
     println!("Starting Custom Transaction example...");
-    let mut ledger = Ledger::<InventoryAdjust, InventoryBalance>::new(config);
+    let mut ledger = Ledger::<InventoryAdjust>::new(config);
     ledger.start();
 
     let item_id = 42;
@@ -84,14 +68,14 @@ fn main() {
     let final_balance = ledger.get_balance(item_id);
     println!(
         "Final inventory for item {}: {}",
-        item_id, final_balance.item_count
+        item_id, final_balance
     );
 
     // Check failure reason
     let status = ledger.get_transaction_status(fail_tx_id);
     if status.is_err() {
         println!(
-            "Expected error for transaction {}: {}",
+            "Expected error for transaction {}: {:?}",
             fail_tx_id,
             status.error_reason()
         );

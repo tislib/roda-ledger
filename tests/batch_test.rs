@@ -1,7 +1,7 @@
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::protocol::*;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::wallet::balance::WalletBalance;
+use roda_ledger::balance::Balance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -20,7 +20,7 @@ async fn test_batch_operation() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let server = Server::<WalletTransaction, WalletBalance>::new(server_config);
+    let server = Server::<WalletTransaction>::new(server_config);
     tokio::spawn(async move {
         let _ = server.run_async().await;
     });

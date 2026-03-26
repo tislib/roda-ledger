@@ -11,7 +11,7 @@ fn test_wal_location_is_populated() {
 
     let config = WalletConfig {
         location: Some(temp_dir.to_string()),
-        capacity: 100,
+        queue_size: 100,
         ..Default::default()
     };
 
@@ -93,7 +93,7 @@ fn test_wal_location_persistence() {
 
     let config = WalletConfig {
         location: Some(temp_dir.to_string()),
-        capacity: 100,
+        queue_size: 100,
         ..Default::default()
     };
     let tx_size: u64;

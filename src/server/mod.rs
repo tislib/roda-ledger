@@ -1,4 +1,3 @@
-use crate::balance::BalanceDataType;
 use crate::ledger::{Ledger, LedgerConfig};
 use crate::protocol::*;
 use crate::transaction::TransactionDataType;
@@ -24,20 +23,12 @@ impl Default for ServerConfig {
     }
 }
 
-pub struct Server<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+pub struct Server<Data: TransactionDataType> {
     config: ServerConfig,
-    ledger: Arc<Ledger<Data, BalanceData>>,
+    ledger: Arc<Ledger<Data>>,
 }
 
-impl<Data, BalanceData> Server<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> Server<Data> {
     pub fn new(config: ServerConfig) -> Self {
         let mut ledger = Ledger::new(config.ledger_config.clone());
         ledger.start();

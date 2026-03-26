@@ -9,16 +9,16 @@ pub enum WalEntryKind {
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TxEntryKind {
+pub enum EntryKind {
     Credit = 0,
     Debit = 1,
 }
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
-pub struct TxFailReason(u8);
+pub struct FailReason(u8);
 
-impl TxFailReason {
+impl FailReason {
     pub const NONE: Self = Self(0); // success
     pub const INSUFFICIENT_FUNDS: Self = Self(1);
     pub const ACCOUNT_NOT_FOUND: Self = Self(2);
@@ -43,7 +43,7 @@ pub struct TxMetadata {
     pub timestamp: u64,            // 8
     pub user_ref: u64,             // 8 — opaque external reference, caller owns context
     pub entry_count: u8,           // 1 — 0 if transaction failed
-    pub fail_reason: TxFailReason, // 1 — FailReason::NONE if succeeded
+    pub fail_reason: FailReason, // 1 — FailReason::NONE if succeeded
     pub _pad: [u8; 6],             // 6 — total: 32 bytes
 }
 
@@ -53,7 +53,7 @@ pub struct TxEntry {
     pub tx_id: u64,        // 8 — links back to TxMetadata
     pub account_id: u64,   // 8
     pub amount: u64,       // 8 — integer minor units, no floats, no decimals
-    pub kind: TxEntryKind, // 1 — Credit or Debit
+    pub kind: EntryKind, // 1 — Credit or Debit
     pub _pad: [u8; 7],     // 7 — total: 32 bytes
 }
 
@@ -70,13 +70,20 @@ impl WalEntry {
             WalEntry::Entry(_) => WalEntryKind::TxEntry,
         }
     }
+
+    pub fn tx_id(&self) -> u64 {
+        match self {
+            WalEntry::Metadata(m) => m.tx_id,
+            WalEntry::Entry(e) => e.tx_id,
+        }
+    }
 }
 
 // Safety checks for bytemuck
 unsafe impl Pod for WalEntryKind {}
 unsafe impl Zeroable for WalEntryKind {}
-unsafe impl Pod for TxEntryKind {}
-unsafe impl Zeroable for TxEntryKind {}
+unsafe impl Pod for EntryKind {}
+unsafe impl Zeroable for EntryKind {}
 
 #[cfg(test)]
 mod tests {
@@ -96,7 +103,7 @@ mod tests {
             timestamp: 2,
             user_ref: 3,
             entry_count: 4,
-            fail_reason: TxFailReason::NONE,
+            fail_reason: FailReason::NONE,
             _pad: [0; 6],
         };
         let bytes = bytemuck::bytes_of(&metadata);
@@ -111,20 +118,20 @@ mod tests {
             tx_id: 1,
             account_id: 2,
             amount: 100,
-            kind: TxEntryKind::Credit,
+            kind: EntryKind::Credit,
             _pad: [0; 7],
         };
         let bytes = bytemuck::bytes_of(&entry);
         assert_eq!(bytes.len(), 32);
         let entry2: TxEntry = *bytemuck::from_bytes(bytes);
         assert_eq!(entry.tx_id, entry2.tx_id);
-        assert_eq!(entry2.kind, TxEntryKind::Credit);
+        assert_eq!(entry2.kind, EntryKind::Credit);
     }
 
     #[test]
     fn test_entry_kind_values() {
-        assert_eq!(TxEntryKind::Credit as u8, 0);
-        assert_eq!(TxEntryKind::Debit as u8, 1);
+        assert_eq!(EntryKind::Credit as u8, 0);
+        assert_eq!(EntryKind::Debit as u8, 1);
     }
 
     #[test]
@@ -140,7 +147,7 @@ mod tests {
             timestamp: 2,
             user_ref: 3,
             entry_count: 4,
-            fail_reason: TxFailReason::NONE,
+            fail_reason: FailReason::NONE,
             _pad: [0; 6],
         };
         let wal_entry = WalEntry::Metadata(metadata);
@@ -155,7 +162,7 @@ mod tests {
             tx_id: 1,
             account_id: 2,
             amount: 100,
-            kind: TxEntryKind::Credit,
+            kind: EntryKind::Credit,
             _pad: [0; 7],
         };
         let wal_entry = WalEntry::Entry(entry);

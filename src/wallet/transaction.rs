@@ -1,6 +1,8 @@
+use crate::entities::{EntryKind, FailReason, TxEntry};
 use crate::transaction::{TransactionDataType, TransactionExecutionContext};
-use crate::wallet::balance::WalletBalance;
 use bytemuck::{Pod, Zeroable};
+
+pub const SYSTEM_ACCOUNT_ID: u64 = 0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
@@ -45,54 +47,38 @@ impl WalletTransaction {
 }
 
 impl TransactionDataType for WalletTransaction {
-    type BalanceData = WalletBalance;
+    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
+        if self.amount == 0 {
+            return;
+        }
 
-    fn process(
-        &self,
-        ctx: &mut impl TransactionExecutionContext<Self::BalanceData>,
-    ) -> Result<(), String> {
         match self.tag {
             WalletTransaction::DEPOSIT => {
-                let mut balance = ctx.get_balance(self.account_id);
-
-                balance.balance += self.amount;
-                ctx.update_balance(self.account_id, balance);
-
-                Ok(())
+                ctx.debit(self.account_id, self.amount);
+                ctx.credit(SYSTEM_ACCOUNT_ID, self.amount);
             }
             WalletTransaction::WITHDRAW => {
-                let mut balance = ctx.get_balance(self.account_id);
-
-                if self.amount > balance.balance {
-                    return Err("Insufficient funds for withdrawal".to_string());
+                let balance = ctx.get_balance(self.account_id);
+                if balance < self.amount as i64 {
+                    ctx.fail(FailReason::INSUFFICIENT_FUNDS);
+                    return;
                 }
-
-                balance.balance -= self.amount;
-                ctx.update_balance(self.account_id, balance);
-
-                Ok(())
+                ctx.credit(self.account_id, self.amount);
+                ctx.debit(SYSTEM_ACCOUNT_ID, self.amount);
             }
             WalletTransaction::TRANSFER => {
                 if self.account_id == self.to_account_id {
-                    return Ok(());
+                    return;
                 }
-
-                let mut from_balance = ctx.get_balance(self.account_id);
-                let mut to_balance = ctx.get_balance(self.to_account_id);
-
-                if self.amount > from_balance.balance {
-                    return Err("Insufficient funds for transfer".to_string());
+                let balance = ctx.get_balance(self.account_id);
+                if balance < self.amount as i64 {
+                    ctx.fail(FailReason::INSUFFICIENT_FUNDS);
+                    return;
                 }
-
-                from_balance.balance -= self.amount;
-                to_balance.balance += self.amount;
-
-                ctx.update_balance(self.account_id, from_balance);
-                ctx.update_balance(self.to_account_id, to_balance);
-
-                Ok(())
+                ctx.credit(self.account_id, self.amount);
+                ctx.debit(self.to_account_id, self.amount);
             }
-            _ => Err(format!("Unknown transaction tag: {}", self.tag)),
+            _ => ctx.fail(FailReason::INVALID_OPERATION),
         }
     }
 }

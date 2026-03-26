@@ -1,33 +1,26 @@
-use crate::balance::BalanceDataType;
+use crate::balance::Balance;
 use crate::protocol::*;
 use crate::transaction::{TransactionDataType, TransactionStatus};
 use std::marker::PhantomData;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use crate::entities::FailReason;
 
-pub struct Client<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+pub struct Client<Data: TransactionDataType> {
     addr: String,
     stream: Option<TcpStream>,
     buf: Vec<u8>,
-    _phantom: PhantomData<(Data, BalanceData)>,
+    _phantom: PhantomData<Data>,
 }
 
-impl<Data, BalanceData> Client<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> Client<Data> {
     pub fn new(addr: String) -> Self {
         let max_size = (std::mem::size_of::<ProtocolHeader>()
             + std::mem::size_of::<RegisterTransactionResponse>())
         .max(std::mem::size_of::<ProtocolHeader>() + std::mem::size_of::<GetStatusResponse>())
         .max(
             std::mem::size_of::<ProtocolHeader>()
-                + std::mem::size_of::<GetBalanceResponse<BalanceData>>(),
+                + std::mem::size_of::<GetBalanceResponse>(),
         )
         .max(std::mem::size_of::<ProtocolHeader>() + std::mem::size_of::<BatchResponse>());
         Self {
@@ -116,7 +109,7 @@ where
             1 => TransactionStatus::Computed,
             2 => TransactionStatus::Committed,
             3 => TransactionStatus::OnSnapshot,
-            4 => TransactionStatus::Error("Unknown error from server".to_string()),
+            4 => TransactionStatus::Error(FailReason::INVALID_OPERATION),
             _ => return Err("Invalid status received from server".into()),
         };
 
@@ -126,7 +119,7 @@ where
     pub async fn get_balance(
         &mut self,
         account_id: u64,
-    ) -> Result<BalanceData, Box<dyn std::error::Error>> {
+    ) -> Result<Balance, Box<dyn std::error::Error>> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(&self.addr).await?;
             stream.set_nodelay(true)?;
@@ -156,7 +149,7 @@ where
         }
         let buf = &mut self.buf[..payload_size];
         stream.read_exact(buf).await?;
-        let response: &GetBalanceResponse<BalanceData> = bytemuck::from_bytes(buf);
+        let response: &GetBalanceResponse = bytemuck::from_bytes(buf);
 
         Ok(response.balance)
     }
@@ -276,7 +269,7 @@ where
     pub async fn get_balances_batch(
         &mut self,
         account_ids: Vec<u64>,
-    ) -> Result<Vec<BalanceData>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Balance>, Box<dyn std::error::Error>> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(&self.addr).await?;
             stream.set_nodelay(true)?;
@@ -340,7 +333,7 @@ where
             assert_eq!(resp_header.op_kind, OperationKind::GET_BALANCE);
 
             let payload_size = resp_header.length as usize;
-            let mut response = GetBalanceResponse::<BalanceData>::default();
+            let mut response = GetBalanceResponse::default();
             bytemuck::bytes_of_mut(&mut response)
                 .copy_from_slice(&self.buf[current_offset..current_offset + payload_size]);
             current_offset += payload_size;

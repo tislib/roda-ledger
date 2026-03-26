@@ -1,4 +1,5 @@
-use crate::balance::BalanceDataType;
+use crate::balance::Balance;
+use crate::entities::WalEntry;
 use crate::sequencer::Sequencer;
 use crate::snapshot::Snapshot;
 use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
@@ -28,28 +29,20 @@ impl Default for LedgerConfig {
     }
 }
 
-pub struct Ledger<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
-    sequencer: Sequencer<Data, BalanceData>,
-    transactor: Transactor<Data, BalanceData>,
-    wal: Wal<Data, BalanceData>,
-    snapshot: Snapshot<Data, BalanceData>,
+pub struct Ledger<Data: TransactionDataType> {
+    sequencer: Sequencer<Data>,
+    transactor: Transactor<Data>,
+    wal: Wal,
+    snapshot: Snapshot,
     running: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
 }
 
-impl<Data, BalanceData> Ledger<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> Ledger<Data> {
     pub fn new(config: LedgerConfig) -> Self {
         let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
-        let transactor_wal_queue = Arc::new(ArrayQueue::new(config.queue_size));
-        let wal_snapshot_queue = Arc::new(ArrayQueue::new(config.queue_size));
+        let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(config.queue_size));
+        let wal_snapshot_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(config.queue_size));
         let running = Arc::new(AtomicBool::new(true));
 
         Self {
@@ -78,11 +71,11 @@ where
         }
     }
 
-    pub fn submit(&self, transaction: Transaction<Data, BalanceData>) -> u64 {
+    pub fn submit(&self, transaction: Transaction<Data>) -> u64 {
         self.sequencer.submit(transaction)
     }
 
-    pub fn get_balance(&self, account_id: u64) -> BalanceData {
+    pub fn get_balance(&self, account_id: u64) -> Balance {
         self.snapshot.get_balance(account_id)
     }
 
@@ -114,7 +107,6 @@ where
 
     pub fn wait_for_transaction(&mut self, transaction_id: u64) {
         let mut prev_snapshot_step = self.snapshot.last_processed_transaction_id();
-        let mut prev_rejected_count = self.transactor.rejected_count() as u64;
 
         let mut no_movement_count = 1;
 
@@ -123,24 +115,16 @@ where
             let current_wal_step = self.wal.last_processed_transaction_id();
             let current_transactor_step = self.transactor.last_processed_transaction_id();
 
-            let rejected_count = self.transactor.rejected_count() as u64;
-
-            let mut target_step = transaction_id;
-            if rejected_count >= transaction_id {
-                return;
-            }
-            target_step -= rejected_count;
-
-            if current_transactor_step >= target_step
-                && current_wal_step >= target_step
-                && current_snapshot_step >= target_step
+            if current_transactor_step >= transaction_id
+                && current_wal_step >= transaction_id
+                && current_snapshot_step >= transaction_id
             {
                 return;
             }
             yield_now();
 
             // Break if no movement
-            if prev_snapshot_step == current_snapshot_step && prev_rejected_count == rejected_count
+            if prev_snapshot_step == current_snapshot_step
             {
                 no_movement_count += 1;
             } else {
@@ -150,7 +134,6 @@ where
                 return;
             }
 
-            prev_rejected_count = rejected_count;
             prev_snapshot_step = current_snapshot_step;
         }
     }
@@ -174,21 +157,19 @@ where
         let last_snapshot_tx_id = self.snapshot.last_processed_transaction_id();
         let last_wal_pos = self.snapshot.last_wal_position();
 
-        let tx_size = std::mem::size_of::<Transaction<Data, BalanceData>>() as u64;
-        let start_pos = if last_snapshot_tx_id == 0 {
-            0
-        } else {
-            last_wal_pos + tx_size
-        };
+        // NOTE: In the entries-based model, we read WalEntry, not Transaction.
+        // Replaying transactions is no longer needed since we have entries.
+        let start_pos = last_wal_pos; // Simplification
 
         let records = self.wal.get_records(start_pos);
         let mut last_replayed_id = last_snapshot_tx_id;
 
-        for tx in records {
-            if tx.id > last_snapshot_tx_id {
-                self.transactor.reprocess_transaction(tx);
-                self.snapshot.reprocess_transaction(tx);
-                last_replayed_id = tx.id;
+        for entry in records {
+            let tx_id = entry.tx_id();
+            if tx_id > last_snapshot_tx_id {
+                self.transactor.apply_wal_entry(entry);
+                self.snapshot.reprocess_transaction(entry);
+                last_replayed_id = self.transactor.last_processed_transaction_id();
             }
         }
 
@@ -202,11 +183,7 @@ where
     }
 }
 
-impl<Data, BalanceData> Drop for Ledger<Data, BalanceData>
-where
-    BalanceData: BalanceDataType,
-    Data: TransactionDataType<BalanceData = BalanceData>,
-{
+impl<Data: TransactionDataType> Drop for Ledger<Data> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         while let Some(handle) = self.handles.pop() {
