@@ -39,9 +39,7 @@ fn wallet_server_bench(c: &mut Criterion) {
     let i = Arc::new(AtomicU64::new(0));
 
     group.bench_function("deposit", |b| {
-        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(
-            addr.clone(),
-        )));
+        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
         let i = i.clone();
         b.to_async(&rt).iter(|| {
             let client = client.clone();
@@ -59,9 +57,7 @@ fn wallet_server_bench(c: &mut Criterion) {
     });
 
     group.bench_function("transfer", |b| {
-        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(
-            addr.clone(),
-        )));
+        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
 
         // Pre-fill some balances
         {
@@ -98,9 +94,7 @@ fn wallet_server_bench(c: &mut Criterion) {
     });
 
     group.bench_function("get_balance", |b| {
-        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(
-            addr.clone(),
-        )));
+        let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
         let i = i.clone();
         b.to_async(&rt).iter(|| {
             let client = client.clone();
@@ -120,9 +114,7 @@ fn wallet_server_bench(c: &mut Criterion) {
         batch_group.measurement_time(Duration::from_secs(10));
 
         batch_group.bench_function(format!("deposit_{}", batch_size), |b| {
-            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(
-                addr.clone(),
-            )));
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
             let i = i.clone();
             b.to_async(&rt).iter(|| {
                 let client = client.clone();
@@ -144,9 +136,7 @@ fn wallet_server_bench(c: &mut Criterion) {
         });
 
         batch_group.bench_function(format!("transfer_{}", batch_size), |b| {
-            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(
-                addr.clone(),
-            )));
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
             let i = i.clone();
             b.to_async(&rt).iter(|| {
                 let client = client.clone();
@@ -172,9 +162,7 @@ fn wallet_server_bench(c: &mut Criterion) {
         });
 
         batch_group.bench_function(format!("get_balance_{}", batch_size), |b| {
-            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(
-                addr.clone(),
-            )));
+            let client = Arc::new(Mutex::new(Client::<WalletTransaction>::new(addr.clone())));
             let i = i.clone();
             b.to_async(&rt).iter(|| {
                 let client = client.clone();

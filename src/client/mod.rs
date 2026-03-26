@@ -1,10 +1,10 @@
 use crate::balance::Balance;
+use crate::entities::FailReason;
 use crate::protocol::*;
 use crate::transaction::{TransactionDataType, TransactionStatus};
 use std::marker::PhantomData;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::entities::FailReason;
 
 pub struct Client<Data: TransactionDataType> {
     addr: String,
@@ -18,10 +18,7 @@ impl<Data: TransactionDataType> Client<Data> {
         let max_size = (std::mem::size_of::<ProtocolHeader>()
             + std::mem::size_of::<RegisterTransactionResponse>())
         .max(std::mem::size_of::<ProtocolHeader>() + std::mem::size_of::<GetStatusResponse>())
-        .max(
-            std::mem::size_of::<ProtocolHeader>()
-                + std::mem::size_of::<GetBalanceResponse>(),
-        )
+        .max(std::mem::size_of::<ProtocolHeader>() + std::mem::size_of::<GetBalanceResponse>())
         .max(std::mem::size_of::<ProtocolHeader>() + std::mem::size_of::<BatchResponse>());
         Self {
             addr,

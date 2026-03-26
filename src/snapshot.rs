@@ -1,14 +1,13 @@
 use crate::balance::Balance;
 use crate::entities::{EntryKind, WalEntry};
-use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::thread::{sleep, JoinHandle};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -180,7 +179,8 @@ impl Snapshot {
             }
         }
         if self.pending_entries.load(Ordering::Relaxed) == 0 {
-            self.last_processed_transaction_id.store(tx_id, Ordering::Relaxed);
+            self.last_processed_transaction_id
+                .store(tx_id, Ordering::Relaxed);
         }
     }
 
@@ -426,4 +426,3 @@ impl SnapshotStorer {
         Ok(())
     }
 }
-

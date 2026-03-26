@@ -58,7 +58,7 @@ fn test_snapshot_creation() {
     // Verify first snapshot contents
     // Entries are sorted by account_id. 0 (system), 1, 2.
     let acc0_id_first = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
-    let acc0_bal_first = i64::from_le_bytes(buffer[32..40].try_into().unwrap());
+    let _acc0_bal_first = i64::from_le_bytes(buffer[32..40].try_into().unwrap());
     let acc1_id_first = u64::from_le_bytes(buffer[40..48].try_into().unwrap());
     let acc1_bal_first = i64::from_le_bytes(buffer[48..56].try_into().unwrap());
     let acc2_id_first = u64::from_le_bytes(buffer[56..64].try_into().unwrap());

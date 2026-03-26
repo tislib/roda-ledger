@@ -1,9 +1,9 @@
 pub mod transaction;
 
+use crate::balance::Balance;
 use crate::ledger::{Ledger, LedgerConfig};
 use crate::transaction::{Transaction, TransactionStatus};
 use crate::wallet::transaction::WalletTransaction;
-use crate::balance::Balance;
 
 #[derive(Clone)]
 pub struct WalletConfig {

@@ -1,8 +1,6 @@
 use bytemuck::{Pod, Zeroable};
-use roda_ledger::balance::Balance;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
-use roda_ledger::entities::{FailReason, TxEntry};
 
 // 1. Balance is now non-generic u64 everywhere.
 // You can still wrap it in your own logic inside transaction processing.
@@ -16,10 +14,7 @@ pub struct InventoryAdjust {
 }
 
 impl TransactionDataType for InventoryAdjust {
-    fn process(
-        &self,
-        ctx: &mut TransactionExecutionContext<'_>,
-    ) {
+    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
         if self.delta < 0 {
             ctx.credit(self.item_id, self.delta.unsigned_abs());
         } else {
@@ -66,10 +61,7 @@ fn main() {
 
     // Check final balance
     let final_balance = ledger.get_balance(item_id);
-    println!(
-        "Final inventory for item {}: {}",
-        item_id, final_balance
-    );
+    println!("Final inventory for item {}: {}", item_id, final_balance);
 
     // Check failure reason
     let status = ledger.get_transaction_status(fail_tx_id);

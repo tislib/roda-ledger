@@ -250,7 +250,9 @@ impl WalRunner {
                     WalEntry::Metadata(m) => {
                         self.write_buffer.extend_from_slice(bytemuck::bytes_of(m))
                     }
-                    WalEntry::Entry(e) => self.write_buffer.extend_from_slice(bytemuck::bytes_of(e)),
+                    WalEntry::Entry(e) => {
+                        self.write_buffer.extend_from_slice(bytemuck::bytes_of(e))
+                    }
                 }
             }
 
@@ -293,7 +295,8 @@ impl WalRunner {
                             Err(returned_tx) => {
                                 tx = returned_tx;
                                 if !self.running.load(Ordering::Relaxed) {
-                                    self.last_processed_transaction_id.store(local_last_id, Ordering::Relaxed);
+                                    self.last_processed_transaction_id
+                                        .store(local_last_id, Ordering::Relaxed);
                                     return;
                                 }
                                 std::thread::yield_now();
@@ -301,7 +304,8 @@ impl WalRunner {
                         }
                     }
                 }
-                self.last_processed_transaction_id.store(local_last_id, Ordering::Relaxed);
+                self.last_processed_transaction_id
+                    .store(local_last_id, Ordering::Relaxed);
             } else {
                 self.last_retry = Some(Instant::now());
             }
@@ -330,7 +334,8 @@ impl WalRunner {
                             tx = returned_tx;
                             if !self.running.load(Ordering::Relaxed) {
                                 if self.pending_entries == 0 {
-                                    self.last_processed_transaction_id.store(tx_id, Ordering::Relaxed);
+                                    self.last_processed_transaction_id
+                                        .store(tx_id, Ordering::Relaxed);
                                 }
                                 return;
                             }
@@ -339,7 +344,8 @@ impl WalRunner {
                     }
                 }
                 if self.pending_entries == 0 {
-                    self.last_processed_transaction_id.store(tx_id, Ordering::Relaxed);
+                    self.last_processed_transaction_id
+                        .store(tx_id, Ordering::Relaxed);
                 }
             } else {
                 std::thread::yield_now();

@@ -1,4 +1,4 @@
-use crate::entities::{EntryKind, FailReason, TxEntry};
+use crate::entities::FailReason;
 use crate::transaction::{TransactionDataType, TransactionExecutionContext};
 use bytemuck::{Pod, Zeroable};
 

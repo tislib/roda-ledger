@@ -39,22 +39,22 @@ impl FailReason {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxMetadata {
-    pub tx_id: u64,                // 8
-    pub timestamp: u64,            // 8
-    pub user_ref: u64,             // 8 — opaque external reference, caller owns context
-    pub entry_count: u8,           // 1 — 0 if transaction failed
+    pub tx_id: u64,              // 8
+    pub timestamp: u64,          // 8
+    pub user_ref: u64,           // 8 — opaque external reference, caller owns context
+    pub entry_count: u8,         // 1 — 0 if transaction failed
     pub fail_reason: FailReason, // 1 — FailReason::NONE if succeeded
-    pub _pad: [u8; 6],             // 6 — total: 32 bytes
+    pub _pad: [u8; 6],           // 6 — total: 32 bytes
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxEntry {
-    pub tx_id: u64,        // 8 — links back to TxMetadata
-    pub account_id: u64,   // 8
-    pub amount: u64,       // 8 — integer minor units, no floats, no decimals
+    pub tx_id: u64,      // 8 — links back to TxMetadata
+    pub account_id: u64, // 8
+    pub amount: u64,     // 8 — integer minor units, no floats, no decimals
     pub kind: EntryKind, // 1 — Credit or Debit
-    pub _pad: [u8; 7],     // 7 — total: 32 bytes
+    pub _pad: [u8; 7],   // 7 — total: 32 bytes
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

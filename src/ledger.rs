@@ -41,8 +41,10 @@ pub struct Ledger<Data: TransactionDataType> {
 impl<Data: TransactionDataType> Ledger<Data> {
     pub fn new(config: LedgerConfig) -> Self {
         let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
-        let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(config.queue_size));
-        let wal_snapshot_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(config.queue_size));
+        let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> =
+            Arc::new(ArrayQueue::new(config.queue_size));
+        let wal_snapshot_queue: Arc<ArrayQueue<WalEntry>> =
+            Arc::new(ArrayQueue::new(config.queue_size));
         let running = Arc::new(AtomicBool::new(true));
 
         Self {
@@ -124,8 +126,7 @@ impl<Data: TransactionDataType> Ledger<Data> {
             yield_now();
 
             // Break if no movement
-            if prev_snapshot_step == current_snapshot_step
-            {
+            if prev_snapshot_step == current_snapshot_step {
                 no_movement_count += 1;
             } else {
                 no_movement_count = 0;

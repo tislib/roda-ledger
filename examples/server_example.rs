@@ -1,7 +1,6 @@
 use roda_ledger::client::Client;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::balance::Balance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::time::Duration;
 

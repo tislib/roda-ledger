@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-
 #[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct BenchData {
@@ -15,10 +14,7 @@ struct BenchData {
 }
 
 impl TransactionDataType for BenchData {
-    fn process(
-        &self,
-        _ctx: &mut TransactionExecutionContext<'_>,
-    ) {}
+    fn process(&self, _ctx: &mut TransactionExecutionContext<'_>) {}
 }
 
 fn wal_bench(c: &mut Criterion) {
@@ -63,7 +59,10 @@ fn wal_bench(c: &mut Criterion) {
                         fail_reason: roda_ledger::entities::FailReason::NONE,
                         _pad: [0; 6],
                     };
-                    while inbound.push(roda_ledger::entities::WalEntry::Metadata(metadata)).is_err() {
+                    while inbound
+                        .push(roda_ledger::entities::WalEntry::Metadata(metadata))
+                        .is_err()
+                    {
                         std::thread::yield_now();
                     }
                 }

@@ -1,6 +1,5 @@
 use crate::testing::reporting::WorkloadMetrics;
 use crate::transaction::Transaction;
-use crate::balance::Balance;
 use crate::wallet::transaction::WalletTransaction;
 use std::error::Error;
 use std::sync::Arc;

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-
 #[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct BenchData {
@@ -14,10 +13,7 @@ struct BenchData {
 }
 
 impl TransactionDataType for BenchData {
-    fn process(
-        &self,
-        ctx: &mut TransactionExecutionContext<'_>,
-    ) {
+    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
         ctx.credit(0, self.amount);
         ctx.debit(1, self.amount);
     }
@@ -34,11 +30,8 @@ fn transactor_bench(c: &mut Criterion) {
     let outbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
     let running = Arc::new(AtomicBool::new(true));
 
-    let mut transactor = Transactor::<BenchData>::new(
-        inbound.clone(),
-        outbound.clone(),
-        running.clone(),
-    );
+    let mut transactor =
+        Transactor::<BenchData>::new(inbound.clone(), outbound.clone(), running.clone());
 
     let handle = transactor.start();
     let mut current_id = 0;

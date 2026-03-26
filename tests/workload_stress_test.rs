@@ -2,7 +2,6 @@ use roda_ledger::ledger::Ledger;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::testing::stress::direct_workload_client::DirectWorkloadClient;
 use roda_ledger::testing::stress::workload::{AccountSelector, Limit, Power, RunConfig, Workload};
-use roda_ledger::balance::Balance;
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use crate::balance::Balance;
+use crate::entities::{EntryKind, FailReason, TxEntry};
 use bytemuck::{Pod, Zeroable};
-use crate::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
+use std::collections::HashMap;
 
 pub struct TransactionExecutionContext<'a> {
     pub(crate) balances: &'a mut HashMap<u64, Balance>,
@@ -134,7 +134,6 @@ pub struct Transaction<Data: TransactionDataType> {
 unsafe impl<Data: TransactionDataType> Pod for Transaction<Data> {}
 unsafe impl<Data: TransactionDataType> Zeroable for Transaction<Data> {}
 
-
 impl<Data: TransactionDataType> Transaction<Data> {
     pub fn new(data: Data) -> Self {
         Self { id: 0, data }
@@ -194,7 +193,6 @@ impl TransactionStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::entities::{FailReason, TxEntry};
     use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
     use bytemuck::{Pod, Zeroable};
     use std::collections::HashMap;

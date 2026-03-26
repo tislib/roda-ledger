@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
-use roda_ledger::entities::{WalEntry, TxMetadata, TxEntry, EntryKind, FailReason};
+use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
 use roda_ledger::snapshot::Snapshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +10,7 @@ fn snapshot_bench(c: &mut Criterion) {
     let batch_size = 10_000;
 
     let mut group = c.benchmark_group("snapshot");
-    group.throughput(Throughput::Elements(batch_size as u64));
+    group.throughput(Throughput::Elements(batch_size));
     group.measurement_time(Duration::from_secs(10));
 
     let inbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));

@@ -1,6 +1,5 @@
 use crate::ledger::Ledger;
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
-use crate::balance::Balance;
 use crate::wallet::transaction::WalletTransaction;
 use arc_swap::ArcSwap;
 use roda_latency_tracker::latency_measurer::{LatencyMeasurer, LatencyStats as RodaLatencyStats};

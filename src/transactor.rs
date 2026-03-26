@@ -1,5 +1,5 @@
 use crate::balance::Balance;
-use crate::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
+use crate::entities::{EntryKind, FailReason, TxMetadata, WalEntry};
 use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
@@ -156,7 +156,7 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                         _pad: [0; 6],
                     };
 
-                    while let Err(_) = self.outbound.push(WalEntry::Metadata(metadata)) {
+                    while self.outbound.push(WalEntry::Metadata(metadata)).is_err() {
                         if !self.running.load(Ordering::Relaxed) {
                             return;
                         }
@@ -172,15 +172,15 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                         _pad: [0; 6],
                     };
 
-                    while let Err(_) = self.outbound.push(WalEntry::Metadata(metadata)) {
+                    while self.outbound.push(WalEntry::Metadata(metadata)).is_err() {
                         if !self.running.load(Ordering::Relaxed) {
                             return;
                         }
                     }
 
-                    // Then push entries 
+                    // Then push entries
                     for entry in entries_tmp.iter() {
-                        while let Err(_) = self.outbound.push(WalEntry::Entry(*entry)) {
+                        while self.outbound.push(WalEntry::Entry(*entry)).is_err() {
                             if !self.running.load(Ordering::Relaxed) {
                                 return;
                             }

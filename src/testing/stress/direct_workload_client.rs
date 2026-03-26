@@ -1,7 +1,6 @@
 use crate::ledger::Ledger;
 use crate::testing::stress::workload::{AccountSelector, RunConfig, Workload, WorkloadClient};
 use crate::transaction::Transaction;
-use crate::balance::Balance;
 use crate::wallet::transaction::WalletTransaction;
 use std::sync::Arc;
 
