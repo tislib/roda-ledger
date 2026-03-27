@@ -47,24 +47,9 @@ impl Scenario for HotAccountContentionScenario {
             };
 
             let _ = workload.run(config, |idx| {
-                let hot_account_idx = 0;
-                let other_account_idx = (1 + (idx % (accounts_ref.len() as u64 - 1))) as usize;
+                let account_idx = (1 + (idx % (accounts_ref.len() as u64 - 1))) as usize;
 
-                if idx % 2 == 0 {
-                    // All transfers TO the hot account
-                    WalletTransaction::transfer(
-                        accounts_ref[other_account_idx],
-                        accounts_ref[hot_account_idx],
-                        1,
-                    )
-                } else {
-                    // All transfers FROM the hot account
-                    WalletTransaction::transfer(
-                        accounts_ref[hot_account_idx],
-                        accounts_ref[other_account_idx],
-                        1,
-                    )
-                }
+                WalletTransaction::deposit(account_idx as u64, 1)
             });
         });
 

@@ -69,6 +69,7 @@ pub struct TxStats {
     pub compute: f64,
     pub commit: f64,
     pub snapshot: f64,
+    pub tc: u64,
 }
 
 pub struct MdReporting {
@@ -89,6 +90,10 @@ impl MdReporting {
 
         output.push_str("## Summary\n");
         output.push_str(&format!("- **Total Duration:** {:?}\n", result.duration));
+        output.push_str(&format!(
+            "- **Total Transactions (TC):** {}\n",
+            result.tx_per_sec.tc
+        ));
         output.push_str(&format!(
             "- **Average TPS (Compute):** {:.2}\n",
             result.tx_per_sec.compute
@@ -133,14 +138,17 @@ impl MdReporting {
         ));
 
         output.push_str("## Metrics over time (every 1s)\n\n");
-        output
-            .push_str("| Time (s) | Compute TPS | Mean Latency | CPU Usage (%) | Memory (MB) |\n");
-        output
-            .push_str("|----------|-------------|--------------|---------------|-------------|\n");
+        output.push_str(
+            "| Time (s) | TC | Compute TPS | Mean Latency | CPU Usage (%) | Memory (MB) |\n",
+        );
+        output.push_str(
+            "|----------|----|-------------|--------------|---------------|-------------|\n",
+        );
         for m in &result.metrics_over_time {
             output.push_str(&format!(
-                "| {:8.1} | {:11.2} | {:12?} | {:13.2} | {:11.2} |\n",
+                "| {:8.1} | {:8} | {:11.2} | {:12?} | {:13.2} | {:11.2} |\n",
                 m.timestamp.as_secs_f64(),
+                m.tx_per_sec.tc,
                 m.tx_per_sec.compute,
                 m.mean_latency,
                 m.cpu_usage,
@@ -234,10 +242,11 @@ impl Reporter {
             if self.last_stdout_report.elapsed() >= Duration::from_secs(10) {
                 if let Some(m) = self.metrics_over_time.last() {
                     println!(
-                        "Scenario {}: {:>4.1}s/{:>4.1}s | TPS: {:>10.2} | Latency: {:>12?} | CPU: {:>6.2}% | Mem: {:>8.2}MB",
+                        "Scenario {}: {:>4.1}s/{:>4.1}s | TC: {:>8} | TPS: {:>10.2} | Latency: {:>12?} | CPU: {:>6.2}% | Mem: {:>8.2}MB",
                         self.scenario_name,
                         m.timestamp.as_secs_f64(),
                         self.duration.as_secs_f64(),
+                        m.tx_per_sec.tc,
                         m.tx_per_sec.compute,
                         m.mean_latency,
                         m.cpu_usage,
@@ -264,6 +273,7 @@ impl Reporter {
             compute: (current_computed - self.last_computed) as f64 / tick_duration,
             commit: (current_committed - self.last_committed) as f64 / tick_duration,
             snapshot: (current_snapshot - self.last_snapshot) as f64 / tick_duration,
+            tc: current_computed,
         };
 
         let mean_latency = self.metrics.get_stats().mean;
@@ -294,6 +304,7 @@ impl Reporter {
             compute: self.ledger.last_computed_id() as f64 / total_duration.as_secs_f64(),
             commit: self.ledger.last_committed_id() as f64 / total_duration.as_secs_f64(),
             snapshot: self.ledger.last_snapshot_id() as f64 / total_duration.as_secs_f64(),
+            tc: self.ledger.last_computed_id(),
         };
 
         let num_buckets = self.metrics.time_series_sum.len();

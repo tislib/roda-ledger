@@ -10,9 +10,22 @@ use roda_ledger::testing::stress::scenarios::spike_recovery::SpikeRecoveryScenar
 use roda_ledger::testing::stress::scenarios::sustain_load::SustainLoadScenario;
 use roda_ledger::testing::stress::scenarios::wal_growth::WalGrowthScenario;
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 fn main() {
+    let data_dir = Path::new("data");
+    if data_dir.exists() && data_dir.is_dir() {
+        if fs::read_dir(data_dir)
+            .expect("Failed to read data directory")
+            .next()
+            .is_some()
+        {
+            panic!("data directory exists and is not empty");
+        }
+    }
+
     let args: Vec<String> = env::args().collect();
     let specific_scenario_name = args.get(1);
 
@@ -33,12 +46,12 @@ fn main() {
         Box::new(SpikeRecoveryScenario::new(Duration::from_mins(2), 100_000)),
         Box::new(AccountScaleScenario::new(
             Duration::from_mins(10),
-            10_000_000,
+            100_000_000,
         )),
         Box::new(MixedWorkloadScenario::new(Duration::from_mins(10), 100_000)),
         Box::new(HotAccountContentionScenario::new(
             Duration::from_mins(10),
-            100_000,
+            10_000_000,
         )),
         Box::new(SnapshotImpactScenario::new(
             Duration::from_mins(10),
