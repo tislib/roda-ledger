@@ -22,6 +22,7 @@ fn snapshot_bench(c: &mut Criterion) {
         true, // in_memory
         Duration::from_secs(60),
         running.clone(),
+        batch_size as usize,
     );
 
     let handles = snapshot.start();

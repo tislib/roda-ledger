@@ -9,48 +9,6 @@ pub type DynError = Box<dyn Error>;
 pub type StepOutcome = Result<(), DynError>;
 pub type RunStepResult = Result<(StepOutcome, u64), DynError>;
 
-pub enum AccountSelector {
-    Single(u64),
-    Multi(Vec<u64>),
-    Range { start: u64, end: u64 },
-    All,
-}
-
-impl AccountSelector {
-    pub fn get_accounts(&self, all_accounts: &[u64]) -> Vec<u64> {
-        match self {
-            AccountSelector::Single(id) => vec![*id],
-            AccountSelector::Multi(ids) => ids.clone(),
-            AccountSelector::Range { start, end } => (*start..=*end).collect(),
-            AccountSelector::All => all_accounts.to_vec(),
-        }
-    }
-
-    /// Selects an account in a deterministic way using the given index for round-robin selection.
-    /// This ensures that the workload is reproducible and avoids randomness-related issues.
-    pub fn select(&self, index: u64, all_accounts: &[u64]) -> u64 {
-        match self {
-            AccountSelector::Single(id) => *id,
-            AccountSelector::Multi(ids) => {
-                if ids.is_empty() {
-                    panic!("No accounts available in Multi selector");
-                }
-                ids[(index as usize) % ids.len()]
-            }
-            AccountSelector::Range { start, end } => {
-                let range = end - start + 1;
-                start + (index % range)
-            }
-            AccountSelector::All => {
-                if all_accounts.is_empty() {
-                    panic!("No accounts available for selection in All selector");
-                }
-                all_accounts[(index as usize) % all_accounts.len()]
-            }
-        }
-    }
-}
-
 pub enum Limit {
     Count(u64),
     Duration(Duration),
@@ -70,14 +28,12 @@ pub trait WorkloadClient: Send + Sync {
     fn submit(&self, tx: Transaction<WalletTransaction>);
 }
 
-/// Workload is designed to be deterministic and reproducible. It uses round-robin
-/// account selection instead of random selection to ensure that tests are stable.
+/// Workload is designed to execute transactions according to the given configuration.
 pub struct Workload<C>
 where
     C: WorkloadClient,
 {
     pub client: C,
-    pub all_accounts: Vec<u64>,
     pub metrics: Option<Arc<WorkloadMetrics>>,
 }
 
@@ -88,18 +44,12 @@ where
     pub fn new(client: C) -> Self {
         Self {
             client,
-            all_accounts: Vec::new(),
             metrics: None,
         }
     }
 
     pub fn with_metrics(mut self, metrics: Arc<WorkloadMetrics>) -> Self {
         self.metrics = Some(metrics);
-        self
-    }
-
-    pub fn with_accounts(mut self, accounts: Vec<u64>) -> Self {
-        self.all_accounts = accounts;
         self
     }
 

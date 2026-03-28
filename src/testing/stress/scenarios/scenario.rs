@@ -1,4 +1,4 @@
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, LedgerConfig};
 use crate::testing::reporting::{Reporter, RunResult, WorkloadMetrics};
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
 use std::error::Error;
@@ -9,6 +9,9 @@ use std::time::Duration;
 pub trait Scenario {
     fn name(&self) -> String;
     fn duration(&self) -> Duration;
+    fn max_accounts(&self) -> u64 {
+        100_000
+    }
 
     fn execute(
         &self,
@@ -22,7 +25,10 @@ pub trait Scenario {
             std::fs::remove_file(wal_path)?;
         }
 
-        let mut ledger = Ledger::new(Default::default());
+        let mut ledger = Ledger::new(LedgerConfig {
+            max_accounts: self.max_accounts() as usize,
+            ..Default::default()
+        });
         ledger.start();
         let ledger = Arc::new(ledger);
 

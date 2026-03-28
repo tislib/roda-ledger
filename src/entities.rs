@@ -25,7 +25,8 @@ impl FailReason {
     pub const ZERO_SUM_VIOLATION: Self = Self(3);
     pub const ENTRY_LIMIT_EXCEEDED: Self = Self(4);
     pub const INVALID_OPERATION: Self = Self(5);
-    // 6–127 reserved for future standard reasons
+    pub const ACCOUNT_LIMIT_EXCEEDED: Self = Self(6);
+    // 7–127 reserved for future standard reasons
     // 128–255 user-defined custom reasons
 
     pub fn is_success(&self) -> bool {

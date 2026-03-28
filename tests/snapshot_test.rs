@@ -6,9 +6,13 @@ use std::time::Duration;
 
 #[test]
 fn test_snapshot_creation() {
-    let temp_dir = "temp_snapshot_test_1";
-    if Path::new(temp_dir).exists() {
-        let _ = fs::remove_dir_all(temp_dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = format!("temp_snapshot_test_{}", nanos);
+    if Path::new(&temp_dir).exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     let config = WalletConfig {
@@ -28,7 +32,7 @@ fn test_snapshot_creation() {
     // Wait for a snapshot to be created
     std::thread::sleep(Duration::from_secs(1));
 
-    let snapshot_path = Path::new(temp_dir).join("snapshot.bin");
+    let snapshot_path = Path::new(&temp_dir).join("snapshot.bin");
     assert!(snapshot_path.exists(), "Snapshot file should exist");
 
     // Read and verify

@@ -3,7 +3,6 @@ use crate::entities::{EntryKind, FailReason, TxMetadata, WalEntry};
 use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -13,7 +12,7 @@ pub struct Transactor<Data: TransactionDataType> {
     outbound: Arc<ArrayQueue<WalEntry>>,
     last_processed_transaction_id: Arc<AtomicU64>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
-    balances: HashMap<u64, Balance>,
+    balances: Vec<Balance>,
     pending_entries: u8,
     running: Arc<AtomicBool>,
 }
@@ -21,7 +20,7 @@ pub struct Transactor<Data: TransactionDataType> {
 pub struct TransactorRunner<Data: TransactionDataType> {
     inbound: Arc<ArrayQueue<Transaction<Data>>>,
     outbound: Arc<ArrayQueue<WalEntry>>,
-    balances: HashMap<u64, Balance>,
+    balances: Vec<Balance>,
     last_processed_transaction_id: Arc<AtomicU64>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     running: Arc<AtomicBool>,
@@ -32,13 +31,16 @@ impl<Data: TransactionDataType> Transactor<Data> {
         inbound: Arc<ArrayQueue<Transaction<Data>>>,
         outbound: Arc<ArrayQueue<WalEntry>>,
         running: Arc<AtomicBool>,
+        max_accounts: usize,
     ) -> Self {
+        let mut accounts = Vec::with_capacity(max_accounts);
+        accounts.resize(max_accounts, Balance::default());
         Self {
             inbound,
             outbound,
             last_processed_transaction_id: Arc::new(Default::default()),
             rejected_transactions: Arc::new(Default::default()),
-            balances: HashMap::new(),
+            balances: accounts,
             pending_entries: 0,
             running,
         }
@@ -46,7 +48,9 @@ impl<Data: TransactionDataType> Transactor<Data> {
 
     pub fn load_balances(&mut self, balances: Vec<(u64, Balance)>) {
         for (account_id, balance) in balances {
-            self.balances.insert(account_id, balance);
+            if let Some(slot) = self.balances.get_mut(account_id as usize) {
+                *slot = balance;
+            }
         }
     }
 
@@ -57,20 +61,16 @@ impl<Data: TransactionDataType> Transactor<Data> {
                 self.pending_entries = m.entry_count;
             }
             WalEntry::Entry(e) => {
-                let mut balance = self
-                    .balances
-                    .get(&e.account_id)
-                    .cloned()
-                    .unwrap_or_default();
-                match e.kind {
-                    EntryKind::Credit => {
-                        balance = balance.saturating_sub(e.amount as i64);
-                    }
-                    EntryKind::Debit => {
-                        balance = balance.saturating_add(e.amount as i64);
+                if let Some(balance) = self.balances.get_mut(e.account_id as usize) {
+                    match e.kind {
+                        EntryKind::Credit => {
+                            *balance = balance.saturating_sub(e.amount as i64);
+                        }
+                        EntryKind::Debit => {
+                            *balance = balance.saturating_add(e.amount as i64);
+                        }
                     }
                 }
-                self.balances.insert(e.account_id, balance);
                 if self.pending_entries > 0 {
                     self.pending_entries -= 1;
                 }
@@ -83,14 +83,17 @@ impl<Data: TransactionDataType> Transactor<Data> {
     }
 
     pub fn last_processed_transaction_id(&self) -> u64 {
-        self.last_processed_transaction_id
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.last_processed_transaction_id.load(Ordering::Relaxed)
     }
 
     pub fn transaction_rejection_reason(&self, transaction_id: u64) -> Option<FailReason> {
         self.rejected_transactions
             .get(&transaction_id)
             .map(|entry| *entry.value())
+    }
+
+    pub fn get_rejected_count(&self) -> u64 {
+        self.rejected_transactions.len() as u64
     }
 
     pub fn start(&mut self) -> JoinHandle<()> {
@@ -119,11 +122,9 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                 let entries_tmp;
 
                 {
-                    let mut ctx = TransactionExecutionContext {
-                        balances: &mut self.balances,
-                        entries,
-                        fail_reason: FailReason::NONE,
-                    };
+                    let mut ctx = TransactionExecutionContext::new(&mut self.balances);
+                    ctx.entries = entries;
+                    ctx.fail_reason = FailReason::NONE;
 
                     transaction.process(&mut ctx);
 

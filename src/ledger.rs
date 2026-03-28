@@ -12,6 +12,7 @@ use std::thread::{JoinHandle, yield_now};
 
 #[derive(Clone, Debug)]
 pub struct LedgerConfig {
+    pub max_accounts: usize,
     pub queue_size: usize,
     pub location: Option<String>,
     pub in_memory: bool,
@@ -21,6 +22,7 @@ pub struct LedgerConfig {
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
+            max_accounts: 1_000_000,
             queue_size: 1024,
             location: None,
             in_memory: false,
@@ -53,6 +55,7 @@ impl<Data: TransactionDataType> Ledger<Data> {
                 sequencer_transactor_queue,
                 transactor_wal_queue.clone(),
                 running.clone(),
+                config.max_accounts,
             ),
             wal: Wal::new(
                 transactor_wal_queue,
@@ -67,6 +70,7 @@ impl<Data: TransactionDataType> Ledger<Data> {
                 config.in_memory,
                 config.snapshot_interval,
                 running.clone(),
+                config.max_accounts,
             ),
             running,
             handles: Vec::new(),
@@ -105,6 +109,10 @@ impl<Data: TransactionDataType> Ledger<Data> {
 
     pub fn last_snapshot_id(&self) -> u64 {
         self.snapshot.last_processed_transaction_id()
+    }
+
+    pub fn get_rejected_count(&self) -> u64 {
+        self.transactor.get_rejected_count()
     }
 
     pub fn wait_for_transaction(&mut self, transaction_id: u64) {

@@ -28,6 +28,7 @@ fn wallet_bench(c: &mut Criterion) {
         let mut wallet = Wallet::new_with_config(WalletConfig {
             in_memory: false,
             queue_size: 1024,
+            max_accounts: account_count as usize,
             ..Default::default()
         });
         wallet.start();
@@ -42,7 +43,7 @@ fn wallet_bench(c: &mut Criterion) {
 
             b.iter(|| {
                 i += 1;
-                let from_account = i % account_count;
+                let from_account = rand::random::<u64>() % account_count;
                 let to_account = (i + account_count / 2) % account_count;
                 wallet.transfer(from_account, to_account, 10);
             });

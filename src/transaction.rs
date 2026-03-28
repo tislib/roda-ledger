@@ -1,16 +1,15 @@
 use crate::balance::Balance;
 use crate::entities::{EntryKind, FailReason, TxEntry};
 use bytemuck::{Pod, Zeroable};
-use std::collections::HashMap;
 
 pub struct TransactionExecutionContext<'a> {
-    pub(crate) balances: &'a mut HashMap<u64, Balance>,
+    pub(crate) balances: &'a mut [Balance],
     pub(crate) entries: Vec<TxEntry>,
     pub(crate) fail_reason: FailReason,
 }
 
 impl<'a> TransactionExecutionContext<'a> {
-    pub fn new(balances: &'a mut HashMap<u64, Balance>) -> Self {
+    pub fn new(balances: &'a mut [Balance]) -> Self {
         Self {
             balances,
             entries: Vec::new(),
@@ -18,42 +17,52 @@ impl<'a> TransactionExecutionContext<'a> {
         }
     }
 
+    #[inline]
     pub fn get_balance(&self, account_id: u64) -> Balance {
-        self.balances.get(&account_id).cloned().unwrap_or_default()
+        self.balances.get(account_id as usize).copied().unwrap_or(0)
     }
 
+    #[inline]
     pub fn credit(&mut self, account_id: u64, amount: u64) {
         if self.fail_reason.is_failure() {
             return;
         }
-        let mut balance = self.get_balance(account_id);
-        balance = balance.saturating_sub(amount as i64);
-        self.balances.insert(account_id, balance);
-        self.entries.push(TxEntry {
-            tx_id: 0,
-            account_id,
-            amount,
-            kind: EntryKind::Credit,
-            _pad: [0; 7],
-        });
+
+        if let Some(balance) = self.balances.get_mut(account_id as usize) {
+            *balance = balance.saturating_sub(amount as i64);
+            self.entries.push(TxEntry {
+                tx_id: 0,
+                account_id,
+                amount,
+                kind: EntryKind::Credit,
+                _pad: [0; 7],
+            });
+        } else {
+            self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
+        }
     }
 
+    #[inline]
     pub fn debit(&mut self, account_id: u64, amount: u64) {
         if self.fail_reason.is_failure() {
             return;
         }
-        let mut balance = self.get_balance(account_id);
-        balance = balance.saturating_add(amount as i64);
-        self.balances.insert(account_id, balance);
-        self.entries.push(TxEntry {
-            tx_id: 0,
-            account_id,
-            amount,
-            kind: EntryKind::Debit,
-            _pad: [0; 7],
-        });
+
+        if let Some(balance) = self.balances.get_mut(account_id as usize) {
+            *balance = balance.saturating_add(amount as i64);
+            self.entries.push(TxEntry {
+                tx_id: 0,
+                account_id,
+                amount,
+                kind: EntryKind::Debit,
+                _pad: [0; 7],
+            });
+        } else {
+            self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
+        }
     }
 
+    #[inline]
     pub fn fail(&mut self, reason: FailReason) {
         self.fail_reason = reason;
     }
@@ -104,13 +113,14 @@ impl<'a> TransactionExecutionContext<'a> {
     pub(crate) fn rollback(&mut self) {
         // Revert entries into balances
         for entry in self.entries.iter().rev() {
-            let balance = self.balances.entry(entry.account_id).or_default();
-            match entry.kind {
-                EntryKind::Credit => {
-                    *balance = balance.saturating_add(entry.amount as i64);
-                }
-                EntryKind::Debit => {
-                    *balance = balance.saturating_sub(entry.amount as i64);
+            if let Some(balance) = self.balances.get_mut(entry.account_id as usize) {
+                match entry.kind {
+                    EntryKind::Credit => {
+                        *balance = balance.saturating_add(entry.amount as i64);
+                    }
+                    EntryKind::Debit => {
+                        *balance = balance.saturating_sub(entry.amount as i64);
+                    }
                 }
             }
         }
@@ -195,7 +205,6 @@ impl TransactionStatus {
 mod tests {
     use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
     use bytemuck::{Pod, Zeroable};
-    use std::collections::HashMap;
 
     #[test]
     fn it_works() {
@@ -212,7 +221,7 @@ mod tests {
 
         let tr1 = Transaction::new(SimpleTransactionDataType(0));
 
-        let mut balances = HashMap::new();
+        let mut balances = vec![0; 100];
         let mut ctx = TransactionExecutionContext::new(&mut balances);
 
         tr1.process(&mut ctx);

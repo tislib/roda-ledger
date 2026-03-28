@@ -29,6 +29,10 @@ impl Scenario for SnapshotImpactScenario {
         self.duration
     }
 
+    fn max_accounts(&self) -> u64 {
+        self.accounts
+    }
+
     fn run(&self) -> Result<RunResult, Box<dyn Error>> {
         let wal_path = std::path::Path::new("data/wal.bin");
         if wal_path.exists() {
@@ -37,6 +41,7 @@ impl Scenario for SnapshotImpactScenario {
 
         // Configure ledger with frequent snapshots
         let config = LedgerConfig {
+            max_accounts: self.max_accounts() as usize,
             snapshot_interval: Duration::from_secs(1),
             ..Default::default()
         };
@@ -64,11 +69,8 @@ impl Scenario for SnapshotImpactScenario {
         metrics: Arc<WorkloadMetrics>,
     ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
-        let accounts: Vec<u64> = (0..self.accounts).collect();
-        workload = workload.with_accounts(accounts.clone());
-
+        let accounts_size = self.accounts;
         let duration = self.duration;
-        let accounts_ref = accounts;
 
         let workload_handle = std::thread::spawn(move || {
             let config = RunConfig {
@@ -76,8 +78,9 @@ impl Scenario for SnapshotImpactScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(config, |idx| {
-                WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100)
+            let _ = workload.run(config, |_| {
+                let account_id = rand::random::<u64>() % accounts_size;
+                WalletTransaction::deposit(account_id, 100)
             });
         });
 

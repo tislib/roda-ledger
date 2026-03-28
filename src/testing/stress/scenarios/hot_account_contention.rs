@@ -28,17 +28,18 @@ impl Scenario for HotAccountContentionScenario {
         self.duration
     }
 
+    fn max_accounts(&self) -> u64 {
+        self.accounts
+    }
+
     fn execute(
         &self,
         client: DirectWorkloadClient,
         metrics: Arc<WorkloadMetrics>,
     ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
-        let accounts: Vec<u64> = (0..self.accounts).collect();
-        workload = workload.with_accounts(accounts.clone());
-
+        let accounts_size = self.accounts;
         let duration = self.duration;
-        let accounts_ref = accounts;
 
         let workload_handle = std::thread::spawn(move || {
             let config = RunConfig {
@@ -46,10 +47,9 @@ impl Scenario for HotAccountContentionScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(config, |idx| {
-                let account_idx = (1 + (idx % (accounts_ref.len() as u64 - 1))) as usize;
-
-                WalletTransaction::deposit(account_idx as u64, 1)
+            let _ = workload.run(config, |_| {
+                let account_id = rand::random::<u64>() % accounts_size;
+                WalletTransaction::deposit(account_id, 1)
             });
         });
 

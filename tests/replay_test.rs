@@ -5,9 +5,13 @@ use std::time::Duration;
 
 #[test]
 fn test_replay_functionality() {
-    let temp_dir = "temp_replay_test";
-    if Path::new(temp_dir).exists() {
-        let _ = fs::remove_dir_all(temp_dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = format!("temp_replay_test_{}", nanos);
+    if Path::new(&temp_dir).exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     // Phase 1: Create some state and a snapshot
