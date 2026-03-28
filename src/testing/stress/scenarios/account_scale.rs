@@ -31,6 +31,10 @@ impl Scenario for AccountScaleScenario {
         self.duration
     }
 
+    fn max_accounts(&self) -> u64 {
+        self.max_accounts
+    }
+
     fn execute(
         &self,
         client: DirectWorkloadClient,
@@ -46,8 +50,8 @@ impl Scenario for AccountScaleScenario {
                 power: Power::Full,
             };
 
-            let _ = workload.run(config, |idx| {
-                let account_id = idx % max_accounts;
+            let _ = workload.run(config, |_| {
+                let account_id = rand::random::<u64>() % max_accounts;
                 WalletTransaction::deposit(account_id, 100)
             });
         });

@@ -28,14 +28,17 @@ impl Scenario for SpikeScenario {
         self.duration
     }
 
+    fn max_accounts(&self) -> u64 {
+        self.accounts
+    }
+
     fn execute(
         &self,
         client: DirectWorkloadClient,
         metrics: Arc<WorkloadMetrics>,
     ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
-        let accounts: Vec<u64> = (0..self.accounts).collect();
-        workload = workload.with_accounts(accounts.clone());
+        let accounts_size = self.accounts;
 
         let config = RunConfig {
             limit: Limit::Duration(self.duration),
@@ -43,8 +46,9 @@ impl Scenario for SpikeScenario {
         };
 
         let workload_handle = std::thread::spawn(move || {
-            let _ = workload.run(config, move |idx| {
-                WalletTransaction::deposit(accounts[idx as usize % accounts.len()], 100)
+            let _ = workload.run(config, move |_| {
+                let account_id = rand::random::<u64>() % accounts_size;
+                WalletTransaction::deposit(account_id, 100)
             });
         });
 

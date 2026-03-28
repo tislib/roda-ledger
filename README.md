@@ -30,7 +30,7 @@ thread contention and maximize mechanical sympathy.
 4. **Snapshotter (Core 3):** The archival layer. Periodically takes snapshots of the ledger state to optimize recovery
    and manage WAL growth.
 
-For a deep dive into the architecture, see [Design.md](Design.md).
+For a deep dive into the architecture, see [Design.md](Design.md) and our [Architectural Decision Records](docs/adr/).
 
 ## Core Components
 
@@ -147,20 +147,20 @@ Roda-Ledger is highly optimized for throughput and latency. Below are the result
 
 | Operation           | Latency (Avg) | Throughput (Avg)      |
 |:--------------------|:--------------|:----------------------|
-| **Wallet Deposit**  | 357.87 ns     | **2.79 Million tx/s** |
-| **Wallet Transfer** | 588.28 ns     | **1.70 Million tx/s** |
+| **Wallet Deposit**  | 150.59 ns     | **6.64 Million tx/s** |
+| **Wallet Transfer** | 165.61 ns     | **6.04 Million tx/s** |
 
 *Benchmarks performed using Criterion.rs with persistence enabled (WAL active).*
 
 ## Stress Testing Performance
 
-The system has been extensively stress-tested across various scenarios. Below are some highlights:
+The system has been extensively stress-tested across various scenarios. Below are some highlights from the latest reports:
 
-- **Maximum Throughput:** Reached up to **1.5 Million TPS** during the WAL Growth and Spike scenarios.
-- **Ultra-Low Latency:** Achieved as low as **37ns** mean latency during mixed workload loads.
-- **Sustained Performance:** Maintains a steady **100K TPS** with nanosecond-level latency over time.
+- **Maximum Throughput:** Reached up to **5.5 Million TPS** during high-contention stress tests.
+- **Ultra-Low Latency:** Achieved as low as **102ns** mean latency during load ramp-up.
+- **Sustained Performance:** Maintains over **650K TPS** with nanosecond-level latency in long-running stability tests.
 
-For detailed reports and more scenarios, see the [Stress Testing Reports](reporting/README.md).
+For detailed reports and more scenarios, see the [Stress Testing Reports](docs/reporting/README.md).
 
 ## Getting Started
 

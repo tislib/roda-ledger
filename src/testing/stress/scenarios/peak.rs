@@ -33,15 +33,17 @@ impl Scenario for PeakScenario {
         self.duration
     }
 
+    fn max_accounts(&self) -> u64 {
+        self.accounts
+    }
+
     fn execute(
         &self,
         client: DirectWorkloadClient,
         metrics: Arc<WorkloadMetrics>,
     ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
-        let accounts: Vec<u64> = (0..self.accounts).collect();
-        workload = workload.with_accounts(accounts.clone());
-
+        let accounts_size = self.accounts;
         let duration = self.duration;
         let peak_rate = self.peak_rate;
 
@@ -70,15 +72,12 @@ impl Scenario for PeakScenario {
                     power: Power::Rate(current_rate.max(1)),
                 };
 
-                let accounts_ref = &accounts;
                 let (res, count) = workload
                     .run_step(
                         config,
-                        move |idx| {
-                            WalletTransaction::deposit(
-                                accounts_ref[idx as usize % accounts_ref.len()],
-                                100,
-                            )
+                        |_| {
+                            let account_id = rand::random::<u64>() % accounts_size;
+                            WalletTransaction::deposit(account_id, 100)
                         },
                         total_count,
                     )

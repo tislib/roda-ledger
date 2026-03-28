@@ -1,7 +1,7 @@
 use roda_ledger::ledger::Ledger;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::testing::stress::direct_workload_client::DirectWorkloadClient;
-use roda_ledger::testing::stress::workload::{AccountSelector, Limit, Power, RunConfig, Workload};
+use roda_ledger::testing::stress::workload::{Limit, Power, RunConfig, Workload};
 use roda_ledger::wallet::transaction::WalletTransaction;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +27,7 @@ fn test_workload_deposit_sustain() {
     };
 
     workload
-        .deposit(AccountSelector::Single(1001), 100, config)
+        .run(config, |_| WalletTransaction::deposit(1001, 100))
         .expect("Deposit failed");
 
     // Wait for processing
@@ -49,7 +49,8 @@ fn test_workload_transfer_spike_direct() {
     let ledger = Arc::new(ledger);
 
     let client = DirectWorkloadClient::new(ledger.clone());
-    let mut workload = Workload::new(client).with_accounts(vec![1001, 1002, 1003]);
+    let mut workload = Workload::new(client);
+    let accounts = [1001, 1002, 1003];
 
     // First deposit some money
     let config_dep = RunConfig {
@@ -57,8 +58,13 @@ fn test_workload_transfer_spike_direct() {
         power: Power::Full,
     };
     workload
-        .deposit(AccountSelector::All, 1000, config_dep)
+        .run(config_dep, |idx| {
+            WalletTransaction::deposit(accounts[idx as usize % accounts.len()], 1_000_000_000)
+        })
         .expect("Initial deposit failed");
+
+    // Wait for deposits to be processed
+    std::thread::sleep(Duration::from_millis(100));
 
     // Then run spike transfer
     let config = RunConfig {
@@ -83,7 +89,7 @@ fn test_workload_peak_load_direct() {
     let ledger = Arc::new(ledger);
 
     let client = DirectWorkloadClient::new(ledger.clone());
-    let mut workload = Workload::new(client).with_accounts((2000..2010).collect());
+    let mut workload = Workload::new(client);
 
     use std::time::Instant;
     let start_time = Instant::now();
@@ -137,13 +143,9 @@ fn test_workload_range_selector_direct() {
     };
 
     workload
-        .deposit(
-            AccountSelector::Range {
-                start: 3000,
-                end: 3010,
-            },
-            100,
-            config,
-        )
+        .run(config, |idx| {
+            let account_id = 3000 + (idx % 11);
+            WalletTransaction::deposit(account_id, 100)
+        })
         .expect("Range deposit failed");
 }

@@ -2,11 +2,10 @@ use crate::balance::Balance;
 use crate::entities::{EntryKind, WalEntry};
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
-use crossbeam_skiplist::SkipMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -17,32 +16,20 @@ pub struct Checkpoint {
     pub last_wal_position: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct BalanceCheckpoint {
-    pub account_id: u64,
-    pub checkpoint: u64,
-}
-
-impl BalanceCheckpoint {
-    pub fn new(account_id: u64, checkpoint: u64) -> Self {
-        Self {
-            account_id,
-            checkpoint,
-        }
-    }
-
-    pub fn range(account_id: u64) -> std::ops::Range<Self> {
-        Self::new(account_id, 0)..Self::new(account_id + 1, 0)
-    }
+pub struct SnapshotBalance {
+    pub snapshot: AtomicI64,
+    pub checkpoint: AtomicI64,
+    pub checkpoint_id: AtomicU8,
 }
 
 pub struct Snapshot {
     inbound: Arc<ArrayQueue<WalEntry>>,
-    // Store as (account_id, checkpoint) -> Balance
-    balances: Arc<SkipMap<BalanceCheckpoint, Balance>>,
+    balances: Arc<Vec<SnapshotBalance>>,
     last_processed_transaction_id: Arc<AtomicU64>,
     checkpoint: Arc<ArcSwap<Checkpoint>>,
     checkpoint_requested: Arc<AtomicBool>,
+    checkpoint_mode: Arc<AtomicBool>,
+    current_checkpoint: Arc<AtomicU8>,
     location: Option<PathBuf>,
     in_memory: bool,
     snapshot_interval: Duration,
@@ -52,18 +39,22 @@ pub struct Snapshot {
 
 pub struct SnapshotRunner {
     inbound: Arc<ArrayQueue<WalEntry>>,
-    balances: Arc<SkipMap<BalanceCheckpoint, Balance>>,
+    balances: Arc<Vec<SnapshotBalance>>,
     last_processed_transaction_id: Arc<AtomicU64>,
     checkpoint: Arc<ArcSwap<Checkpoint>>,
     checkpoint_requested: Arc<AtomicBool>,
+    checkpoint_mode: Arc<AtomicBool>,
+    current_checkpoint: Arc<AtomicU8>,
     pending_entries: u8,
     running: Arc<AtomicBool>,
 }
 
 pub struct SnapshotStorer {
-    balances: Arc<SkipMap<BalanceCheckpoint, Balance>>,
+    balances: Arc<Vec<SnapshotBalance>>,
     checkpoint: Arc<ArcSwap<Checkpoint>>,
     checkpoint_requested: Arc<AtomicBool>,
+    checkpoint_mode: Arc<AtomicBool>,
+    current_checkpoint: Arc<AtomicU8>,
     location: Option<PathBuf>,
     in_memory: bool,
     snapshot_interval: Duration,
@@ -77,6 +68,7 @@ impl Snapshot {
         in_memory: bool,
         snapshot_interval: Duration,
         running: Arc<AtomicBool>,
+        max_accounts: usize,
     ) -> Self {
         let location = if in_memory {
             None
@@ -89,12 +81,22 @@ impl Snapshot {
             Some(path.to_path_buf())
         };
 
+        let balances = (0..max_accounts)
+            .map(|_| SnapshotBalance {
+                snapshot: AtomicI64::new(0),
+                checkpoint: AtomicI64::new(0),
+                checkpoint_id: AtomicU8::new(0),
+            })
+            .collect();
+
         Self {
             inbound,
-            balances: Arc::new(SkipMap::new()),
+            balances: Arc::new(balances),
             last_processed_transaction_id: Arc::new(Default::default()),
             checkpoint: Arc::new(ArcSwap::new(Arc::new(Checkpoint::default()))),
             checkpoint_requested: Arc::new(AtomicBool::new(false)),
+            checkpoint_mode: Arc::new(AtomicBool::new(false)),
+            current_checkpoint: Arc::new(AtomicU8::new(0)),
             location,
             in_memory,
             snapshot_interval,
@@ -110,6 +112,8 @@ impl Snapshot {
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
             checkpoint: self.checkpoint.clone(),
             checkpoint_requested: self.checkpoint_requested.clone(),
+            checkpoint_mode: self.checkpoint_mode.clone(),
+            current_checkpoint: self.current_checkpoint.clone(),
             pending_entries: 0,
             running: self.running.clone(),
         };
@@ -125,6 +129,8 @@ impl Snapshot {
             balances: self.balances.clone(),
             checkpoint: self.checkpoint.clone(),
             checkpoint_requested: self.checkpoint_requested.clone(),
+            checkpoint_mode: self.checkpoint_mode.clone(),
+            current_checkpoint: self.current_checkpoint.clone(),
             location: self.location.clone(),
             in_memory: self.in_memory,
             snapshot_interval: self.snapshot_interval,
@@ -162,16 +168,17 @@ impl Snapshot {
                 self.pending_entries.store(m.entry_count, Ordering::Relaxed);
             }
             WalEntry::Entry(e) => {
-                let checkpoint_id = self.checkpoint.load().checkpoint_id;
-                let balance = self.get_balance(e.account_id);
-                let new_balance = match e.kind {
-                    EntryKind::Credit => balance.saturating_sub(e.amount as i64),
-                    EntryKind::Debit => balance.saturating_add(e.amount as i64),
-                };
-                self.balances.insert(
-                    BalanceCheckpoint::new(e.account_id, checkpoint_id),
-                    new_balance,
-                );
+                if let Some(sb) = self.balances.get(e.account_id as usize) {
+                    let balance = sb.snapshot.load(Ordering::Acquire);
+                    let new_balance = match e.kind {
+                        EntryKind::Credit => balance.saturating_sub(e.amount as i64),
+                        EntryKind::Debit => balance.saturating_add(e.amount as i64),
+                    };
+                    sb.snapshot.store(new_balance, Ordering::Release);
+                    // During replay/reprocess, we just sync both
+                    sb.checkpoint.store(new_balance, Ordering::Release);
+                }
+
                 let current = self.pending_entries.load(Ordering::Relaxed);
                 if current > 0 {
                     self.pending_entries.store(current - 1, Ordering::Relaxed);
@@ -216,17 +223,18 @@ impl Snapshot {
             last_wal_position,
         }));
 
-        let balance_size = std::mem::size_of::<Balance>();
-        let mut balance_buf = vec![0u8; balance_size];
+        let mut balance_buf = [0u8; 8];
 
         loop {
             match file.read_exact(&mut buf_u64) {
                 Ok(_) => {
                     let account_id = u64::from_le_bytes(buf_u64);
                     file.read_exact(&mut balance_buf)?;
-                    let balance: Balance = *bytemuck::from_bytes(&balance_buf);
-                    self.balances
-                        .insert(BalanceCheckpoint::new(account_id, checkpoint_id), balance);
+                    let balance = i64::from_le_bytes(balance_buf);
+                    if let Some(sb) = self.balances.get(account_id as usize) {
+                        sb.snapshot.store(balance, Ordering::Release);
+                        sb.checkpoint.store(balance, Ordering::Release);
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
@@ -237,42 +245,26 @@ impl Snapshot {
     }
 
     pub fn get_all_balances(&self) -> Vec<(u64, Balance)> {
-        let mut results = Vec::new();
-        let mut last_account_id = None;
-        let mut last_balance = None;
-
-        for entry in self.balances.iter() {
-            let key = entry.key();
-            if Some(key.account_id) == last_account_id {
-                last_balance = Some(*entry.value());
-            } else {
-                if let (Some(id), Some(bal)) = (last_account_id, last_balance) {
-                    results.push((id, bal));
+        self.balances
+            .iter()
+            .enumerate()
+            .filter_map(|(id, sb)| {
+                let bal = sb.snapshot.load(Ordering::Acquire);
+                if bal != 0 {
+                    Some((id as u64, bal))
+                } else {
+                    None
                 }
-                last_account_id = Some(key.account_id);
-                last_balance = Some(*entry.value());
-            }
-        }
-        if let (Some(id), Some(bal)) = (last_account_id, last_balance) {
-            results.push((id, bal));
-        }
-        results
+            })
+            .collect()
     }
 
     pub fn get_balance(&self, account_id: u64) -> Balance {
-        // Find the highest checkpoint for the account.
-        // SkipMap keys are sorted by account_id ASC, then checkpoint ASC.
-        // range((account_id, u64::MAX)..) would give entries starting from (account_id, MAX), which is wrong.
-        // We need to look at entries for account_id and take the last one.
-        // Or we can use range(BalanceCheckpoint::new(account_id, 0)..BalanceCheckpoint::new(account_id + 1, 0)) and take last.
-        if let Some(entry) = self
-            .balances
-            .range(BalanceCheckpoint::range(account_id))
-            .next_back()
-        {
-            return *entry.value();
+        if let Some(sb) = self.balances.get(account_id as usize) {
+            sb.snapshot.load(Ordering::Acquire)
+        } else {
+            0
         }
-        0
     }
 }
 
@@ -291,24 +283,23 @@ impl SnapshotRunner {
                         self.pending_entries = m.entry_count;
                     }
                     WalEntry::Entry(e) => {
-                        let checkpoint_id = self.checkpoint.load().checkpoint_id;
-                        let balance = if let Some(entry) = self
-                            .balances
-                            .range(BalanceCheckpoint::range(e.account_id))
-                            .next_back()
-                        {
-                            *entry.value()
-                        } else {
-                            0
-                        };
-                        let new_balance = match e.kind {
-                            EntryKind::Credit => balance.saturating_sub(e.amount as i64),
-                            EntryKind::Debit => balance.saturating_add(e.amount as i64),
-                        };
-                        self.balances.insert(
-                            BalanceCheckpoint::new(e.account_id, checkpoint_id),
-                            new_balance,
-                        );
+                        if let Some(sb) = self.balances.get(e.account_id as usize) {
+                            let balance = sb.snapshot.load(Ordering::Acquire);
+                            let new_balance = match e.kind {
+                                EntryKind::Credit => balance.saturating_sub(e.amount as i64),
+                                EntryKind::Debit => balance.saturating_add(e.amount as i64),
+                            };
+                            sb.snapshot.store(new_balance, Ordering::Release);
+
+                            if !self.checkpoint_mode.load(Ordering::Acquire) {
+                                // Normal mode: update checkpoint balance too
+                                sb.checkpoint.store(new_balance, Ordering::Release);
+                            } else {
+                                // Checkpoint mode: track that we updated it
+                                let current_cp = self.current_checkpoint.load(Ordering::Acquire);
+                                sb.checkpoint_id.store(current_cp, Ordering::Release);
+                            }
+                        }
                         if self.pending_entries > 0 {
                             self.pending_entries -= 1;
                         }
@@ -321,13 +312,30 @@ impl SnapshotRunner {
             } else {
                 if self.checkpoint_requested.load(Ordering::Relaxed) && self.pending_entries == 0 {
                     let cp = self.checkpoint.load();
+                    let new_cp_id = cp.checkpoint_id + 1;
+
+                    // Increment current_checkpoint (wrapping u8)
+                    let next_cp_tag = self
+                        .current_checkpoint
+                        .load(Ordering::Acquire)
+                        .wrapping_add(1);
+                    if next_cp_tag == 0 {
+                        // Avoid 0 as it's the default state
+                        self.current_checkpoint.store(1, Ordering::Release);
+                    } else {
+                        self.current_checkpoint
+                            .store(next_cp_tag, Ordering::Release);
+                    }
+
                     let new_checkpoint = Checkpoint {
-                        checkpoint_id: cp.checkpoint_id + 1,
+                        checkpoint_id: new_cp_id,
                         last_transaction_id,
                         last_wal_position,
                     };
                     self.checkpoint.store(Arc::new(new_checkpoint));
-                    self.checkpoint_requested.store(false, Ordering::Relaxed);
+
+                    self.checkpoint_mode.store(true, Ordering::Release);
+                    self.checkpoint_requested.store(false, Ordering::Release);
                 }
                 std::thread::yield_now();
             }
@@ -350,77 +358,70 @@ impl SnapshotStorer {
                 }
             }
 
-            // Request checkpoint
-            self.checkpoint_requested.store(true, Ordering::Relaxed);
+            // 1. Request checkpoint
+            self.checkpoint_requested.store(true, Ordering::Release);
 
-            // Wait for checkpoint to be fulfilled
-            while self.checkpoint_requested.load(Ordering::Relaxed) {
+            // 2. Wait for Runner to enter checkpoint mode
+            while !self.checkpoint_mode.load(Ordering::Acquire) {
                 if !self.running.load(Ordering::Relaxed) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
 
-            let checkpoint = self.checkpoint.load();
+            let cp_tag = self.current_checkpoint.load(Ordering::Acquire);
 
-            // Collect all balances up to current checkpoint_id
-            let balances = self.collect_balances(checkpoint.checkpoint_id);
-
-            if let Err(e) = self.save_snapshot(balances) {
+            // 3. Save snapshot (reads from .checkpoint)
+            if let Err(e) = self.save_snapshot() {
                 eprintln!("Failed to save snapshot: {}", e);
             }
-        }
-    }
 
-    fn collect_balances(&self, up_to_checkpoint: u64) -> Vec<(u64, Balance)> {
-        let mut results = Vec::new();
-        let mut last_account_id = None;
-        let mut last_balance = None;
+            // 4. Exit checkpoint mode
+            self.checkpoint_mode.store(false, Ordering::Release);
 
-        for entry in self.balances.iter() {
-            let key = entry.key();
-            if key.checkpoint > up_to_checkpoint {
-                continue;
-            }
-
-            if Some(key.account_id) == last_account_id {
-                last_balance = Some(*entry.value());
-            } else {
-                if let (Some(id), Some(bal)) = (last_account_id, last_balance) {
-                    results.push((id, bal));
+            // 5. Catch up: balances updated during checkpoint mode
+            for sb in self.balances.iter() {
+                if sb.checkpoint_id.load(Ordering::Acquire) == cp_tag {
+                    // Update checkpoint value to current snapshot value
+                    let val = sb.snapshot.load(Ordering::Acquire);
+                    sb.checkpoint.store(val, Ordering::Release);
+                    // Reset tag
+                    sb.checkpoint_id.store(0, Ordering::Release);
                 }
-                last_account_id = Some(key.account_id);
-                last_balance = Some(*entry.value());
             }
         }
-        if let (Some(id), Some(bal)) = (last_account_id, last_balance) {
-            results.push((id, bal));
-        }
-        results
     }
 
-    fn save_snapshot(&self, balances: Vec<(u64, Balance)>) -> std::io::Result<()> {
+    fn save_snapshot(&self) -> std::io::Result<()> {
         let location = self.location.as_ref().unwrap();
         let tmp_path = location.join("snapshot.bin.tmp");
         let final_path = location.join("snapshot.bin");
 
         let mut file = std::fs::File::create(&tmp_path)?;
-
-        let mut buffer =
-            Vec::with_capacity(32 + balances.len() * (8 + std::mem::size_of::<Balance>()));
-
-        // Write snapshot header: checkpoint_id, last_transaction_id, last_wal_position (each u64)
         let cp = self.checkpoint.load();
+
+        let mut buffer = Vec::with_capacity(1024 * 1024);
         buffer.extend_from_slice(&cp.checkpoint_id.to_le_bytes());
         buffer.extend_from_slice(&cp.last_transaction_id.to_le_bytes());
         buffer.extend_from_slice(&cp.last_wal_position.to_le_bytes());
 
-        for (account_id, balance) in balances {
-            buffer.extend_from_slice(&account_id.to_le_bytes());
-            buffer.extend_from_slice(bytemuck::bytes_of(&balance));
+        for (id, sb) in self.balances.iter().enumerate() {
+            let bal = sb.checkpoint.load(Ordering::Acquire);
+            if bal != 0 {
+                buffer.extend_from_slice(&(id as u64).to_le_bytes());
+                buffer.extend_from_slice(&bal.to_le_bytes());
+            }
+
+            if buffer.len() > 8 * 1024 * 1024 {
+                file.write_all(&buffer)?;
+                buffer.clear();
+            }
         }
 
-        file.write_all(&buffer)?;
+        if !buffer.is_empty() {
+            file.write_all(&buffer)?;
+        }
+
         file.sync_all()?;
         std::fs::rename(tmp_path, final_path)?;
         Ok(())

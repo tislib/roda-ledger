@@ -7,6 +7,7 @@ use crate::wallet::transaction::WalletTransaction;
 
 #[derive(Clone)]
 pub struct WalletConfig {
+    pub max_accounts: usize,
     pub queue_size: usize,
     pub location: Option<String>,
     pub in_memory: bool,
@@ -16,6 +17,7 @@ pub struct WalletConfig {
 impl Default for WalletConfig {
     fn default() -> Self {
         Self {
+            max_accounts: 1_000_000,
             queue_size: 1024,
             location: None,
             in_memory: false,
@@ -59,6 +61,7 @@ impl Wallet {
         };
 
         let ledger_config = LedgerConfig {
+            max_accounts: config.max_accounts,
             queue_size: config.queue_size,
             location: resolved_location.clone(),
             in_memory: config.in_memory,
@@ -389,10 +392,14 @@ mod tests {
 
     #[test]
     fn test_wallet_custom_location() {
-        let temp_dir = "temp_ledger_test";
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir = format!("temp_ledger_test_{}", nanos);
         let mut wallet = Wallet::new_with_config(WalletConfig {
             queue_size: 10,
-            location: Some(temp_dir.to_string()),
+            location: Some(temp_dir.clone()),
             in_memory: false,
             ..Default::default()
         });
@@ -404,7 +411,7 @@ mod tests {
         assert_eq!(balance, 100);
 
         // Verify file exists
-        let wal_path = std::path::Path::new(temp_dir).join("wal.bin");
+        let wal_path = std::path::Path::new(&temp_dir).join("wal.bin");
         assert!(wal_path.exists());
 
         // Cleanup via destroy

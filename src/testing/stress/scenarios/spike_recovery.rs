@@ -28,17 +28,18 @@ impl Scenario for SpikeRecoveryScenario {
         self.duration
     }
 
+    fn max_accounts(&self) -> u64 {
+        self.accounts
+    }
+
     fn execute(
         &self,
         client: DirectWorkloadClient,
         metrics: Arc<WorkloadMetrics>,
     ) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let mut workload = Workload::new(client).with_metrics(metrics);
-        let accounts: Vec<u64> = (0..self.accounts).collect();
-        workload = workload.with_accounts(accounts.clone());
-
+        let accounts_size = self.accounts;
         let duration = self.duration;
-        let accounts_ref = accounts;
 
         let workload_handle = std::thread::spawn(move || {
             let half_duration = duration / 2;
@@ -52,11 +53,9 @@ impl Scenario for SpikeRecoveryScenario {
             let (res, count) = workload
                 .run_step(
                     spike_config,
-                    |idx| {
-                        WalletTransaction::deposit(
-                            accounts_ref[idx as usize % accounts_ref.len()],
-                            100,
-                        )
+                    |_| {
+                        let account_id = rand::random::<u64>() % accounts_size;
+                        WalletTransaction::deposit(account_id, 100)
                     },
                     0,
                 )
@@ -74,8 +73,9 @@ impl Scenario for SpikeRecoveryScenario {
 
             let _ = workload.run_step(
                 recovery_config,
-                |idx| {
-                    WalletTransaction::deposit(accounts_ref[idx as usize % accounts_ref.len()], 100)
+                |_| {
+                    let account_id = rand::random::<u64>() % accounts_size;
+                    WalletTransaction::deposit(account_id, 100)
                 },
                 count,
             );

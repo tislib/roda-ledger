@@ -5,9 +5,13 @@ use std::time::Duration;
 
 #[test]
 fn crash_recovery_test() {
-    let temp_dir = "temp_crash_recovery_test";
-    if Path::new(temp_dir).exists() {
-        let _ = fs::remove_dir_all(temp_dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = format!("temp_crash_recovery_test_{}", nanos);
+    if Path::new(&temp_dir).exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     let account_id = 1;
@@ -21,6 +25,7 @@ fn crash_recovery_test() {
             location: Some(temp_dir.to_string()),
             in_memory: false,
             snapshot_interval: Duration::from_millis(100),
+            max_accounts: 1_000_000,
         };
 
         let mut wallet = Wallet::new_with_config(config);
@@ -50,6 +55,7 @@ fn crash_recovery_test() {
             location: Some(temp_dir.to_string()),
             in_memory: false,
             snapshot_interval: Duration::from_millis(100),
+            max_accounts: 1_000_000,
         };
 
         let mut wallet = Wallet::new_with_config(config);
