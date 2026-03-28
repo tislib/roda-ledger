@@ -1,5 +1,7 @@
 # Roda-Ledger Architecture: Pipelined Execution
 
+![Process Diagram](process_diagram.svg)
+
 Roda-Ledger is built on a "Core-Per-Stage" model, utilizing asynchronous pipelining and lock-free ArrayQueues to eliminate thread contention and maximize mechanical sympathy.
 
 ## 1. Pipeline Stages

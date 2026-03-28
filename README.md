@@ -30,7 +30,7 @@ thread contention and maximize mechanical sympathy.
 4. **Snapshotter (Core 3):** The archival layer. Periodically takes snapshots of the ledger state to optimize recovery
    and manage WAL growth.
 
-For a deep dive into the architecture, see [Design.md](Design.md) and our [Architectural Decision Records](docs/adr/).
+For a deep dive into the architecture, see [Design.md](docs/Design.md) and our [Architectural Decision Records](docs/adr/).
 
 ## Core Components
 
@@ -45,7 +45,7 @@ use roda_ledger::ledger::{Ledger, LedgerConfig};
 let config = LedgerConfig {
     location: Some("ledger_data".to_string()),
     in_memory: false,
-    ..Default::default ()
+    ..Default::default()
 };
 
 // Data: Your transaction data type
@@ -101,7 +101,7 @@ execute any deterministic logic you require.
 
 ```rust
 use roda_ledger::transaction::{TransactionDataType, TransactionExecutionContext};
-use roda_ledger::entities::{FailReason, TxEntry};
+use roda_ledger::entities::FailReason;
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -112,14 +112,15 @@ pub struct MyTransaction {
 }
 
 impl TransactionDataType for MyTransaction {
-    fn process(
-        &self,
-        ctx: &mut impl TransactionExecutionContext,
-    ) -> (FailReason, Vec<TxEntry>) {
-        let mut balance = ctx.get_balance(self.account_id);
-        balance += self.amount;
-        ctx.update_balance(self.account_id, balance);
-        (FailReason::NONE, Vec::new())
+    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
+        if self.amount == 0 {
+            return;
+        }
+        
+        // Simple deposit logic: 
+        // Debit (increase) user's account and Credit (decrease) a system/mint account
+        ctx.debit(self.account_id, self.amount);
+        ctx.credit(0, self.amount); // Account 0 is the system account
     }
 }
 ```
