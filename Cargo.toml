@@ -36,7 +36,7 @@ grpc = ["dep:tonic", "dep:prost", "dep:tonic-build"]
 tonic-build = { version = "0.12", optional = true }
 
 [[bench]]
-name = "wallet_bench"
+name = "ledger_bench"
 harness = false
 
 [[bench]]
