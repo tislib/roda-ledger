@@ -1,0 +1,14 @@
+services:
+  roda-ledger:
+    build: .
+    ports:
+      - "50051:50051"
+    environment:
+      - RODA_GRPC_ADDR=0.0.0.0:50051
+      - RODA_DATA_DIR=/data
+      - RODA_MAX_ACCOUNTS=1000000
+      - RODA_SNAPSHOT_INTERVAL=600
+      - RODA_IN_MEMORY=false
+    volumes:
+      - ./data:/data
+    restart: always

@@ -20,10 +20,20 @@ impl GrpcServer {
 
         println!("gRPC server listening on {}", self.addr);
 
-        Server::builder()
-            .add_service(LedgerServer::new(handler))
-            .serve(self.addr)
-            .await?;
+        let mut builder = Server::builder().add_service(LedgerServer::new(handler));
+
+        #[cfg(feature = "grpc")]
+        {
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/ledger_descriptor.bin"
+                )))
+                .build_v1()?;
+            builder = builder.add_service(reflection_service);
+        }
+
+        builder.serve(self.addr).await?;
 
         Ok(())
     }
