@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+package roda.ledger.v1;
+
+// Ledger is the primary service for submitting and querying financial transactions.
+// All monetary amounts are in integer minor units (e.g. cents, not dollars).
+// No floating point is used anywhere in this API.
+//
+// All RPCs are unary. Batching is done by grouping multiple operations or IDs
+// inside a single request message. The client controls batch size.
+service Ledger {
+
+  // SubmitOperation submits a single financial operation to the ledger.
+  // Returns immediately with a transaction_id once the operation is sequenced.
+  // Each operation is atomic and serialized in the global order.
+  // The transaction_id is monotonically increasing and globally ordered.
+  // Use GetTransactionStatus or GetTransactionStatuses to poll for finality.
+  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
+
+  // SubmitBatch submits multiple operations in a single round trip.
+  // Operations are sequenced and executed in the order provided in the request,
+  // however, there is no global order guarantee (meaning other transactions from
+  // different clients may be interleaved between operations in this batch).
+  // There is no atomic guarantee for the whole batch — each operation is
+  // independent and atomic on its own. Failure of one does not affect others.
+  // Results are returned in the same order as the input operations.
+  // Prefer this over repeated SubmitOperation calls for high-throughput ingestion.
+  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
+
+  // GetBalance returns the current balance for a single account.
+  // Balance reflects all transactions that have reached ON_SNAPSHOT stage.
+  // For accounts that have never received a transaction, returns 0.
+  //
+  // GetBalance is not linearizable by default — it reflects the Snapshotter stage,
+  // which may lag behind committed transactions. To achieve a linearizable read
+  // after a write, poll GetBalance until last_snapshot_tx_id >= your transaction_id.
+  // Alternatively, use GetPipelineIndex to check snapshot_index before reading.
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+
+  // GetBalances returns balances for multiple accounts in a single round trip.
+  // Results are returned in the same order as the input account_ids.
+  //
+  // GetBalances is not linearizable by default — it reflects the Snapshotter stage,
+  // which may lag behind committed transactions. To achieve a linearizable read
+  // after a write, poll GetBalances until last_snapshot_tx_id >= your transaction_id.
+  // Alternatively, use GetPipelineIndex to check snapshot_index before reading.
+  rpc GetBalances(GetBalancesRequest) returns (GetBalancesResponse);
+
+  // GetTransactionStatus returns the current pipeline stage of a single transaction.
+  // See TransactionStatus for the meaning of each stage.
+  rpc GetTransactionStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // GetTransactionStatuses returns the pipeline stage of multiple transactions
+  // in a single round trip. Results are returned in the same order as the input IDs.
+  // Use this to poll a batch of submitted transactions for finality instead of
+  // calling GetTransactionStatus N times.
+  rpc GetTransactionStatuses(GetStatusesRequest) returns (GetStatusesResponse);
+
+  // GetPipelineIndex returns the current progress index of each pipeline stage.
+  // Use this for health checks, lag monitoring, and determining when a bulk load
+  // is complete without querying individual transactions.
+  rpc GetPipelineIndex(GetPipelineIndexRequest) returns (GetPipelineIndexResponse);
+}
+
+// ---- Operation messages ----
+
+// SubmitOperationRequest wraps one of the supported operation types.
+// Exactly one operation field must be set. Setting zero or more than one is an error.
+message SubmitOperationRequest {
+  oneof operation {
+    Deposit    deposit    = 1;
+    Withdrawal withdrawal = 2;
+    Transfer   transfer   = 3;
+    Complex    complex    = 4;
+  }
+}
+
+// Deposit credits an account from the system source.
+// The system source (SYSTEM_SOURCE) absorbs the corresponding debit to maintain
+// the zero-sum invariant. Deposits never fail due to insufficient funds.
+message Deposit {
+  uint64 account  = 1; // Target account ID. Must be < max_accounts.
+  uint64 amount   = 2; // Amount to deposit in minor units. Must be > 0.
+  uint64 user_ref = 3; // Opaque external reference. Stored in WAL, not interpreted
+                       // by the ledger. Use this to link to your own database record
+                       // (e.g. an order ID, payment ID).
+}
+
+// Withdrawal debits an account to the system sink.
+// The system sink (SYSTEM_SINK) absorbs the corresponding credit to maintain
+// the zero-sum invariant. Fails with INSUFFICIENT_FUNDS if balance < amount.
+message Withdrawal {
+  uint64 account  = 1; // Source account ID. Must be < max_accounts.
+  uint64 amount   = 2; // Amount to withdraw in minor units. Must be > 0.
+  uint64 user_ref = 3; // Opaque external reference. See Deposit.user_ref.
+}
+
+// Transfer moves funds between two accounts atomically.
+// No value enters or leaves the system — both credit and debit happen in the same transaction.
+// Fails with INSUFFICIENT_FUNDS if from account balance < amount.
+// If from == to, the operation is a no-op and succeeds immediately.
+message Transfer {
+  uint64 from     = 1; // Source account ID. Must be < max_accounts.
+  uint64 to       = 2; // Destination account ID. Must be < max_accounts.
+  uint64 amount   = 3; // Amount to transfer in minor units. Must be > 0.
+  uint64 user_ref = 4; // Opaque external reference. See Deposit.user_ref.
+}
+
+// Complex is a user-defined multi-step atomic operation.
+// All steps execute atomically — either all commit or none do.
+// The zero-sum invariant is always enforced: sum(credits) must equal sum(debits).
+// Additional checks are controlled via the flags field.
+// Maximum 255 steps per operation.
+message Complex {
+  repeated Step steps = 1; // Ordered list of credit/debit steps.
+  uint64 flags        = 2; // Bitset of ComplexOperationFlags. See flag definitions below.
+  uint64 user_ref     = 3; // Opaque external reference. See Deposit.user_ref.
+}
+
+// ComplexOperationFlags is a bitset encoded as uint64.
+// Each bit enables an additional validation check applied atomically with execution.
+// Combine multiple flags with bitwise OR (e.g. flags = 0x1 | 0x2 = 3).
+//
+// Defined bits:
+//
+//   0x0000000000000001 (bit 0) — CHECK_NEGATIVE_BALANCE
+//       Reject the entire operation if any account touched by the steps would go
+//       negative after execution. Enforces that no account is overdrafted as a
+//       result of this specific operation. Without this flag, negative balances
+//       are permitted (useful for liability accounts or system accounts).
+//       Rejection code: INSUFFICIENT_FUNDS.
+//
+//   0x0000000000000002–0x4000000000000000 (bits 1–62) — Reserved.
+//       Reserved for future standard checks. Do not set these bits.
+//
+// Example — fee deduction with overdraft protection:
+//   flags    = 1  (CHECK_NEGATIVE_BALANCE)
+//   steps    = [Credit(sender, amount+fee), Debit(receiver, amount), Debit(fee_acct, fee)]
+//   Outcome  = rejected if sender balance would go negative after the credit step.
+
+// Step is a single credit or debit within a Complex operation.
+message Step {
+  oneof kind {
+    CreditStep credit = 1; // Reduce account balance (funds leave this account).
+    DebitStep  debit  = 2; // Increase account balance (funds arrive at this account).
+  }
+}
+
+// CreditStep reduces the balance of an account.
+// In double-entry terms: the account is on the credit side of the entry.
+// Economically: funds flow out of this account.
+message CreditStep {
+  uint64 account_id = 1; // Account to credit. Must be < max_accounts.
+  uint64 amount     = 2; // Amount in minor units. Must be > 0.
+}
+
+// DebitStep increases the balance of an account.
+// In double-entry terms: the account is on the debit side of the entry.
+// Economically: funds flow into this account.
+message DebitStep {
+  uint64 account_id = 1; // Account to debit. Must be < max_accounts.
+  uint64 amount     = 2; // Amount in minor units. Must be > 0.
+}
+
+// ---- Submit responses ----
+
+// SubmitOperationResponse is returned after an operation is sequenced.
+// The transaction_id is assigned by the Sequencer and is available immediately —
+// before the operation has been executed, persisted, or snapshotted.
+message SubmitOperationResponse {
+  uint64 transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
+}
+
+message SubmitBatchRequest {
+  repeated SubmitOperationRequest operations = 1; // Operations to submit, in order.
+                                                  // Each is independent — failure of one
+                                                  // does not affect others.
+}
+
+message SubmitBatchResponse {
+  repeated SubmitOperationResponse results = 1; // One result per input operation, same order.
+}
+
+// ---- Balance messages ----
+
+message GetBalanceRequest {
+  uint64 account_id = 1; // Account to query. Returns 0 if never touched.
+}
+
+message GetBalanceResponse {
+  int64 balance = 1; // Current balance in minor units. May be negative for liability
+                     // or system accounts. Reflects only transactions that have reached
+                     // ON_SNAPSHOT — see TransactionStatus for stage definitions.
+  uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
+                                  // this ID are reflected in the balance. The actual
+                                  // last snapshot ID might be slightly higher.
+}
+
+message GetBalancesRequest {
+  repeated uint64 account_ids = 1; // Accounts to query. Duplicates allowed.
+}
+
+message GetBalancesResponse {
+  repeated int64 balances = 1; // One balance per input account_id, in the same order.
+                               // Returns 0 for accounts that have never been touched.
+  uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
+                                  // this ID are reflected in the balances.
+}
+
+// ---- Status messages ----
+
+message GetStatusRequest {
+  uint64 transaction_id = 1;
+}
+
+// GetStatusResponse returns the pipeline stage and rejection reason for a transaction.
+message GetStatusResponse {
+  TransactionStatus status      = 1; // Current pipeline stage. See TransactionStatus.
+  uint32            fail_reason = 2; // Rejection code. 0 = success. Only meaningful when
+                                     // status == ERROR.
+                                     // Standard codes:
+                                     //   1 = INSUFFICIENT_FUNDS
+                                     //   2 = ACCOUNT_NOT_FOUND
+                                     //   3 = ZERO_SUM_VIOLATION
+                                     //   4 = ENTRY_LIMIT_EXCEEDED
+                                     //   5 = INVALID_OPERATION
+                                     //   6 = ACCOUNT_LIMIT_EXCEEDED
+                                     // Codes 128–255 are user-defined.
+}
+
+message GetStatusesRequest {
+  repeated uint64 transaction_ids = 1; // Transaction IDs to query.
+}
+
+message GetStatusesResponse {
+  repeated GetStatusResponse results = 1; // One result per input transaction_id, same order.
+}
+
+// TransactionStatus represents the pipeline stage a transaction has reached.
+// Stages are strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
+// ERROR is a terminal state reachable only from PENDING (rejected before or during execution).
+enum TransactionStatus {
+  // PENDING: Sequenced but not yet processed by the Transactor.
+  // The transaction has a transaction_id but business logic has not run.
+  // Balance has not changed. Not durable.
+  PENDING = 0;
+
+  // COMPUTED: The Transactor has executed the business logic.
+  // Balance changes are live in the Transactor's in-memory state.
+  // NOT yet written to WAL — a crash at this point would lose this transaction.
+  // GetBalance does not yet reflect this transaction.
+  COMPUTED = 1;
+
+  // COMMITTED: The WAL Storer has flushed the transaction to disk.
+  // The transaction is durable — it will survive a crash and be replayed on restart.
+  // GetBalance does not yet reflect this transaction (that requires ON_SNAPSHOT).
+  COMMITTED = 2;
+
+  // ON_SNAPSHOT: The Snapshotter has applied the transaction's entries to the balance cache.
+  // GetBalance now reflects this transaction. This is the final successful state —
+  // durable and queryable.
+  ON_SNAPSHOT = 3;
+
+  // ERROR: The transaction was rejected. Business logic ran but a constraint was
+  // violated (e.g. insufficient funds, zero-sum violation). A WAL record was written
+  // for audit purposes. No balance changes occurred. Check fail_reason for the cause.
+  ERROR = 4;
+}
+
+// ---- Pipeline index ----
+
+// GetPipelineIndexRequest has no parameters.
+message GetPipelineIndexRequest {}
+
+// GetPipelineIndexResponse returns the highest transaction_id fully processed
+// by each pipeline stage. Maps directly to Ledger::last_computed_id(),
+// last_committed_id(), and last_snapshot_id() in library mode.
+//
+// Common use cases:
+//   Health check:          all three indexes should be advancing
+//   Commit lag:            computed_index - committed_index
+//   Snapshot lag:          committed_index - snapshot_index
+//   Bulk load completion:  poll until snapshot_index >= last submitted transaction_id
+message GetPipelineIndexResponse {
+  // computed_index: highest transaction_id processed by the Transactor.
+  // Business logic has run. Balance changes are in memory but not yet durable.
+  // Maps to Ledger::last_computed_id().
+  uint64 computed_index = 1;
+
+  // committed_index: highest transaction_id flushed to WAL.
+  // All transactions at or below this index are durable and crash-safe.
+  // Maps to Ledger::last_committed_id().
+  uint64 committed_index = 2;
+
+  // snapshot_index: highest transaction_id applied to the balance cache.
+  // GetBalance reflects all transactions at or below this index.
+  // Maps to Ledger::last_snapshot_id().
+  uint64 snapshot_index = 3;
+}
