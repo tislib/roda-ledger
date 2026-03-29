@@ -15,7 +15,6 @@ Roda-Ledger is a specialized database engine designed for recording and executin
 - **Crypto-Exchanges**: Real-time matching engines and wallet management.
 - **Payment Gateways**: High-volume transaction clearing and settlement.
 - **Gaming Economies**: Managing in-game currencies and item trades at scale.
-- **HFT Systems**: Low-latency risk management and position tracking.
 
 ---
 
