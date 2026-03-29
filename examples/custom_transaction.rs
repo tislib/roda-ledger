@@ -1,5 +1,5 @@
 use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::transaction::{ComplexOperation, ComplexOperationFlags, Operation, Step};
+use roda_ledger::transaction::{CompositeOperation, CompositeOperationFlags, Operation, Step};
 use smallvec::smallvec;
 
 fn main() {
@@ -8,7 +8,7 @@ fn main() {
         ..Default::default()
     };
 
-    println!("Starting Complex Operation example...");
+    println!("Starting Composite Operation example...");
     let mut ledger = Ledger::new(config);
     ledger.start();
 
@@ -38,7 +38,7 @@ fn main() {
         user_ref: 0,
     });
 
-    // Complex operation: Transfer with a fee
+    // Composite operation: Transfer with a fee
     let user_a = 101;
     let user_b = 102;
     let fee_account = 0;
@@ -49,8 +49,8 @@ fn main() {
         user_ref: 0,
     });
 
-    println!("Executing complex operation: Transfer 100 with 5 fee...");
-    let complex_tx_id = ledger.submit(Operation::Complex(Box::new(ComplexOperation {
+    println!("Executing composite operation: Transfer 100 with 5 fee...");
+    let composite_tx_id = ledger.submit(Operation::Composite(Box::new(CompositeOperation {
         steps: smallvec![
             Step::Credit {
                 account_id: user_a,
@@ -65,12 +65,12 @@ fn main() {
                 amount: 5
             }, // System gets 5 fee
         ],
-        flags: ComplexOperationFlags::empty(),
+        flags: CompositeOperationFlags::empty(),
         user_ref: 12345,
     })));
 
     // Wait for everything
-    ledger.wait_for_transaction(complex_tx_id);
+    ledger.wait_for_transaction(composite_tx_id);
 
     // Check final balances
     println!("Final balances:");

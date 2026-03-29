@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::transaction::{ComplexOperation, ComplexOperationFlags, Operation, Step};
+use roda_ledger::transaction::{CompositeOperation, CompositeOperationFlags, Operation, Step};
 use smallvec::smallvec;
 use std::time::Duration;
 
@@ -56,12 +56,12 @@ fn wallet_bench(c: &mut Criterion) {
         });
     }
 
-    group.bench_function("complex_operation", |b| {
+    group.bench_function("composite_operation", |b| {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start();
         b.iter(|| {
             i += 1;
-            ledger.submit(Operation::Complex(Box::new(ComplexOperation {
+            ledger.submit(Operation::Composite(Box::new(CompositeOperation {
                 steps: smallvec![
                     Step::Credit {
                         account_id: 0, // SYSTEM_ACCOUNT_ID
@@ -72,7 +72,7 @@ fn wallet_bench(c: &mut Criterion) {
                         amount: 100
                     },
                 ],
-                flags: ComplexOperationFlags::empty(),
+                flags: CompositeOperationFlags::empty(),
                 user_ref: 12345,
             })));
         });
