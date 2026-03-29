@@ -69,10 +69,10 @@ let balance = ledger.get_balance(account_id);
 
 ### Operations
 
-Roda-Ledger uses a concrete `Operation` enum for all interactions. It supports `Deposit`, `Withdrawal`, `Transfer`, and `Complex` multi-step atomic operations.
+Roda-Ledger uses a concrete `Operation` enum for all interactions. It supports `Deposit`, `Withdrawal`, `Transfer`, `Composite`, and `Named` operations.
 
 ```rust
-use roda_ledger::transaction::{Operation, ComplexOperation, Step, ComplexOperationFlags};
+use roda_ledger::transaction::{Operation, CompositeOperation, Step, CompositeOperationFlags};
 use smallvec::smallvec;
 
 // 1. Simple Deposit
@@ -81,14 +81,14 @@ ledger.submit(Operation::Deposit { account: 1, amount: 1000, user_ref: 0 });
 // 2. Simple Transfer
 ledger.submit(Operation::Transfer { from: 1, to: 2, amount: 500, user_ref: 0 });
 
-// 3. Complex Atomic Operation (e.g., Transfer with a Fee)
-ledger.submit(Operation::Complex(Box::new(ComplexOperation {
+// 3. Composite Atomic Operation (e.g., Transfer with a Fee)
+ledger.submit(Operation::Composite(Box::new(CompositeOperation {
     steps: smallvec![
         Step::Credit { account_id: 1, amount: 105 }, // Sender pays amount + fee
         Step::Debit  { account_id: 2, amount: 100 }, // Receiver gets amount
         Step::Debit  { account_id: 0, amount: 5   }, // System gets fee
     ],
-    flags: ComplexOperationFlags::CHECK_NEGATIVE_BALANCE,
+    flags: CompositeOperationFlags::CHECK_NEGATIVE_BALANCE,
     user_ref: 12345,
 })));
 ```

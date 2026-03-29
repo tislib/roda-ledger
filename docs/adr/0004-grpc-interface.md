@@ -87,7 +87,7 @@ The gRPC interface is designed for high-throughput financial operations while ma
    - `SubmitOperation`: Each operation is atomic and strictly serialized.
    - `SubmitBatch`: Operations are executed in the order provided in the request. However, the batch itself is **not atomic** as a whole (failures are independent), and there is no guarantee of global contiguous order — operations from other clients may be interleaved between them.
 5. **Explicit Pipeline Stages**: Clients can poll for the status of a transaction through strictly ordered stages: `PENDING` -> `COMPUTED` -> `COMMITTED` -> `ON_SNAPSHOT`.
-6. **Zero-Sum Invariant**: All operations, including complex ones, must maintain a zero-sum balance across the system.
+6. **Zero-Sum Invariant**: All operations, including composite ones, must maintain a zero-sum balance across the system.
 7. **Isolation Guarantees**:
 
 | Guarantee | Provided | Notes |
@@ -102,7 +102,8 @@ The gRPC interface is designed for high-throughput financial operations while ma
 The interface supports:
 - **Deposit/Withdrawal**: Moving funds in/out of the system.
 - **Transfer**: Atomic movement between accounts.
-- **Complex**: User-defined atomic multi-step operations with optional validation flags (e.g., overdraft protection).
+- **Composite**: User-defined atomic multi-step operations with optional validation flags (e.g., overdraft protection).
+- **Named**: Invoke a registered operation by name with positional `repeated int64` params. Ties to WASM roadmap — no breaking change when ADR-008 lands.
 - **Queries**: Account balances (returning `last_snapshot_tx_id` to indicate currency/freshness) and transaction status polling.
 
 The full protobuf definition is maintained in [proto/ledger.proto](../../proto/ledger.proto).
@@ -259,8 +260,8 @@ batch semantics. No path to streaming-equivalent patterns if needed in future.
 ## References
 
 - ADR-001 — entries-based execution model
-- ADR-003 — `Operation` enum, `Complex`, `ComplexOperationFlags` (`u64` bitfield)
+- ADR-003 — `Operation` enum, `Composite`, `CompositeOperationFlags` (`u64` bitfield)
 - `src/ledger.rs` — `Ledger::last_computed_id()`, `last_committed_id()`, `last_snapshot_id()`
-- `src/transaction.rs` — `Operation`, `TransactionStatus`, `ComplexOperationFlags`
+- `src/transaction.rs` — `Operation`, `TransactionStatus`, `CompositeOperationFlags`
 - `src/entities.rs` — `FailReason` codes
 - `tonic` — https://github.com/hyperium/tonic

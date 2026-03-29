@@ -1,7 +1,7 @@
 use crate::balance::Balance;
 use crate::entities::{EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxMetadata, WalEntry};
 use crate::transaction::{
-    ComplexOperationFlags, Operation, Step, Transaction, TransactionExecutionContext,
+    CompositeOperationFlags, Operation, Step, Transaction, TransactionExecutionContext,
 };
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
@@ -157,7 +157,7 @@ impl TransactorRunner {
                                 ctx.debit(*to, *amount);
                             }
                         }
-                        Operation::Complex(op) => {
+                        Operation::Composite(op) => {
                             for step in &op.steps {
                                 match step {
                                     Step::Credit { account_id, amount } => {
@@ -171,7 +171,7 @@ impl TransactorRunner {
 
                             if op
                                 .flags
-                                .contains(ComplexOperationFlags::CHECK_NEGATIVE_BALANCE)
+                                .contains(CompositeOperationFlags::CHECK_NEGATIVE_BALANCE)
                             {
                                 for entry in &ctx.entries {
                                     if ctx.get_balance(entry.account_id) < 0 {
@@ -180,6 +180,9 @@ impl TransactorRunner {
                                     }
                                 }
                             }
+                        }
+                        Operation::Named { .. } => {
+                            panic!("Named operations not implemented yet");
                         }
                     }
 

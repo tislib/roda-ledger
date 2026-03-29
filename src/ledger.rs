@@ -142,7 +142,7 @@ impl Ledger {
         self.transactor.get_rejected_count()
     }
 
-    pub fn wait_for_transaction(&mut self, transaction_id: u64) {
+    pub fn wait_for_transaction(&self, transaction_id: u64) {
         let mut prev_snapshot_step = self.snapshot.last_processed_transaction_id();
 
         let mut no_movement_count = 1;

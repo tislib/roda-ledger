@@ -37,6 +37,12 @@ impl FailReason {
     pub fn is_failure(&self) -> bool {
         self.0 != 0
     }
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+    pub fn from_u8(v: u8) -> Self {
+        Self(v)
+    }
 }
 
 #[repr(C)]

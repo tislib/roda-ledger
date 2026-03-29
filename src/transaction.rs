@@ -21,7 +21,12 @@ pub enum Operation {
         amount: u64,
         user_ref: u64,
     },
-    Complex(Box<ComplexOperation>),
+    Composite(Box<CompositeOperation>),
+    Named {
+        name: String,
+        params: Vec<i64>,
+        user_ref: u64,
+    },
 }
 
 impl Operation {
@@ -30,15 +35,16 @@ impl Operation {
             Operation::Transfer { user_ref, .. } => *user_ref,
             Operation::Deposit { user_ref, .. } => *user_ref,
             Operation::Withdrawal { user_ref, .. } => *user_ref,
-            Operation::Complex(op) => op.user_ref,
+            Operation::Composite(op) => op.user_ref,
+            Operation::Named { user_ref, .. } => *user_ref,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ComplexOperation {
+pub struct CompositeOperation {
     pub steps: SmallVec<[Step; 8]>,
-    pub flags: ComplexOperationFlags,
+    pub flags: CompositeOperationFlags,
     pub user_ref: u64,
 }
 
@@ -50,7 +56,7 @@ pub enum Step {
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-    pub struct ComplexOperationFlags: u64 {
+    pub struct CompositeOperationFlags: u64 {
         const CHECK_NEGATIVE_BALANCE = 0b00000001;
     }
 }
