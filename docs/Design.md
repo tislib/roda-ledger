@@ -4,6 +4,8 @@
 
 Roda-Ledger is built on a "Core-Per-Stage" model, utilizing asynchronous pipelining and lock-free ArrayQueues to eliminate thread contention and maximize mechanical sympathy.
 
+For detailed information on the consistency guarantees (serializability, linearizability) and the zero-sum invariant, see the [Operations & Consistency Model](operations_consistency.md).
+
 ## 1. Pipeline Stages
 
 ### A. Core 0: The Sequencer

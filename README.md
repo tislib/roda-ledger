@@ -1,147 +1,146 @@
 # Roda-Ledger
 
-A high-performance, durable, and crash-consistent financial ledger and transaction executor built in Rust.
+### 🚀 Ultra-High Performance Ledger for Modern Finance
 
-## Overview
+A high-performance, durable, and crash-consistent financial ledger and transaction executor built in Rust, capable of processing **6.6 Million+ transactions per second** with **nanosecond-level latency**.
 
-Roda-Ledger is designed for low-latency, high-throughput financial applications. It utilizes a pipelined architecture to
-maximize hardware efficiency while ensuring strict transaction ordering and durability. It is built to handle millions
-of transactions per second with microsecond-level latency.
+---
 
-## Key Features
+## What is Roda-Ledger?
 
-- **High Performance:** Pipelined execution model optimized for modern CPU architectures.
-- **Strict Durability:** Write-Ahead Logging (WAL) ensures every transaction is persisted before confirmation.
-- **Crash Consistency:** Automatic state recovery via snapshot loading and WAL replay.
-- **Customizable:** Use the built-in `Operation` enum for standard financial transactions or define multi-step `Complex` atomic operations.
-- **Thread-Safe:** Lock-free communication between pipeline stages.
+Roda-Ledger is a specialized database engine designed for recording and executing financial transactions with industry-leading performance. It serves as a high-performance "source of truth" for account balances, providing strict durability, deterministic execution, and the reliability required for mission-critical financial systems.
 
-## Architecture: Pipelined Execution
+### Target Use Cases
+- **Core Banking**: High-volume retail and investment banking ledger systems.
+- **Crypto-Exchanges**: Real-time matching engines and wallet management.
+- **Payment Gateways**: High-volume transaction clearing and settlement.
+- **Gaming Economies**: Managing in-game currencies and item trades at scale.
+- **HFT Systems**: Low-latency risk management and position tracking.
 
-Roda-Ledger uses a "Core-Per-Stage" model, utilizing asynchronous pipelining and lock-free `ArrayQueue`s to eliminate
-thread contention and maximize mechanical sympathy.
+---
 
-1. **Sequencer (Core 0):** The entry point. Assigns unique, monotonic IDs to incoming transactions and manages the
-   ingestion interface.
-2. **Transactor (Core 1):** The deterministic engine. Performs all business logic, balance checks, and state
-   transitions. It maintains a hot cache of the ledger state in memory.
-3. **WAL Storer (Core 2):** The durability layer. Responsible for writing transactions to the Write-Ahead Log (WAL) on
-   disk.
-4. **Snapshotter (Core 3):** The archival layer. Periodically takes snapshots of the ledger state to optimize recovery
-   and manage WAL growth.
+## Why Roda-Ledger?
 
-For a deep dive into the architecture, see [Design.md](docs/Design.md) and our [Architectural Decision Records](docs/adr/).
+Roda-Ledger is built for scale. While traditional databases struggle with the lock contention of high-frequency ledger updates, Roda-Ledger's architecture allows it to outpace everything in its class.
 
-## Core Components
+### The "Plus" (Strengths)
+- **🚀 Industry-Leading Throughput**: Process over **6.6 Million transactions per second** (TPS) on CX33 server at Hetzner.
+- **⏱️ Predictable Low Latency**: Nanosecond to microsecond level execution times, ensuring your system never bottlenecks.
+- **💾 Strict Durability**: Every transaction is persisted via Write-Ahead Logging (WAL) before confirmation—zero data loss.
+- **⚛️ Atomic Composite Operations**: Perform multi-step transfers (e.g., Transfer + Fee) as a single atomic unit.
+- **🔄 Crash Consistency**: Automatic state recovery from snapshots and WAL replay after a crash.
+- **🛠️ Flexible Integration**: Run as a standalone gRPC server or embed it as a Rust library.
 
-### Ledger
+### The "Minus" (Trade-offs)
+- **Single-Node Focus**: Optimized for vertical scaling; currently operates as a single-leader instance.
+- **Memory-Bound**: For peak performance, the "hot" state (account balances) should fit in RAM.
+- **Specialized Engine**: Not a general-purpose database; designed specifically for financial ledger operations.
 
-The `Ledger` is the primary interface. It coordinates the pipeline stages and provides methods for submitting
-transactions and retrieving balances.
+---
 
-```rust
-use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::transaction::Operation;
+## ⚡ Quick Start: Server Mode (Docker)
 
-let config = LedgerConfig {
-    location: Some("ledger_data".to_string()),
-    in_memory: false,
-    ..Default::default()
-};
+The fastest way to deploy Roda-Ledger is using the official Docker image.
 
-let mut ledger = Ledger::new(config);
-ledger.start();
-
-// Submit a transaction (Deposit)
-let account_id = 1;
-let tx_id = ledger.submit(Operation::Deposit { 
-    account: account_id, 
-    amount: 100, 
-    user_ref: 0 
-});
-
-// Wait for the transaction to be fully processed across all pipeline stages
-ledger.wait_for_transaction(tx_id);
-
-// Retrieve the resulting balance
-let balance = ledger.get_balance(account_id);
+### 1. Run the Server
+```bash
+docker run -p 50051:50051 -v $(pwd)/data:/data tislib/roda-ledger:latest
 ```
 
-### Operations
+### 2. Interact via gRPC
+Use `grpcurl` to submit operations:
 
-Roda-Ledger uses a concrete `Operation` enum for all interactions. It supports `Deposit`, `Withdrawal`, `Transfer`, `Composite`, and `Named` operations.
-
-```rust
-use roda_ledger::transaction::{Operation, CompositeOperation, Step, CompositeOperationFlags};
-use smallvec::smallvec;
-
-// 1. Simple Deposit
-ledger.submit(Operation::Deposit { account: 1, amount: 1000, user_ref: 0 });
-
-// 2. Simple Transfer
-ledger.submit(Operation::Transfer { from: 1, to: 2, amount: 500, user_ref: 0 });
-
-// 3. Composite Atomic Operation (e.g., Transfer with a Fee)
-ledger.submit(Operation::Composite(Box::new(CompositeOperation {
-    steps: smallvec![
-        Step::Credit { account_id: 1, amount: 105 }, // Sender pays amount + fee
-        Step::Debit  { account_id: 2, amount: 100 }, // Receiver gets amount
-        Step::Debit  { account_id: 0, amount: 5   }, // System gets fee
-    ],
-    flags: CompositeOperationFlags::CHECK_NEGATIVE_BALANCE,
-    user_ref: 12345,
-})));
+**Deposit Funds:**
+```bash
+grpcurl -plaintext -d '{"deposit": {"account": 1, "amount": "1000", "user_ref": "123"}}' \
+  localhost:50051 roda.ledger.v1.Ledger/SubmitOperation
 ```
 
-## Durability, Persistence, and Crash Recovery
+**Get Balance:**
+```bash
+grpcurl -plaintext -d '{"account_id": 1}' \
+  localhost:50051 roda.ledger.v1.Ledger/GetBalance
+```
 
-Roda-Ledger is built to be "crash-safe" by design, ensuring that once a transaction is confirmed as committed, it will
-never be lost.
+---
 
-- **Write-Ahead Log (WAL):** Every transaction is appended to a persistent, append-only log on disk before it is marked
-  as `Committed`.
-- **Snapshots:** To prevent the WAL from growing indefinitely and to speed up startup, the system periodically takes
-  snapshots of all account balances.
-- **Persistence:** You can choose between full persistence (on-disk) or high-performance in-memory mode via
-  `LedgerConfig`.
-- **Crash Recovery:** Upon restart, Roda-Ledger automatically:
-    1. Identifies the latest consistent snapshot.
-    2. Loads all balances from that snapshot.
-    3. Replays all transactions from the WAL that occurred *after* the snapshot was taken.
-    4. Resumes normal operation from the exact point where it left off.
+## 🦀 Quick Start: Library Mode (Rust)
 
-## Benchmarks
+Integrate Roda-Ledger directly into your Rust application for maximum performance.
 
-Roda-Ledger is highly optimized for throughput and latency. Below are the results from the `wallet_bench`:
-
-| Operation           | Latency (Avg) | Throughput (Avg)      |
-|:--------------------|:--------------|:----------------------|
-| **Wallet Deposit**  | 150.59 ns     | **6.64 Million tx/s** |
-| **Wallet Transfer** | 165.61 ns     | **6.04 Million tx/s** |
-
-*Benchmarks performed using Criterion.rs with persistence enabled (WAL active).*
-
-## Stress Testing Performance
-
-The system has been extensively stress-tested across various scenarios. Below are some highlights from the latest reports:
-
-- **Maximum Throughput:** Reached up to **5.5 Million TPS** during high-contention stress tests.
-- **Ultra-Low Latency:** Achieved as low as **102ns** mean latency during load ramp-up.
-- **Sustained Performance:** Maintains over **650K TPS** with nanosecond-level latency in long-running stability tests.
-
-For detailed reports and more scenarios, see the [Stress Testing Reports](docs/reporting/README.md).
-
-## Getting Started
-
-Add Roda-Ledger to your `Cargo.toml`:
-
+### 1. Add Dependency
+Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 roda-ledger = { git = "https://github.com/tislib/roda-ledger" }
 ```
 
-Check out the [examples](examples/) and [tests](tests/) directories for more examples of how to use the ledger and its features.
+### 2. Basic Usage
+```rust
+use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::transaction::Operation;
+
+fn main() {
+    // Initialize with default config
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    ledger.start();
+
+    // Submit a deposit
+    let tx_id = ledger.submit(Operation::Deposit { 
+        account: 1, 
+        amount: 1000, 
+        user_ref: 0 
+    });
+
+    // Wait for the transaction to be persisted (WAL)
+    ledger.wait_for_transaction(tx_id);
+
+    // Retrieve balance
+    let balance = ledger.get_balance(1);
+    println!("Account 1 balance: {}", balance);
+}
+```
+
+---
+
+## Key Features
+
+- **Pipelined Architecture**: Separates Sequencing, Execution, Persistence, and Snapshotting into dedicated CPU cores to eliminate lock contention.
+- **Zero-Sum Invariant**: Ensures that value is never created or destroyed; every credit is balanced by a corresponding debit.
+- **Complex Operations**: Support for `Composite` operations allowing complex business logic within a single transaction.
+- **Lock-Free Communication**: Uses high-speed `ArrayQueue`s for inter-stage communication.
+
+## Architecture
+
+Roda-Ledger utilizes a **Core-Per-Stage** model to maximize mechanical sympathy:
+1. **Sequencer**: Assigns monotonic IDs and manages ingestion.
+2. **Transactor**: Single-threaded deterministic execution engine (No locks needed!).
+3. **WAL Storer**: Handles high-speed disk persistence.
+4. **Snapshotter**: Periodically captures state for fast recovery.
+
+Detailed docs: [Benchmarks](docs/benchmarks.md) | [Architecture & Design](docs/Design.md) | [Consistency Model](docs/operations_consistency.md)
+
+## Performance Benchmarks
+
+| Operation | Latency (Avg) | Throughput (Avg) |
+| :--- | :--- | :--- |
+| **Wallet Deposit** | 198 ns | **5.0 Million tx/s** |
+| **Wallet Transfer** | 151 ns | **6.6 Million tx/s** |
+
+*Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/benchmarks.md](docs/benchmarks.md)*
+
+---
+
+## The Road Ahead
+
+Roda-Ledger is evolving from a high-performance core into a full-featured distributed financial infrastructure.
+
+- **🌐 Distribution via Raft**: High availability and horizontal read scalability through a Raft-based cluster mode.
+- **🏗️ Account Hierarchies**: Support for complex sub-account structures and parent-child balance aggregation.
+- **⚡ WASM Runtime**: Sandbox for user-defined transaction logic, allowing custom business rules to run at native speeds.
+- **🛡️ Extreme Resilience**: Continued hardening with advanced crash-simulations (OOMKill, MultiCrash) and checksum-validated recovery.
+
+---
 
 ## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Apache License 2.0. See [LICENSE](LICENSE) for details.

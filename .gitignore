@@ -15,4 +15,5 @@ target
 
 .idea/
 **/wal.bin
+**/snapshot.bin
 dev/
