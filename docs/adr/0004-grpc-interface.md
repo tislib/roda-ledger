@@ -1,8 +1,10 @@
 # ADR-004: gRPC External Interface
 
-**Status:** Proposed  
+**Status:** Accepted  
 **Date:** 2026-03-29  
 **Author:** Taleh Ibrahimli
+
+---
 
 ## Context
 
