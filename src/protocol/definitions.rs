@@ -1,5 +1,4 @@
 use crate::balance::Balance;
-use crate::transaction::TransactionDataType;
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -33,14 +32,9 @@ pub struct BatchResponse {
     pub batch_size: u32,
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
-pub struct RegisterTransactionRequest<Data>
-where
-    Data: TransactionDataType,
-{
-    pub data: Data,
-}
+pub struct RegisterTransactionRequest {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]

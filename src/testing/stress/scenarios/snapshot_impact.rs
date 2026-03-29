@@ -3,7 +3,7 @@ use crate::testing::reporting::{Reporter, RunResult, WorkloadMetrics};
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
 use crate::testing::stress::scenarios::scenario::Scenario;
 use crate::testing::stress::workload::{Limit, Power, RunConfig, Workload};
-use crate::wallet::transaction::WalletTransaction;
+use crate::transaction::Operation;
 use std::error::Error;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -80,7 +80,11 @@ impl Scenario for SnapshotImpactScenario {
 
             let _ = workload.run(config, |_| {
                 let account_id = rand::random::<u64>() % accounts_size;
-                WalletTransaction::deposit(account_id, 100)
+                Operation::Deposit {
+                    account: account_id,
+                    amount: 100,
+                    user_ref: 0,
+                }
             });
         });
 

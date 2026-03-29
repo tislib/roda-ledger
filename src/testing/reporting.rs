@@ -1,6 +1,5 @@
 use crate::ledger::Ledger;
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
-use crate::wallet::transaction::WalletTransaction;
 use arc_swap::ArcSwap;
 use roda_latency_tracker::latency_measurer::{LatencyMeasurer, LatencyStats as RodaLatencyStats};
 use serde::Serialize;
@@ -176,7 +175,7 @@ impl JsonOutput {
 pub struct Reporter {
     scenario_name: String,
     duration: Duration,
-    ledger: Arc<Ledger<WalletTransaction>>,
+    ledger: Arc<Ledger>,
     metrics: Arc<WorkloadMetrics>,
     metrics_over_time: Vec<TimeMetric>,
 
@@ -194,11 +193,7 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    pub fn new(
-        scenario_name: String,
-        duration: Duration,
-        ledger: Arc<Ledger<WalletTransaction>>,
-    ) -> Self {
+    pub fn new(scenario_name: String, duration: Duration, ledger: Arc<Ledger>) -> Self {
         let metrics = Arc::new(WorkloadMetrics::new(duration));
         let mut sys = System::new_all();
         sys.refresh_all();

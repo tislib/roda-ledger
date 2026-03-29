@@ -1,55 +1,82 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::wallet::{Wallet, WalletConfig};
+use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::transaction::{ComplexOperation, ComplexOperationFlags, Operation, Step};
+use smallvec::smallvec;
 use std::time::Duration;
 
 fn wallet_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("wallet");
+    let mut group = c.benchmark_group("ledger");
     group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(60));
     let mut i = 0;
 
     group.bench_function("deposit", |b| {
-        let mut wallet = Wallet::new_with_config(WalletConfig {
-            in_memory: false,
-            queue_size: 1024,
-            ..Default::default()
-        });
-        wallet.start();
-
+        let mut ledger = Ledger::new(LedgerConfig::temp());
+        ledger.start();
         b.iter(|| {
             i += 1;
-            wallet.deposit(i % 1000, 100);
+            ledger.submit(Operation::Deposit {
+                account: i % 1000,
+                amount: 100,
+                user_ref: 0,
+            });
         });
-
-        wallet.destroy();
     });
 
     for account_count in [1000, 1_000_000, 10_000_000, 50_000_000] {
-        let mut wallet = Wallet::new_with_config(WalletConfig {
-            in_memory: false,
-            queue_size: 1024,
+        let mut ledger = Ledger::new(LedgerConfig {
             max_accounts: account_count as usize,
-            ..Default::default()
+            ..LedgerConfig::temp()
         });
-        wallet.start();
+        ledger.start();
 
         // Pre-fill some balances
+        let mut last_tx_id = 0;
         for i in 0..account_count {
-            wallet.deposit(i, 10000);
+            last_tx_id = ledger.submit(Operation::Deposit {
+                account: i,
+                amount: 10000,
+                user_ref: 0,
+            });
         }
+        ledger.wait_for_transaction(last_tx_id);
 
         group.bench_function(format!("transfer_{}", account_count), |b| {
-            wallet.wait_pending_operations();
-
             b.iter(|| {
                 i += 1;
-                let from_account = rand::random::<u64>() % account_count;
-                let to_account = (i + account_count / 2) % account_count;
-                wallet.transfer(from_account, to_account, 10);
+                let from_account = 1 + rand::random::<u64>() % account_count;
+                let to_account = 1 + (i + account_count / 2) % account_count;
+                ledger.submit(Operation::Transfer {
+                    from: from_account,
+                    to: to_account,
+                    amount: 10,
+                    user_ref: 0,
+                });
             });
         });
-        wallet.destroy();
     }
+
+    group.bench_function("complex_operation", |b| {
+        let mut ledger = Ledger::new(LedgerConfig::temp());
+        ledger.start();
+        b.iter(|| {
+            i += 1;
+            ledger.submit(Operation::Complex(Box::new(ComplexOperation {
+                steps: smallvec![
+                    Step::Credit {
+                        account_id: 0, // SYSTEM_ACCOUNT_ID
+                        amount: 100
+                    },
+                    Step::Debit {
+                        account_id: i % 1000,
+                        amount: 100
+                    },
+                ],
+                flags: ComplexOperationFlags::empty(),
+                user_ref: 12345,
+            })));
+        });
+    });
 
     group.finish();
 }

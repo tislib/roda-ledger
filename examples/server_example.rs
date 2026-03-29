@@ -1,7 +1,7 @@
 use roda_ledger::client::Client;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::wallet::transaction::WalletTransaction;
+use roda_ledger::transaction::Operation;
 use std::time::Duration;
 
 #[tokio::main]
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 2. Start the Server in a background task
-    let server = Server::<WalletTransaction>::new(server_config);
+    let server = Server::new(server_config);
 
     let _server_handle = std::thread::spawn(move || {
         if let Err(e) = server.run() {
@@ -31,15 +31,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Give the server a moment to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // 3. Connect as a client using our new Client implementation
-    let mut client = Client::<WalletTransaction>::new(addr);
+    // 3. Connect as a client
+    let mut client = Client::new(addr);
     println!("Client initialized");
 
     let account_id = 1001;
     let deposit_amount = 5000;
 
     let tx_id = client
-        .register_transaction(WalletTransaction::deposit(account_id, deposit_amount))
+        .register_transaction(Operation::Deposit {
+            account: account_id,
+            amount: deposit_amount,
+            user_ref: 0,
+        })
         .await?;
     println!(
         "Sent deposit request for account {} with amount {}. Transaction ID: {}",
@@ -51,11 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transfer_amount = 2000;
 
     let tx_id_2 = client
-        .register_transaction(WalletTransaction::transfer(
-            account_id,
-            to_account_id,
-            transfer_amount,
-        ))
+        .register_transaction(Operation::Transfer {
+            from: account_id,
+            to: to_account_id,
+            amount: transfer_amount,
+            user_ref: 0,
+        })
         .await?;
     println!(
         "Sent transfer request from {} to {} with amount {}. Transaction ID: {}",

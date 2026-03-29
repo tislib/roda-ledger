@@ -1,6 +1,59 @@
 use crate::balance::Balance;
 use crate::entities::{EntryKind, FailReason, TxEntry};
-use bytemuck::{Pod, Zeroable};
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Operation {
+    Transfer {
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+    },
+    Deposit {
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+    },
+    Withdrawal {
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+    },
+    Complex(Box<ComplexOperation>),
+}
+
+impl Operation {
+    pub fn user_ref(&self) -> u64 {
+        match self {
+            Operation::Transfer { user_ref, .. } => *user_ref,
+            Operation::Deposit { user_ref, .. } => *user_ref,
+            Operation::Withdrawal { user_ref, .. } => *user_ref,
+            Operation::Complex(op) => op.user_ref,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ComplexOperation {
+    pub steps: SmallVec<[Step; 8]>,
+    pub flags: ComplexOperationFlags,
+    pub user_ref: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Step {
+    Credit { account_id: u64, amount: u64 },
+    Debit { account_id: u64, amount: u64 },
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    pub struct ComplexOperationFlags: u64 {
+        const CHECK_NEGATIVE_BALANCE = 0b00000001;
+    }
+}
 
 pub struct TransactionExecutionContext<'a> {
     pub(crate) balances: &'a mut [Balance],
@@ -127,30 +180,14 @@ impl<'a> TransactionExecutionContext<'a> {
     }
 }
 
-pub trait TransactionDataType: Pod + Zeroable + Copy + Send + Sync {
-    fn process(&self, ctx: &mut TransactionExecutionContext<'_>);
-    fn user_ref(&self) -> u64 {
-        0
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct Transaction<Data: TransactionDataType> {
+pub struct Transaction {
     pub id: u64,
-    pub data: Data,
+    pub operation: Operation,
 }
 
-unsafe impl<Data: TransactionDataType> Pod for Transaction<Data> {}
-unsafe impl<Data: TransactionDataType> Zeroable for Transaction<Data> {}
-
-impl<Data: TransactionDataType> Transaction<Data> {
-    pub fn new(data: Data) -> Self {
-        Self { id: 0, data }
-    }
-
-    pub fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
-        self.data.process(ctx);
+impl Transaction {
+    pub fn new(operation: Operation) -> Self {
+        Self { id: 0, operation }
     }
 }
 
@@ -203,27 +240,20 @@ impl TransactionStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
-    use bytemuck::{Pod, Zeroable};
+    use crate::transaction::{Operation, Transaction, TransactionExecutionContext};
 
     #[test]
     fn it_works() {
-        #[repr(transparent)]
-        #[derive(Copy, Clone, Debug, Default, Pod, Zeroable, PartialEq)]
-        struct SimpleTransactionDataType(u64);
-
-        impl TransactionDataType for SimpleTransactionDataType {
-            fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
-                ctx.credit(0, 100);
-                ctx.debit(1, 100);
-            }
-        }
-
-        let tr1 = Transaction::new(SimpleTransactionDataType(0));
+        let tr1 = Transaction::new(Operation::Deposit {
+            account: 1,
+            amount: 100,
+            user_ref: 0,
+        });
 
         let mut balances = vec![0; 100];
-        let mut ctx = TransactionExecutionContext::new(&mut balances);
+        let _ctx = TransactionExecutionContext::new(&mut balances);
 
-        tr1.process(&mut ctx);
+        // process is now handled in Transactor
+        assert_eq!(tr1.operation.user_ref(), 0);
     }
 }

@@ -2,7 +2,7 @@ use crate::balance::Balance;
 use crate::entities::WalEntry;
 use crate::sequencer::Sequencer;
 use crate::snapshot::Snapshot;
-use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
+use crate::transaction::{Operation, Transaction, TransactionStatus};
 use crate::transactor::Transactor;
 use crate::wal::Wal;
 use crossbeam_queue::ArrayQueue;
@@ -16,6 +16,7 @@ pub struct LedgerConfig {
     pub queue_size: usize,
     pub location: Option<String>,
     pub in_memory: bool,
+    pub temporary: bool, // data will be deleted after the ledger is dropped
     pub snapshot_interval: std::time::Duration,
 }
 
@@ -26,21 +27,45 @@ impl Default for LedgerConfig {
             queue_size: 1024,
             location: None,
             in_memory: false,
+            temporary: false,
             snapshot_interval: std::time::Duration::from_secs(600),
         }
     }
 }
 
-pub struct Ledger<Data: TransactionDataType> {
-    sequencer: Sequencer<Data>,
-    transactor: Transactor<Data>,
+impl LedgerConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn temp() -> Self {
+        let mut dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        dir.push(format!("roda-ledger-{}", nanos));
+        let _ = std::fs::create_dir_all(&dir);
+
+        Self {
+            location: Some(dir.to_string_lossy().to_string()),
+            temporary: true,
+            ..Default::default()
+        }
+    }
+}
+
+pub struct Ledger {
+    sequencer: Sequencer,
+    transactor: Transactor,
     wal: Wal,
     snapshot: Snapshot,
     running: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
+    config: LedgerConfig,
 }
 
-impl<Data: TransactionDataType> Ledger<Data> {
+impl Ledger {
     pub fn new(config: LedgerConfig) -> Self {
         let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
         let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> =
@@ -50,6 +75,7 @@ impl<Data: TransactionDataType> Ledger<Data> {
         let running = Arc::new(AtomicBool::new(true));
 
         Self {
+            config: config.clone(),
             sequencer: Sequencer::new(sequencer_transactor_queue.clone()),
             transactor: Transactor::new(
                 sequencer_transactor_queue,
@@ -77,7 +103,8 @@ impl<Data: TransactionDataType> Ledger<Data> {
         }
     }
 
-    pub fn submit(&self, transaction: Transaction<Data>) -> u64 {
+    pub fn submit(&self, operation: Operation) -> u64 {
+        let transaction = Transaction::new(operation);
         self.sequencer.submit(transaction)
     }
 
@@ -192,11 +219,17 @@ impl<Data: TransactionDataType> Ledger<Data> {
     }
 }
 
-impl<Data: TransactionDataType> Drop for Ledger<Data> {
+impl Drop for Ledger {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();
+        }
+
+        if self.config.temporary
+            && let Some(loc) = self.config.location.clone()
+        {
+            let _ = std::fs::remove_dir_all(loc);
         }
     }
 }

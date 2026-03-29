@@ -1,43 +1,52 @@
-use roda_ledger::wallet::{Wallet, WalletConfig};
+use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::transaction::Operation;
 
 fn main() {
-    // 1. Initialize the Wallet with a custom configuration
+    // 1. Initialize the Ledger with a custom configuration
     // We'll use in-memory mode for this example to avoid creating files.
-    let config = WalletConfig {
+    let config = LedgerConfig {
         in_memory: true,
         queue_size: 1024,
         ..Default::default()
     };
 
-    println!("Starting Roda-Ledger Wallet example...");
-    let mut wallet = Wallet::new_with_config(config);
-    wallet.start();
+    println!("Starting Roda-Ledger example...");
+    let mut ledger = Ledger::new(config);
+    ledger.start();
 
     // 2. Perform some operations
     let account_a = 101;
     let account_b = 102;
 
     println!("Depositing $1000 into account {}...", account_a);
-    wallet.deposit(account_a, 1000);
+    ledger.submit(Operation::Deposit {
+        account: account_a,
+        amount: 1000,
+        user_ref: 0,
+    });
 
     println!("Transferring $400 from {} to {}...", account_a, account_b);
-    let tx_id = wallet.transfer(account_a, account_b, 400);
+    let tx_id = ledger.submit(Operation::Transfer {
+        from: account_a,
+        to: account_b,
+        amount: 400,
+        user_ref: 0,
+    });
 
     // 3. Wait for transactions to be fully processed
     // Roda-Ledger is pipelined, so operations are asynchronous.
-    // wait_pending_operations() ensures all submitted transactions reach the Snapshot phase.
     println!("Waiting for transactions to complete...");
-    wallet.wait_pending_operations();
+    ledger.wait_for_transaction(tx_id);
 
     // 4. Check balances
-    let balance_a = wallet.get_balance(account_a);
-    let balance_b = wallet.get_balance(account_b);
+    let balance_a = ledger.get_balance(account_a);
+    let balance_b = ledger.get_balance(account_b);
 
     println!("Account {} balance: ${}", account_a, balance_a);
     println!("Account {} balance: ${}", account_b, balance_b);
 
     // 5. Inspect transaction status
-    let status = wallet.get_transaction_status(tx_id);
+    let status = ledger.get_transaction_status(tx_id);
     println!("Transfer transaction status: {:?}", status);
 
     if status.is_committed() {
@@ -45,6 +54,6 @@ fn main() {
     }
 
     // 6. Cleanup
-    wallet.destroy();
+    // Ledger is dropped automatically when it goes out of scope, stopping its threads.
     println!("Example completed successfully.");
 }

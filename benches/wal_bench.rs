@@ -1,21 +1,10 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
-use roda_ledger::transaction::{TransactionDataType, TransactionExecutionContext};
 use roda_ledger::wal::Wal;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct BenchData {
-    amount: u64,
-}
-
-impl TransactionDataType for BenchData {
-    fn process(&self, _ctx: &mut TransactionExecutionContext<'_>) {}
-}
 
 fn wal_bench(c: &mut Criterion) {
     let batch_size = 10_000;

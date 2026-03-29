@@ -1,6 +1,5 @@
 use crate::ledger::{Ledger, LedgerConfig};
 use crate::protocol::*;
-use crate::transaction::TransactionDataType;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -23,12 +22,12 @@ impl Default for ServerConfig {
     }
 }
 
-pub struct Server<Data: TransactionDataType> {
+pub struct Server {
     config: ServerConfig,
-    ledger: Arc<Ledger<Data>>,
+    ledger: Arc<Ledger>,
 }
 
-impl<Data: TransactionDataType> Server<Data> {
+impl Server {
     pub fn new(config: ServerConfig) -> Self {
         let mut ledger = Ledger::new(config.ledger_config.clone());
         ledger.start();
