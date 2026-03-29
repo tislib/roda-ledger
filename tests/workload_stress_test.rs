@@ -2,7 +2,7 @@ use roda_ledger::ledger::Ledger;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::testing::stress::direct_workload_client::DirectWorkloadClient;
 use roda_ledger::testing::stress::workload::{Limit, Power, RunConfig, Workload};
-use roda_ledger::wallet::transaction::WalletTransaction;
+use roda_ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ fn test_workload_deposit_sustain() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
+    let mut ledger = Ledger::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -27,7 +27,11 @@ fn test_workload_deposit_sustain() {
     };
 
     workload
-        .run(config, |_| WalletTransaction::deposit(1001, 100))
+        .run(config, |_| Operation::Deposit {
+            account: 1001,
+            amount: 100,
+            user_ref: 0,
+        })
         .expect("Deposit failed");
 
     // Wait for processing
@@ -44,7 +48,7 @@ fn test_workload_transfer_spike_direct() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
+    let mut ledger = Ledger::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -58,8 +62,10 @@ fn test_workload_transfer_spike_direct() {
         power: Power::Full,
     };
     workload
-        .run(config_dep, |idx| {
-            WalletTransaction::deposit(accounts[idx as usize % accounts.len()], 1_000_000_000)
+        .run(config_dep, |idx| Operation::Deposit {
+            account: accounts[idx as usize % accounts.len()],
+            amount: 1_000_000_000,
+            user_ref: 0,
         })
         .expect("Initial deposit failed");
 
@@ -72,7 +78,12 @@ fn test_workload_transfer_spike_direct() {
         power: Power::Full,
     };
     workload
-        .run(config, |_| WalletTransaction::transfer(1001, 1002, 10))
+        .run(config, |_| Operation::Transfer {
+            from: 1001,
+            to: 1002,
+            amount: 10,
+            user_ref: 0,
+        })
         .expect("Spike failed");
 }
 
@@ -84,7 +95,7 @@ fn test_workload_peak_load_direct() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
+    let mut ledger = Ledger::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -116,7 +127,15 @@ fn test_workload_peak_load_direct() {
         };
 
         let (_, count) = workload
-            .run_step(config, |_| WalletTransaction::deposit(2005, 1), total_count)
+            .run_step(
+                config,
+                |_| Operation::Deposit {
+                    account: 2005,
+                    amount: 1,
+                    user_ref: 0,
+                },
+                total_count,
+            )
             .expect("Step failed");
         total_count += count;
     }
@@ -130,7 +149,7 @@ fn test_workload_range_selector_direct() {
         ..Default::default()
     };
 
-    let mut ledger = Ledger::<WalletTransaction>::new(ledger_config);
+    let mut ledger = Ledger::new(ledger_config);
     ledger.start();
     let ledger = Arc::new(ledger);
 
@@ -145,7 +164,11 @@ fn test_workload_range_selector_direct() {
     workload
         .run(config, |idx| {
             let account_id = 3000 + (idx % 11);
-            WalletTransaction::deposit(account_id, 100)
+            Operation::Deposit {
+                account: account_id,
+                amount: 100,
+                user_ref: 0,
+            }
         })
         .expect("Range deposit failed");
 }

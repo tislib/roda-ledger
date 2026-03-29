@@ -1,4 +1,5 @@
-use roda_ledger::wallet::{Wallet, WalletConfig};
+use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::transaction::Operation;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -15,19 +16,27 @@ fn test_snapshot_creation() {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    let config = WalletConfig {
+    let config = LedgerConfig {
         location: Some(temp_dir.to_string()),
         in_memory: false,
         snapshot_interval: Duration::from_millis(500), // Fast snapshots for testing
         ..Default::default()
     };
 
-    let mut wallet = Wallet::new_with_config(config);
-    wallet.start();
+    let mut ledger = Ledger::new(config);
+    ledger.start();
 
-    wallet.deposit(1, 100);
-    wallet.deposit(2, 200);
-    wallet.wait_pending_operations();
+    ledger.submit(Operation::Deposit {
+        account: 1,
+        amount: 100,
+        user_ref: 0,
+    });
+    let last_id = ledger.submit(Operation::Deposit {
+        account: 2,
+        amount: 200,
+        user_ref: 0,
+    });
+    ledger.wait_for_transaction(last_id);
 
     // Wait for a snapshot to be created
     std::thread::sleep(Duration::from_secs(1));
@@ -42,7 +51,7 @@ fn test_snapshot_creation() {
 
     // Snapshot format now:
     // Header: 3 * u64 = 24 bytes: checkpoint_id, last_transaction_id, last_wal_position
-    // Then entries: each is u64 (8 bytes) + WalletBalance (8 bytes) = 16 bytes per entry.
+    // Then entries: each is u64 (8 bytes) + Balance (8 bytes) = 16 bytes per entry.
 
     assert_eq!(
         buffer.len(),
@@ -75,8 +84,12 @@ fn test_snapshot_creation() {
     assert_eq!(acc2_bal_first, 200);
 
     // Let's do another deposit and wait for next snapshot
-    wallet.deposit(1, 50);
-    wallet.wait_pending_operations();
+    let last_id = ledger.submit(Operation::Deposit {
+        account: 1,
+        amount: 50,
+        user_ref: 0,
+    });
+    ledger.wait_for_transaction(last_id);
 
     // Wait for next snapshot
     std::thread::sleep(Duration::from_secs(1));

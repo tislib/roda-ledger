@@ -1,6 +1,5 @@
 use crate::testing::reporting::WorkloadMetrics;
-use crate::transaction::Transaction;
-use crate::wallet::transaction::WalletTransaction;
+use crate::transaction::Operation;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +24,7 @@ pub struct RunConfig {
 }
 
 pub trait WorkloadClient: Send + Sync {
-    fn submit(&self, tx: Transaction<WalletTransaction>);
+    fn submit(&self, operation: Operation);
 }
 
 /// Workload is designed to execute transactions according to the given configuration.
@@ -60,7 +59,7 @@ where
         operation_gen: F,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
-        F: FnMut(u64) -> WalletTransaction + Send,
+        F: FnMut(u64) -> Operation + Send,
     {
         self.run_step(config, operation_gen, 0).map(|_| ())
     }
@@ -73,7 +72,7 @@ where
         offset: u64,
     ) -> RunStepResult
     where
-        F: FnMut(u64) -> WalletTransaction + Send,
+        F: FnMut(u64) -> Operation + Send,
     {
         let start_time = Instant::now();
         let mut count = 0;
@@ -91,11 +90,10 @@ where
                     break;
                 }
 
-                let tx_data = operation_gen(offset + count);
-                let tx = Transaction::new(tx_data);
+                let operation = operation_gen(offset + count);
 
                 let start = Instant::now();
-                self.client.submit(tx);
+                self.client.submit(operation);
                 let elapsed = start.elapsed();
 
                 if let Some(metrics) = &self.metrics {
@@ -120,11 +118,10 @@ where
                         break;
                     }
 
-                    let tx_data = operation_gen(offset + count);
-                    let tx = Transaction::new(tx_data);
+                    let operation = operation_gen(offset + count);
 
                     let start = Instant::now();
-                    self.client.submit(tx);
+                    self.client.submit(operation);
                     let elapsed = start.elapsed();
 
                     if let Some(metrics) = &self.metrics {

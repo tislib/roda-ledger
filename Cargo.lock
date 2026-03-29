@@ -55,6 +55,9 @@ name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bumpalo"
@@ -708,6 +711,7 @@ name = "roda-ledger"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bitflags",
  "bytemuck",
  "criterion",
  "crossbeam-queue",
@@ -716,6 +720,7 @@ dependencies = [
  "roda-latency-tracker",
  "serde",
  "serde_json",
+ "smallvec",
  "sysinfo",
  "tokio",
 ]
@@ -805,6 +810,9 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "socket2"

@@ -1,5 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::wallet::{Wallet, WalletConfig};
+use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::transaction::Operation;
 use std::fs;
 
 fn wallet_deposit_bench(c: &mut Criterion) {
@@ -7,24 +8,31 @@ fn wallet_deposit_bench(c: &mut Criterion) {
     let batch_size = 100_000;
     let operation_count = 2;
 
-    let mut group = c.benchmark_group("wallet_deposit");
+    let mut group = c.benchmark_group("ledger_deposit");
     group.throughput(Throughput::Elements(operation_count * batch_size as u64));
 
     group.bench_function("deposit", |b| {
-        let mut wallet = Wallet::new_with_config(WalletConfig {
+        let mut ledger = Ledger::new(LedgerConfig {
             queue_size: 1024,
+            temporary: true,
             ..Default::default()
         });
-        wallet.start();
+        ledger.start();
 
         b.iter(|| {
             for _ in 0..batch_size {
-                wallet.deposit(1, 100);
-                wallet.withdraw(1, 100);
+                ledger.submit(Operation::Deposit {
+                    account: 1,
+                    amount: 100,
+                    user_ref: 0,
+                });
+                ledger.submit(Operation::Withdrawal {
+                    account: 1,
+                    amount: 100,
+                    user_ref: 0,
+                });
             }
         });
-
-        wallet.destroy();
     });
 
     group.finish();

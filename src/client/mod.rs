@@ -1,19 +1,17 @@
 use crate::balance::Balance;
 use crate::entities::FailReason;
 use crate::protocol::*;
-use crate::transaction::{TransactionDataType, TransactionStatus};
-use std::marker::PhantomData;
+use crate::transaction::{Operation, TransactionStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub struct Client<Data: TransactionDataType> {
+pub struct Client {
     addr: String,
     stream: Option<TcpStream>,
     buf: Vec<u8>,
-    _phantom: PhantomData<Data>,
 }
 
-impl<Data: TransactionDataType> Client<Data> {
+impl Client {
     pub fn new(addr: String) -> Self {
         let max_size = (std::mem::size_of::<ProtocolHeader>()
             + std::mem::size_of::<RegisterTransactionResponse>())
@@ -24,13 +22,12 @@ impl<Data: TransactionDataType> Client<Data> {
             addr,
             stream: None,
             buf: vec![0u8; max_size],
-            _phantom: PhantomData,
         }
     }
 
     pub async fn register_transaction(
         &mut self,
-        data: Data,
+        operation: Operation,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(&self.addr).await?;
@@ -39,16 +36,16 @@ impl<Data: TransactionDataType> Client<Data> {
         }
         let stream = self.stream.as_mut().unwrap();
 
+        let payload = serde_json::to_vec(&operation)?;
         let header = ProtocolHeader {
             op_kind: OperationKind::REGISTER_TRANSACTION,
             _padding: [0; 3],
-            length: std::mem::size_of::<RegisterTransactionRequest<Data>>() as u32,
+            length: payload.len() as u32,
         };
-        let request = RegisterTransactionRequest { data };
 
         self.buf.clear();
         self.buf.extend_from_slice(bytemuck::bytes_of(&header));
-        self.buf.extend_from_slice(bytemuck::bytes_of(&request));
+        self.buf.extend_from_slice(&payload);
         stream.write_all(&self.buf).await?;
 
         let mut header_buf = [0u8; std::mem::size_of::<ProtocolHeader>()];
@@ -188,7 +185,7 @@ impl<Data: TransactionDataType> Client<Data> {
 
     pub async fn register_transactions_batch(
         &mut self,
-        transactions: Vec<Data>,
+        operations: Vec<Operation>,
     ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(&self.addr).await?;
@@ -197,7 +194,7 @@ impl<Data: TransactionDataType> Client<Data> {
         }
         let stream = self.stream.as_mut().unwrap();
 
-        let batch_size = transactions.len() as u32;
+        let batch_size = operations.len() as u32;
 
         self.buf.clear();
         // 1. Send BATCH request
@@ -211,15 +208,15 @@ impl<Data: TransactionDataType> Client<Data> {
         self.buf.extend_from_slice(bytemuck::bytes_of(&request));
 
         // 2. Send all requests
-        for data in transactions {
+        for operation in operations {
+            let payload = serde_json::to_vec(&operation)?;
             let header = ProtocolHeader {
                 op_kind: OperationKind::REGISTER_TRANSACTION,
                 _padding: [0; 3],
-                length: std::mem::size_of::<RegisterTransactionRequest<Data>>() as u32,
+                length: payload.len() as u32,
             };
-            let request = RegisterTransactionRequest { data };
             self.buf.extend_from_slice(bytemuck::bytes_of(&header));
-            self.buf.extend_from_slice(bytemuck::bytes_of(&request));
+            self.buf.extend_from_slice(&payload);
         }
         stream.write_all(&self.buf).await?;
 

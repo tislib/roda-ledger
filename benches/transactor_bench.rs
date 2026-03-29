@@ -1,26 +1,12 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
-use roda_ledger::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
+use roda_ledger::transaction::{Operation, Transaction};
 use roda_ledger::transactor::Transactor;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-
-#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct BenchData {
-    account_id: u64,
-    amount: u64,
-}
-
-impl TransactionDataType for BenchData {
-    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
-        ctx.credit(0, self.amount);
-        ctx.debit(self.account_id, self.amount);
-    }
-}
 
 fn transactor_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("transactor");
@@ -31,7 +17,7 @@ fn transactor_bench(c: &mut Criterion) {
     let outbound = Arc::new(ArrayQueue::new(1024));
     let running = Arc::new(AtomicBool::new(true));
 
-    let mut transactor = Transactor::<BenchData>::new(
+    let mut transactor = Transactor::new(
         inbound.clone(),
         outbound.clone(),
         running.clone(),
@@ -57,12 +43,14 @@ fn transactor_bench(c: &mut Criterion) {
         b.iter(|| {
             current_id += 1;
             let account_id = rand::random::<u64>() % 10_000_000;
-            let mut tx = Transaction::new(BenchData {
-                account_id,
+            let mut tx = Transaction::new(Operation::Deposit {
+                account: account_id,
                 amount: 100,
+                user_ref: 0,
             });
             tx.id = current_id;
-            while inbound.push(tx).is_err() {
+            while let Err(returned_tx) = inbound.push(tx) {
+                tx = returned_tx;
                 spin_loop();
             }
         });

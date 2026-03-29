@@ -1,14 +1,16 @@
 use crate::balance::Balance;
-use crate::entities::{EntryKind, FailReason, TxMetadata, WalEntry};
-use crate::transaction::{Transaction, TransactionDataType, TransactionExecutionContext};
+use crate::entities::{EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxMetadata, WalEntry};
+use crate::transaction::{
+    ComplexOperationFlags, Operation, Step, Transaction, TransactionExecutionContext,
+};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-pub struct Transactor<Data: TransactionDataType> {
-    inbound: Arc<ArrayQueue<Transaction<Data>>>,
+pub struct Transactor {
+    inbound: Arc<ArrayQueue<Transaction>>,
     outbound: Arc<ArrayQueue<WalEntry>>,
     last_processed_transaction_id: Arc<AtomicU64>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
@@ -17,8 +19,8 @@ pub struct Transactor<Data: TransactionDataType> {
     running: Arc<AtomicBool>,
 }
 
-pub struct TransactorRunner<Data: TransactionDataType> {
-    inbound: Arc<ArrayQueue<Transaction<Data>>>,
+pub struct TransactorRunner {
+    inbound: Arc<ArrayQueue<Transaction>>,
     outbound: Arc<ArrayQueue<WalEntry>>,
     balances: Vec<Balance>,
     last_processed_transaction_id: Arc<AtomicU64>,
@@ -26,9 +28,9 @@ pub struct TransactorRunner<Data: TransactionDataType> {
     running: Arc<AtomicBool>,
 }
 
-impl<Data: TransactionDataType> Transactor<Data> {
+impl Transactor {
     pub fn new(
-        inbound: Arc<ArrayQueue<Transaction<Data>>>,
+        inbound: Arc<ArrayQueue<Transaction>>,
         outbound: Arc<ArrayQueue<WalEntry>>,
         running: Arc<AtomicBool>,
         max_accounts: usize,
@@ -112,7 +114,7 @@ impl<Data: TransactionDataType> Transactor<Data> {
     }
 }
 
-impl<Data: TransactionDataType> TransactorRunner<Data> {
+impl TransactorRunner {
     pub fn run(&mut self) {
         let mut entries = Vec::with_capacity(16);
 
@@ -126,7 +128,60 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                     ctx.entries = entries;
                     ctx.fail_reason = FailReason::NONE;
 
-                    transaction.process(&mut ctx);
+                    match &transaction.operation {
+                        Operation::Deposit {
+                            account, amount, ..
+                        } => {
+                            ctx.debit(*account, *amount);
+                            ctx.credit(SYSTEM_ACCOUNT_ID, *amount);
+                        }
+                        Operation::Withdrawal {
+                            account, amount, ..
+                        } => {
+                            if ctx.get_balance(*account) < *amount as i64 {
+                                ctx.fail(FailReason::INSUFFICIENT_FUNDS);
+                            } else {
+                                ctx.credit(*account, *amount);
+                                ctx.debit(SYSTEM_ACCOUNT_ID, *amount);
+                            }
+                        }
+                        Operation::Transfer {
+                            from, to, amount, ..
+                        } => {
+                            if from == to {
+                                // no-op
+                            } else if ctx.get_balance(*from) < *amount as i64 {
+                                ctx.fail(FailReason::INSUFFICIENT_FUNDS);
+                            } else {
+                                ctx.credit(*from, *amount);
+                                ctx.debit(*to, *amount);
+                            }
+                        }
+                        Operation::Complex(op) => {
+                            for step in &op.steps {
+                                match step {
+                                    Step::Credit { account_id, amount } => {
+                                        ctx.credit(*account_id, *amount);
+                                    }
+                                    Step::Debit { account_id, amount } => {
+                                        ctx.debit(*account_id, *amount);
+                                    }
+                                }
+                            }
+
+                            if op
+                                .flags
+                                .contains(ComplexOperationFlags::CHECK_NEGATIVE_BALANCE)
+                            {
+                                for entry in &ctx.entries {
+                                    if ctx.get_balance(entry.account_id) < 0 {
+                                        ctx.fail(FailReason::INSUFFICIENT_FUNDS);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     fail_reason = ctx.verify();
 
@@ -151,7 +206,7 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                     let metadata = TxMetadata {
                         tx_id: transaction.id,
                         timestamp: 0, // will be written by the WAL
-                        user_ref: transaction.data.user_ref(),
+                        user_ref: transaction.operation.user_ref(),
                         entry_count: 0,
                         fail_reason,
                         _pad: [0; 6],
@@ -167,7 +222,7 @@ impl<Data: TransactionDataType> TransactorRunner<Data> {
                     let metadata = TxMetadata {
                         tx_id: transaction.id,
                         timestamp: 0, // will be written by the WAL
-                        user_ref: transaction.data.user_ref(),
+                        user_ref: transaction.operation.user_ref(),
                         entry_count: entries_tmp.len() as u8,
                         fail_reason: FailReason::NONE,
                         _pad: [0; 6],

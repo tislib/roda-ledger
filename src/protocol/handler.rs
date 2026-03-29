@@ -1,6 +1,6 @@
 use crate::ledger::Ledger;
 use crate::protocol::*;
-use crate::transaction::{Transaction, TransactionDataType, TransactionStatus};
+use crate::transaction::{Operation, TransactionStatus};
 
 pub struct ProtocolHandler {
     buffer: Vec<u8>,
@@ -23,11 +23,7 @@ impl ProtocolHandler {
         }
     }
 
-    pub fn handle_bytes<Data: TransactionDataType>(
-        &mut self,
-        data: &[u8],
-        ledger: &Ledger<Data>,
-    ) -> Vec<u8> {
+    pub fn handle_bytes(&mut self, data: &[u8], ledger: &Ledger) -> Vec<u8> {
         self.buffer.extend_from_slice(data);
         let mut all_responses = Vec::new();
 
@@ -56,18 +52,16 @@ impl ProtocolHandler {
         all_responses
     }
 
-    fn process_frame<Data: TransactionDataType>(
+    fn process_frame(
         &mut self,
         header: ProtocolHeader,
         payload: &[u8],
-        ledger: &Ledger<Data>,
+        ledger: &Ledger,
     ) -> (Option<Vec<u8>>, usize) {
         match header.op_kind {
             OperationKind::REGISTER_TRANSACTION => {
-                let req_size = std::mem::size_of::<RegisterTransactionRequest<Data>>();
-                let request: &RegisterTransactionRequest<Data> =
-                    bytemuck::from_bytes(&payload[..req_size]);
-                let tx_id = ledger.submit(Transaction::new(request.data));
+                let operation: Operation = serde_json::from_slice(payload).unwrap();
+                let tx_id = ledger.submit(operation);
 
                 let response = RegisterTransactionResponse {
                     transaction_id: tx_id,

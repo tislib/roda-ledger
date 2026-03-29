@@ -13,7 +13,7 @@ of transactions per second with microsecond-level latency.
 - **High Performance:** Pipelined execution model optimized for modern CPU architectures.
 - **Strict Durability:** Write-Ahead Logging (WAL) ensures every transaction is persisted before confirmation.
 - **Crash Consistency:** Automatic state recovery via snapshot loading and WAL replay.
-- **Customizable:** Easily define custom transaction logic and balance types.
+- **Customizable:** Use the built-in `Operation` enum for standard financial transactions or define multi-step `Complex` atomic operations.
 - **Thread-Safe:** Lock-free communication between pipeline stages.
 
 ## Architecture: Pipelined Execution
@@ -41,6 +41,7 @@ transactions and retrieving balances.
 
 ```rust
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::transaction::Operation;
 
 let config = LedgerConfig {
     location: Some("ledger_data".to_string()),
@@ -48,13 +49,16 @@ let config = LedgerConfig {
     ..Default::default()
 };
 
-// Data: Your transaction data type
-let mut ledger = Ledger::<Data>::new(config);
+let mut ledger = Ledger::new(config);
 ledger.start();
 
-// Submit a transaction
+// Submit a transaction (Deposit)
 let account_id = 1;
-let tx_id = ledger.submit(Transaction::new(Data::deposit(account_id, 100)));
+let tx_id = ledger.submit(Operation::Deposit { 
+    account: account_id, 
+    amount: 100, 
+    user_ref: 0 
+});
 
 // Wait for the transaction to be fully processed across all pipeline stages
 ledger.wait_for_transaction(tx_id);
@@ -63,66 +67,30 @@ ledger.wait_for_transaction(tx_id);
 let balance = ledger.get_balance(account_id);
 ```
 
-### Example: Wallet
+### Operations
 
-The `Wallet` is a built-in example application that demonstrates how to use the `Ledger` for common banking operations.
-
-```rust
-use roda_ledger::wallet::{Wallet, WalletConfig};
-
-let mut wallet = Wallet::new_with_config(WalletConfig::default());
-wallet.start();
-
-// Simple API for financial operations
-let tx_id1 = wallet.deposit(1, 1000);              // Deposit $1000 to account 1
-let tx_id2 = wallet.transfer(1, 2, 500);           // Transfer $500 from account 1 to 2
-
-// Ensure all operations are completed and reflected in the balance
-// This waits until the pipeline stages have processed the transactions
-wallet.wait_pending_operations();
-
-// Retrieve account balances
-let balance1 = wallet.get_balance(1);              // Result: 500
-let balance2 = wallet.get_balance(2);              // Result: 500
-
-// Check transaction status
-let status = wallet.get_transaction_status(tx_id2);
-if status.is_committed() {
-    println!("Transfer was successful!");
-} else if status.is_err() {
-    println!("Transaction failed: {}", status.error_reason());
-}
-```
-
-### Custom Transactions
-
-You can define your own transaction logic by implementing the `TransactionDataType` trait. This allows the `Ledger` to
-execute any deterministic logic you require.
+Roda-Ledger uses a concrete `Operation` enum for all interactions. It supports `Deposit`, `Withdrawal`, `Transfer`, and `Complex` multi-step atomic operations.
 
 ```rust
-use roda_ledger::transaction::{TransactionDataType, TransactionExecutionContext};
-use roda_ledger::entities::FailReason;
-use bytemuck::{Pod, Zeroable};
+use roda_ledger::transaction::{Operation, ComplexOperation, Step, ComplexOperationFlags};
+use smallvec::smallvec;
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
-pub struct MyTransaction {
-    pub account_id: u64,
-    pub amount: u64,
-}
+// 1. Simple Deposit
+ledger.submit(Operation::Deposit { account: 1, amount: 1000, user_ref: 0 });
 
-impl TransactionDataType for MyTransaction {
-    fn process(&self, ctx: &mut TransactionExecutionContext<'_>) {
-        if self.amount == 0 {
-            return;
-        }
-        
-        // Simple deposit logic: 
-        // Debit (increase) user's account and Credit (decrease) a system/mint account
-        ctx.debit(self.account_id, self.amount);
-        ctx.credit(0, self.amount); // Account 0 is the system account
-    }
-}
+// 2. Simple Transfer
+ledger.submit(Operation::Transfer { from: 1, to: 2, amount: 500, user_ref: 0 });
+
+// 3. Complex Atomic Operation (e.g., Transfer with a Fee)
+ledger.submit(Operation::Complex(Box::new(ComplexOperation {
+    steps: smallvec![
+        Step::Credit { account_id: 1, amount: 105 }, // Sender pays amount + fee
+        Step::Debit  { account_id: 2, amount: 100 }, // Receiver gets amount
+        Step::Debit  { account_id: 0, amount: 5   }, // System gets fee
+    ],
+    flags: ComplexOperationFlags::CHECK_NEGATIVE_BALANCE,
+    user_ref: 12345,
+})));
 ```
 
 ## Durability, Persistence, and Crash Recovery

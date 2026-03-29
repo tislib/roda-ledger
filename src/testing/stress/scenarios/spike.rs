@@ -2,7 +2,7 @@ use crate::testing::reporting::WorkloadMetrics;
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
 use crate::testing::stress::scenarios::scenario::Scenario;
 use crate::testing::stress::workload::{Limit, Power, RunConfig, Workload};
-use crate::wallet::transaction::WalletTransaction;
+use crate::transaction::Operation;
 use std::error::Error;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -48,7 +48,11 @@ impl Scenario for SpikeScenario {
         let workload_handle = std::thread::spawn(move || {
             let _ = workload.run(config, move |_| {
                 let account_id = rand::random::<u64>() % accounts_size;
-                WalletTransaction::deposit(account_id, 100)
+                Operation::Deposit {
+                    account: account_id,
+                    amount: 100,
+                    user_ref: 0,
+                }
             });
         });
 

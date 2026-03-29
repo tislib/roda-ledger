@@ -1,7 +1,7 @@
 use roda_ledger::client::Client;
 use roda_ledger::ledger::LedgerConfig;
 use roda_ledger::server::{Server, ServerConfig};
-use roda_ledger::wallet::transaction::WalletTransaction;
+use roda_ledger::transaction::Operation;
 use std::time::Duration;
 
 #[tokio::test]
@@ -18,7 +18,7 @@ async fn test_server_client_integration() {
         },
     };
 
-    let server = Server::<WalletTransaction>::new(server_config);
+    let server = Server::new(server_config);
 
     tokio::spawn(async move {
         if let Err(e) = server.run_async().await {
@@ -29,14 +29,18 @@ async fn test_server_client_integration() {
     // Give the server a moment to start
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut client = Client::<WalletTransaction>::new(addr);
+    let mut client = Client::new(addr);
 
     let account_id = 1001;
     let deposit_amount = 5000;
 
     // 1. Register Transaction
     let tx_id = client
-        .register_transaction(WalletTransaction::deposit(account_id, deposit_amount))
+        .register_transaction(Operation::Deposit {
+            account: account_id,
+            amount: deposit_amount,
+            user_ref: 0,
+        })
         .await
         .expect("Failed to register transaction");
 

@@ -14,6 +14,8 @@ pub enum EntryKind {
     Debit = 1,
 }
 
+pub const SYSTEM_ACCOUNT_ID: u64 = 0;
+
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct FailReason(u8);
