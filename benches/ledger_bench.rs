@@ -4,10 +4,10 @@ use roda_ledger::transaction::{CompositeOperation, CompositeOperationFlags, Oper
 use smallvec::smallvec;
 use std::time::Duration;
 
-fn wallet_bench(c: &mut Criterion) {
+fn ledger_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("ledger");
     group.throughput(Throughput::Elements(1));
-    group.measurement_time(Duration::from_secs(60));
+    group.measurement_time(Duration::from_secs(10));
     let mut i = 0;
 
     group.bench_function("deposit", |b| {
@@ -81,5 +81,5 @@ fn wallet_bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, wallet_bench);
+criterion_group!(benches, ledger_bench);
 criterion_main!(benches);

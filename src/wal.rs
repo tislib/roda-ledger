@@ -1,4 +1,5 @@
 use crate::entities::{TxEntry, TxMetadata, WalEntry, WalEntryKind};
+use crate::pipeline_mode::PipelineMode;
 use crossbeam_queue::ArrayQueue;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
@@ -15,6 +16,7 @@ pub struct Wal {
     last_processed_transaction_id: Arc<AtomicU64>,
     in_memory: bool,
     running: Arc<AtomicBool>,
+    pipeline_mode: PipelineMode,
 }
 
 pub struct WalRunner {
@@ -29,6 +31,7 @@ pub struct WalRunner {
     current_offset: u64,
     pending_entries: u8,
     running: Arc<AtomicBool>,
+    pipeline_mode: PipelineMode,
 }
 
 impl Wal {
@@ -38,6 +41,7 @@ impl Wal {
         ledger_folder: Option<&str>,
         in_memory: bool,
         running: Arc<AtomicBool>,
+        pipeline_mode: PipelineMode,
     ) -> Self {
         let file_path = if in_memory {
             None
@@ -57,6 +61,7 @@ impl Wal {
             last_processed_transaction_id: Arc::new(Default::default()),
             in_memory,
             running,
+            pipeline_mode,
         }
     }
 
@@ -192,6 +197,7 @@ impl Wal {
             current_offset,
             pending_entries: 0,
             running: self.running.clone(),
+            pipeline_mode: self.pipeline_mode,
         }
     }
 }
@@ -213,13 +219,15 @@ impl WalRunner {
             }
         }
 
+        let mut retry_count = 0;
         while self.running.load(Ordering::Relaxed) {
             // Check if we should retry
             if self
                 .last_retry
                 .is_some_and(|last| Instant::now().duration_since(last) < Duration::from_secs(1))
             {
-                std::thread::yield_now();
+                self.pipeline_mode.wait_strategy(retry_count);
+                retry_count += 1;
                 continue;
             }
 
@@ -227,7 +235,8 @@ impl WalRunner {
             if self.buffer.is_empty() {
                 let count = self.inbound.len().min(self.buffer.capacity());
                 if count == 0 {
-                    std::thread::yield_now();
+                    self.pipeline_mode.wait_strategy(retry_count);
+                    retry_count += 1;
                     continue;
                 }
                 for _ in 0..count {
@@ -238,9 +247,12 @@ impl WalRunner {
             }
 
             if self.buffer.is_empty() {
-                std::thread::yield_now();
+                self.pipeline_mode.wait_strategy(retry_count);
+                retry_count += 1;
                 continue;
             }
+
+            retry_count = 0;
 
             // Prepare data in write buffer
             self.write_buffer.clear();
@@ -314,8 +326,10 @@ impl WalRunner {
     }
 
     pub fn run_in_memory(&mut self) {
+        let mut retry_count = 0;
         while self.running.load(Ordering::Relaxed) {
             if let Some(tx) = self.inbound.pop() {
+                retry_count = 0;
                 let tx_id = tx.tx_id();
                 match tx {
                     WalEntry::Metadata(m) => self.pending_entries = m.entry_count,
@@ -348,7 +362,8 @@ impl WalRunner {
                         .store(tx_id, Ordering::Relaxed);
                 }
             } else {
-                std::thread::yield_now();
+                self.pipeline_mode.wait_strategy(retry_count);
+                retry_count += 1;
             }
         }
     }

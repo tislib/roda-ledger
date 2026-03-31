@@ -1,6 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
 use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
+use roda_ledger::ledger::PipelineMode;
 use roda_ledger::snapshot::Snapshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,6 @@ fn snapshot_bench(c: &mut Criterion) {
 
     let inbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
     let running = Arc::new(AtomicBool::new(true));
-
     let snapshot = Snapshot::new(
         inbound.clone(),
         None,
@@ -23,6 +23,7 @@ fn snapshot_bench(c: &mut Criterion) {
         Duration::from_secs(60),
         running.clone(),
         batch_size as usize,
+        PipelineMode::LowLatency,
     );
 
     let handles = snapshot.start();

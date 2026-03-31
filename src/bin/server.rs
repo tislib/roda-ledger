@@ -1,5 +1,6 @@
 use roda_ledger::grpc::GrpcServer;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use spdlog::Level;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,11 +22,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.parse().unwrap_or(false))
         .unwrap_or(false);
 
+    let log_level_str = env::var("RODA_LOG_LEVEL").unwrap_or_else(|_| "debug".to_string());
+    let log_level = match log_level_str.to_lowercase().as_str() {
+        "trace" => Level::Trace,
+        "debug" => Level::Debug,
+        "info" => Level::Info,
+        "warn" => Level::Warn,
+        "error" => Level::Error,
+        "critical" => Level::Critical,
+        _ => Level::Debug,
+    };
+
     let config = LedgerConfig {
         max_accounts,
         location: data_dir,
         in_memory,
         snapshot_interval: Duration::from_secs(snapshot_interval_secs),
+        log_level,
         ..LedgerConfig::default()
     };
 

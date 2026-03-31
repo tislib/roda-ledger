@@ -1,14 +1,17 @@
 use crate::balance::Balance;
 use crate::entities::WalEntry;
+pub use crate::pipeline_mode::PipelineMode;
 use crate::sequencer::Sequencer;
 use crate::snapshot::Snapshot;
 use crate::transaction::{Operation, Transaction, TransactionStatus};
 use crate::transactor::Transactor;
 use crate::wal::Wal;
 use crossbeam_queue::ArrayQueue;
+use spdlog::{Level, LevelFilter, debug, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{JoinHandle, yield_now};
+use std::thread::{JoinHandle, sleep, yield_now};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct LedgerConfig {
@@ -18,17 +21,21 @@ pub struct LedgerConfig {
     pub in_memory: bool,
     pub temporary: bool, // data will be deleted after the ledger is dropped
     pub snapshot_interval: std::time::Duration,
+    pub pipeline_mode: PipelineMode,
+    pub log_level: Level,
 }
 
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
             max_accounts: 1_000_000,
-            queue_size: 1024,
+            queue_size: 2048,
             location: None,
             in_memory: false,
             temporary: false,
-            snapshot_interval: std::time::Duration::from_secs(600),
+            snapshot_interval: Duration::from_secs(600),
+            pipeline_mode: PipelineMode::Balanced,
+            log_level: Level::Info,
         }
     }
 }
@@ -50,6 +57,7 @@ impl LedgerConfig {
         Self {
             location: Some(dir.to_string_lossy().to_string()),
             temporary: true,
+            log_level: Level::Critical,
             ..Default::default()
         }
     }
@@ -67,6 +75,10 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn new(config: LedgerConfig) -> Self {
+        spdlog::default_logger().set_level_filter(LevelFilter::MoreSevereEqual(config.log_level));
+
+        info!("Initializing Ledger with config: {:?}", config);
+
         let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
         let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> =
             Arc::new(ArrayQueue::new(config.queue_size));
@@ -82,6 +94,7 @@ impl Ledger {
                 transactor_wal_queue.clone(),
                 running.clone(),
                 config.max_accounts,
+                config.pipeline_mode,
             ),
             wal: Wal::new(
                 transactor_wal_queue,
@@ -89,6 +102,7 @@ impl Ledger {
                 config.location.as_deref(),
                 config.in_memory,
                 running.clone(),
+                config.pipeline_mode,
             ),
             snapshot: Snapshot::new(
                 wal_snapshot_queue,
@@ -97,6 +111,7 @@ impl Ledger {
                 config.snapshot_interval,
                 running.clone(),
                 config.max_accounts,
+                config.pipeline_mode,
             ),
             running,
             handles: Vec::new(),
@@ -166,7 +181,7 @@ impl Ledger {
             } else {
                 no_movement_count = 0;
             }
-            if no_movement_count > 10_000 {
+            if no_movement_count > 1_000_000 {
                 return;
             }
 
@@ -175,13 +190,17 @@ impl Ledger {
     }
 
     pub fn start(&mut self) {
+        info!("Starting Ledger stages...");
         self.replay();
         self.handles.push(self.transactor.start());
         self.handles.push(self.wal.start());
         self.handles.extend(self.snapshot.start());
+        // wait for all threads to start
+        sleep(Duration::from_millis(100));
     }
 
     fn replay(&mut self) {
+        info!("Starting WAL replay...");
         // 1. Restore snapshot from disk
         let _ = self.snapshot.restore();
 
@@ -203,6 +222,7 @@ impl Ledger {
         for entry in records {
             let tx_id = entry.tx_id();
             if tx_id > last_snapshot_tx_id {
+                debug!("Replaying transaction {}", tx_id);
                 self.transactor.apply_wal_entry(entry);
                 self.snapshot.reprocess_transaction(entry);
                 last_replayed_id = self.transactor.last_processed_transaction_id();
@@ -221,6 +241,7 @@ impl Ledger {
 
 impl Drop for Ledger {
     fn drop(&mut self) {
+        info!("Shutting down Ledger...");
         self.running.store(false, Ordering::Relaxed);
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();

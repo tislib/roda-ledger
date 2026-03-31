@@ -1,5 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
+use roda_ledger::ledger::PipelineMode;
 use roda_ledger::transaction::{Operation, Transaction};
 use roda_ledger::transactor::Transactor;
 use std::hint::spin_loop;
@@ -22,6 +23,7 @@ fn transactor_bench(c: &mut Criterion) {
         outbound.clone(),
         running.clone(),
         10_000_000,
+        PipelineMode::LowLatency,
     );
 
     let handle = transactor.start();

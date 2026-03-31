@@ -1,5 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
+use roda_ledger::ledger::PipelineMode;
 use roda_ledger::wal::Wal;
 use std::fs;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ fn wal_bench(c: &mut Criterion) {
             if in_memory { None } else { Some(&path) },
             in_memory,
             running.clone(),
+            PipelineMode::LowLatency,
         );
 
         let handle = wal.start();
