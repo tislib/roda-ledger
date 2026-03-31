@@ -1,6 +1,7 @@
 pub mod balance;
 pub mod entities;
 pub mod ledger;
+pub mod pipeline_mode;
 mod replay;
 mod sequencer;
 pub mod snapshot;

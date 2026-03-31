@@ -1,5 +1,6 @@
 use crate::balance::Balance;
 use crate::entities::{EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxMetadata, WalEntry};
+use crate::pipeline_mode::PipelineMode;
 use crate::transaction::{
     CompositeOperationFlags, Operation, Step, Transaction, TransactionExecutionContext,
 };
@@ -17,6 +18,7 @@ pub struct Transactor {
     balances: Vec<Balance>,
     pending_entries: u8,
     running: Arc<AtomicBool>,
+    pipeline_mode: PipelineMode,
 }
 
 pub struct TransactorRunner {
@@ -26,6 +28,7 @@ pub struct TransactorRunner {
     last_processed_transaction_id: Arc<AtomicU64>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     running: Arc<AtomicBool>,
+    pipeline_mode: PipelineMode,
 }
 
 impl Transactor {
@@ -34,6 +37,7 @@ impl Transactor {
         outbound: Arc<ArrayQueue<WalEntry>>,
         running: Arc<AtomicBool>,
         max_accounts: usize,
+        pipeline_mode: PipelineMode,
     ) -> Self {
         let mut accounts = Vec::with_capacity(max_accounts);
         accounts.resize(max_accounts, Balance::default());
@@ -45,6 +49,7 @@ impl Transactor {
             balances: accounts,
             pending_entries: 0,
             running,
+            pipeline_mode,
         }
     }
 
@@ -106,6 +111,7 @@ impl Transactor {
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
             rejected_transactions: self.rejected_transactions.clone(),
             running: self.running.clone(),
+            pipeline_mode: self.pipeline_mode,
         };
         std::thread::Builder::new()
             .name("transactor".to_string())
@@ -117,9 +123,11 @@ impl Transactor {
 impl TransactorRunner {
     pub fn run(&mut self) {
         let mut entries = Vec::with_capacity(16);
+        let mut retry_count = 0;
 
         while self.running.load(Ordering::Relaxed) {
             if let Some(transaction) = self.inbound.pop() {
+                retry_count = 0;
                 let fail_reason;
                 let entries_tmp;
 
@@ -253,7 +261,8 @@ impl TransactorRunner {
                 entries = entries_tmp;
                 entries.clear();
             } else {
-                std::thread::yield_now();
+                self.pipeline_mode.wait_strategy(retry_count);
+                retry_count += 1;
             }
         }
     }

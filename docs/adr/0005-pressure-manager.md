@@ -1,6 +1,6 @@
 # ADR-005: PressureManager — Adaptive Pipeline Execution Mode
 
-**Status:** Accepted  
+**Status:** Postponed (due to existing problems)  
 **Date:** 2026-03-29  
 **Author:** Taleh Ibrahimli  
 

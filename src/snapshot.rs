@@ -1,7 +1,9 @@
 use crate::balance::Balance;
 use crate::entities::{EntryKind, WalEntry};
+use crate::pipeline_mode::PipelineMode;
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
+use spdlog::{debug, error, info};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +37,7 @@ pub struct Snapshot {
     snapshot_interval: Duration,
     pending_entries: AtomicU8,
     running: Arc<AtomicBool>,
+    pipeline_mode: PipelineMode,
 }
 
 pub struct SnapshotRunner {
@@ -47,6 +50,7 @@ pub struct SnapshotRunner {
     current_checkpoint: Arc<AtomicU8>,
     pending_entries: u8,
     running: Arc<AtomicBool>,
+    pipeline_mode: PipelineMode,
 }
 
 pub struct SnapshotStorer {
@@ -69,6 +73,7 @@ impl Snapshot {
         snapshot_interval: Duration,
         running: Arc<AtomicBool>,
         max_accounts: usize,
+        pipeline_mode: PipelineMode,
     ) -> Self {
         let location = if in_memory {
             None
@@ -102,6 +107,7 @@ impl Snapshot {
             snapshot_interval,
             pending_entries: AtomicU8::new(0),
             running,
+            pipeline_mode,
         }
     }
 
@@ -116,6 +122,7 @@ impl Snapshot {
             current_checkpoint: self.current_checkpoint.clone(),
             pending_entries: 0,
             running: self.running.clone(),
+            pipeline_mode: self.pipeline_mode,
         };
         let h1 = std::thread::Builder::new()
             .name("snapshot".to_string())
@@ -200,9 +207,11 @@ impl Snapshot {
         let final_path = location.join("snapshot.bin");
 
         if !final_path.exists() {
+            info!("No snapshot file found at {:?}", final_path);
             return Ok(());
         }
 
+        info!("Restoring snapshot from {:?}", final_path);
         let mut file = std::fs::File::open(&final_path)?;
         let mut buf_u64 = [0u8; 8];
 
@@ -270,11 +279,13 @@ impl Snapshot {
 
 impl SnapshotRunner {
     pub fn run(&mut self) {
-        let mut last_transaction_id = 0;
+        let mut last_transaction_id = self.last_processed_transaction_id.load(Ordering::Relaxed);
         let mut last_wal_position = self.checkpoint.load().last_wal_position;
 
+        let mut retry_count = 0;
         while self.running.load(Ordering::Relaxed) {
             if let Some(wal_entry) = self.inbound.pop() {
+                retry_count = 0;
                 last_transaction_id = wal_entry.tx_id();
                 last_wal_position += 33; // Each entry is 33 bytes (1 kind + 32 struct)
 
@@ -337,7 +348,8 @@ impl SnapshotRunner {
                     self.checkpoint_mode.store(true, Ordering::Release);
                     self.checkpoint_requested.store(false, Ordering::Release);
                 }
-                std::thread::yield_now();
+                self.pipeline_mode.wait_strategy(retry_count);
+                retry_count += 1;
             }
         }
     }
@@ -359,6 +371,7 @@ impl SnapshotStorer {
             }
 
             // 1. Request checkpoint
+            debug!("Requesting snapshot checkpoint");
             self.checkpoint_requested.store(true, Ordering::Release);
 
             // 2. Wait for Runner to enter checkpoint mode
@@ -372,8 +385,9 @@ impl SnapshotStorer {
             let cp_tag = self.current_checkpoint.load(Ordering::Acquire);
 
             // 3. Save snapshot (reads from .checkpoint)
+            info!("Saving snapshot checkpoint {}", cp_tag);
             if let Err(e) = self.save_snapshot() {
-                eprintln!("Failed to save snapshot: {}", e);
+                error!("Failed to save snapshot: {}", e);
             }
 
             // 4. Exit checkpoint mode
