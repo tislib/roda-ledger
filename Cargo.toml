@@ -29,6 +29,7 @@ lz4_flex = "0.11"
 tonic-reflection = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
 tempfile = "3"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -73,6 +74,10 @@ required-features = ["grpc"]
 [[bin]]
 name = "power-tune"
 path = "src/bin/power_tune.rs"
+
+[[bin]]
+name = "roda-ctl"
+path = "src/bin/roda_ctl.rs"
 
 [profile.bench]
 debug = true
