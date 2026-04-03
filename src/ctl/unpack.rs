@@ -4,14 +4,15 @@ use std::path::Path;
 use crate::entities::*;
 
 use super::json::{compute_tx_crc, verify_tx_crc, wal_entry_to_json};
-use super::{make_storage, parse_segment_id_from_path, CtlError};
+use super::{CtlError, make_storage, parse_segment_id_from_path};
 
 pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<(), CtlError> {
-    let segment_id = parse_segment_id_from_path(segment_path)
-        .ok_or_else(|| CtlError::new(format!(
+    let segment_id = parse_segment_id_from_path(segment_path).ok_or_else(|| {
+        CtlError::new(format!(
             "cannot parse segment ID from {:?} (expected wal_NNNNNN.bin)",
             segment_path.file_name().unwrap_or_default()
-        )))?;
+        ))
+    })?;
 
     let data_dir = segment_path
         .parent()
@@ -46,7 +47,14 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
         match entry {
             WalEntry::Metadata(m) => {
                 if let Some((prev, idx)) = pending_meta.take() {
-                    if let Err(e) = flush_tx(&prev, &pending_entries, &pending_json, idx, ignore_crc, &mut writer) {
+                    if let Err(e) = flush_tx(
+                        &prev,
+                        &pending_entries,
+                        &pending_json,
+                        idx,
+                        ignore_crc,
+                        &mut writer,
+                    ) {
                         result = Err(e);
                         return;
                     }
@@ -56,7 +64,8 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
 
                 if m.entry_count == 0 {
                     if !verify_tx_crc(m, &[]) {
-                        let msg = crc_error_msg(record_index, m.tx_id, m.crc32c, compute_tx_crc(m, &[]));
+                        let msg =
+                            crc_error_msg(record_index, m.tx_id, m.crc32c, compute_tx_crc(m, &[]));
                         if !ignore_crc {
                             result = Err(CtlError::new(msg));
                             return;
@@ -83,7 +92,14 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
             }
             WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {
                 if let Some((prev, idx)) = pending_meta.take() {
-                    if let Err(e) = flush_tx(&prev, &pending_entries, &pending_json, idx, ignore_crc, &mut writer) {
+                    if let Err(e) = flush_tx(
+                        &prev,
+                        &pending_entries,
+                        &pending_json,
+                        idx,
+                        ignore_crc,
+                        &mut writer,
+                    ) {
                         result = Err(e);
                         return;
                     }
@@ -99,7 +115,14 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
     result?;
 
     if let Some((prev, idx)) = pending_meta.take() {
-        flush_tx(&prev, &pending_entries, &pending_json, idx, ignore_crc, &mut writer)?;
+        flush_tx(
+            &prev,
+            &pending_entries,
+            &pending_json,
+            idx,
+            ignore_crc,
+            &mut writer,
+        )?;
     }
     writer.flush()?;
     Ok(())
@@ -115,7 +138,12 @@ fn flush_tx(
 ) -> Result<(), CtlError> {
     let ok = verify_tx_crc(meta, entries);
     if !ok {
-        let msg = crc_error_msg(record_index, meta.tx_id, meta.crc32c, compute_tx_crc(meta, entries));
+        let msg = crc_error_msg(
+            record_index,
+            meta.tx_id,
+            meta.crc32c,
+            compute_tx_crc(meta, entries),
+        );
         if !ignore_crc {
             return Err(CtlError::new(msg));
         }

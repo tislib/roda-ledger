@@ -4,7 +4,7 @@ use crate::entities::*;
 use crate::storage::{SegmentStaus, WAL_MAGIC, WAL_VERSION};
 
 use super::json::{compute_tx_crc, verify_tx_crc};
-use super::{make_storage, CtlError, SegmentReport, SnapshotReport, VerifyReport};
+use super::{CtlError, SegmentReport, SnapshotReport, VerifyReport, make_storage};
 
 pub fn run(
     dir: &Path,
@@ -25,7 +25,11 @@ pub fn run(
 
     let all_segments = storage.list_all_segments()?;
     let filtered_ids: Vec<u32> = if let Some((from, to)) = filter {
-        all_segments.iter().map(|s| s.id()).filter(|id| *id >= from && *id <= to).collect()
+        all_segments
+            .iter()
+            .map(|s| s.id())
+            .filter(|id| *id >= from && *id <= to)
+            .collect()
     } else {
         all_segments.iter().map(|s| s.id()).collect()
     };
@@ -63,9 +67,14 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
         Ok(s) => s,
         Err(e) => {
             return SegmentReport {
-                filename, status: "UNKNOWN".into(), record_count: 0,
-                first_tx_id: 0, last_tx_id: 0, ok: false,
-                errors: vec![format!("Cannot open: {}", e)], snapshot: None,
+                filename,
+                status: "UNKNOWN".into(),
+                record_count: 0,
+                first_tx_id: 0,
+                last_tx_id: 0,
+                ok: false,
+                errors: vec![format!("Cannot open: {}", e)],
+                snapshot: None,
             };
         }
     };
@@ -79,9 +88,14 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
     // load() verifies file-level CRC for SEALED segments
     if let Err(e) = segment.load() {
         return SegmentReport {
-            filename, status: status.into(), record_count: 0,
-            first_tx_id: 0, last_tx_id: 0, ok: false,
-            errors: vec![format!("Cannot load: {}", e)], snapshot: None,
+            filename,
+            status: status.into(),
+            record_count: 0,
+            first_tx_id: 0,
+            last_tx_id: 0,
+            ok: false,
+            errors: vec![format!("Cannot load: {}", e)],
+            snapshot: None,
         };
     }
 
@@ -94,7 +108,8 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
     let mut pending_entries: Vec<TxEntry> = Vec::new();
     let mut header_checked = false;
     // Per-account last known computed_balance for continuity checks.
-    let mut account_balances: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+    let mut account_balances: std::collections::HashMap<u64, i64> =
+        std::collections::HashMap::new();
 
     let visit_result = segment.visit_wal_records(|entry| {
         record_count += 1;
@@ -111,7 +126,10 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                         ok = false;
                     }
                     if h.segment_id != segment_id {
-                        errors.push(format!("SegmentHeader: segment_id {} != filename {}", h.segment_id, segment_id));
+                        errors.push(format!(
+                            "SegmentHeader: segment_id {} != filename {}",
+                            h.segment_id, segment_id
+                        ));
                         ok = false;
                     }
                     first_tx_id = h.first_tx_id;
@@ -121,11 +139,11 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                 flush_pending(&mut pending_meta, &pending_entries, &mut errors, &mut ok);
                 pending_entries.clear();
 
-                if let Some(prev) = last_meta_tx {
-                    if m.tx_id <= prev {
-                        errors.push(format!("tx_id not monotonic: {} after {}", m.tx_id, prev));
-                        ok = false;
-                    }
+                if let Some(prev) = last_meta_tx
+                    && m.tx_id <= prev
+                {
+                    errors.push(format!("tx_id not monotonic: {} after {}", m.tx_id, prev));
+                    ok = false;
                 }
                 last_meta_tx = Some(m.tx_id);
                 last_tx_id = m.tx_id;
@@ -170,11 +188,17 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                 pending_entries.clear();
 
                 if s.segment_id != segment_id {
-                    errors.push(format!("SegmentSealed: segment_id {} != filename {}", s.segment_id, segment_id));
+                    errors.push(format!(
+                        "SegmentSealed: segment_id {} != filename {}",
+                        s.segment_id, segment_id
+                    ));
                     ok = false;
                 }
                 if s.record_count != record_count {
-                    errors.push(format!("SegmentSealed: record_count {} != actual {}", s.record_count, record_count));
+                    errors.push(format!(
+                        "SegmentSealed: record_count {} != actual {}",
+                        s.record_count, record_count
+                    ));
                     ok = false;
                 }
                 last_tx_id = s.last_tx_id;
@@ -192,20 +216,26 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
         let snap_file = format!("snapshot_{:06}.bin", segment_id);
         match segment.load_snapshot() {
             Ok(Some(data)) => Some(SnapshotReport {
-                filename: snap_file, account_count: data.balances.len() as u64,
-                ok: true, errors: vec![],
+                filename: snap_file,
+                account_count: data.balances.len() as u64,
+                ok: true,
+                errors: vec![],
             }),
             Ok(None) => {
                 ok = false;
                 Some(SnapshotReport {
-                    filename: snap_file, account_count: 0, ok: false,
+                    filename: snap_file,
+                    account_count: 0,
+                    ok: false,
                     errors: vec!["Snapshot exists but failed verification".into()],
                 })
             }
             Err(e) => {
                 ok = false;
                 Some(SnapshotReport {
-                    filename: snap_file, account_count: 0, ok: false,
+                    filename: snap_file,
+                    account_count: 0,
+                    ok: false,
                     errors: vec![format!("Snapshot error: {}", e)],
                 })
             }
@@ -215,8 +245,14 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
     };
 
     SegmentReport {
-        filename, status: status.into(), record_count, first_tx_id,
-        last_tx_id, ok, errors, snapshot,
+        filename,
+        status: status.into(),
+        record_count,
+        first_tx_id,
+        last_tx_id,
+        ok,
+        errors,
+        snapshot,
     }
 }
 
@@ -225,9 +261,14 @@ fn verify_active_wal(storage: &crate::storage::Storage) -> SegmentReport {
         Ok(s) => s,
         Err(e) => {
             return SegmentReport {
-                filename: "wal.bin".into(), status: "ACTIVE".into(),
-                record_count: 0, first_tx_id: 0, last_tx_id: 0, ok: false,
-                errors: vec![format!("Cannot open active WAL: {}", e)], snapshot: None,
+                filename: "wal.bin".into(),
+                status: "ACTIVE".into(),
+                record_count: 0,
+                first_tx_id: 0,
+                last_tx_id: 0,
+                ok: false,
+                errors: vec![format!("Cannot open active WAL: {}", e)],
+                snapshot: None,
             };
         }
     };
@@ -254,8 +295,14 @@ fn verify_active_wal(storage: &crate::storage::Storage) -> SegmentReport {
     }
 
     SegmentReport {
-        filename: "wal.bin".into(), status: "ACTIVE".into(),
-        record_count, first_tx_id, last_tx_id, ok, errors, snapshot: None,
+        filename: "wal.bin".into(),
+        status: "ACTIVE".into(),
+        record_count,
+        first_tx_id,
+        last_tx_id,
+        ok,
+        errors,
+        snapshot: None,
     }
 }
 
@@ -270,7 +317,9 @@ fn flush_pending(
         if !verify_tx_crc(&meta, entries) {
             errors.push(format!(
                 "Record CRC mismatch (tx_id {}): expected {:#010x}, actual {:#010x}",
-                meta.tx_id, meta.crc32c, compute_tx_crc(&meta, entries)
+                meta.tx_id,
+                meta.crc32c,
+                compute_tx_crc(&meta, entries)
             ));
             *ok = false;
         }
@@ -300,7 +349,9 @@ fn flush_pending(
         if entries.len() != meta.entry_count as usize {
             errors.push(format!(
                 "tx_id {}: entry_count mismatch (declared={}, actual={})",
-                meta.tx_id, meta.entry_count, entries.len()
+                meta.tx_id,
+                meta.entry_count,
+                entries.len()
             ));
             *ok = false;
         }
@@ -310,12 +361,23 @@ fn flush_pending(
 fn verify_cross_segment(results: &[SegmentReport]) -> Vec<String> {
     let mut errors = Vec::new();
     for w in results.windows(2) {
-        let prev_id = w[0].filename.strip_prefix("wal_").and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse::<u32>().ok());
-        let next_id = w[1].filename.strip_prefix("wal_").and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse::<u32>().ok());
-        if let (Some(p), Some(n)) = (prev_id, next_id) {
-            if n != p + 1 {
-                errors.push(format!("Cross-segment: gap between segment {} and {}", p, n));
-            }
+        let prev_id = w[0]
+            .filename
+            .strip_prefix("wal_")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .and_then(|s| s.parse::<u32>().ok());
+        let next_id = w[1]
+            .filename
+            .strip_prefix("wal_")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .and_then(|s| s.parse::<u32>().ok());
+        if let (Some(p), Some(n)) = (prev_id, next_id)
+            && n != p + 1
+        {
+            errors.push(format!(
+                "Cross-segment: gap between segment {} and {}",
+                p, n
+            ));
         }
         if w[0].last_tx_id > 0 && w[1].first_tx_id > 0 && w[1].first_tx_id != w[0].last_tx_id + 1 {
             errors.push(format!(

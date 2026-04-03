@@ -22,11 +22,7 @@ impl RodaCtl {
         unpack::run(segment_path, out, ignore_crc)
     }
 
-    pub fn pack(
-        input: &Path,
-        out: Option<&Path>,
-        no_validate: bool,
-    ) -> Result<(), CtlError> {
+    pub fn pack(input: &Path, out: Option<&Path>, no_validate: bool) -> Result<(), CtlError> {
         pack::run(input, out, no_validate)
     }
 
@@ -101,7 +97,7 @@ pub struct SnapshotReport {
 impl VerifyReport {
     pub fn all_ok(&self) -> bool {
         self.segments.iter().all(|s| s.ok)
-            && self.active.as_ref().map_or(true, |a| a.ok)
+            && self.active.as_ref().is_none_or(|a| a.ok)
             && self.cross_errors.is_empty()
     }
 
@@ -120,7 +116,11 @@ impl VerifyReport {
         }
 
         let total_seg = self.segments.len() + if self.active.is_some() { 1 } else { 0 };
-        let total_snap = self.segments.iter().filter(|s| s.snapshot.is_some()).count();
+        let total_snap = self
+            .segments
+            .iter()
+            .filter(|s| s.snapshot.is_some())
+            .count();
         let total_txs: u64 = self
             .segments
             .iter()
@@ -132,7 +132,11 @@ impl VerifyReport {
                 }
             })
             .sum();
-        let status = if self.all_ok() { "all OK" } else { "ERRORS FOUND" };
+        let status = if self.all_ok() {
+            "all OK"
+        } else {
+            "ERRORS FOUND"
+        };
         let _ = writeln!(
             w,
             "\nSummary: {} segments, {} snapshots, {} transactions -- {}",

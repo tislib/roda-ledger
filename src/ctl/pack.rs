@@ -4,8 +4,8 @@ use std::path::Path;
 use crate::entities::*;
 use crate::storage::StorageConfig;
 
-use super::json::{compute_tx_crc, json_to_wal_entry};
 use super::CtlError;
+use super::json::{compute_tx_crc, json_to_wal_entry};
 
 pub fn run(input: &Path, out: Option<&Path>, no_validate: bool) -> Result<(), CtlError> {
     let reader: Box<dyn BufRead> = if input == Path::new("-") {
@@ -52,8 +52,8 @@ pub fn run(input: &Path, out: Option<&Path>, no_validate: bool) -> Result<(), Ct
     };
 
     // Write via a temporary Storage + active segment + append_entries
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| CtlError::new(format!("cannot create temp dir: {}", e)))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| CtlError::new(format!("cannot create temp dir: {}", e)))?;
 
     let storage = crate::storage::Storage::new(StorageConfig {
         data_dir: temp_dir.path().to_string_lossy().to_string(),
@@ -106,13 +106,13 @@ fn validate_structure(entries: &[WalEntry]) -> Result<(), CtlError> {
     let mut last_tx_id: Option<u64> = None;
     for entry in entries {
         if let WalEntry::Metadata(m) = entry {
-            if let Some(prev) = last_tx_id {
-                if m.tx_id <= prev {
-                    return Err(CtlError::new(format!(
-                        "tx_id not monotonically increasing: {} after {}",
-                        m.tx_id, prev
-                    )));
-                }
+            if let Some(prev) = last_tx_id
+                && m.tx_id <= prev
+            {
+                return Err(CtlError::new(format!(
+                    "tx_id not monotonically increasing: {} after {}",
+                    m.tx_id, prev
+                )));
             }
             last_tx_id = Some(m.tx_id);
         }
@@ -127,10 +127,10 @@ fn recompute_crcs(entries: &mut [WalEntry]) {
             let count = meta.entry_count as usize;
             let mut tx_entries: Vec<TxEntry> = Vec::with_capacity(count);
             for j in 1..=count {
-                if i + j < entries.len() {
-                    if let WalEntry::Entry(e) = &entries[i + j] {
-                        tx_entries.push(*e);
-                    }
+                if i + j < entries.len()
+                    && let WalEntry::Entry(e) = &entries[i + j]
+                {
+                    tx_entries.push(*e);
                 }
             }
             let mut m = *meta;

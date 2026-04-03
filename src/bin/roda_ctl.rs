@@ -60,27 +60,35 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Unpack { segment, out, ignore_crc } => {
-            RodaCtl::unpack(&segment, out.as_deref(), ignore_crc)
-        }
-        Commands::Pack { input, out, no_validate } => {
-            RodaCtl::pack(&input, out.as_deref(), no_validate)
-        }
-        Commands::Verify { path, segment, range } => {
+        Commands::Unpack {
+            segment,
+            out,
+            ignore_crc,
+        } => RodaCtl::unpack(&segment, out.as_deref(), ignore_crc),
+        Commands::Pack {
+            input,
+            out,
+            no_validate,
+        } => RodaCtl::pack(&input, out.as_deref(), no_validate),
+        Commands::Verify {
+            path,
+            segment,
+            range,
+        } => {
             let range_parsed = range.as_deref().and_then(parse_range);
             match RodaCtl::verify(&path, segment, range_parsed) {
                 Ok(report) => {
                     report.print(&mut std::io::stderr(), &path);
-                    if report.all_ok() { Ok(()) } else {
+                    if report.all_ok() {
+                        Ok(())
+                    } else {
                         Err(roda_ledger::ctl::CtlError::new("verification failed"))
                     }
                 }
                 Err(e) => Err(e),
             }
         }
-        Commands::Seal { segment, force } => {
-            RodaCtl::seal(&segment, force)
-        }
+        Commands::Seal { segment, force } => RodaCtl::seal(&segment, force),
     };
 
     if let Err(e) = result {
@@ -91,6 +99,8 @@ fn main() {
 
 fn parse_range(s: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = s.split("..").collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
 }

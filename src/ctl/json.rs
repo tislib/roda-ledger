@@ -44,13 +44,25 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
     match entry_type {
         "SegmentHeader" => {
             let segment_id = value["segment_id"].as_u64().ok_or("missing segment_id")? as u32;
-            let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(WAL_VERSION as u64) as u8;
-            let magic = value.get("magic").and_then(|v| v.as_str()).and_then(parse_hex_u32).unwrap_or(WAL_MAGIC);
+            let version = value
+                .get("version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(WAL_VERSION as u64) as u8;
+            let magic = value
+                .get("magic")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hex_u32)
+                .unwrap_or(WAL_MAGIC);
             let first_tx_id = value["first_tx_id"].as_u64().ok_or("missing first_tx_id")?;
             Ok(WalEntry::SegmentHeader(SegmentHeader {
                 entry_type: WalEntryKind::SegmentHeader as u8,
-                version, _pad0: [0; 2], magic, segment_id,
-                _pad1: [0; 4], first_tx_id, _pad2: [0; 16],
+                version,
+                _pad0: [0; 2],
+                magic,
+                segment_id,
+                _pad1: [0; 4],
+                first_tx_id,
+                _pad2: [0; 16],
             }))
         }
         "TxMetadata" => {
@@ -60,11 +72,21 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
             let flags = value.get("flags").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let user_ref = value.get("user_ref").and_then(|v| v.as_u64()).unwrap_or(0);
             let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-            let tag = value.get("tag").and_then(|v| v.as_str()).map(hex_decode_tag).unwrap_or([0u8; 8]);
+            let tag = value
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(hex_decode_tag)
+                .unwrap_or([0u8; 8]);
             Ok(WalEntry::Metadata(TxMetadata {
                 entry_type: WalEntryKind::TxMetadata as u8,
-                entry_count, fail_reason, flags, crc32c: 0,
-                tx_id, timestamp, user_ref, tag,
+                entry_count,
+                fail_reason,
+                flags,
+                crc32c: 0,
+                tx_id,
+                timestamp,
+                user_ref,
+                tag,
             }))
         }
         "TxEntry" => {
@@ -76,19 +98,32 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 "Debit" => EntryKind::Debit,
                 other => return Err(format!("unknown kind: {}", other)),
             };
-            let computed_balance = value["computed_balance"].as_i64().ok_or("missing computed_balance")?;
+            let computed_balance = value["computed_balance"]
+                .as_i64()
+                .ok_or("missing computed_balance")?;
             Ok(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
-                kind, _pad0: [0; 6], tx_id, account_id, amount, computed_balance,
+                kind,
+                _pad0: [0; 6],
+                tx_id,
+                account_id,
+                amount,
+                computed_balance,
             }))
         }
         "SegmentSealed" => {
             let segment_id = value["segment_id"].as_u64().ok_or("missing segment_id")? as u32;
             let last_tx_id = value["last_tx_id"].as_u64().ok_or("missing last_tx_id")?;
-            let record_count = value["record_count"].as_u64().ok_or("missing record_count")?;
+            let record_count = value["record_count"]
+                .as_u64()
+                .ok_or("missing record_count")?;
             Ok(WalEntry::SegmentSealed(SegmentSealed {
                 entry_type: WalEntryKind::SegmentSealed as u8,
-                _pad0: [0; 3], segment_id, last_tx_id, record_count, _pad1: [0; 16],
+                _pad0: [0; 3],
+                segment_id,
+                last_tx_id,
+                record_count,
+                _pad1: [0; 16],
             }))
         }
         other => Err(format!("unknown record type: {}", other)),
@@ -132,9 +167,13 @@ fn hex_decode_tag(s: &str) -> [u8; 8] {
     let is_hex16 = s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit());
     if is_hex16 {
         for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            if i >= 8 { break; }
-            if let Ok(cs) = std::str::from_utf8(chunk) {
-                if let Ok(b) = u8::from_str_radix(cs, 16) { tag[i] = b; }
+            if i >= 8 {
+                break;
+            }
+            if let Ok(cs) = std::str::from_utf8(chunk)
+                && let Ok(b) = u8::from_str_radix(cs, 16)
+            {
+                tag[i] = b;
             }
         }
     } else {
@@ -147,6 +186,9 @@ fn hex_decode_tag(s: &str) -> [u8; 8] {
 }
 
 fn parse_hex_u32(s: &str) -> Option<u32> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u32::from_str_radix(s, 16).ok()
 }

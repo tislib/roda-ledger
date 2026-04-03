@@ -2,14 +2,15 @@ use std::path::Path;
 
 use crate::storage::SegmentStaus;
 
-use super::{make_storage, parse_segment_id_from_path, CtlError};
+use super::{CtlError, make_storage, parse_segment_id_from_path};
 
 pub fn run(segment_path: &Path, force: bool) -> Result<(), CtlError> {
-    let segment_id = parse_segment_id_from_path(segment_path)
-        .ok_or_else(|| CtlError::new(format!(
+    let segment_id = parse_segment_id_from_path(segment_path).ok_or_else(|| {
+        CtlError::new(format!(
             "cannot parse segment ID from {:?} (expected wal_NNNNNN.bin)",
             segment_path.file_name().unwrap_or_default()
-        )))?;
+        ))
+    })?;
 
     let data_dir = segment_path
         .parent()
@@ -20,7 +21,7 @@ pub fn run(segment_path: &Path, force: bool) -> Result<(), CtlError> {
     if !segment_path.exists() {
         return Err(CtlError::new(format!("file not found: {:?}", segment_path)));
     }
-    if segment_path.file_name().map_or(false, |f| f == "wal.bin") {
+    if segment_path.file_name().is_some_and(|f| f == "wal.bin") {
         return Err(CtlError::new("cannot seal the active WAL (wal.bin)"));
     }
 
