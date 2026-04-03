@@ -18,3 +18,4 @@ target
 **/snapshot.bin
 dev/
 temp*
+data/

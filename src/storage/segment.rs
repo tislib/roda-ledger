@@ -242,4 +242,24 @@ impl Segment {
     pub(crate) fn current_wal_offset(&self) -> usize {
         self.wal_position
     }
+
+    // ── Public helpers for CLI tooling (ADR-007) ─────────────────────────────
+
+    /// Removes `.crc` and `.seal` files so the segment can be re-sealed.
+    /// Call before `open()` so the segment opens as CLOSED.
+    /// Removes `.crc` and `.seal` files, resetting this segment to CLOSED state
+    /// so it can be re-sealed.
+    pub(crate) fn force_unseal(&mut self) -> Result<(), std::io::Error> {
+        let dir = Path::new(&self.data_dir);
+        let crc = segment_crc_path(dir, self.segment_id);
+        let seal = segment_seal_path(dir, self.segment_id);
+        if crc.exists() {
+            std::fs::remove_file(&crc)?;
+        }
+        if seal.exists() {
+            std::fs::remove_file(&seal)?;
+        }
+        self.status = SegmentStaus::CLOSED;
+        Ok(())
+    }
 }
