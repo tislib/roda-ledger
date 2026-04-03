@@ -112,9 +112,6 @@ impl<'r> Recover<'r> {
 
         for segment in self.segments.iter() {
             if segment.has_snapshot() {
-                if segment.id() <= last_snapshot_segment_id {
-                    panic!("Snapshot segments must be in ascending order by id"); // fixme delete this panic
-                }
                 last_snapshot_segment_id = segment.id();
             }
         }
