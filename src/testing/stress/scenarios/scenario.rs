@@ -29,7 +29,7 @@ pub trait Scenario {
             max_accounts: self.max_accounts() as usize,
             ..Default::default()
         });
-        ledger.start();
+        ledger.start().unwrap();
         let ledger = Arc::new(ledger);
 
         let mut reporter = Reporter::new(self.name(), self.duration(), ledger);

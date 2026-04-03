@@ -2,14 +2,16 @@ pub mod balance;
 pub mod entities;
 pub mod ledger;
 pub mod pipeline_mode;
-mod replay;
+mod recover;
+pub mod seal;
 mod sequencer;
 pub mod snapshot;
-mod snapshot_store;
+pub mod storage;
 pub mod testing;
 pub mod transaction;
 pub mod transactor;
 pub mod wal;
 
+mod entries;
 #[cfg(feature = "grpc")]
 pub mod grpc;

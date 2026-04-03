@@ -1,41 +1,40 @@
 use crate::balance::Balance;
 use crate::entities::WalEntry;
 pub use crate::pipeline_mode::PipelineMode;
+use crate::recover::Recover;
+use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::Snapshot;
+use crate::storage::{Storage, StorageConfig};
 use crate::transaction::{Operation, Transaction, TransactionStatus};
 use crate::transactor::Transactor;
 use crate::wal::Wal;
 use crossbeam_queue::ArrayQueue;
-use spdlog::{Level, LevelFilter, debug, info};
+use spdlog::{Level, LevelFilter, error, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{JoinHandle, sleep, yield_now};
+use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct LedgerConfig {
     pub max_accounts: usize,
     pub queue_size: usize,
-    pub location: Option<String>,
-    pub in_memory: bool,
-    pub temporary: bool, // data will be deleted after the ledger is dropped
-    pub snapshot_interval: std::time::Duration,
+    pub storage: StorageConfig,
     pub pipeline_mode: PipelineMode,
     pub log_level: Level,
+    pub seal_check_internal: Duration,
 }
 
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
             max_accounts: 1_000_000,
-            queue_size: 2048,
-            location: None,
-            in_memory: false,
-            temporary: false,
-            snapshot_interval: Duration::from_secs(600),
+            queue_size: 1024,
+            storage: StorageConfig::default(),
             pipeline_mode: PipelineMode::Balanced,
             log_level: Level::Info,
+            seal_check_internal: Duration::from_secs(1),
         }
     }
 }
@@ -52,12 +51,17 @@ impl LedgerConfig {
             .unwrap_or_default()
             .as_nanos();
         dir.push(format!("roda-ledger-{}", nanos));
-        let _ = std::fs::create_dir_all(&dir);
+        // Directory creation is handled by Storage::new()
 
         Self {
-            location: Some(dir.to_string_lossy().to_string()),
-            temporary: true,
+            storage: StorageConfig {
+                data_dir: dir.to_string_lossy().to_string(),
+                temporary: true,
+                snapshot_frequency: 2,
+                wal_segment_size_mb: 2048,
+            },
             log_level: Level::Critical,
+            seal_check_internal: Duration::from_millis(10),
             ..Default::default()
         }
     }
@@ -68,8 +72,11 @@ pub struct Ledger {
     transactor: Transactor,
     wal: Wal,
     snapshot: Snapshot,
+    seal: Seal,
+    storage: Arc<Storage>,
     running: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
+    #[allow(dead_code)]
     config: LedgerConfig,
 }
 
@@ -79,12 +86,28 @@ impl Ledger {
 
         info!("Initializing Ledger with config: {:?}", config);
 
+        let storage = Storage::new(config.storage.clone()).unwrap();
+        let storage = Arc::new(storage);
+
         let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
-        let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> =
-            Arc::new(ArrayQueue::new(config.queue_size));
+        let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(1024 * 128));
         let wal_snapshot_queue: Arc<ArrayQueue<WalEntry>> =
             Arc::new(ArrayQueue::new(config.queue_size));
         let running = Arc::new(AtomicBool::new(true));
+
+        let snapshot = Snapshot::new(
+            wal_snapshot_queue.clone(),
+            config.max_accounts,
+            running.clone(),
+            config.pipeline_mode,
+        );
+
+        let seal = Seal::new(
+            config.max_accounts,
+            storage.clone(),
+            running.clone(),
+            config.seal_check_internal,
+        );
 
         Self {
             config: config.clone(),
@@ -98,21 +121,14 @@ impl Ledger {
             ),
             wal: Wal::new(
                 transactor_wal_queue,
-                wal_snapshot_queue.clone(),
-                config.location.as_deref(),
-                config.in_memory,
-                running.clone(),
-                config.pipeline_mode,
-            ),
-            snapshot: Snapshot::new(
                 wal_snapshot_queue,
-                config.location.as_deref(),
-                config.in_memory,
-                config.snapshot_interval,
+                storage.clone(),
                 running.clone(),
-                config.max_accounts,
                 config.pipeline_mode,
             ),
+            snapshot,
+            seal,
+            storage,
             running,
             handles: Vec::new(),
         }
@@ -125,6 +141,10 @@ impl Ledger {
 
     pub fn get_balance(&self, account_id: u64) -> Balance {
         self.snapshot.get_balance(account_id)
+    }
+
+    pub fn last_sealed_segment_id(&self) -> u32 {
+        self.seal.last_sealed_segment_id()
     }
 
     pub fn get_transaction_status(&self, transaction_id: u64) -> TransactionStatus {
@@ -158,84 +178,75 @@ impl Ledger {
     }
 
     pub fn wait_for_transaction(&self, transaction_id: u64) {
-        let mut prev_snapshot_step = self.snapshot.last_processed_transaction_id();
+        self.wait_for_transaction_until(transaction_id, Duration::from_secs(10));
+    }
 
-        let mut no_movement_count = 1;
+    pub fn wait_for_transaction_until(&self, transaction_id: u64, duration: Duration) {
+        let mut retry_count = 0;
+        let start_time = std::time::Instant::now();
 
         loop {
             let current_snapshot_step = self.snapshot.last_processed_transaction_id();
-            let current_wal_step = self.wal.last_processed_transaction_id();
-            let current_transactor_step = self.transactor.last_processed_transaction_id();
 
-            if current_transactor_step >= transaction_id
-                && current_wal_step >= transaction_id
-                && current_snapshot_step >= transaction_id
-            {
-                return;
-            }
-            yield_now();
-
-            // Break if no movement
-            if prev_snapshot_step == current_snapshot_step {
-                no_movement_count += 1;
-            } else {
-                no_movement_count = 0;
-            }
-            if no_movement_count > 1_000_000 {
+            if current_snapshot_step >= transaction_id {
                 return;
             }
 
-            prev_snapshot_step = current_snapshot_step;
+            self.config.pipeline_mode.wait_strategy(retry_count);
+            retry_count += 1;
+
+            if start_time.elapsed() >= duration {
+                break;
+            }
         }
     }
 
-    pub fn start(&mut self) {
+    pub fn wait_for_seal(&self) {
+        let mut retry_count = 0;
+        loop {
+            let segment_count = self.storage.last_segment_id();
+            if segment_count.is_err() {
+                error!(
+                    "Failed to get last segment id: {}",
+                    segment_count.err().unwrap()
+                );
+                sleep(Duration::from_secs(1));
+                continue;
+            }
+            let segment_count = segment_count.unwrap();
+            if segment_count == self.seal.last_sealed_segment_id() {
+                println!("All segments sealed: {}", segment_count);
+                return;
+            }
+
+            retry_count += 1;
+            self.config.pipeline_mode.wait_strategy(retry_count);
+        }
+    }
+
+    pub fn start(&mut self) -> std::io::Result<()> {
         info!("Starting Ledger stages...");
-        self.replay();
-        self.handles.push(self.transactor.start());
-        self.handles.push(self.wal.start());
-        self.handles.extend(self.snapshot.start());
+        self.recover()?;
+        self.handles.push(self.transactor.start()?);
+        self.handles.push(self.wal.start()?);
+        self.handles.push(self.snapshot.start()?);
+        self.handles.push(self.seal.start()?);
         // wait for all threads to start
         sleep(Duration::from_millis(100));
+
+        Ok(())
     }
 
-    fn replay(&mut self) {
-        info!("Starting WAL replay...");
-        // 1. Restore snapshot from disk
-        let _ = self.snapshot.restore();
+    fn recover(&mut self) -> std::io::Result<()> {
+        let mut recover = Recover::new(
+            &mut self.transactor,
+            &self.snapshot,
+            &mut self.seal,
+            &self.sequencer,
+            &self.storage,
+        );
 
-        // 2. Update transactor balances from snapshot
-        let balances = self.snapshot.get_all_balances();
-        self.transactor.load_balances(balances);
-
-        // 3. Replay WAL records
-        let last_snapshot_tx_id = self.snapshot.last_processed_transaction_id();
-        let last_wal_pos = self.snapshot.last_wal_position();
-
-        // NOTE: In the entries-based model, we read WalEntry, not Transaction.
-        // Replaying transactions is no longer needed since we have entries.
-        let start_pos = last_wal_pos; // Simplification
-
-        let records = self.wal.get_records(start_pos);
-        let mut last_replayed_id = last_snapshot_tx_id;
-
-        for entry in records {
-            let tx_id = entry.tx_id();
-            if tx_id > last_snapshot_tx_id {
-                debug!("Replaying transaction {}", tx_id);
-                self.transactor.apply_wal_entry(entry);
-                self.snapshot.reprocess_transaction(entry);
-                last_replayed_id = self.transactor.last_processed_transaction_id();
-            }
-        }
-
-        // Synchronize last_processed_transaction_id
-        self.wal.set_last_processed_transaction_id(last_replayed_id);
-        self.snapshot
-            .set_last_processed_transaction_id(last_replayed_id);
-
-        // Set sequencer's next ID
-        self.sequencer.set_next_id(last_replayed_id + 1);
+        recover.recover()
     }
 }
 
@@ -245,12 +256,6 @@ impl Drop for Ledger {
         self.running.store(false, Ordering::Relaxed);
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();
-        }
-
-        if self.config.temporary
-            && let Some(loc) = self.config.location.clone()
-        {
-            let _ = std::fs::remove_dir_all(loc);
         }
     }
 }
