@@ -8,18 +8,15 @@ mod tests {
         SubmitOperationRequest, Transfer, Withdrawal, step,
     };
     use roda_ledger::ledger::{Ledger, LedgerConfig};
+    use roda_ledger::storage::StorageConfig;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
 
     async fn setup_grpc_server() -> (Arc<Ledger>, SocketAddr) {
-        let config = LedgerConfig {
-            in_memory: true,
-            ..LedgerConfig::default()
-        };
-        let mut ledger = Ledger::new(config);
-        ledger.start();
+        let mut ledger = Ledger::new(LedgerConfig::temp());
+        ledger.start().unwrap();
         let ledger = Arc::new(ledger);
 
         // Find a free port

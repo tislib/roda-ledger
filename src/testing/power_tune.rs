@@ -58,7 +58,7 @@ pub fn run_power_tune(
         }
 
         let mut ledger = Ledger::new(config);
-        ledger.start();
+        ledger.start().unwrap();
 
         let start = Instant::now();
         let mut last_id = 0;

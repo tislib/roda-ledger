@@ -12,7 +12,7 @@ fn ledger_bench(c: &mut Criterion) {
 
     group.bench_function("deposit", |b| {
         let mut ledger = Ledger::new(LedgerConfig::temp());
-        ledger.start();
+        ledger.start().unwrap();
         b.iter(|| {
             i += 1;
             ledger.submit(Operation::Deposit {
@@ -28,7 +28,7 @@ fn ledger_bench(c: &mut Criterion) {
             max_accounts: account_count as usize,
             ..LedgerConfig::temp()
         });
-        ledger.start();
+        ledger.start().unwrap();
 
         // Pre-fill some balances
         let mut last_tx_id = 0;
@@ -58,7 +58,7 @@ fn ledger_bench(c: &mut Criterion) {
 
     group.bench_function("composite_operation", |b| {
         let mut ledger = Ledger::new(LedgerConfig::temp());
-        ledger.start();
+        ledger.start().unwrap();
         b.iter(|| {
             i += 1;
             ledger.submit(Operation::Composite(Box::new(CompositeOperation {

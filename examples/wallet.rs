@@ -1,18 +1,18 @@
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
 
 fn main() {
     // 1. Initialize the Ledger with a custom configuration
     // We'll use in-memory mode for this example to avoid creating files.
     let config = LedgerConfig {
-        in_memory: true,
         queue_size: 1024,
         ..Default::default()
     };
 
     println!("Starting Roda-Ledger example...");
     let mut ledger = Ledger::new(config);
-    ledger.start();
+    ledger.start().unwrap();
 
     // 2. Perform some operations
     let account_a = 101;

@@ -20,7 +20,7 @@ impl Sequencer {
 
     #[inline(always)]
     pub fn submit(&self, mut transaction: Transaction) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::Acquire);
         transaction.id = id;
 
         let mut retry_count = 0;
@@ -37,6 +37,6 @@ impl Sequencer {
     }
 
     pub(crate) fn set_next_id(&self, next_id: u64) {
-        self.next_id.store(next_id, Ordering::Relaxed);
+        self.next_id.store(next_id, Ordering::Release);
     }
 }

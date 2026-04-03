@@ -1,10 +1,10 @@
 use roda_ledger::grpc::GrpcServer;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::storage::StorageConfig;
 use spdlog::Level;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,9 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_accounts = env::var("RODA_MAX_ACCOUNTS")
         .map(|s| s.parse().unwrap_or(1_000_000))
         .unwrap_or(1_000_000);
-    let snapshot_interval_secs = env::var("RODA_SNAPSHOT_INTERVAL")
-        .map(|s| s.parse().unwrap_or(600))
-        .unwrap_or(600);
+    // How many WAL segment seals between snapshots (0 = never snapshot)
+    let snapshot_frequency = env::var("RODA_SNAPSHOT_FREQUENCY")
+        .map(|s| s.parse().unwrap_or(4u32))
+        .unwrap_or(4u32);
     let in_memory = env::var("RODA_IN_MEMORY")
         .map(|s| s.parse().unwrap_or(false))
         .unwrap_or(false);
@@ -35,17 +36,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = LedgerConfig {
         max_accounts,
-        location: data_dir,
-        in_memory,
-        snapshot_interval: Duration::from_secs(snapshot_interval_secs),
         log_level,
+        storage: StorageConfig {
+            data_dir: data_dir.unwrap_or("data/".to_string()),
+            snapshot_frequency,
+            ..Default::default()
+        },
         ..LedgerConfig::default()
     };
 
     println!("Starting roda-ledger with config: {:?}", config);
 
     let mut ledger = Ledger::new(config);
-    ledger.start();
+    ledger.start().unwrap();
 
     let ledger_arc = Arc::new(ledger);
     let server = GrpcServer::new(ledger_arc, grpc_addr);

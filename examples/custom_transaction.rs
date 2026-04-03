@@ -1,16 +1,20 @@
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::{CompositeOperation, CompositeOperationFlags, Operation, Step};
 use smallvec::smallvec;
 
 fn main() {
     let config = LedgerConfig {
-        in_memory: true,
+        storage: StorageConfig {
+            temporary: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     println!("Starting Composite Operation example...");
     let mut ledger = Ledger::new(config);
-    ledger.start();
+    ledger.start().unwrap();
 
     let item_id = 42;
 

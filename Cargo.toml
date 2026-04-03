@@ -24,8 +24,11 @@ smallvec = { version = "1.13", features = ["serde"] }
 bitflags = { version = "2.8", features = ["serde"] }
 tonic = { version = "0.12", features = ["transport"], optional = true }
 spdlog-rs = "0.5.3"
+crc32c = "0.6"
+lz4_flex = "0.11"
 tonic-reflection = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
+tempfile = "3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -54,6 +57,10 @@ name = "snapshot_bench"
 harness = false
 
 [[bench]]
+name = "transaction_runner_bench"
+harness = false
+
+[[bench]]
 name = "grpc_bench"
 harness = false
 required-features = ["grpc"]
@@ -66,3 +73,6 @@ required-features = ["grpc"]
 [[bin]]
 name = "power-tune"
 path = "src/bin/power_tune.rs"
+
+[profile.bench]
+debug = true

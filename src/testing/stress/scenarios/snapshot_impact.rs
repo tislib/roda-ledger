@@ -1,4 +1,5 @@
 use crate::ledger::{Ledger, LedgerConfig};
+use crate::storage::StorageConfig;
 use crate::testing::reporting::{Reporter, RunResult, WorkloadMetrics};
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
 use crate::testing::stress::scenarios::scenario::Scenario;
@@ -39,15 +40,18 @@ impl Scenario for SnapshotImpactScenario {
             std::fs::remove_file(wal_path)?;
         }
 
-        // Configure ledger with frequent snapshots
+        // Configure ledger with frequent snapshots (every WAL segment seal)
         let config = LedgerConfig {
             max_accounts: self.max_accounts() as usize,
-            snapshot_interval: Duration::from_secs(1),
+            storage: StorageConfig {
+                snapshot_frequency: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start();
+        ledger.start().unwrap();
         let ledger = Arc::new(ledger);
 
         let mut reporter = Reporter::new(self.name(), self.duration(), ledger);

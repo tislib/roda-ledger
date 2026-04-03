@@ -1,20 +1,19 @@
-use crate::entities::{TxEntry, TxMetadata, WalEntry, WalEntryKind};
+use crate::entities::WalEntry;
+use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline_mode::PipelineMode;
+use crate::storage::Storage;
 use crossbeam_queue::ArrayQueue;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::thread::{JoinHandle, sleep};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Wal {
     inbound: Arc<ArrayQueue<WalEntry>>,
     outbound: Arc<ArrayQueue<WalEntry>>,
-    file_path: Option<PathBuf>,
+    storage: Arc<Storage>,
     last_processed_transaction_id: Arc<AtomicU64>,
-    in_memory: bool,
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
 }
@@ -22,44 +21,32 @@ pub struct Wal {
 pub struct WalRunner {
     inbound: Arc<ArrayQueue<WalEntry>>,
     outbound: Arc<ArrayQueue<WalEntry>>,
-    file: Option<File>,
-    file_path: Option<PathBuf>,
+    storage: Arc<Storage>,
     buffer: Vec<WalEntry>,
-    write_buffer: Vec<u8>,
-    last_retry: Option<Instant>,
     last_processed_transaction_id: Arc<AtomicU64>,
-    current_offset: u64,
-    pending_entries: u8,
+    /// Number of entries at the front of `buffer` that form one or more complete
+    /// transactions.  Everything in `buffer[..committed_len]` is safe to write/forward.
+    committed_len: usize,
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
+    // Segmentation state
+    record_count: u64,
+    last_committed_tx_id: u64,
 }
 
 impl Wal {
     pub fn new(
         inbound: Arc<ArrayQueue<WalEntry>>,
         outbound: Arc<ArrayQueue<WalEntry>>,
-        ledger_folder: Option<&str>,
-        in_memory: bool,
+        storage: Arc<Storage>,
         running: Arc<AtomicBool>,
         pipeline_mode: PipelineMode,
     ) -> Self {
-        let file_path = if in_memory {
-            None
-        } else {
-            let folder = ledger_folder.unwrap_or("data");
-            let path = Path::new(folder);
-            if !path.exists() {
-                let _ = std::fs::create_dir_all(path);
-            }
-            Some(path.join("wal.bin"))
-        };
-
         Self {
             inbound,
             outbound,
-            file_path,
+            storage,
             last_processed_transaction_id: Arc::new(Default::default()),
-            in_memory,
             running,
             pipeline_mode,
         }
@@ -70,300 +57,150 @@ impl Wal {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn get_records(&self, offset: u64) -> Vec<WalEntry> {
-        if self.in_memory || self.file_path.is_none() {
-            return Vec::new();
-        }
-
-        let mut file = match File::open(self.file_path.as_ref().unwrap()) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
-        };
-
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            return Vec::new();
-        }
-
-        let mut reader = std::io::BufReader::with_capacity(128 * 1024, file);
-        let mut records = Vec::new();
-
-        loop {
-            let (kind, size) = {
-                let buffer = match reader.fill_buf() {
-                    Ok(b) => {
-                        if b.is_empty() {
-                            break;
-                        }
-                        b
-                    }
-                    Err(_) => break,
-                };
-
-                let kind = buffer[0];
-                let size = match kind {
-                    k if k == WalEntryKind::TxMetadata as u8 => 32,
-                    k if k == WalEntryKind::TxEntry as u8 => 32,
-                    _ => break,
-                };
-
-                if buffer.len() < 1 + size {
-                    // Not enough data for full record in buffer, need to read more
-                    // We'll fall back to read_exact for this record
-                    (kind, Some(size))
-                } else {
-                    // We have the full record in buffer
-                    let record_data = &buffer[1..1 + size];
-                    if kind == WalEntryKind::TxMetadata as u8 {
-                        let metadata: TxMetadata = bytemuck::pod_read_unaligned(record_data);
-                        records.push(WalEntry::Metadata(metadata));
-                    } else {
-                        let entry: TxEntry = bytemuck::pod_read_unaligned(record_data);
-                        records.push(WalEntry::Entry(entry));
-                    }
-                    reader.consume(1 + size);
-                    continue;
-                }
-            };
-
-            // Fallback for when record spans across BufReader's internal buffer
-            if let Some(size) = size {
-                let mut full_record = vec![0u8; 1 + size];
-                if reader.read_exact(&mut full_record).is_err() {
-                    break;
-                }
-                let record_data = &full_record[1..];
-                if kind == WalEntryKind::TxMetadata as u8 {
-                    let metadata: TxMetadata = bytemuck::pod_read_unaligned(record_data);
-                    records.push(WalEntry::Metadata(metadata));
-                } else {
-                    let entry: TxEntry = bytemuck::pod_read_unaligned(record_data);
-                    records.push(WalEntry::Entry(entry));
-                }
-            } else {
-                break;
-            }
-        }
-        records
-    }
-
-    pub fn set_last_processed_transaction_id(&self, last_id: u64) {
+    pub fn move_forward(&self, last_id: u64) {
         self.last_processed_transaction_id
             .store(last_id, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn start(&self) -> JoinHandle<()> {
+    pub fn start(&self) -> std::io::Result<JoinHandle<()>> {
         let mut runner = self.create_runner();
-        let in_memory = self.in_memory;
         std::thread::Builder::new()
             .name("wal".to_string())
             .spawn(move || {
-                if in_memory {
-                    runner.run_in_memory();
-                } else {
-                    runner.run();
-                }
+                runner.run();
             })
-            .unwrap()
     }
 
     fn create_runner(&self) -> WalRunner {
-        let mut current_offset = 0;
-        let file = if self.in_memory {
-            None
-        } else {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.file_path.as_ref().unwrap())
-                .ok();
-
-            if let Some(ref f) = file {
-                current_offset = f.metadata().map(|m| m.len()).unwrap_or(0);
-            }
-            file
-        };
-
-        let buffer_capacity = (128 * 1024) / std::mem::size_of::<WalEntry>();
-
         WalRunner {
             inbound: self.inbound.clone(),
             outbound: self.outbound.clone(),
-            file,
-            file_path: self.file_path.clone(),
-            buffer: Vec::with_capacity(buffer_capacity.max(1)),
-            write_buffer: Vec::with_capacity(buffer_capacity.max(1) * 33),
-            last_retry: None,
+            storage: self.storage.clone(),
+            buffer: Vec::with_capacity(self.inbound.capacity()),
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
-            current_offset,
-            pending_entries: 0,
+            committed_len: 0,
             running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
+            record_count: 0,
+            last_committed_tx_id: 0,
         }
     }
 }
 
 impl WalRunner {
-    pub fn run(&mut self) {
-        // Try to open file if not open
-        if self.file.is_none() {
-            if let Ok(file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.file_path.as_ref().unwrap())
-            {
-                self.current_offset = file.metadata().map(|m| m.len()).unwrap_or(0);
-                self.file = Some(file);
-            } else {
-                self.last_retry = Some(Instant::now());
-                return;
+    /// Drain up to `capacity - buffer.len()` items from inbound into `buffer`,
+    /// tracking transaction boundaries.  This is the **only** place
+    /// `pending_entries` / `pending_tx_id` / `committed_len` are updated.
+    ///
+    /// After the call, `buffer[..committed_len]` contains one or more complete
+    /// transactions ready to be written/forwarded.  Any remaining entries in
+    /// `buffer[committed_len..]` are a partial transaction that will be completed
+    /// in a future call.
+    ///
+    /// Returns `true` when there is at least one complete transaction to process.
+    fn fill_buffer(&mut self) -> bool {
+        let available = self
+            .inbound
+            .len()
+            .min(self.buffer.capacity() - self.buffer.len());
+        let mut pending_entries = 0;
+        let mut pending_tx_id = 0;
+        for _ in 0..available {
+            if let Some(entry) = self.inbound.pop() {
+                match &entry {
+                    WalEntry::Metadata(m) => {
+                        pending_entries = m.entry_count;
+                        pending_tx_id = m.tx_id;
+                    }
+                    WalEntry::Entry(_) => {
+                        if pending_entries > 0 {
+                            pending_entries -= 1;
+                        }
+                    }
+                    WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
+                }
+                self.buffer.push(entry);
+
+                if pending_entries == 0 && pending_tx_id != 0 {
+                    // A full transaction just landed in the buffer.
+                    self.committed_len = self.buffer.len();
+                    self.last_committed_tx_id = pending_tx_id;
+                }
             }
         }
+        self.committed_len > 0
+    }
 
-        let mut retry_count = 0;
-        while self.running.load(Ordering::Relaxed) {
-            // Check if we should retry
-            if self
-                .last_retry
-                .is_some_and(|last| Instant::now().duration_since(last) < Duration::from_secs(1))
-            {
-                self.pipeline_mode.wait_strategy(retry_count);
-                retry_count += 1;
-                continue;
-            }
-
-            // Fill buffer if empty
-            if self.buffer.is_empty() {
-                let count = self.inbound.len().min(self.buffer.capacity());
-                if count == 0 {
-                    self.pipeline_mode.wait_strategy(retry_count);
-                    retry_count += 1;
-                    continue;
-                }
-                for _ in 0..count {
-                    if let Some(tx) = self.inbound.pop() {
-                        self.buffer.push(tx);
+    /// Push `entry` to the outbound queue, yielding until space is available.
+    /// Returns `false` if a shutdown was requested while waiting.
+    fn push_outbound(&mut self, mut entry: WalEntry) -> bool {
+        loop {
+            match self.outbound.push(entry) {
+                Ok(_) => return true,
+                Err(returned) => {
+                    entry = returned;
+                    if !self.running.load(Ordering::Relaxed) {
+                        return false;
                     }
+                    std::thread::yield_now();
                 }
             }
-
-            if self.buffer.is_empty() {
-                self.pipeline_mode.wait_strategy(retry_count);
-                retry_count += 1;
-                continue;
-            }
-
-            retry_count = 0;
-
-            // Prepare data in write buffer
-            self.write_buffer.clear();
-            for entry in &self.buffer {
-                self.write_buffer.push(entry.kind() as u8);
-                match entry {
-                    WalEntry::Metadata(m) => {
-                        self.write_buffer.extend_from_slice(bytemuck::bytes_of(m))
-                    }
-                    WalEntry::Entry(e) => {
-                        self.write_buffer.extend_from_slice(bytemuck::bytes_of(e))
-                    }
-                }
-            }
-
-            // Try to write buffer
-            let success = if let Some(ref mut file) = self.file {
-                match file.write_all(&self.write_buffer) {
-                    Ok(_) => file.flush().is_ok(),
-                    Err(_) => false,
-                }
-            } else {
-                false
-            };
-
-            if success {
-                // Success! Reset retry timer and move to outbound
-                self.last_retry = None;
-                self.current_offset += self.write_buffer.len() as u64;
-
-                let mut local_last_id = self.last_processed_transaction_id.load(Ordering::Relaxed);
-
-                for tx in self.buffer.drain(..) {
-                    let tx_id = tx.tx_id();
-                    match tx {
-                        WalEntry::Metadata(m) => self.pending_entries = m.entry_count,
-                        WalEntry::Entry(_) => {
-                            if self.pending_entries > 0 {
-                                self.pending_entries -= 1;
-                            }
-                        }
-                    }
-
-                    if self.pending_entries == 0 {
-                        local_last_id = tx_id;
-                    }
-
-                    let mut tx = tx;
-                    loop {
-                        match self.outbound.push(tx) {
-                            Ok(_) => break,
-                            Err(returned_tx) => {
-                                tx = returned_tx;
-                                if !self.running.load(Ordering::Relaxed) {
-                                    self.last_processed_transaction_id
-                                        .store(local_last_id, Ordering::Relaxed);
-                                    return;
-                                }
-                                std::thread::yield_now();
-                            }
-                        }
-                    }
-                }
-                self.last_processed_transaction_id
-                    .store(local_last_id, Ordering::Relaxed);
-            } else {
-                self.last_retry = Some(Instant::now());
-            }
-            // If write failed, buffer remains full and will be retried in next tick (after 1s)
         }
     }
 
-    pub fn run_in_memory(&mut self) {
+    pub fn run(&mut self) {
         let mut retry_count = 0;
-        while self.running.load(Ordering::Relaxed) {
-            if let Some(tx) = self.inbound.pop() {
-                retry_count = 0;
-                let tx_id = tx.tx_id();
-                match tx {
-                    WalEntry::Metadata(m) => self.pending_entries = m.entry_count,
-                    WalEntry::Entry(_) => {
-                        if self.pending_entries > 0 {
-                            self.pending_entries -= 1;
-                        }
-                    }
-                }
+        let mut active_segment = self.storage.active_segment().unwrap();
 
-                let mut tx = tx;
-                loop {
-                    match self.outbound.push(tx) {
-                        Ok(_) => break,
-                        Err(returned_tx) => {
-                            tx = returned_tx;
-                            if !self.running.load(Ordering::Relaxed) {
-                                if self.pending_entries == 0 {
-                                    self.last_processed_transaction_id
-                                        .store(tx_id, Ordering::Relaxed);
-                                }
-                                return;
-                            }
-                            std::thread::yield_now();
-                        }
-                    }
-                }
-                if self.pending_entries == 0 {
-                    self.last_processed_transaction_id
-                        .store(tx_id, Ordering::Relaxed);
-                }
-            } else {
+        while self.running.load(Ordering::Relaxed) {
+            // Fill the buffer; skip this iteration if no complete transaction is ready yet.
+            if !self.fill_buffer() {
                 self.pipeline_mode.wait_strategy(retry_count);
                 retry_count += 1;
+                continue;
+            }
+            retry_count = 0;
+
+            if active_segment.current_wal_offset() == 0 {
+                let first_tx_id = self.buffer[0].tx_id();
+                active_segment.append_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
+                    active_segment.id(),
+                    first_tx_id,
+                ))])
+            }
+
+            active_segment.append_entries(&self.buffer[..self.committed_len]); //fixme move retry logic to here
+
+            // Forward committed entries downstream and publish the committed tx id.
+            let committed_tx_id = self.last_committed_tx_id;
+            let committed: Vec<WalEntry> = self.buffer.drain(..self.committed_len).collect();
+            self.committed_len = 0;
+            for entry in committed {
+                if !self.push_outbound(entry) {
+                    return;
+                }
+            }
+            self.last_processed_transaction_id
+                .store(committed_tx_id, Ordering::Relaxed);
+
+            // Rotate the segment when the size threshold is exceeded.
+            // No pending-entries guard needed here: the buffer contract already
+            // guarantees we only ever write complete transactions.
+            if active_segment.current_wal_offset()
+                >= (self.storage.config().wal_segment_size_mb * 1024 * 1024) as usize
+            {
+                active_segment.append_entries(&[WalEntry::SegmentSealed(
+                    wal_segment_sealed_entry(
+                        active_segment.id(),
+                        self.last_committed_tx_id,
+                        active_segment.record_count(),
+                    ),
+                )]);
+                active_segment
+                    .close()
+                    .expect("Failed to close active segment"); // fixme implement retry logic
+                drop(active_segment);
+                active_segment = self.storage.active_segment().unwrap();
             }
         }
     }

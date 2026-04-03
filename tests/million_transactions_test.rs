@@ -1,16 +1,16 @@
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
+use std::time::Duration;
 
 #[test]
 fn million_deposits_final_balance() {
     let total_txs: u64 = 1_000_000;
     let mut ledger = Ledger::new(LedgerConfig {
-        queue_size: 1024,
-        location: None,
-        in_memory: true,
-        ..Default::default()
+        seal_check_internal: Duration::from_millis(10),
+        ..LedgerConfig::temp()
     });
-    ledger.start();
+    ledger.start().unwrap();
 
     // Generate 1,000,000 deposit transactions of amount 1 into account 1
     let mut last_id = 0;
