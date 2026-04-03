@@ -1,4 +1,5 @@
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
@@ -16,22 +17,25 @@ fn crash_recovery_test() {
     }
 
     let account_id = 1;
-    let num_transactions = 1_000;
+    let num_transactions = 1_000_000;
     let deposit_amount = 1;
 
-    // Phase 1: Insert transactions
+    // Phase 1: Insert transactions — WAL replay will be used on restart (no snapshot at 64MB segments)
     {
         let config = LedgerConfig {
             queue_size: 1024,
-            location: Some(temp_dir.to_string()),
-            in_memory: false,
-            snapshot_interval: Duration::from_millis(100),
             max_accounts: 1_000_000,
+            storage: StorageConfig {
+                data_dir: temp_dir.to_string(),
+                snapshot_frequency: 2,
+                ..Default::default()
+            },
+            seal_check_internal: Duration::from_millis(1),
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start();
+        ledger.start().unwrap();
 
         let mut last_tx_id = 0;
         for _ in 0..num_transactions {
@@ -42,7 +46,7 @@ fn crash_recovery_test() {
             });
         }
 
-        // Wait until transactions reach WAL by checking status
+        // Wait until transactions reach WAL
         loop {
             let status = ledger.get_transaction_status(last_tx_id);
             if status.is_committed() {
@@ -50,25 +54,24 @@ fn crash_recovery_test() {
             }
             std::thread::yield_now();
         }
-
-        // Wait for snapshot
-        std::thread::sleep(Duration::from_millis(150));
-        // Ledger is dropped here when it goes out of scope
     }
 
     // Phase 2: Start again and add more transactions
     {
         let config = LedgerConfig {
             queue_size: 1024,
-            location: Some(temp_dir.to_string()),
-            in_memory: false,
-            snapshot_interval: Duration::from_millis(100),
             max_accounts: 1_000_000,
+            storage: StorageConfig {
+                data_dir: temp_dir.to_string(),
+                snapshot_frequency: 2,
+                ..Default::default()
+            },
+            seal_check_internal: Duration::from_millis(1),
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start(); // This should trigger replay
+        ledger.start().unwrap(); // triggers WAL replay
 
         let mut last_tx_id = 0;
         for _ in 0..num_transactions {
@@ -79,7 +82,6 @@ fn crash_recovery_test() {
             });
         }
 
-        // Wait until transactions reach WAL by checking status
         loop {
             let status = ledger.get_transaction_status(last_tx_id);
             if status.is_committed() {
@@ -87,36 +89,31 @@ fn crash_recovery_test() {
             }
             std::thread::yield_now();
         }
-
-        // Wait for snapshot
-        std::thread::sleep(Duration::from_millis(150));
-        // Ledger is dropped here when it goes out of scope
     }
 
     // Phase 3: Start again and verify
     {
         let config = LedgerConfig {
             queue_size: 1024,
-            location: Some(temp_dir.to_string()),
-            in_memory: false,
-            snapshot_interval: Duration::from_millis(100),
             max_accounts: 1_000_000,
+            storage: StorageConfig {
+                data_dir: temp_dir.to_string(),
+                snapshot_frequency: 2,
+                ..Default::default()
+            },
+            seal_check_internal: Duration::from_millis(1),
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start(); // This should trigger replay
+        ledger.start().unwrap(); // triggers WAL replay
 
         let balance = ledger.get_balance(account_id);
 
-        // Verify balance
+        // Verify balance: 2 phases × 1000 transactions × 1 deposit each
         assert_eq!(balance, (2 * num_transactions * deposit_amount) as i64);
-
-        // Wait for snapshot
-        std::thread::sleep(Duration::from_millis(150));
     }
 
-    // Final cleanup
     if Path::new(&temp_dir).exists() {
         let _ = fs::remove_dir_all(&temp_dir);
     }

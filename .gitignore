@@ -17,3 +17,4 @@ target
 **/wal.bin
 **/snapshot.bin
 dev/
+temp*

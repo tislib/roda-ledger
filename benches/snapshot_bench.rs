@@ -5,28 +5,24 @@ use roda_ledger::ledger::PipelineMode;
 use roda_ledger::snapshot::Snapshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 fn snapshot_bench(c: &mut Criterion) {
     let batch_size = 10_000;
 
     let mut group = c.benchmark_group("snapshot");
     group.throughput(Throughput::Elements(batch_size));
-    group.measurement_time(Duration::from_secs(10));
+    group.measurement_time(std::time::Duration::from_secs(10));
 
     let inbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
     let running = Arc::new(AtomicBool::new(true));
     let snapshot = Snapshot::new(
         inbound.clone(),
-        None,
-        true, // in_memory
-        Duration::from_secs(60),
+        1_000_000,
         running.clone(),
-        batch_size as usize,
         PipelineMode::LowLatency,
     );
 
-    let handles = snapshot.start();
+    let handle = snapshot.start().unwrap();
     let mut current_id = 0;
 
     group.bench_function("process", |b| {
@@ -34,25 +30,32 @@ fn snapshot_bench(c: &mut Criterion) {
             let start_id = current_id;
             for _ in 0..batch_size {
                 current_id += 1;
-                let metadata = TxMetadata {
+                let mut metadata = TxMetadata {
+                    entry_type: 0,
                     tx_id: current_id,
                     timestamp: 0,
                     user_ref: 0,
                     entry_count: 2,
                     fail_reason: FailReason::NONE,
-                    _pad: [0; 6],
+                    flags: 0,
+                    crc32c: 0,
+                    tag: [0; 8],
                 };
+                // compute CRC for correctness
+                metadata.crc32c = crc32c::crc32c(bytemuck::bytes_of(&metadata));
                 while inbound.push(WalEntry::Metadata(metadata)).is_err() {
                     std::thread::yield_now();
                 }
 
                 for account_id in 0..2 {
                     let entry = TxEntry {
+                        entry_type: 1,
                         tx_id: current_id,
                         account_id: account_id as u64,
                         amount: 100,
                         kind: EntryKind::Credit,
-                        _pad: [0; 7],
+                        _pad0: [0; 6],
+                        computed_balance: 100,
                     };
                     while inbound.push(WalEntry::Entry(entry)).is_err() {
                         std::thread::yield_now();
@@ -68,9 +71,7 @@ fn snapshot_bench(c: &mut Criterion) {
 
     group.finish();
     running.store(false, Ordering::Relaxed);
-    for h in handles {
-        let _ = h.join();
-    }
+    let _ = handle.join();
 }
 
 criterion_group!(benches, snapshot_bench);

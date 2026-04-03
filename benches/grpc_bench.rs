@@ -9,6 +9,8 @@ use roda_ledger::grpc::proto::{Deposit, SubmitBatchRequest, SubmitOperationReque
 #[cfg(feature = "grpc")]
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 #[cfg(feature = "grpc")]
+use roda_ledger::storage::StorageConfig;
+#[cfg(feature = "grpc")]
 use std::net::SocketAddr;
 #[cfg(feature = "grpc")]
 use std::sync::Arc;
@@ -18,11 +20,13 @@ use tokio::runtime::Runtime;
 #[cfg(feature = "grpc")]
 async fn setup_grpc_server() -> (Arc<Ledger>, SocketAddr) {
     let config = LedgerConfig {
-        in_memory: true,
+        storage: StorageConfig {
+            ..Default::default()
+        },
         ..LedgerConfig::default()
     };
     let mut ledger = Ledger::new(config);
-    ledger.start();
+    ledger.start().unwrap();
     let ledger = Arc::new(ledger);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

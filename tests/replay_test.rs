@@ -1,8 +1,15 @@
 use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+
+/// Force segment rotation and snapshot:
+///   1MB segments + snapshot_frequency=1 ensures snapshot after first seal.
+///   35K txs × 2 records × 33 bytes ≈ 2.3MB → at least 2 seals.
+const SMALL_SEGMENT_MB: u64 = 1;
+const SNAP_EVERY_SEAL: u32 = 1;
 
 #[test]
 fn test_replay_functionality() {
@@ -15,23 +22,30 @@ fn test_replay_functionality() {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    // Phase 1: Create some state and a snapshot
+    // Phase 1: Create some state, trigger a snapshot via WAL segment seal
     {
         let config = LedgerConfig {
-            location: Some(temp_dir.to_string()),
-            in_memory: false,
-            snapshot_interval: Duration::from_millis(100),
+            storage: StorageConfig {
+                data_dir: temp_dir.to_string(),
+                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                snapshot_frequency: SNAP_EVERY_SEAL,
+                ..Default::default()
+            },
+            seal_check_internal: Duration::from_millis(1),
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start();
+        ledger.start().unwrap();
 
-        ledger.submit(Operation::Deposit {
-            account: 1,
-            amount: 100,
-            user_ref: 0,
-        });
+        // Submit enough transactions to trigger a WAL seal and snapshot
+        for _ in 0..35_000 {
+            ledger.submit(Operation::Deposit {
+                account: 1,
+                amount: 1,
+                user_ref: 0,
+            });
+        }
         let last_id = ledger.submit(Operation::Deposit {
             account: 2,
             amount: 200,
@@ -39,27 +53,34 @@ fn test_replay_functionality() {
         });
         ledger.wait_for_transaction(last_id);
 
-        // Wait for a snapshot to be created
-        std::thread::sleep(Duration::from_millis(500));
-
-        // Check balances before "crash"
-        assert_eq!(ledger.get_balance(1), 100);
+        assert_eq!(ledger.get_balance(1), 35_000);
         assert_eq!(ledger.get_balance(2), 200);
     }
 
-    // Give some time for the old threads to hopefully finish or at least not interfere with files
-    std::thread::sleep(Duration::from_millis(200));
-
+    // Phase 2: Restart, add more transactions (no new snapshot expected)
     {
         let config = LedgerConfig {
-            location: Some(temp_dir.to_string()),
-            in_memory: false,
-            snapshot_interval: Duration::from_secs(10), // Long interval to avoid snapshotting phase 2
+            storage: StorageConfig {
+                data_dir: temp_dir.to_string(),
+                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                snapshot_frequency: 100,
+                ..Default::default()
+            },
+            // High frequency → no new snapshot during phase 2 short run
+            seal_check_internal: Duration::from_millis(1),
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start();
+        ledger.start().unwrap();
+
+        // Balances restored from snapshot + WAL replay
+        assert_eq!(
+            ledger.get_balance(1),
+            35_000,
+            "Account 1 should be restored"
+        );
+        assert_eq!(ledger.get_balance(2), 200, "Account 2 should be restored");
 
         ledger.submit(Operation::Deposit {
             account: 1,
@@ -74,45 +95,46 @@ fn test_replay_functionality() {
         });
         ledger.wait_for_transaction(last_id);
 
-        assert_eq!(ledger.get_balance(1), 180);
+        assert_eq!(ledger.get_balance(1), 35_080);
         assert_eq!(ledger.get_balance(2), 170);
-
-        // Wait for WAL flush but no snapshot
-        std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Wait a bit to simulate a restart
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Phase 3: Start a new instance and see if it replayed
+    // Phase 3: Restart again and verify everything is replayed correctly
     {
         let config = LedgerConfig {
-            location: Some(temp_dir.to_string()),
-            in_memory: false,
-            // Disable auto snapshots for phase 3 to avoid interference
-            snapshot_interval: Duration::from_secs(3600),
+            storage: StorageConfig {
+                data_dir: temp_dir.to_string(),
+                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                snapshot_frequency: 100,
+                ..Default::default()
+            },
+            seal_check_internal: Duration::from_millis(1),
             ..Default::default()
         };
 
         let mut ledger = Ledger::new(config);
-        ledger.start(); // This should trigger replay
+        ledger.start().unwrap();
 
-        // Check balances after replay
-        // Account 1: 100 (snapshot) + 50 (WAL) + 30 (WAL) = 180
-        // Account 2: 200 (snapshot) - 30 (WAL) = 170
-        assert_eq!(ledger.get_balance(1), 180);
-        assert_eq!(ledger.get_balance(2), 170);
+        assert_eq!(
+            ledger.get_balance(1),
+            35_080,
+            "Account 1 balance should survive restart"
+        );
+        assert_eq!(
+            ledger.get_balance(2),
+            170,
+            "Account 2 balance should survive restart"
+        );
 
-        // Further transactions should work correctly
+        // New transactions after replay should work correctly
         let last_id = ledger.submit(Operation::Deposit {
             account: 1,
             amount: 20,
             user_ref: 0,
         });
         ledger.wait_for_transaction(last_id);
-        assert_eq!(ledger.get_balance(1), 200);
+        assert_eq!(ledger.get_balance(1), 35_100);
     }
 
-    // Cleanup
     let _ = fs::remove_dir_all(temp_dir);
 }

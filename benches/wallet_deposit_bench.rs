@@ -1,5 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use roda_ledger::ledger::{Ledger, LedgerConfig, PipelineMode};
+use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
 use std::fs;
 
@@ -14,11 +15,14 @@ fn wallet_deposit_bench(c: &mut Criterion) {
     group.bench_function("deposit", |b| {
         let mut ledger = Ledger::new(LedgerConfig {
             queue_size: 1024,
-            temporary: true,
             pipeline_mode: PipelineMode::LowLatency,
+            storage: StorageConfig {
+                temporary: true,
+                ..Default::default()
+            },
             ..LedgerConfig::default()
         });
-        ledger.start();
+        ledger.start().unwrap();
 
         b.iter(|| {
             for _ in 0..batch_size {

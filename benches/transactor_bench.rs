@@ -14,8 +14,8 @@ fn transactor_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(10));
 
-    let inbound = Arc::new(ArrayQueue::new(1024));
-    let outbound = Arc::new(ArrayQueue::new(1024));
+    let inbound = Arc::new(ArrayQueue::new(10240000));
+    let outbound = Arc::new(ArrayQueue::new(10240000));
     let running = Arc::new(AtomicBool::new(true));
 
     let mut transactor = Transactor::new(
@@ -23,19 +23,23 @@ fn transactor_bench(c: &mut Criterion) {
         outbound.clone(),
         running.clone(),
         10_000_000,
-        PipelineMode::LowLatency,
+        PipelineMode::Balanced,
     );
 
-    let handle = transactor.start();
+    let handle = transactor.start().unwrap();
 
     let outbound_drain = outbound.clone();
     let running_drain = running.clone();
+    let pipeline_mode = PipelineMode::Balanced;
     let drain_handle = thread::spawn(move || {
+        let mut retry_count = 0;
         while running_drain.load(Ordering::Relaxed) || !outbound_drain.is_empty() {
             while outbound_drain.pop().is_some() {
                 // discard
+                retry_count = 0;
             }
-            spin_loop();
+            retry_count += 1;
+            pipeline_mode.wait_strategy(retry_count);
         }
     });
 
