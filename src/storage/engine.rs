@@ -1,6 +1,7 @@
 use crate::storage::Segment;
 use crate::storage::layout::parse_segment_id;
 use spdlog::info;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Snapshot file magic: "SNAP" = 0x534E4150
 pub const SNAPSHOT_MAGIC: u32 = 0x534E4150;
@@ -27,12 +28,25 @@ impl Default for StorageConfig {
 
 pub struct Storage {
     config: StorageConfig,
+    last_segment_id: AtomicU32,
 }
 
 impl Storage {
     pub fn new(config: StorageConfig) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(&config.data_dir)?;
-        Ok(Self { config })
+
+        let mut segment_ids: Vec<u32> = std::fs::read_dir(&config.data_dir)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| parse_segment_id(&e.file_name().to_string_lossy()))
+            .collect();
+        segment_ids.sort();
+
+        let last_segment_id = AtomicU32::new(segment_ids.last().copied().unwrap_or(0) + 1);
+
+        Ok(Self {
+            config,
+            last_segment_id,
+        })
     }
 
     pub fn config(&self) -> &StorageConfig {
@@ -40,9 +54,9 @@ impl Storage {
     }
 
     pub fn active_segment(&self) -> Result<Segment, std::io::Error> {
-        let last_segment_id = self.last_segment_id()?;
+        let last_segment_id = self.last_segment_id();
 
-        Segment::open_active(self.config.data_dir.clone(), last_segment_id + 1)
+        Segment::open_active(self.config.data_dir.clone(), last_segment_id)
     }
 
     pub fn segment(&self, segment_id: u32) -> Result<Segment, std::io::Error> {
@@ -62,12 +76,12 @@ impl Storage {
         Ok(segments)
     }
 
-    pub fn last_segment_id(&self) -> Result<u32, std::io::Error> {
-        let segment_ids: Vec<u32> = std::fs::read_dir(&self.config.data_dir)?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| parse_segment_id(&e.file_name().to_string_lossy()))
-            .collect();
-        Ok(segment_ids.iter().max().copied().unwrap_or(0))
+    pub fn last_segment_id(&self) -> u32 {
+        self.last_segment_id.load(Ordering::Acquire)
+    }
+
+    pub fn next_segment(&self) {
+        self.last_segment_id.fetch_add(1, Ordering::AcqRel);
     }
 }
 

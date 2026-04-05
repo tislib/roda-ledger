@@ -62,6 +62,10 @@ name = "transaction_runner_bench"
 harness = false
 
 [[bench]]
+name = "query_bench"
+harness = false
+
+[[bench]]
 name = "grpc_bench"
 harness = false
 required-features = ["grpc"]

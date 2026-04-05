@@ -10,46 +10,19 @@ fn ledger_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     let mut i = 0;
 
-    group.bench_function("deposit", |b| {
-        let mut ledger = Ledger::new(LedgerConfig::temp());
-        ledger.start().unwrap();
-        b.iter(|| {
-            i += 1;
-            ledger.submit(Operation::Deposit {
-                account: i % 1000,
-                amount: 100,
-                user_ref: 0,
-            });
-        });
-    });
-
     for account_count in [1000, 1_000_000, 10_000_000, 50_000_000] {
-        let mut ledger = Ledger::new(LedgerConfig {
-            max_accounts: account_count as usize,
-            ..LedgerConfig::temp()
-        });
-        ledger.start().unwrap();
-
-        // Pre-fill some balances
-        let mut last_tx_id = 0;
-        for i in 0..account_count {
-            last_tx_id = ledger.submit(Operation::Deposit {
-                account: i,
-                amount: 10000,
-                user_ref: 0,
+        group.bench_function(format!("deposit_{}", account_count), |b| {
+            let mut ledger = Ledger::new(LedgerConfig {
+                max_accounts: account_count as usize,
+                ..LedgerConfig::temp()
             });
-        }
-        ledger.wait_for_transaction(last_tx_id);
-
-        group.bench_function(format!("transfer_{}", account_count), |b| {
+            ledger.start().unwrap();
             b.iter(|| {
                 i += 1;
-                let from_account = 1 + rand::random::<u64>() % account_count;
-                let to_account = 1 + (i + account_count / 2) % account_count;
-                ledger.submit(Operation::Transfer {
-                    from: from_account,
-                    to: to_account,
-                    amount: 10,
+                let account = 1 + rand::random::<u64>() % account_count;
+                ledger.submit(Operation::Deposit {
+                    account,
+                    amount: 10000,
                     user_ref: 0,
                 });
             });
