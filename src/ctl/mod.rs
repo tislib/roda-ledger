@@ -7,7 +7,7 @@ mod verify;
 use std::io::Write;
 use std::path::Path;
 
-use crate::storage::{Storage, StorageConfig};
+use crate::storage::{Segment, Storage, StorageConfig};
 
 /// Top-level entry point for all `roda-ctl` operations.
 /// The binary creates this struct and dispatches commands to it.
@@ -37,6 +37,33 @@ impl RodaCtl {
     pub fn seal(segment_path: &Path, force: bool) -> Result<(), CtlError> {
         seal::run(segment_path, force)
     }
+}
+
+pub fn open_segment_from_path(path: &Path) -> Result<Segment, CtlError> {
+    let mut data_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_string_lossy()
+        .to_string();
+
+    if data_dir.is_empty() {
+        data_dir = ".".to_string();
+    }
+
+    let storage = make_storage(&data_dir)?;
+    let segment = match path.file_name().and_then(|f| f.to_str()) {
+        Some("wal.bin") => storage.active_segment()?,
+        _ => {
+            let segment_id = parse_segment_id_from_path(path).ok_or_else(|| {
+                CtlError::new(format!(
+                    "cannot parse segment ID from {:?} (expected wal_NNNNNN.bin)",
+                    path.file_name().unwrap_or_default()
+                ))
+            })?;
+            storage.segment(segment_id)?
+        }
+    };
+    Ok(segment)
 }
 
 // ── Error type ───────────────────────────────────────────────────────────────
@@ -204,7 +231,7 @@ fn parse_segment_id_from_name(name: &str) -> Option<u32> {
     }
 }
 
-fn make_storage(data_dir: &str) -> Result<Storage, CtlError> {
+pub(crate) fn make_storage(data_dir: &str) -> Result<Storage, CtlError> {
     Storage::new(StorageConfig {
         data_dir: data_dir.to_string(),
         temporary: false,

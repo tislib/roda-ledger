@@ -60,6 +60,18 @@ service Ledger {
   // Use this for health checks, lag monitoring, and determining when a bulk load
   // is complete without querying individual transactions.
   rpc GetPipelineIndex(GetPipelineIndexRequest) returns (GetPipelineIndexResponse);
+
+  // GetTransaction retrieves the full details of a specific transaction by ID.
+  // Queries the in-memory index first (hot tier); falls back to sealed segment
+  // files on a cache miss (cold tier). Required for payment status checks,
+  // reconciliation, and audit.
+  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+
+  // GetAccountHistory retrieves transactions involving a specific account,
+  // newest first, with pagination. Queries the in-memory index first; falls
+  // back to sealed segments on a cache miss. Required for account statements,
+  // balance verification, and dispute resolution.
+  rpc GetAccountHistory(GetAccountHistoryRequest) returns (GetAccountHistoryResponse);
 }
 
 // ---- Operation messages ----
@@ -305,4 +317,41 @@ message GetPipelineIndexResponse {
   // GetBalance reflects all transactions at or below this index.
   // Maps to Ledger::last_snapshot_id().
   uint64 snapshot_index = 3;
+}
+
+// ---- Transaction query (ADR-008) ----
+
+message GetTransactionRequest {
+  uint64 tx_id = 1;
+}
+
+message GetTransactionResponse {
+  uint64               tx_id       = 1;
+  repeated TxEntryRecord entries   = 2;
+}
+
+// TxEntryRecord represents a single debit or credit within a transaction.
+message TxEntryRecord {
+  uint64    account_id       = 1;
+  uint64    amount           = 2;
+  EntryKind kind             = 3;
+  int64     computed_balance = 4;
+}
+
+enum EntryKind {
+  CREDIT = 0;
+  DEBIT  = 1;
+}
+
+// ---- Account history query (ADR-008) ----
+
+message GetAccountHistoryRequest {
+  uint64 account_id = 1;
+  uint64 from_tx_id = 2;  // 0 = latest
+  uint32 limit      = 3;  // default 20, max 1000
+}
+
+message GetAccountHistoryResponse {
+  repeated TxEntryRecord entries    = 1;
+  uint64                 next_tx_id = 2;  // 0 = no more entries
 }

@@ -1,4 +1,5 @@
 mod engine;
+mod index;
 mod layout;
 mod segment;
 mod snapshot;

@@ -6,10 +6,11 @@ use crate::storage::SegmentStaus::SEALED;
 use crate::storage::{Segment, Storage};
 use crate::transactor::Transactor;
 use spdlog::info;
+use std::collections::HashMap;
 
 pub struct Recover<'r> {
     transactor: &'r mut Transactor,
-    snapshot: &'r Snapshot,
+    snapshot: &'r mut Snapshot,
     seal: &'r mut Seal,
     sequencer: &'r Sequencer,
     storage: &'r Storage,
@@ -19,7 +20,7 @@ pub struct Recover<'r> {
 impl<'r> Recover<'r> {
     pub fn new(
         transactor: &'r mut Transactor,
-        snapshot: &'r Snapshot,
+        snapshot: &'r mut Snapshot,
         seal: &'r mut Seal,
         sequencer: &'r Sequencer,
         storage: &'r Storage,
@@ -43,6 +44,7 @@ impl<'r> Recover<'r> {
         // find the latest snapshot
         let latest_snapshot_segment_id = self.locate_latest_snapshot_segment_id()?;
         let mut last_tx_id = 0;
+        let mut recover_balances = HashMap::new();
 
         // restore the latest snapshot
         for segment in self.segments.iter_mut() {
@@ -56,9 +58,7 @@ impl<'r> Recover<'r> {
                 let data = segment.load_snapshot()?.unwrap();
 
                 for (account_id, balance) in data.balances {
-                    self.transactor
-                        .recover_balance(account_id as usize, balance);
-                    self.snapshot.recover_balance(account_id as usize, balance);
+                    recover_balances.insert(account_id, balance);
                     self.seal.recover_balance(account_id as usize, balance)?;
                 }
 
@@ -77,10 +77,7 @@ impl<'r> Recover<'r> {
             segment.visit_wal_records(|record| match record {
                 WalEntry::Metadata(metadata) => last_tx_id = metadata.tx_id,
                 WalEntry::Entry(entry) => {
-                    self.transactor
-                        .recover_balance(entry.account_id as usize, entry.computed_balance);
-                    self.snapshot
-                        .recover_balance(entry.account_id as usize, entry.computed_balance);
+                    recover_balances.insert(entry.account_id, entry.computed_balance);
                 }
                 _ => {}
             })?;
@@ -89,15 +86,19 @@ impl<'r> Recover<'r> {
         // process active WAL records
         let active_segment = self.storage.active_segment()?;
         active_segment.visit_wal_records(|record| match record {
-            WalEntry::Metadata(metadata) => last_tx_id = metadata.tx_id,
+            WalEntry::Metadata(metadata) => {
+                last_tx_id = metadata.tx_id;
+                self.snapshot.recover_index_tx_metadata(metadata);
+            }
             WalEntry::Entry(entry) => {
-                self.transactor
-                    .recover_balance(entry.account_id as usize, entry.computed_balance);
-                self.snapshot
-                    .recover_balance(entry.account_id as usize, entry.computed_balance);
+                recover_balances.insert(entry.account_id, entry.computed_balance);
+                self.snapshot.recover_index_tx_entry(entry);
             }
             _ => {}
         })?;
+
+        self.transactor.recover_balances(&recover_balances);
+        self.snapshot.recover_balances(&recover_balances);
 
         // restore last tx ids
         self.transactor.store_last_processed_id(last_tx_id);

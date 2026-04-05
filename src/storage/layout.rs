@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-
 // ── WAL file paths ────────────────────────────────────────────────────────────
 
 /// Returns the path of the active WAL file: `{data_dir}/wal.bin`.
@@ -20,6 +19,18 @@ pub(super) fn segment_crc_path(data_dir: &Path, id: u32) -> PathBuf {
 /// Returns the path of a WAL segment seal marker: `{data_dir}/wal_{id:06}.seal`.
 pub(super) fn segment_seal_path(data_dir: &Path, id: u32) -> PathBuf {
     data_dir.join(format!("wal_{:06}.seal", id))
+}
+
+// ── Index file paths (ADR-008) ───────────────────────────────────────────
+
+/// Returns the path of a transaction index: `{data_dir}/wal_index_{id:06}.bin`.
+pub(super) fn segment_tx_index_path(data_dir: &Path, id: u32) -> PathBuf {
+    data_dir.join(format!("wal_index_{:06}.bin", id))
+}
+
+/// Returns the path of an account index: `{data_dir}/account_index_{id:06}.bin`.
+pub(super) fn segment_account_index_path(data_dir: &Path, id: u32) -> PathBuf {
+    data_dir.join(format!("account_index_{:06}.bin", id))
 }
 
 // ── Snapshot file paths ───────────────────────────────────────────────────────

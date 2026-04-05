@@ -2,7 +2,7 @@ use crate::storage::layout::{
     snapshot_bin_path, snapshot_bin_tmp_path, snapshot_crc_path, snapshot_crc_tmp_path,
 };
 use crate::storage::segment::Segment;
-use spdlog::{info, warn};
+use spdlog::warn;
 use std::io::Write;
 use std::path::Path;
 
@@ -85,11 +85,6 @@ impl Segment {
         // 8. Atomic rename both files
         std::fs::rename(&bin_tmp, &bin_final)?;
         std::fs::rename(&crc_tmp, &crc_final)?;
-
-        info!(
-            "Snapshot saved: segment={} accounts={}",
-            segment_id, account_count
-        );
         Ok(())
     }
 

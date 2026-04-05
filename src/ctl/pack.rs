@@ -2,10 +2,9 @@ use std::io::BufRead;
 use std::path::Path;
 
 use crate::entities::*;
-use crate::storage::StorageConfig;
 
-use super::CtlError;
 use super::json::{compute_tx_crc, json_to_wal_entry};
+use super::{CtlError, make_storage};
 
 pub fn run(input: &Path, out: Option<&Path>, no_validate: bool) -> Result<(), CtlError> {
     let reader: Box<dyn BufRead> = if input == Path::new("-") {
@@ -51,18 +50,25 @@ pub fn run(input: &Path, out: Option<&Path>, no_validate: bool) -> Result<(), Ct
         }
     };
 
+    // Ensure output directory exists and is a valid storage directory
+    let mut output_data_dir = output
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_string_lossy()
+        .to_string();
+    if output_data_dir.is_empty() {
+        output_data_dir = ".".to_string();
+    }
+    let _ = make_storage(&output_data_dir)?;
+
     // Write via a temporary Storage + active segment + append_entries
     let temp_dir =
         tempfile::tempdir().map_err(|e| CtlError::new(format!("cannot create temp dir: {}", e)))?;
 
-    let storage = crate::storage::Storage::new(StorageConfig {
-        data_dir: temp_dir.path().to_string_lossy().to_string(),
-        temporary: false,
-        ..Default::default()
-    })?;
+    let storage = make_storage(&temp_dir.path().to_string_lossy())?;
 
     let mut segment = storage.active_segment()?;
-    segment.append_entries(&entries);
+    segment.write_entries(&entries);
 
     // Copy the written wal.bin to the desired output path
     let src = temp_dir.path().join("wal.bin");

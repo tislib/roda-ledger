@@ -39,4 +39,8 @@ impl Sequencer {
     pub(crate) fn set_next_id(&self, next_id: u64) {
         self.next_id.store(next_id, Ordering::Release);
     }
+
+    pub(crate) fn last_id(&self) -> u64 {
+        self.next_id.load(Ordering::Acquire) - 1
+    }
 }

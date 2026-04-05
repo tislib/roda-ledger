@@ -2,7 +2,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
 use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
 use roda_ledger::ledger::PipelineMode;
-use roda_ledger::snapshot::Snapshot;
+use roda_ledger::snapshot::{Snapshot, SnapshotMessage};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,13 +13,16 @@ fn snapshot_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size));
     group.measurement_time(std::time::Duration::from_secs(10));
 
-    let inbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
+    let inbound: Arc<ArrayQueue<SnapshotMessage>> =
+        Arc::new(ArrayQueue::new(batch_size as usize * 10));
     let running = Arc::new(AtomicBool::new(true));
-    let snapshot = Snapshot::new(
+    let mut snapshot = Snapshot::new(
         inbound.clone(),
         1_000_000,
         running.clone(),
         PipelineMode::LowLatency,
+        1 << 20,
+        1 << 21,
     );
 
     let handle = snapshot.start().unwrap();
@@ -43,7 +46,10 @@ fn snapshot_bench(c: &mut Criterion) {
                 };
                 // compute CRC for correctness
                 metadata.crc32c = crc32c::crc32c(bytemuck::bytes_of(&metadata));
-                while inbound.push(WalEntry::Metadata(metadata)).is_err() {
+                while inbound
+                    .push(SnapshotMessage::Entry(WalEntry::Metadata(metadata)))
+                    .is_err()
+                {
                     std::thread::yield_now();
                 }
 
@@ -57,7 +63,10 @@ fn snapshot_bench(c: &mut Criterion) {
                         _pad0: [0; 6],
                         computed_balance: 100,
                     };
-                    while inbound.push(WalEntry::Entry(entry)).is_err() {
+                    while inbound
+                        .push(SnapshotMessage::Entry(WalEntry::Entry(entry)))
+                        .is_err()
+                    {
                         std::thread::yield_now();
                     }
                 }

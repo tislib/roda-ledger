@@ -1,6 +1,7 @@
 use crate::entities::WalEntry;
 use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline_mode::PipelineMode;
+use crate::snapshot::SnapshotMessage;
 use crate::storage::Storage;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::thread::JoinHandle;
 
 pub struct Wal {
     inbound: Arc<ArrayQueue<WalEntry>>,
-    outbound: Arc<ArrayQueue<WalEntry>>,
+    outbound: Arc<ArrayQueue<SnapshotMessage>>,
     storage: Arc<Storage>,
     last_processed_transaction_id: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
@@ -18,7 +19,7 @@ pub struct Wal {
 
 pub struct WalRunner {
     inbound: Arc<ArrayQueue<WalEntry>>,
-    outbound: Arc<ArrayQueue<WalEntry>>,
+    outbound: Arc<ArrayQueue<SnapshotMessage>>,
     storage: Arc<Storage>,
     buffer: Vec<WalEntry>,
     last_processed_transaction_id: Arc<AtomicU64>,
@@ -27,6 +28,9 @@ pub struct WalRunner {
     committed_len: usize,
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
+    // Transaction state (across fill_buffer calls)
+    pending_entries: u8,
+    pending_tx_id: u64,
     // Segmentation state
     last_committed_tx_id: u64,
 }
@@ -34,7 +38,7 @@ pub struct WalRunner {
 impl Wal {
     pub fn new(
         inbound: Arc<ArrayQueue<WalEntry>>,
-        outbound: Arc<ArrayQueue<WalEntry>>,
+        outbound: Arc<ArrayQueue<SnapshotMessage>>,
         storage: Arc<Storage>,
         running: Arc<AtomicBool>,
         pipeline_mode: PipelineMode,
@@ -50,13 +54,12 @@ impl Wal {
     }
 
     pub fn last_processed_transaction_id(&self) -> u64 {
-        self.last_processed_transaction_id
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.last_processed_transaction_id.load(Ordering::Acquire)
     }
 
     pub fn move_forward(&self, last_id: u64) {
         self.last_processed_transaction_id
-            .store(last_id, std::sync::atomic::Ordering::Relaxed);
+            .store(last_id, Ordering::Release);
     }
 
     pub fn start(&self) -> std::io::Result<JoinHandle<()>> {
@@ -78,6 +81,8 @@ impl Wal {
             committed_len: 0,
             running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
+            pending_entries: 0,
+            pending_tx_id: 0,
             last_committed_tx_id: 0,
         }
     }
@@ -99,26 +104,25 @@ impl WalRunner {
             .inbound
             .len()
             .min(self.buffer.capacity() - self.buffer.len());
-        let mut pending_entries = 0;
-        let mut pending_tx_id = 0;
         for _ in 0..available {
             if let Some(entry) = self.inbound.pop() {
                 match &entry {
                     WalEntry::Metadata(m) => {
-                        pending_entries = m.entry_count;
-                        pending_tx_id = m.tx_id;
+                        self.pending_entries = m.entry_count;
+                        self.pending_tx_id = m.tx_id;
                     }
                     WalEntry::Entry(_) => {
-                        pending_entries = pending_entries.saturating_sub(1);
+                        self.pending_entries = self.pending_entries.saturating_sub(1);
                     }
                     WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
                 }
                 self.buffer.push(entry);
 
-                if pending_entries == 0 && pending_tx_id != 0 {
+                if self.pending_entries == 0 && self.pending_tx_id != 0 {
                     // A full transaction just landed in the buffer.
                     self.committed_len = self.buffer.len();
-                    self.last_committed_tx_id = pending_tx_id;
+                    self.last_committed_tx_id = self.pending_tx_id;
+                    self.pending_tx_id = 0; // reset for next tx
                 }
             }
         }
@@ -127,12 +131,13 @@ impl WalRunner {
 
     /// Push `entry` to the outbound queue, yielding until space is available.
     /// Returns `false` if a shutdown was requested while waiting.
-    fn push_outbound(&mut self, mut entry: WalEntry) -> bool {
+    fn push_outbound(&mut self, entry: WalEntry) -> bool {
+        let mut msg = SnapshotMessage::Entry(entry);
         loop {
-            match self.outbound.push(entry) {
+            match self.outbound.push(msg) {
                 Ok(_) => return true,
                 Err(returned) => {
-                    entry = returned;
+                    msg = returned;
                     if !self.running.load(Ordering::Relaxed) {
                         return false;
                     }
@@ -157,25 +162,13 @@ impl WalRunner {
 
             if active_segment.current_wal_offset() == 0 {
                 let first_tx_id = self.buffer[0].tx_id();
-                active_segment.append_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
+                active_segment.write_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
                     active_segment.id(),
                     first_tx_id,
                 ))])
             }
 
-            active_segment.append_entries(&self.buffer[..self.committed_len]); //fixme move retry logic to here
-
-            // Forward committed entries downstream and publish the committed tx id.
-            let committed_tx_id = self.last_committed_tx_id;
-            let committed: Vec<WalEntry> = self.buffer.drain(..self.committed_len).collect();
-            self.committed_len = 0;
-            for entry in committed {
-                if !self.push_outbound(entry) {
-                    return;
-                }
-            }
-            self.last_processed_transaction_id
-                .store(committed_tx_id, Ordering::Relaxed);
+            active_segment.write_entries(&self.buffer[..self.committed_len]); //fixme move retry logic to here
 
             // Rotate the segment when the size threshold is exceeded.
             // No pending-entries guard needed here: the buffer contract already
@@ -183,19 +176,30 @@ impl WalRunner {
             if active_segment.current_wal_offset()
                 >= (self.storage.config().wal_segment_size_mb * 1024 * 1024) as usize
             {
-                active_segment.append_entries(&[WalEntry::SegmentSealed(
-                    wal_segment_sealed_entry(
-                        active_segment.id(),
-                        self.last_committed_tx_id,
-                        active_segment.record_count(),
-                    ),
-                )]);
+                active_segment.write_entries(&[WalEntry::SegmentSealed(wal_segment_sealed_entry(
+                    active_segment.id(),
+                    self.last_committed_tx_id,
+                    active_segment.record_count(),
+                ))]);
                 active_segment
                     .close()
                     .expect("Failed to close active segment"); // fixme implement retry logic
+                self.storage.next_segment();
                 drop(active_segment);
                 active_segment = self.storage.active_segment().unwrap();
             }
+
+            // Forward committed entries downstream and publish the committed tx id.
+            let committed_tx_id = self.last_committed_tx_id;
+            let committed: Vec<WalEntry> = self.buffer.drain(..self.committed_len).collect();
+            self.committed_len = 0;
+            for entry in committed {
+                if !self.push_outbound(entry) {
+                    break;
+                }
+            }
+            self.last_processed_transaction_id
+                .store(committed_tx_id, Ordering::Release);
         }
     }
 }
