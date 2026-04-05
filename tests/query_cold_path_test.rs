@@ -24,7 +24,7 @@ fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<Vec<IndexedTxEntry>>
         }),
     });
     match rx.recv().unwrap() {
-        QueryResponse::Transaction(result) => result,
+        QueryResponse::Transaction(result) => result.map(|r| r.entries),
         _ => panic!("unexpected response type"),
     }
 }
@@ -451,5 +451,5 @@ fn test_continuous_queries_during_rotation_no_data_loss() {
 
     let res = r.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
 
-    assert_eq!(res.len(), 2);
+    assert_eq!(res.entries.len(), 2);
 }

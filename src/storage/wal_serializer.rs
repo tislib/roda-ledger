@@ -1,4 +1,6 @@
-use crate::entities::{SegmentHeader, SegmentSealed, TxEntry, TxMetadata, WalEntry, WalEntryKind};
+use crate::entities::{
+    SegmentHeader, SegmentSealed, TxEntry, TxLink, TxMetadata, WalEntry, WalEntryKind,
+};
 
 pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
     match entry {
@@ -6,6 +8,7 @@ pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
         WalEntry::Entry(e) => bytemuck::bytes_of(e),
         WalEntry::SegmentHeader(h) => bytemuck::bytes_of(h),
         WalEntry::SegmentSealed(s) => bytemuck::bytes_of(s),
+        WalEntry::Link(l) => bytemuck::bytes_of(l),
     }
 }
 
@@ -37,6 +40,10 @@ pub fn parse_wal_record(data: &[u8]) -> Result<WalEntry, std::io::Error> {
             let header: SegmentHeader = bytemuck::pod_read_unaligned(record_data);
             Ok(WalEntry::SegmentHeader(header))
         }
+        k if k == WalEntryKind::Link as u8 => {
+            let link: TxLink = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::Link(link))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown WAL record kind={}", kind),
@@ -57,7 +64,7 @@ mod tests {
             entry_type: WalEntryKind::TxMetadata as u8,
             entry_count: 2,
             fail_reason: FailReason::NONE,
-            flags: 0,
+            link_count: 0,
             crc32c: 0xDEADBEEF,
             tx_id: 42,
             timestamp: 1_700_000_000,

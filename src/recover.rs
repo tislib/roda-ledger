@@ -1,4 +1,4 @@
-use crate::entities::WalEntry;
+use crate::entities::{FailReason, WalEntry};
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::Snapshot;
@@ -39,10 +39,17 @@ impl<'r> Recover<'r> {
         info!("Starting recovery...");
 
         // locate segments
-        self.segments = self.storage.list_all_segments()?;
+        self.segments = self.storage.list_all_segments().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to list segments during recovery: {}", e))
+        })?;
 
         // find the latest snapshot
-        let latest_snapshot_segment_id = self.locate_latest_snapshot_segment_id()?;
+        let latest_snapshot_segment_id = self.locate_latest_snapshot_segment_id().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to locate latest snapshot segment: {}", e),
+            )
+        })?;
         let mut last_tx_id = 0;
         let mut recover_balances = HashMap::new();
 
@@ -55,11 +62,26 @@ impl<'r> Recover<'r> {
 
             // restore the snapshot
             if segment.id() == latest_snapshot_segment_id {
-                let data = segment.load_snapshot()?.unwrap();
+                let data = segment.load_snapshot().map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("failed to load snapshot for segment {}: {}", segment.id(), e),
+                    )
+                })?.unwrap();
 
                 for (account_id, balance) in data.balances {
                     recover_balances.insert(account_id, balance);
-                    self.seal.recover_balance(account_id as usize, balance)?;
+                    self.seal
+                        .recover_balance(account_id as usize, balance)
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "failed to recover balance for account {} from snapshot: {}",
+                                    account_id, e
+                                ),
+                            )
+                        })?;
                 }
 
                 last_tx_id = data.last_tx_id;
@@ -69,33 +91,94 @@ impl<'r> Recover<'r> {
 
             // process the segments after snapshot
             if segment.status() != SEALED {
-                self.seal.recover_pre_seal(segment)?;
+                self.seal.recover_pre_seal(segment).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("failed to recover pre-seal for segment {}: {}", segment.id(), e),
+                    )
+                })?;
             }
 
-            segment.load()?;
+            segment.load().map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to load segment {}: {}", segment.id(), e),
+                )
+            })?;
 
             segment.visit_wal_records(|record| match record {
-                WalEntry::Metadata(metadata) => last_tx_id = metadata.tx_id,
+                WalEntry::Metadata(metadata) => {
+                    last_tx_id = metadata.tx_id;
+                }
                 WalEntry::Entry(entry) => {
                     recover_balances.insert(entry.account_id, entry.computed_balance);
                 }
+                WalEntry::Link(_) => {}
                 _ => {}
+            }).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to visit wal records for segment {}: {}",
+                        segment.id(),
+                        e
+                    ),
+                )
             })?;
-        }
+    }
 
-        // process active WAL records
-        let active_segment = self.storage.active_segment()?;
-        active_segment.visit_wal_records(|record| match record {
-            WalEntry::Metadata(metadata) => {
-                last_tx_id = metadata.tx_id;
-                self.snapshot.recover_index_tx_metadata(metadata);
+    // process active WAL records
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let active_segment = self.storage.active_segment().map_err(|e| {
+        std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
+    })?;
+    let mut current_recover_tx_id = 0u64;
+    active_segment.visit_wal_records(|record| match record {
+        WalEntry::Metadata(metadata) => {
+            last_tx_id = metadata.tx_id;
+            current_recover_tx_id = metadata.tx_id;
+            self.snapshot.recover_index_tx_metadata(metadata);
+        }
+        WalEntry::Entry(entry) => {
+            recover_balances.insert(entry.account_id, entry.computed_balance);
+            self.snapshot.recover_index_tx_entry(entry);
+        }
+        WalEntry::Link(link) => {
+            self.snapshot
+                .recover_index_tx_link(current_recover_tx_id, link);
+        }
+        _ => {}
+    }).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to visit active wal records: {}", e),
+        )
+    })?;
+
+    // Rebuild dedup cache from active WAL committed transactions
+    // Re-scan active WAL to populate dedup entries
+    active_segment.visit_wal_records(|record| {
+        if let WalEntry::Metadata(metadata) = record {
+            // Only non-duplicate committed transactions should be in the dedup cache
+            if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
+                let timestamp_ms = metadata.timestamp / 1_000_000; // nanos → ms
+                self.transactor.dedup_cache_mut().recover_entry(
+                    metadata.user_ref,
+                    metadata.tx_id,
+                    timestamp_ms,
+                    now_ms,
+                );
             }
-            WalEntry::Entry(entry) => {
-                recover_balances.insert(entry.account_id, entry.computed_balance);
-                self.snapshot.recover_index_tx_entry(entry);
-            }
-            _ => {}
-        })?;
+        }
+    }).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to re-scan active wal records for dedup: {}", e),
+        )
+    })?;
 
         self.transactor.recover_balances(&recover_balances);
         self.snapshot.recover_balances(&recover_balances);

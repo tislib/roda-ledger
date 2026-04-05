@@ -146,8 +146,9 @@ impl Ledger for LedgerHandler {
         });
 
         match rx.recv() {
-            Ok(QueryResponse::Transaction(Some(entries))) => {
-                let entry_records: Vec<proto::TxEntryRecord> = entries
+            Ok(QueryResponse::Transaction(Some(result))) => {
+                let entry_records: Vec<proto::TxEntryRecord> = result
+                    .entries
                     .iter()
                     .map(|e| proto::TxEntryRecord {
                         account_id: e.account_id,
@@ -156,9 +157,18 @@ impl Ledger for LedgerHandler {
                         computed_balance: e.computed_balance,
                     })
                     .collect();
+                let link_records: Vec<proto::TxLinkRecord> = result
+                    .links
+                    .iter()
+                    .map(|l| proto::TxLinkRecord {
+                        to_tx_id: l.to_tx_id,
+                        kind: l.kind as i32,
+                    })
+                    .collect();
                 Ok(Response::new(proto::GetTransactionResponse {
                     tx_id,
                     entries: entry_records,
+                    links: link_records,
                 }))
             }
             Ok(QueryResponse::Transaction(None)) => Err(Status::not_found("transaction not found")),

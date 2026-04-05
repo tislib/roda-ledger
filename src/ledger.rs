@@ -4,7 +4,7 @@ pub use crate::pipeline_mode::PipelineMode;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
-use crate::snapshot::{QueryRequest, Snapshot, SnapshotMessage};
+use crate::snapshot::{QueryKind, QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Storage, StorageConfig};
 use crate::transaction::{Operation, Transaction, TransactionStatus};
 use crate::transactor::Transactor;
@@ -13,6 +13,7 @@ use crossbeam_queue::ArrayQueue;
 use spdlog::{Level, LevelFilter, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ pub struct LedgerConfig {
     pub seal_check_internal: Duration,
     pub index_circle1_size: usize,
     pub index_circle2_size: usize,
+    pub dedup_enabled: bool,
+    pub dedup_window_ms: u64,
 }
 
 impl Default for LedgerConfig {
@@ -39,6 +42,8 @@ impl Default for LedgerConfig {
             seal_check_internal: Duration::from_secs(1),
             index_circle1_size: 1 << 20, // 1M slots
             index_circle2_size: 1 << 21, // 2M entries
+            dedup_enabled: true,
+            dedup_window_ms: 10_000, // 10 seconds
         }
     }
 }
@@ -125,6 +130,8 @@ impl Ledger {
                 running.clone(),
                 config.max_accounts,
                 config.pipeline_mode,
+                config.dedup_enabled,
+                config.dedup_window_ms,
             ),
             wal: Wal::new(
                 transactor_wal_queue,
@@ -201,6 +208,25 @@ impl Ledger {
         }
     }
 
+    /// Synchronous version of `query`. Blocks the current thread until the
+    /// response is received from the Snapshot stage.
+    pub fn query_block(&self, request: QueryRequest) -> QueryResponse {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let kind = request.kind;
+        let original_respond = request.respond;
+
+        self.query(QueryRequest {
+            kind,
+            respond: Box::new(move |res| {
+                let res_clone = res.clone();
+                original_respond(res);
+                let _ = tx.send(res_clone);
+            }),
+        });
+
+        rx.recv().expect("query_block: failed to receive response")
+    }
+
     pub fn get_rejected_count(&self) -> u64 {
         self.transactor.get_rejected_count()
     }
@@ -253,11 +279,21 @@ impl Ledger {
 
     pub fn start(&mut self) -> std::io::Result<()> {
         info!("Starting Ledger stages...");
-        self.recover()?;
-        self.handles.push(self.transactor.start()?);
-        self.handles.push(self.wal.start()?);
-        self.handles.push(self.snapshot.start()?);
-        self.handles.push(self.seal.start()?);
+        self.recover().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to recover ledger during start: {}", e))
+        })?;
+        self.handles.push(self.transactor.start().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
+        })?);
+        self.handles.push(self.wal.start().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
+        })?);
+        self.handles.push(self.snapshot.start().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
+        })?);
+        self.handles.push(self.seal.start().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
+        })?);
 
         Ok(())
     }
@@ -271,7 +307,9 @@ impl Ledger {
             &self.storage,
         );
 
-        recover.recover()
+        recover.recover().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to recover ledger state: {}", e))
+        })
     }
 }
 

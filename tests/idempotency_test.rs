@@ -25,11 +25,13 @@ fn make_config(dir: &str) -> LedgerConfig {
     }
 }
 
-/// Two deposits with the same user_ref are both processed (user_ref is not a dedup key).
+/// With dedup enabled, duplicate user_ref within the window is rejected.
+/// Only the first deposit should affect the balance.
 #[test]
-fn test_duplicate_user_ref_both_processed() {
+fn test_duplicate_user_ref_rejected_with_dedup() {
     let config = LedgerConfig {
         seal_check_internal: Duration::from_millis(10),
+        dedup_enabled: true,
         ..LedgerConfig::temp()
     };
     let mut ledger = Ledger::new(config);
@@ -38,12 +40,43 @@ fn test_duplicate_user_ref_both_processed() {
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
         amount: 100,
-        user_ref: 42, // same user_ref
+        user_ref: 42,
     });
     let id2 = ledger.submit(Operation::Deposit {
         account: 1,
         amount: 100,
-        user_ref: 42, // same user_ref
+        user_ref: 42, // same user_ref → DUPLICATE
+    });
+    ledger.wait_for_transaction(id2);
+
+    assert_ne!(id1, id2, "tx IDs must be different");
+    assert_eq!(
+        ledger.get_balance(1),
+        100,
+        "only first deposit should affect balance; second is DUPLICATE"
+    );
+}
+
+/// With dedup disabled, duplicate user_ref values are both processed.
+#[test]
+fn test_duplicate_user_ref_both_processed_when_dedup_disabled() {
+    let config = LedgerConfig {
+        seal_check_internal: Duration::from_millis(10),
+        dedup_enabled: false,
+        ..LedgerConfig::temp()
+    };
+    let mut ledger = Ledger::new(config);
+    ledger.start().unwrap();
+
+    let id1 = ledger.submit(Operation::Deposit {
+        account: 1,
+        amount: 100,
+        user_ref: 42,
+    });
+    let id2 = ledger.submit(Operation::Deposit {
+        account: 1,
+        amount: 100,
+        user_ref: 42,
     });
     ledger.wait_for_transaction(id2);
 
@@ -51,7 +84,37 @@ fn test_duplicate_user_ref_both_processed() {
     assert_eq!(
         ledger.get_balance(1),
         200,
-        "both deposits with same user_ref should process"
+        "both deposits should process when dedup is disabled"
+    );
+}
+
+/// user_ref=0 bypasses dedup check even when enabled.
+#[test]
+fn test_zero_user_ref_bypasses_dedup() {
+    let config = LedgerConfig {
+        seal_check_internal: Duration::from_millis(10),
+        dedup_enabled: true,
+        ..LedgerConfig::temp()
+    };
+    let mut ledger = Ledger::new(config);
+    ledger.start().unwrap();
+
+    let id1 = ledger.submit(Operation::Deposit {
+        account: 1,
+        amount: 100,
+        user_ref: 0,
+    });
+    let id2 = ledger.submit(Operation::Deposit {
+        account: 1,
+        amount: 100,
+        user_ref: 0,
+    });
+    ledger.wait_for_transaction(id2);
+
+    assert_eq!(
+        ledger.get_balance(1),
+        200,
+        "user_ref=0 should bypass dedup"
     );
 }
 

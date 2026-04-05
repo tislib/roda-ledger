@@ -9,7 +9,8 @@
 //!
 //! Both circle sizes must be powers of two so modulo reduces to a bitmask.
 
-use crate::entities::{EntryKind, WalEntryKind};
+use crate::entities::{EntryKind, TxLinkKind, WalEntryKind};
+use std::collections::HashMap;
 
 // ── TxSlot (circle1) ──────────────────────────────────────────────────────────
 
@@ -34,7 +35,7 @@ pub struct TxSlot {
 /// A mismatch on `account_id` while following `prev_link` signals eviction —
 /// the slot was overwritten by a newer entry; the chain is broken naturally.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IndexedTxEntry {
     pub entry_type: u8,        // 1 @ 0  — WalEntryKind::TxEntry
     pub kind: EntryKind,       // 1 @ 1  — Credit or Debit
@@ -65,6 +66,15 @@ impl Default for IndexedTxEntry {
     }
 }
 
+// ── IndexedTxLink ────────────────────────────────────────────────────────────
+
+/// A stored link associated with a transaction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IndexedTxLink {
+    pub kind: TxLinkKind,
+    pub to_tx_id: u64,
+}
+
 // ── TransactionIndexer ────────────────────────────────────────────────────────
 
 /// In-memory transaction and account index (ADR-008).
@@ -79,6 +89,9 @@ pub struct TransactionIndexer {
     circle2_mask: usize,
     account_heads_mask: usize,
     write_head2: usize, // monotonically increasing; masked on access
+    /// Links indexed by tx_id. Bounded implicitly by transaction throughput;
+    /// most transactions have zero links (common case: empty map entries).
+    links: HashMap<u64, Vec<IndexedTxLink>>,
 }
 
 impl TransactionIndexer {
@@ -107,6 +120,7 @@ impl TransactionIndexer {
             circle2_mask: circle2_size - 1,
             account_heads_mask: account_heads_size - 1,
             write_head2: 0,
+            links: HashMap::new(),
         }
     }
 
@@ -163,6 +177,19 @@ impl TransactionIndexer {
 
         self.account_heads[head_slot] = (account_id, slot_idx as u32);
         self.write_head2 += 1;
+    }
+
+    /// Record a link for a transaction.
+    pub fn insert_link(&mut self, tx_id: u64, kind: TxLinkKind, to_tx_id: u64) {
+        self.links
+            .entry(tx_id)
+            .or_default()
+            .push(IndexedTxLink { kind, to_tx_id });
+    }
+
+    /// Look up links for a transaction by `tx_id`.
+    pub fn get_links(&self, tx_id: u64) -> Option<&Vec<IndexedTxLink>> {
+        self.links.get(&tx_id)
     }
 
     /// Look up a transaction's entries by `tx_id`.

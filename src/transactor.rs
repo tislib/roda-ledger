@@ -1,6 +1,8 @@
 use crate::balance::Balance;
+use crate::dedup::{DedupCache, DedupResult};
 use crate::entities::{
-    EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxMetadata, WalEntry, WalEntryKind,
+    EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
+    WalEntryKind,
 };
 use crate::pipeline_mode::PipelineMode;
 use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction};
@@ -20,6 +22,7 @@ pub struct Transactor {
     balances: Vec<Balance>,
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
+    dedup: DedupCache,
 }
 
 pub struct TransactorRunner {
@@ -35,6 +38,7 @@ pub struct TransactorRunner {
     input_retry_count: u64,
     fail_reason: FailReason,
     position: usize,
+    dedup: DedupCache,
 }
 
 impl Transactor {
@@ -44,6 +48,8 @@ impl Transactor {
         running: Arc<AtomicBool>,
         max_accounts: usize,
         pipeline_mode: PipelineMode,
+        dedup_enabled: bool,
+        dedup_window_ms: u64,
     ) -> Self {
         let mut accounts = Vec::with_capacity(max_accounts);
         accounts.resize(max_accounts, Balance::default());
@@ -55,6 +61,7 @@ impl Transactor {
             balances: accounts,
             running,
             pipeline_mode,
+            dedup: DedupCache::new(dedup_enabled, dedup_window_ms),
         }
     }
 
@@ -86,6 +93,10 @@ impl Transactor {
         self.rejected_transactions.len() as u64
     }
 
+    pub(crate) fn dedup_cache_mut(&mut self) -> &mut DedupCache {
+        &mut self.dedup
+    }
+
     pub fn start(&mut self) -> std::io::Result<JoinHandle<()>> {
         let mut runner = TransactorRunner {
             inbound: self.inbound.clone(),
@@ -100,6 +111,7 @@ impl Transactor {
             input_retry_count: 0,
             fail_reason: FailReason::NONE,
             position: 0,
+            dedup: std::mem::replace(&mut self.dedup, DedupCache::new(false, 0)),
         };
         std::thread::Builder::new()
             .name("transactor".to_string())
@@ -124,6 +136,7 @@ impl TransactorRunner {
             input_retry_count: 0,
             fail_reason: FailReason::NONE,
             position: 0,
+            dedup: DedupCache::new(false, 0),
         }
     }
 
@@ -202,15 +215,28 @@ impl TransactorRunner {
     }
 
     fn process(&mut self, timestamp: u64) {
+        let timestamp_ms = timestamp / 1_000_000; // nanos → ms
         let mut tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
             self.fail_reason = FailReason::NONE;
             let operation = &self.transaction_buffer[idx].operation;
 
             tx_id = self.transaction_buffer[idx].id;
+            let user_ref = operation.user_ref();
 
-            // push meta at self.position
+            // --- Deduplication check ---
+            match self.dedup.check(user_ref, timestamp_ms) {
+                DedupResult::Duplicate(original_tx_id) => {
+                    self.emit_duplicate(tx_id, user_ref, timestamp, original_tx_id);
+                    self.rejected_transactions
+                        .insert(tx_id, FailReason::DUPLICATE);
+                    // position already advanced by emit_duplicate
+                    continue;
+                }
+                DedupResult::Proceed => {}
+            }
 
+            // --- Normal operation processing ---
             match operation.clone() {
                 Operation::Deposit {
                     user_ref,
@@ -296,12 +322,16 @@ impl TransactorRunner {
                 if let Some(WalEntry::Metadata(m)) = self.entries.get_mut(meta_idx) {
                     m.fail_reason = fail_reason;
                     m.entry_count = 0;
+                    m.link_count = 0;
                     m.crc32c = 0;
                     let digest = crc32c::crc32c(bytemuck::bytes_of(m));
                     m.crc32c = digest;
                 }
 
                 self.rejected_transactions.insert(tx_id, fail_reason);
+
+                // Record in dedup (even failed txs get deduped)
+                self.dedup.insert(user_ref, tx_id);
 
                 // advance: meta only
                 self.position += 1;
@@ -327,6 +357,9 @@ impl TransactorRunner {
                     m.crc32c = digest;
                 }
 
+                // Record in dedup
+                self.dedup.insert(user_ref, tx_id);
+
                 // advance: meta + entries
                 self.position += 1 + entry_count;
             }
@@ -338,13 +371,53 @@ impl TransactorRunner {
         }
     }
 
+    /// Emit a duplicate transaction: TxMetadata (entry_count=0, link_count=1, fail_reason=DUPLICATE)
+    /// followed by a TxLink { kind: Duplicate, to_tx_id: original }.
+    fn emit_duplicate(
+        &mut self,
+        tx_id: u64,
+        user_ref: u64,
+        timestamp: u64,
+        original_tx_id: u64,
+    ) {
+        let link = TxLink {
+            entry_type: WalEntryKind::Link as u8,
+            link_kind: TxLinkKind::Duplicate as u8,
+            _pad: [0; 6],
+            to_tx_id: original_tx_id,
+            _pad2: [0; 24],
+        };
+
+        let mut meta = TxMetadata {
+            entry_type: WalEntryKind::TxMetadata as u8,
+            entry_count: 0,
+            link_count: 1,
+            fail_reason: FailReason::DUPLICATE,
+            crc32c: 0,
+            tx_id,
+            timestamp,
+            user_ref,
+            tag: *b"DUPLICAT",
+        };
+
+        // CRC covers meta + link
+        meta.crc32c = 0;
+        let digest = crc32c::crc32c(bytemuck::bytes_of(&meta));
+        let digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&link));
+        meta.crc32c = digest;
+
+        self.entries.push(WalEntry::Metadata(meta));
+        self.entries.push(WalEntry::Link(link));
+        self.position += 2; // meta + link
+    }
+
     #[inline]
     fn meta(&mut self, tx_id: u64, tag: [u8; 8], user_ref: u64, timestamp: u64) {
         self.entries.push(WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
             entry_count: 0,
+            link_count: 0,
             fail_reason: FailReason::NONE,
-            flags: 0,
             crc32c: 0,
             tx_id,
             timestamp,

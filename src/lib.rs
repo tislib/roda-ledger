@@ -1,5 +1,6 @@
 pub mod balance;
 pub mod ctl;
+pub mod dedup;
 pub mod entities;
 pub mod ledger;
 pub mod pipeline_mode;

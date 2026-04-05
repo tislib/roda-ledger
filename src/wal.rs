@@ -29,7 +29,8 @@ pub struct WalRunner {
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
     // Transaction state (across fill_buffer calls)
-    pending_entries: u8,
+    /// Total remaining records (entries + links) for the current transaction.
+    pending_records: u8,
     pending_tx_id: u64,
     // Segmentation state
     last_committed_tx_id: u64,
@@ -81,7 +82,7 @@ impl Wal {
             committed_len: 0,
             running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
-            pending_entries: 0,
+            pending_records: 0,
             pending_tx_id: 0,
             last_committed_tx_id: 0,
         }
@@ -108,17 +109,18 @@ impl WalRunner {
             if let Some(entry) = self.inbound.pop() {
                 match &entry {
                     WalEntry::Metadata(m) => {
-                        self.pending_entries = m.entry_count;
+                        self.pending_records =
+                            m.entry_count.saturating_add(m.link_count);
                         self.pending_tx_id = m.tx_id;
                     }
-                    WalEntry::Entry(_) => {
-                        self.pending_entries = self.pending_entries.saturating_sub(1);
+                    WalEntry::Entry(_) | WalEntry::Link(_) => {
+                        self.pending_records = self.pending_records.saturating_sub(1);
                     }
                     WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
                 }
                 self.buffer.push(entry);
 
-                if self.pending_entries == 0 && self.pending_tx_id != 0 {
+                if self.pending_records == 0 && self.pending_tx_id != 0 {
                     // A full transaction just landed in the buffer.
                     self.committed_len = self.buffer.len();
                     self.last_committed_tx_id = self.pending_tx_id;

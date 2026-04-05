@@ -1,4 +1,5 @@
 use crate::entities::*;
+use crate::entities::TxLinkKind;
 use crate::storage::{WAL_MAGIC, WAL_VERSION};
 
 pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
@@ -14,9 +15,9 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "type": "TxMetadata",
             "tx_id": m.tx_id,
             "entry_count": m.entry_count,
+            "link_count": m.link_count,
             "fail_reason": m.fail_reason.as_u8(),
             "crc32c": format!("{:#010x}", m.crc32c),
-            "flags": m.flags,
             "user_ref": m.user_ref,
             "timestamp": m.timestamp,
             "tag": hex_encode_tag(&m.tag),
@@ -34,6 +35,14 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "segment_id": s.segment_id,
             "last_tx_id": s.last_tx_id,
             "record_count": s.record_count,
+        }),
+        WalEntry::Link(l) => serde_json::json!({
+            "type": "TxLink",
+            "kind": match l.kind() {
+                TxLinkKind::Duplicate => "Duplicate",
+                TxLinkKind::Reversal => "Reversal",
+            },
+            "to_tx_id": l.to_tx_id,
         }),
     }
 }
@@ -68,8 +77,8 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
         "TxMetadata" => {
             let tx_id = value["tx_id"].as_u64().ok_or("missing tx_id")?;
             let entry_count = value["entry_count"].as_u64().ok_or("missing entry_count")? as u8;
+            let link_count = value.get("link_count").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let fail_reason = FailReason::from_u8(value["fail_reason"].as_u64().unwrap_or(0) as u8);
-            let flags = value.get("flags").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let user_ref = value.get("user_ref").and_then(|v| v.as_u64()).unwrap_or(0);
             let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
             let tag = value
@@ -80,8 +89,8 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
             Ok(WalEntry::Metadata(TxMetadata {
                 entry_type: WalEntryKind::TxMetadata as u8,
                 entry_count,
+                link_count,
                 fail_reason,
-                flags,
                 crc32c: 0,
                 tx_id,
                 timestamp,
@@ -126,22 +135,56 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 _pad1: [0; 16],
             }))
         }
+        "TxLink" => {
+            let to_tx_id = value["to_tx_id"].as_u64().ok_or("missing to_tx_id")?;
+            let kind = match value["kind"].as_str().ok_or("missing kind")? {
+                "Duplicate" => TxLinkKind::Duplicate,
+                "Reversal" => TxLinkKind::Reversal,
+                other => return Err(format!("unknown link kind: {}", other)),
+            };
+            Ok(WalEntry::Link(TxLink {
+                entry_type: WalEntryKind::Link as u8,
+                link_kind: kind as u8,
+                _pad: [0; 6],
+                to_tx_id,
+                _pad2: [0; 24],
+            }))
+        }
         other => Err(format!("unknown record type: {}", other)),
     }
 }
 
 pub fn compute_tx_crc(meta: &TxMetadata, entries: &[TxEntry]) -> u32 {
+    compute_tx_crc_with_links(meta, entries, &[])
+}
+
+pub fn compute_tx_crc_with_links(
+    meta: &TxMetadata,
+    entries: &[TxEntry],
+    links: &[TxLink],
+) -> u32 {
     let mut m = *meta;
     m.crc32c = 0;
     let mut digest = crc32c::crc32c(bytemuck::bytes_of(&m));
     for e in entries {
         digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(e));
     }
+    for l in links {
+        digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(l));
+    }
     digest
 }
 
 pub fn verify_tx_crc(meta: &TxMetadata, entries: &[TxEntry]) -> bool {
-    compute_tx_crc(meta, entries) == meta.crc32c
+    verify_tx_crc_with_links(meta, entries, &[])
+}
+
+pub fn verify_tx_crc_with_links(
+    meta: &TxMetadata,
+    entries: &[TxEntry],
+    links: &[TxLink],
+) -> bool {
+    compute_tx_crc_with_links(meta, entries, links) == meta.crc32c
 }
 
 fn hex_encode_tag(tag: &[u8; 8]) -> String {
