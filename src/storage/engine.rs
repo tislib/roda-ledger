@@ -33,9 +33,26 @@ pub struct Storage {
 
 impl Storage {
     pub fn new(config: StorageConfig) -> Result<Self, std::io::Error> {
-        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to create data directory at {}: {}",
+                    config.data_dir, e
+                ),
+            )
+        })?;
 
-        let mut segment_ids: Vec<u32> = std::fs::read_dir(&config.data_dir)?
+        let mut segment_ids: Vec<u32> = std::fs::read_dir(&config.data_dir)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to read data directory at {}: {}",
+                        config.data_dir, e
+                    ),
+                )
+            })?
             .filter_map(|e| e.ok())
             .filter_map(|e| parse_segment_id(&e.file_name().to_string_lossy()))
             .collect();
@@ -64,7 +81,16 @@ impl Storage {
     }
 
     pub fn list_all_segments(&self) -> Result<Vec<Segment>, std::io::Error> {
-        let mut segments: Vec<Segment> = std::fs::read_dir(&self.config.data_dir)?
+        let mut segments: Vec<Segment> = std::fs::read_dir(&self.config.data_dir)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to read data directory at {}: {}",
+                        self.config.data_dir, e
+                    ),
+                )
+            })?
             .filter_map(|e| e.ok())
             .filter_map(|e| parse_segment_id(&e.file_name().to_string_lossy()))
             .map(|id| self.segment(id))

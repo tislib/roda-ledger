@@ -67,13 +67,38 @@ impl Segment {
         let wal_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&wal_file_path)?;
+            .open(&wal_file_path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to open active wal file at {:?}: {}",
+                        wal_file_path, e
+                    ),
+                )
+            })?;
 
-        let metadata = wal_file.metadata()?;
+        let metadata = wal_file.metadata().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to get metadata for active wal file at {:?}: {}",
+                    wal_file_path, e
+                ),
+            )
+        })?;
         // fix me, verify wal data and find if any transaction is broken or partially written in tail
 
         let wal_data = if metadata.len() > 0 {
-            read_wal_data(&wal_file_path)?
+            read_wal_data(&wal_file_path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to read active wal data at {:?}: {}",
+                        wal_file_path, e
+                    ),
+                )
+            })?
         } else {
             vec![]
         };
@@ -100,12 +125,39 @@ impl Segment {
         let data_dir_path = Path::new(&self.data_dir);
         let wal_file_path = segment_wal_path(data_dir_path, self.segment_id);
         let wal_crc_file_path = segment_crc_path(data_dir_path, self.segment_id);
-        let wal_file = OpenOptions::new().append(true).open(&wal_file_path)?;
+        let wal_file = OpenOptions::new()
+            .append(true)
+            .open(&wal_file_path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to open wal file for segment {} at {:?}: {}",
+                        self.segment_id, wal_file_path, e
+                    ),
+                )
+            })?;
 
-        let wal_data = read_wal_data(&wal_file_path)?;
+        let wal_data = read_wal_data(&wal_file_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to read wal data for segment {} at {:?}: {}",
+                    self.segment_id, wal_file_path, e
+                ),
+            )
+        })?;
 
         if self.status == SegmentStaus::SEALED {
-            verify_wal_data(&wal_data[..], &wal_crc_file_path, self.segment_id)?;
+            verify_wal_data(&wal_data[..], &wal_crc_file_path, self.segment_id).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to verify wal data for segment {} at {:?}: {}",
+                        self.segment_id, wal_file_path, e
+                    ),
+                )
+            })?;
         }
 
         self.wal_file = Some(wal_file);
@@ -174,16 +226,32 @@ impl Segment {
             "Segment is not active, cannot close"
         );
 
-        let file = self.wal_file.as_ref().unwrap();
+        let file = self
+            .wal_file
+            .as_ref()
+            .expect("active segment should have wal_file");
 
         self.status = SegmentStaus::CLOSED;
-        file.sync_all()?;
+        file.sync_all().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to sync wal file before closing: {}", e),
+            )
+        })?;
 
         // rename wal file to wal.bin
         let data_dir_path = Path::new(&self.data_dir);
         let active_wal_file_path = active_wal_path(data_dir_path);
         let closed_wal_file_path = segment_wal_path(data_dir_path, self.segment_id);
-        std::fs::rename(&active_wal_file_path, &closed_wal_file_path)?;
+        std::fs::rename(&active_wal_file_path, &closed_wal_file_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to rename active wal file {:?} to {:?}: {}",
+                    active_wal_file_path, closed_wal_file_path, e
+                ),
+            )
+        })?;
 
         Ok(())
     }
@@ -207,13 +275,38 @@ impl Segment {
 
         let data_dir_path = Path::new(&self.data_dir);
         let crc_file_path = segment_crc_path(data_dir_path, self.segment_id);
-        let mut crc_file = File::create(&crc_file_path)?;
-        crc_file.write_all(&crc_data)?;
-        crc_file.sync_all()?;
+        let mut crc_file = File::create(&crc_file_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to create crc file at {:?}: {}", crc_file_path, e),
+            )
+        })?;
+        crc_file.write_all(&crc_data).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to write crc data to {:?}: {}", crc_file_path, e),
+            )
+        })?;
+        crc_file.sync_all().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to sync crc file at {:?}: {}", crc_file_path, e),
+            )
+        })?;
 
         let seal_file_path = segment_seal_path(data_dir_path, self.segment_id);
-        let seal_file = File::create(&seal_file_path)?;
-        seal_file.sync_all()?;
+        let seal_file = File::create(&seal_file_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to create seal file at {:?}: {}", seal_file_path, e),
+            )
+        })?;
+        seal_file.sync_all().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to sync seal file at {:?}: {}", seal_file_path, e),
+            )
+        })?;
 
         self.status = SegmentStaus::SEALED;
 

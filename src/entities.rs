@@ -7,6 +7,7 @@ pub enum WalEntryKind {
     TxEntry = 1,
     SegmentHeader = 2,
     SegmentSealed = 3,
+    Link = 4,
 }
 
 #[repr(u8)]
@@ -30,7 +31,8 @@ impl FailReason {
     pub const ENTRY_LIMIT_EXCEEDED: Self = Self(4);
     pub const INVALID_OPERATION: Self = Self(5);
     pub const ACCOUNT_LIMIT_EXCEEDED: Self = Self(6);
-    // 7–127 reserved for future standard reasons
+    pub const DUPLICATE: Self = Self(7);
+    // 8–127 reserved for future standard reasons
     // 128–255 user-defined custom reasons
 
     pub fn is_success(&self) -> bool {
@@ -51,9 +53,9 @@ impl FailReason {
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxMetadata {
     pub entry_type: u8,          // 1 @ 0  — WalEntryKind::TxMetadata
-    pub entry_count: u8,         // 1 @ 1  — 0 if transaction failed
-    pub fail_reason: FailReason, // 1 @ 2  — FailReason::NONE if succeeded
-    pub flags: u8,               // 1 @ 3
+    pub entry_count: u8,         // 1 @ 1  — number of TxEntry records following
+    pub link_count: u8,          // 1 @ 2  — number of TxLink records after entries
+    pub fail_reason: FailReason, // 1 @ 3
     pub crc32c: u32,             // 4 @ 4  — CRC32C; zero this field when computing
     pub tx_id: u64,              // 8 @ 8
     pub timestamp: u64,          // 8 @ 16
@@ -105,12 +107,40 @@ pub struct TxEntry {
     pub computed_balance: i64, // 8 @ 32 — running balance after this entry, set by Transactor
 } // total: 40 bytes
 
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TxLinkKind {
+    Duplicate = 0,
+    Reversal = 1,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct TxLink {
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Link (4)
+    pub link_kind: u8,   // 1 @ 1  — TxLinkKind as u8
+    pub _pad: [u8; 6],   // 6 @ 2
+    pub to_tx_id: u64,   // 8 @ 8  — referenced transaction
+    pub _pad2: [u8; 24], // 24 @ 16
+} // total: 40 bytes
+
+impl TxLink {
+    pub fn kind(&self) -> TxLinkKind {
+        match self.link_kind {
+            0 => TxLinkKind::Duplicate,
+            1 => TxLinkKind::Reversal,
+            _ => TxLinkKind::Duplicate, // fallback
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalEntry {
     Metadata(TxMetadata),
     Entry(TxEntry),
     SegmentHeader(SegmentHeader),
     SegmentSealed(SegmentSealed),
+    Link(TxLink),
 }
 
 impl WalEntry {
@@ -120,6 +150,7 @@ impl WalEntry {
             WalEntry::Entry(_) => WalEntryKind::TxEntry,
             WalEntry::SegmentHeader(_) => WalEntryKind::SegmentHeader,
             WalEntry::SegmentSealed(_) => WalEntryKind::SegmentSealed,
+            WalEntry::Link(_) => WalEntryKind::Link,
         }
     }
 
@@ -129,6 +160,7 @@ impl WalEntry {
             WalEntry::Entry(e) => e.tx_id,
             WalEntry::SegmentHeader(_) => 0,
             WalEntry::SegmentSealed(_) => 0,
+            WalEntry::Link(_) => 0,
         }
     }
 }
@@ -138,9 +170,12 @@ unsafe impl Pod for WalEntryKind {}
 unsafe impl Zeroable for WalEntryKind {}
 unsafe impl Pod for EntryKind {}
 unsafe impl Zeroable for EntryKind {}
+unsafe impl Pod for TxLinkKind {}
+unsafe impl Zeroable for TxLinkKind {}
 
 // Hard compile-time guarantees: every WAL entry must be exactly 40 bytes.
 const _: () = assert!(std::mem::size_of::<TxMetadata>() == 40);
 const _: () = assert!(std::mem::size_of::<TxEntry>() == 40);
 const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SegmentSealed>() == 40);
+const _: () = assert!(std::mem::size_of::<TxLink>() == 40);

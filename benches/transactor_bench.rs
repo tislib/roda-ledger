@@ -24,6 +24,8 @@ fn transactor_bench(c: &mut Criterion) {
         running.clone(),
         10_000_000,
         PipelineMode::Balanced,
+        true,
+        10000,
     );
 
     let handle = transactor.start().unwrap();

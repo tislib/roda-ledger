@@ -328,6 +328,7 @@ message GetTransactionRequest {
 message GetTransactionResponse {
   uint64               tx_id       = 1;
   repeated TxEntryRecord entries   = 2;
+  repeated TxLinkRecord  links     = 3;
 }
 
 // TxEntryRecord represents a single debit or credit within a transaction.
@@ -341,6 +342,17 @@ message TxEntryRecord {
 enum EntryKind {
   CREDIT = 0;
   DEBIT  = 1;
+}
+
+// TxLinkRecord represents a link between transactions (ADR-009).
+message TxLinkRecord {
+  uint64   to_tx_id = 1;  // Referenced transaction ID.
+  LinkKind kind     = 2;  // Type of link relationship.
+}
+
+enum LinkKind {
+  DUPLICATE = 0;  // This transaction is a duplicate of to_tx_id.
+  REVERSAL  = 1;  // This transaction reverses to_tx_id.
 }
 
 // ---- Account history query (ADR-008) ----

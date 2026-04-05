@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::entities::*;
 use crate::storage::{SegmentStaus, WAL_MAGIC, WAL_VERSION};
 
-use super::json::{compute_tx_crc, verify_tx_crc};
+use super::json::{compute_tx_crc_with_links, verify_tx_crc_with_links};
 use super::{CtlError, SegmentReport, SnapshotReport, VerifyReport, make_storage};
 
 pub fn run(
@@ -106,6 +106,7 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
     let mut last_meta_tx: Option<u64> = None;
     let mut pending_meta: Option<TxMetadata> = None;
     let mut pending_entries: Vec<TxEntry> = Vec::new();
+    let mut pending_links: Vec<TxLink> = Vec::new();
     let mut header_checked = false;
     // Per-account last known computed_balance for continuity checks.
     let mut account_balances: std::collections::HashMap<u64, i64> =
@@ -136,8 +137,15 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                 }
             }
             WalEntry::Metadata(m) => {
-                flush_pending(&mut pending_meta, &pending_entries, &mut errors, &mut ok);
+                flush_pending(
+                    &mut pending_meta,
+                    &pending_entries,
+                    &pending_links,
+                    &mut errors,
+                    &mut ok,
+                );
                 pending_entries.clear();
+                pending_links.clear();
 
                 if let Some(prev) = last_meta_tx
                     && m.tx_id <= prev
@@ -148,8 +156,8 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                 last_meta_tx = Some(m.tx_id);
                 last_tx_id = m.tx_id;
 
-                if m.entry_count == 0 {
-                    if !verify_tx_crc(m, &[]) {
+                if m.entry_count == 0 && m.link_count == 0 {
+                    if !verify_tx_crc_with_links(m, &[], &[]) {
                         errors.push(format!("Record CRC mismatch (tx_id {})", m.tx_id));
                         ok = false;
                     }
@@ -183,9 +191,21 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                     pending_entries.push(*e);
                 }
             }
+            WalEntry::Link(l) => {
+                if pending_meta.is_some() {
+                    pending_links.push(*l);
+                }
+            }
             WalEntry::SegmentSealed(s) => {
-                flush_pending(&mut pending_meta, &pending_entries, &mut errors, &mut ok);
+                flush_pending(
+                    &mut pending_meta,
+                    &pending_entries,
+                    &pending_links,
+                    &mut errors,
+                    &mut ok,
+                );
                 pending_entries.clear();
+                pending_links.clear();
 
                 if s.segment_id != segment_id {
                     errors.push(format!(
@@ -309,17 +329,18 @@ fn verify_active_wal(storage: &crate::storage::Storage) -> SegmentReport {
 fn flush_pending(
     pending_meta: &mut Option<TxMetadata>,
     entries: &[TxEntry],
+    links: &[TxLink],
     errors: &mut Vec<String>,
     ok: &mut bool,
 ) {
     if let Some(meta) = pending_meta.take() {
-        // CRC check.
-        if !verify_tx_crc(&meta, entries) {
+        // CRC check (covers metadata + entries + links).
+        if !verify_tx_crc_with_links(&meta, entries, links) {
             errors.push(format!(
                 "Record CRC mismatch (tx_id {}): expected {:#010x}, actual {:#010x}",
                 meta.tx_id,
                 meta.crc32c,
-                compute_tx_crc(&meta, entries)
+                compute_tx_crc_with_links(&meta, entries, links)
             ));
             *ok = false;
         }
@@ -352,6 +373,17 @@ fn flush_pending(
                 meta.tx_id,
                 meta.entry_count,
                 entries.len()
+            ));
+            *ok = false;
+        }
+
+        // Link count declared in metadata must match actual links.
+        if links.len() != meta.link_count as usize {
+            errors.push(format!(
+                "tx_id {}: link_count mismatch (declared={}, actual={})",
+                meta.tx_id,
+                meta.link_count,
+                links.len()
             ));
             *ok = false;
         }

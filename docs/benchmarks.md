@@ -2,7 +2,7 @@
 
 This document contains the latest performance benchmarks for Roda-Ledger.
 
-**Date:** 2026-03-29
+**Date:** 2026-04-05
 **Environment:** CX33 server at Hetzner
 
 ## Snapshot Performance
@@ -17,22 +17,15 @@ This document contains the latest performance benchmarks for Roda-Ledger.
 | :--- | :--- | :--- |
 | `transactor/process` | 284.16 ns | 3.5191 Melem/s |
 
-## WAL (Write-Ahead Log) Performance
-
-| Operation | Time (Avg) | Throughput (Avg) |
-| :--- | :--- | :--- |
-| `wal_in_memory/append` | 18.237 ns | 54.835 Melem/s |
-| `wal_on_disk/append` | 40.873 ns | 24.466 Melem/s |
 
 ## Ledger Operations Performance
 
 | Operation | Time (Avg) | Throughput (Avg) |
 | :--- | :--- | :--- |
-| `ledger/deposit` | 197.94 ns | 5.0520 Melem/s |
-| `ledger/transfer_1000` | 172.18 ns | 5.8080 Melem/s |
-| `ledger/transfer_1000000` | 150.53 ns | 6.6432 Melem/s |
-| `ledger/transfer_10000000` | 206.21 ns | 4.8493 Melem/s |
-| `ledger/transfer_50000000` | 219.65 ns | 4.5526 Melem/s |
+| `ledger/deposit_1000` | 302.73 ns | 3.3032 Melem/s |
+| `ledger/deposit_1000000` | 337.59 ns | 2.9621 Melem/s |
+| `ledger/deposit_10000000` | 350.05 ns | 2.8567 Melem/s |
+| `ledger/deposit_50000000` | 577.87 ns | 1.7305 Melem/s |
 | `ledger/complex_operation` | 538.06 ns | 1.8585 Melem/s |
 
 ## gRPC Performance

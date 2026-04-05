@@ -34,7 +34,17 @@ impl Segment {
         let wal_data = self.wal_data();
         let mut offset: usize = 0;
         while offset < wal_data.len() {
-            let entry = parse_wal_record(&wal_data[offset..])?;
+            let entry = parse_wal_record(&wal_data[offset..]).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to parse wal record at offset {} for segment {}: {}",
+                        offset,
+                        self.id(),
+                        e
+                    ),
+                )
+            })?;
             match &entry {
                 WalEntry::Metadata(m) => {
                     tx_offsets.push((m.tx_id, offset as u64));
@@ -42,7 +52,7 @@ impl Segment {
                 WalEntry::Entry(e) => {
                     account_entries.push((e.account_id, e.tx_id));
                 }
-                WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
+                WalEntry::Link(_) | WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
             }
             offset += 40;
         }
@@ -117,15 +127,16 @@ impl Segment {
         }
 
         let metadata = parse_wal_record(&wal_data[offset..])?;
-        let entry_count = match &metadata {
-            WalEntry::Metadata(m) => m.entry_count as usize,
+        let (entry_count, link_count) = match &metadata {
+            WalEntry::Metadata(m) => (m.entry_count as usize, m.link_count as usize),
             _ => return Ok(Vec::new()),
         };
 
-        let mut entries = Vec::with_capacity(1 + entry_count);
+        let total = entry_count + link_count;
+        let mut entries = Vec::with_capacity(1 + total);
         entries.push(metadata);
 
-        for i in 0..entry_count {
+        for i in 0..total {
             let entry_offset = offset + (1 + i) * 40;
             if entry_offset >= wal_data.len() {
                 break;
@@ -143,30 +154,93 @@ impl Segment {
 ///
 /// Format: `[record_count: 8 bytes LE]` followed by `[u64 LE][u64 LE] × count`.
 fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = File::create(path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to create index file at {:?}: {}", path, e),
+        )
+    })?;
     let count = entries.len() as u64;
-    file.write_all(&count.to_le_bytes())?;
+    file.write_all(&count.to_le_bytes()).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to write entry count to index file at {:?}: {}",
+                path, e
+            ),
+        )
+    })?;
     for &(a, b) in entries {
-        file.write_all(&a.to_le_bytes())?;
-        file.write_all(&b.to_le_bytes())?;
+        file.write_all(&a.to_le_bytes()).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to write entry part A to index file at {:?}: {}",
+                    path, e
+                ),
+            )
+        })?;
+        file.write_all(&b.to_le_bytes()).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to write entry part B to index file at {:?}: {}",
+                    path, e
+                ),
+            )
+        })?;
     }
-    file.sync_all()?;
+    file.sync_all().map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to sync index file at {:?}: {}", path, e),
+        )
+    })?;
     Ok(())
 }
 
 /// Read a flat array of `(u64, u64)` pairs from a binary index file.
 fn read_index_file(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
-    let mut file = File::open(path)?;
+    let mut file = File::open(path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to open index file at {:?}: {}", path, e),
+        )
+    })?;
     let mut buf = [0u8; 8];
 
-    file.read_exact(&mut buf)?;
+    file.read_exact(&mut buf).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to read entry count from index file at {:?}: {}",
+                path, e
+            ),
+        )
+    })?;
     let count = u64::from_le_bytes(buf) as usize;
 
     let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        file.read_exact(&mut buf)?;
+    for i in 0..count {
+        file.read_exact(&mut buf).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to read entry part A (entry {}) from index file at {:?}: {}",
+                    i, path, e
+                ),
+            )
+        })?;
         let a = u64::from_le_bytes(buf);
-        file.read_exact(&mut buf)?;
+        file.read_exact(&mut buf).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to read entry part B (entry {}) from index file at {:?}: {}",
+                    i, path, e
+                ),
+            )
+        })?;
         let b = u64::from_le_bytes(buf);
         entries.push((a, b));
     }

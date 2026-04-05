@@ -21,7 +21,7 @@ fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<Vec<IndexedTxEntry>>
         }),
     });
     match rx.recv().unwrap() {
-        QueryResponse::Transaction(result) => result,
+        QueryResponse::Transaction(result) => result.map(|r| r.entries),
         _ => panic!("unexpected response type"),
     }
 }

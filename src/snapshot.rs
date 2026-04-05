@@ -1,6 +1,6 @@
 use crate::balance::Balance;
-use crate::entities::{TxEntry, TxMetadata, WalEntry};
-use crate::index::{IndexedTxEntry, TransactionIndexer};
+use crate::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
+use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline_mode::PipelineMode;
 use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
@@ -43,8 +43,16 @@ pub enum QueryKind {
 }
 
 /// Response payload returned via the `QueryRequest.respond` callback.
+/// Transaction query result containing entries and links.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionResult {
+    pub entries: Vec<IndexedTxEntry>,
+    pub links: Vec<IndexedTxLink>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryResponse {
-    Transaction(Option<Vec<IndexedTxEntry>>),
+    Transaction(Option<TransactionResult>),
     AccountHistory(Vec<IndexedTxEntry>),
 }
 
@@ -61,7 +69,8 @@ struct SnapshotRunner {
     inbound: Arc<ArrayQueue<SnapshotMessage>>,
     balances: Arc<Vec<AtomicI64>>,
     last_processed_transaction_id: Arc<AtomicU64>,
-    pending_entries: u8,
+    /// Total remaining records (entries + links) for the current transaction.
+    pending_records: u8,
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
     indexer: TransactionIndexer,
@@ -111,7 +120,7 @@ impl Snapshot {
             inbound: self.inbound.clone(),
             balances: self.balances.clone(),
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
-            pending_entries: 0,
+            pending_records: 0,
             running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
             indexer: self.indexer.take().unwrap(),
@@ -146,6 +155,12 @@ impl Snapshot {
         self.store_last_processed_id(metadata.tx_id);
     }
 
+    pub(crate) fn recover_index_tx_link(&mut self, tx_id: u64, link: &TxLink) {
+        if let Some(indexer) = &mut self.indexer {
+            indexer.insert_link(tx_id, link.kind(), link.to_tx_id);
+        }
+    }
+
     pub(crate) fn recover_index_tx_entry(&mut self, entry: &TxEntry) {
         if let Some(indexer) = &mut self.indexer {
             indexer.insert_entry(
@@ -176,7 +191,7 @@ impl SnapshotRunner {
                         match wal_entry {
                             WalEntry::Metadata(m) => {
                                 self.indexer.insert_tx(m.tx_id, m.entry_count);
-                                self.pending_entries = m.entry_count;
+                                self.pending_records = m.entry_count.saturating_add(m.link_count);
                                 last_processed_tx_id = m.tx_id;
                             }
                             WalEntry::Entry(e) => {
@@ -189,12 +204,20 @@ impl SnapshotRunner {
                                 );
                                 self.balances[e.account_id as usize]
                                     .store(e.computed_balance, Ordering::Release);
-                                self.pending_entries -= 1;
+                                self.pending_records = self.pending_records.saturating_sub(1);
+                            }
+                            WalEntry::Link(l) => {
+                                self.indexer.insert_link(
+                                    last_processed_tx_id,
+                                    l.kind(),
+                                    l.to_tx_id,
+                                );
+                                self.pending_records = self.pending_records.saturating_sub(1);
                             }
                             WalEntry::SegmentSealed(_) => {}
                             WalEntry::SegmentHeader(_) => {}
                         }
-                        if last_processed_tx_id > 0 && self.pending_entries == 0 {
+                        if last_processed_tx_id > 0 && self.pending_records == 0 {
                             self.last_processed_transaction_id
                                 .store(last_processed_tx_id, Ordering::Release);
                         }
@@ -202,7 +225,12 @@ impl SnapshotRunner {
                     SnapshotMessage::Query(q) => {
                         let response = match q.kind {
                             QueryKind::GetTransaction { tx_id } => {
-                                QueryResponse::Transaction(self.indexer.get_transaction(tx_id))
+                                let result = self.indexer.get_transaction(tx_id).map(|entries| {
+                                    let links =
+                                        self.indexer.get_links(tx_id).cloned().unwrap_or_default();
+                                    TransactionResult { entries, links }
+                                });
+                                QueryResponse::Transaction(result)
                             }
                             QueryKind::GetAccountHistory {
                                 account_id,

@@ -39,8 +39,8 @@ fn snapshot_bench(c: &mut Criterion) {
                     timestamp: 0,
                     user_ref: 0,
                     entry_count: 2,
+                    link_count: 0,
                     fail_reason: FailReason::NONE,
-                    flags: 0,
                     crc32c: 0,
                     tag: [0; 8],
                 };

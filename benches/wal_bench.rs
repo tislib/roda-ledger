@@ -51,8 +51,8 @@ fn wal_bench(c: &mut Criterion) {
                     timestamp: 0,
                     user_ref: 0,
                     entry_count: 0,
+                    link_count: 0,
                     fail_reason: roda_ledger::entities::FailReason::NONE,
-                    flags: 0,
                     crc32c: 0,
                     tag: [0; 8],
                 };
