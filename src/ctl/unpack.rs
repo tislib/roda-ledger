@@ -4,24 +4,10 @@ use std::path::Path;
 use crate::entities::*;
 
 use super::json::{compute_tx_crc, verify_tx_crc, wal_entry_to_json};
-use super::{CtlError, make_storage, parse_segment_id_from_path};
+use super::{CtlError, open_segment_from_path};
 
 pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<(), CtlError> {
-    let segment_id = parse_segment_id_from_path(segment_path).ok_or_else(|| {
-        CtlError::new(format!(
-            "cannot parse segment ID from {:?} (expected wal_NNNNNN.bin)",
-            segment_path.file_name().unwrap_or_default()
-        ))
-    })?;
-
-    let data_dir = segment_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_string_lossy()
-        .to_string();
-
-    let storage = make_storage(&data_dir)?;
-    let mut segment = storage.segment(segment_id)?;
+    let mut segment = open_segment_from_path(segment_path)?;
     segment.load()?;
 
     let out_writer: Box<dyn Write> = match out {

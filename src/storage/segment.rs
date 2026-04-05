@@ -123,11 +123,15 @@ impl Segment {
         &self.data_dir
     }
 
+    pub(super) fn wal_data(&self) -> &[u8] {
+        &self.wal_data
+    }
+
     pub(crate) fn status(&self) -> SegmentStaus {
         self.status
     }
 
-    pub(crate) fn append_entries(&mut self, entries: &[WalEntry]) {
+    pub(crate) fn write_entries(&mut self, entries: &[WalEntry]) {
         assert_eq!(
             self.status,
             SegmentStaus::ACTIVE,

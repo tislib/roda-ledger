@@ -1,6 +1,7 @@
 use crate::grpc::proto;
 use crate::grpc::proto::ledger_server::Ledger;
 use crate::ledger::Ledger as InternalLedger;
+use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -128,5 +129,90 @@ impl Ledger for LedgerHandler {
             committed_index: self.ledger.last_committed_id(),
             snapshot_index: self.ledger.last_snapshot_id(),
         }))
+    }
+
+    async fn get_transaction(
+        &self,
+        request: Request<proto::GetTransactionRequest>,
+    ) -> Result<Response<proto::GetTransactionResponse>, Status> {
+        let tx_id = request.into_inner().tx_id;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        self.ledger.query(QueryRequest {
+            kind: QueryKind::GetTransaction { tx_id },
+            respond: Box::new(move |resp| {
+                let _ = tx.send(resp);
+            }),
+        });
+
+        match rx.recv() {
+            Ok(QueryResponse::Transaction(Some(entries))) => {
+                let entry_records: Vec<proto::TxEntryRecord> = entries
+                    .iter()
+                    .map(|e| proto::TxEntryRecord {
+                        account_id: e.account_id,
+                        amount: e.amount,
+                        kind: e.kind as i32,
+                        computed_balance: e.computed_balance,
+                    })
+                    .collect();
+                Ok(Response::new(proto::GetTransactionResponse {
+                    tx_id,
+                    entries: entry_records,
+                }))
+            }
+            Ok(QueryResponse::Transaction(None)) => Err(Status::not_found("transaction not found")),
+            _ => Err(Status::internal("query failed")),
+        }
+    }
+
+    async fn get_account_history(
+        &self,
+        request: Request<proto::GetAccountHistoryRequest>,
+    ) -> Result<Response<proto::GetAccountHistoryResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 {
+            20
+        } else {
+            req.limit.min(1000)
+        } as usize;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        self.ledger.query(QueryRequest {
+            kind: QueryKind::GetAccountHistory {
+                account_id: req.account_id,
+                from_tx_id: req.from_tx_id,
+                limit,
+            },
+            respond: Box::new(move |resp| {
+                let _ = tx.send(resp);
+            }),
+        });
+
+        match rx.recv() {
+            Ok(QueryResponse::AccountHistory(entries)) => {
+                let next_tx_id = entries.last().map_or(0, |e| {
+                    if e.prev_link == 0 {
+                        0
+                    } else {
+                        e.tx_id.saturating_sub(1)
+                    }
+                });
+                let entry_records: Vec<proto::TxEntryRecord> = entries
+                    .iter()
+                    .map(|e| proto::TxEntryRecord {
+                        account_id: e.account_id,
+                        amount: e.amount,
+                        kind: e.kind as i32,
+                        computed_balance: e.computed_balance,
+                    })
+                    .collect();
+                Ok(Response::new(proto::GetAccountHistoryResponse {
+                    entries: entry_records,
+                    next_tx_id,
+                }))
+            }
+            _ => Err(Status::internal("query failed")),
+        }
     }
 }

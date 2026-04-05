@@ -1,7 +1,7 @@
 use crate::entities::WalEntry;
 use crate::storage::SegmentStaus::SEALED;
 use crate::storage::{Segment, Storage};
-use spdlog::{debug, error, info, warn};
+use spdlog::{debug, error, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{JoinHandle, sleep};
@@ -114,6 +114,15 @@ impl SealRunner {
         segment.load()?;
         segment.seal()?;
 
+        // Build on-disk transaction and account index files (ADR-008).
+        if let Err(e) = segment.build_indexes() {
+            error!(
+                "Seal: failed to build indexes for segment {}: {}",
+                segment.id(),
+                e
+            );
+        }
+
         // 3. Record the last sealed segment id
         self.last_sealed_id.store(segment.id(), Ordering::Release);
 
@@ -146,12 +155,6 @@ impl SealRunner {
                 })
                 .collect();
             snapshot_records.sort_unstable_by_key(|(id, _)| *id);
-
-            info!(
-                "Seal: snapshot for segment {}: {:?}",
-                segment.id(),
-                snapshot_records
-            );
 
             debug!("Seal: saving snapshot for WAL segment {}", segment.id());
             if let Err(e) = segment.save_snapshot(&snapshot_records[..]) {

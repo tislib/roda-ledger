@@ -6,6 +6,7 @@ use crate::pipeline_mode::PipelineMode;
 use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
+use std::collections::HashMap;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -58,9 +59,11 @@ impl Transactor {
     }
 
     // --- Replay accessors (called from recover) ---
-    pub(crate) fn recover_balance(&mut self, account_id: usize, balance: Balance) {
-        if let Some(slot) = self.balances.get_mut(account_id) {
-            *slot = balance;
+    pub(crate) fn recover_balances(&mut self, balances: &HashMap<u64, Balance>) {
+        for (account_id, balance) in balances {
+            if let Some(slot) = self.balances.get_mut(*account_id as usize) {
+                *slot = *balance;
+            }
         }
     }
 

@@ -4,16 +4,16 @@ pub use crate::pipeline_mode::PipelineMode;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{QueryRequest, Snapshot, SnapshotMessage};
 use crate::storage::{Storage, StorageConfig};
 use crate::transaction::{Operation, Transaction, TransactionStatus};
 use crate::transactor::Transactor;
 use crate::wal::Wal;
 use crossbeam_queue::ArrayQueue;
-use spdlog::{Level, LevelFilter, error, info};
+use spdlog::{Level, LevelFilter, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{JoinHandle, sleep};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -24,6 +24,8 @@ pub struct LedgerConfig {
     pub pipeline_mode: PipelineMode,
     pub log_level: Level,
     pub seal_check_internal: Duration,
+    pub index_circle1_size: usize,
+    pub index_circle2_size: usize,
 }
 
 impl Default for LedgerConfig {
@@ -35,6 +37,8 @@ impl Default for LedgerConfig {
             pipeline_mode: PipelineMode::Balanced,
             log_level: Level::Info,
             seal_check_internal: Duration::from_secs(1),
+            index_circle1_size: 1 << 20, // 1M slots
+            index_circle2_size: 1 << 21, // 2M entries
         }
     }
 }
@@ -76,6 +80,7 @@ pub struct Ledger {
     storage: Arc<Storage>,
     running: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
+    query_queue: Arc<ArrayQueue<SnapshotMessage>>,
     #[allow(dead_code)]
     config: LedgerConfig,
 }
@@ -91,7 +96,7 @@ impl Ledger {
 
         let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
         let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(1024 * 128));
-        let wal_snapshot_queue: Arc<ArrayQueue<WalEntry>> =
+        let wal_snapshot_queue: Arc<ArrayQueue<SnapshotMessage>> =
             Arc::new(ArrayQueue::new(config.queue_size));
         let running = Arc::new(AtomicBool::new(true));
 
@@ -100,6 +105,8 @@ impl Ledger {
             config.max_accounts,
             running.clone(),
             config.pipeline_mode,
+            config.index_circle1_size,
+            config.index_circle2_size,
         );
 
         let seal = Seal::new(
@@ -121,7 +128,7 @@ impl Ledger {
             ),
             wal: Wal::new(
                 transactor_wal_queue,
-                wal_snapshot_queue,
+                wal_snapshot_queue.clone(),
                 storage.clone(),
                 running.clone(),
                 config.pipeline_mode,
@@ -129,6 +136,7 @@ impl Ledger {
             snapshot,
             seal,
             storage,
+            query_queue: wal_snapshot_queue,
             running,
             handles: Vec::new(),
         }
@@ -173,6 +181,26 @@ impl Ledger {
         self.snapshot.last_processed_transaction_id()
     }
 
+    /// Push a query into the Snapshot stage queue.
+    ///
+    /// The caller is responsible for creating the `QueryRequest` with a response
+    /// channel and blocking on `rx.recv()`. Ledger is a thin passthrough — it
+    /// wraps the request in `SnapshotMessage::Query` and handles backpressure.
+    pub fn query(&self, request: QueryRequest) {
+        let mut msg = SnapshotMessage::Query(request);
+        let mut retry_count = 0u64;
+        loop {
+            match self.query_queue.push(msg) {
+                Ok(_) => return,
+                Err(returned) => {
+                    msg = returned;
+                    self.config.pipeline_mode.wait_strategy(retry_count);
+                    retry_count += 1;
+                }
+            }
+        }
+    }
+
     pub fn get_rejected_count(&self) -> u64 {
         self.transactor.get_rejected_count()
     }
@@ -189,7 +217,7 @@ impl Ledger {
             let current_snapshot_step = self.snapshot.last_processed_transaction_id();
 
             if current_snapshot_step >= transaction_id {
-                return;
+                break;
             }
 
             self.config.pipeline_mode.wait_strategy(retry_count);
@@ -201,21 +229,20 @@ impl Ledger {
         }
     }
 
+    // wait for the last submitted transaction to pass through the pipeline
+    pub fn wait_for_pass(&self) {
+        let current_transaction_id = self.sequencer.last_id();
+
+        self.wait_for_transaction(current_transaction_id);
+    }
+
     pub fn wait_for_seal(&self) {
+        self.wait_for_pass();
+
         let mut retry_count = 0;
         loop {
-            let segment_count = self.storage.last_segment_id();
-            if segment_count.is_err() {
-                error!(
-                    "Failed to get last segment id: {}",
-                    segment_count.err().unwrap()
-                );
-                sleep(Duration::from_secs(1));
-                continue;
-            }
-            let segment_count = segment_count.unwrap();
+            let segment_count = self.storage.last_segment_id() - 1;
             if segment_count == self.seal.last_sealed_segment_id() {
-                println!("All segments sealed: {}", segment_count);
                 return;
             }
 
@@ -231,8 +258,6 @@ impl Ledger {
         self.handles.push(self.wal.start()?);
         self.handles.push(self.snapshot.start()?);
         self.handles.push(self.seal.start()?);
-        // wait for all threads to start
-        sleep(Duration::from_millis(100));
 
         Ok(())
     }
@@ -240,7 +265,7 @@ impl Ledger {
     fn recover(&mut self) -> std::io::Result<()> {
         let mut recover = Recover::new(
             &mut self.transactor,
-            &self.snapshot,
+            &mut self.snapshot,
             &mut self.seal,
             &self.sequencer,
             &self.storage,
