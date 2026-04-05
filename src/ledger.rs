@@ -4,7 +4,7 @@ pub use crate::pipeline_mode::PipelineMode;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
-use crate::snapshot::{QueryKind, QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
+use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Storage, StorageConfig};
 use crate::transaction::{Operation, Transaction, TransactionStatus};
 use crate::transactor::Transactor;
@@ -13,7 +13,6 @@ use crossbeam_queue::ArrayQueue;
 use spdlog::{Level, LevelFilter, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -280,20 +279,27 @@ impl Ledger {
     pub fn start(&mut self) -> std::io::Result<()> {
         info!("Starting Ledger stages...");
         self.recover().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to recover ledger during start: {}", e))
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to recover ledger during start: {}", e),
+            )
         })?;
         self.handles.push(self.transactor.start().map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
         })?);
-        self.handles.push(self.wal.start().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
-        })?);
+        self.handles.push(
+            self.wal.start().map_err(|e| {
+                std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
+            })?,
+        );
         self.handles.push(self.snapshot.start().map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
         })?);
-        self.handles.push(self.seal.start().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
-        })?);
+        self.handles.push(
+            self.seal.start().map_err(|e| {
+                std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
+            })?,
+        );
 
         Ok(())
     }

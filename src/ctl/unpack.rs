@@ -3,9 +3,7 @@ use std::path::Path;
 
 use crate::entities::*;
 
-use super::json::{
-    compute_tx_crc_with_links, verify_tx_crc_with_links, wal_entry_to_json,
-};
+use super::json::{compute_tx_crc_with_links, verify_tx_crc_with_links, wal_entry_to_json};
 use super::{CtlError, open_segment_from_path};
 
 pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<(), CtlError> {

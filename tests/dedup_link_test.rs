@@ -1,8 +1,6 @@
 use roda_ledger::entities::{FailReason, TxLinkKind};
 use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::snapshot::{
-    QueryKind, QueryRequest, QueryResponse, TransactionResult,
-};
+use roda_ledger::snapshot::{QueryKind, QueryRequest, QueryResponse, TransactionResult};
 use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
 use std::fs;
@@ -40,14 +38,6 @@ fn temp_ledger() -> Ledger {
     })
 }
 
-fn temp_ledger_no_dedup() -> Ledger {
-    Ledger::new(LedgerConfig {
-        seal_check_internal: Duration::from_millis(10),
-        dedup_enabled: false,
-        ..LedgerConfig::temp()
-    })
-}
-
 fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<TransactionResult> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     ledger.query(QueryRequest {
@@ -70,7 +60,7 @@ fn test_dedup_rejects_duplicate_deposit() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
 
-    let id1 = ledger.submit(Operation::Deposit {
+    let _id1 = ledger.submit(Operation::Deposit {
         account: 1,
         amount: 500,
         user_ref: 100,
@@ -82,7 +72,11 @@ fn test_dedup_rejects_duplicate_deposit() {
     });
     ledger.wait_for_transaction(id2);
 
-    assert_eq!(ledger.get_balance(1), 500, "only first deposit should commit");
+    assert_eq!(
+        ledger.get_balance(1),
+        500,
+        "only first deposit should commit"
+    );
     assert!(
         ledger.get_transaction_status(id2).is_err(),
         "second tx should be ERROR"
@@ -191,7 +185,7 @@ fn test_dedup_transfer() {
     });
     ledger.wait_for_transaction(fund);
 
-    let id1 = ledger.submit(Operation::Transfer {
+    let _id1 = ledger.submit(Operation::Transfer {
         from: 1,
         to: 2,
         amount: 300,
@@ -205,7 +199,11 @@ fn test_dedup_transfer() {
     });
     ledger.wait_for_transaction(id2);
 
-    assert_eq!(ledger.get_balance(1), 700, "only one transfer should happen");
+    assert_eq!(
+        ledger.get_balance(1),
+        700,
+        "only one transfer should happen"
+    );
     assert_eq!(ledger.get_balance(2), 300);
     assert_eq!(
         ledger.get_transaction_status(id2).error_reason(),
@@ -226,7 +224,7 @@ fn test_dedup_withdrawal() {
     });
     ledger.wait_for_transaction(fund);
 
-    let id1 = ledger.submit(Operation::Withdrawal {
+    let _id1 = ledger.submit(Operation::Withdrawal {
         account: 1,
         amount: 200,
         user_ref: 77,
@@ -336,7 +334,7 @@ fn test_dedup_survives_restart_with_seal() {
         // If the transaction was in a sealed segment, its user_ref may have expired
         // from the dedup window. This is expected behavior — dedup window is bounded.
         // The test verifies the mechanism works for recent transactions.
-        let status = ledger.get_transaction_status(id2);
+        let _status = ledger.get_transaction_status(id2);
         // After seal + restart, the active WAL is replayed to rebuild dedup.
         // If the transaction was committed in the active WAL, it should be deduped.
         // If it was in a sealed segment, it may not be (dedup window expired).
@@ -368,7 +366,7 @@ fn test_dedup_cross_operation_types() {
     });
     ledger.wait_for_transaction(fund);
 
-    let id1 = ledger.submit(Operation::Deposit {
+    let _id1 = ledger.submit(Operation::Deposit {
         account: 1,
         amount: 100,
         user_ref: 50,
@@ -407,7 +405,11 @@ fn test_original_tx_has_no_links() {
     ledger.wait_for_transaction(id1);
 
     let result = query_transaction(&ledger, id1).expect("should find tx");
-    assert_eq!(result.entries.len(), 2, "deposit has 2 entries (debit+credit)");
+    assert_eq!(
+        result.entries.len(),
+        2,
+        "deposit has 2 entries (debit+credit)"
+    );
     assert!(result.links.is_empty(), "original tx should have no links");
 }
 

@@ -1,5 +1,5 @@
-use crate::entities::*;
 use crate::entities::TxLinkKind;
+use crate::entities::*;
 use crate::storage::{WAL_MAGIC, WAL_VERSION};
 
 pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
@@ -77,7 +77,10 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
         "TxMetadata" => {
             let tx_id = value["tx_id"].as_u64().ok_or("missing tx_id")?;
             let entry_count = value["entry_count"].as_u64().ok_or("missing entry_count")? as u8;
-            let link_count = value.get("link_count").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            let link_count = value
+                .get("link_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u8;
             let fail_reason = FailReason::from_u8(value["fail_reason"].as_u64().unwrap_or(0) as u8);
             let user_ref = value.get("user_ref").and_then(|v| v.as_u64()).unwrap_or(0);
             let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -158,11 +161,7 @@ pub fn compute_tx_crc(meta: &TxMetadata, entries: &[TxEntry]) -> u32 {
     compute_tx_crc_with_links(meta, entries, &[])
 }
 
-pub fn compute_tx_crc_with_links(
-    meta: &TxMetadata,
-    entries: &[TxEntry],
-    links: &[TxLink],
-) -> u32 {
+pub fn compute_tx_crc_with_links(meta: &TxMetadata, entries: &[TxEntry], links: &[TxLink]) -> u32 {
     let mut m = *meta;
     m.crc32c = 0;
     let mut digest = crc32c::crc32c(bytemuck::bytes_of(&m));
@@ -175,15 +174,7 @@ pub fn compute_tx_crc_with_links(
     digest
 }
 
-pub fn verify_tx_crc(meta: &TxMetadata, entries: &[TxEntry]) -> bool {
-    verify_tx_crc_with_links(meta, entries, &[])
-}
-
-pub fn verify_tx_crc_with_links(
-    meta: &TxMetadata,
-    entries: &[TxEntry],
-    links: &[TxLink],
-) -> bool {
+pub fn verify_tx_crc_with_links(meta: &TxMetadata, entries: &[TxEntry], links: &[TxLink]) -> bool {
     compute_tx_crc_with_links(meta, entries, links) == meta.crc32c
 }
 

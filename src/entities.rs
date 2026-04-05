@@ -117,11 +117,11 @@ pub enum TxLinkKind {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxLink {
-    pub entry_type: u8,   // 1 @ 0  — WalEntryKind::Link (4)
-    pub link_kind: u8,    // 1 @ 1  — TxLinkKind as u8
-    pub _pad: [u8; 6],    // 6 @ 2
-    pub to_tx_id: u64,    // 8 @ 8  — referenced transaction
-    pub _pad2: [u8; 24],  // 24 @ 16
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Link (4)
+    pub link_kind: u8,   // 1 @ 1  — TxLinkKind as u8
+    pub _pad: [u8; 6],   // 6 @ 2
+    pub to_tx_id: u64,   // 8 @ 8  — referenced transaction
+    pub _pad2: [u8; 24], // 24 @ 16
 } // total: 40 bytes
 
 impl TxLink {

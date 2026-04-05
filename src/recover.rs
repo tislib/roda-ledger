@@ -40,7 +40,10 @@ impl<'r> Recover<'r> {
 
         // locate segments
         self.segments = self.storage.list_all_segments().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to list segments during recovery: {}", e))
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to list segments during recovery: {}", e),
+            )
         })?;
 
         // find the latest snapshot
@@ -62,12 +65,19 @@ impl<'r> Recover<'r> {
 
             // restore the snapshot
             if segment.id() == latest_snapshot_segment_id {
-                let data = segment.load_snapshot().map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("failed to load snapshot for segment {}: {}", segment.id(), e),
-                    )
-                })?.unwrap();
+                let data = segment
+                    .load_snapshot()
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to load snapshot for segment {}: {}",
+                                segment.id(),
+                                e
+                            ),
+                        )
+                    })?
+                    .unwrap();
 
                 for (account_id, balance) in data.balances {
                     recover_balances.insert(account_id, balance);
@@ -94,7 +104,11 @@ impl<'r> Recover<'r> {
                 self.seal.recover_pre_seal(segment).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
-                        format!("failed to recover pre-seal for segment {}: {}", segment.id(), e),
+                        format!(
+                            "failed to recover pre-seal for segment {}: {}",
+                            segment.id(),
+                            e
+                        ),
                     )
                 })?;
             }
@@ -106,79 +120,85 @@ impl<'r> Recover<'r> {
                 )
             })?;
 
-            segment.visit_wal_records(|record| match record {
+            segment
+                .visit_wal_records(|record| match record {
+                    WalEntry::Metadata(metadata) => {
+                        last_tx_id = metadata.tx_id;
+                    }
+                    WalEntry::Entry(entry) => {
+                        recover_balances.insert(entry.account_id, entry.computed_balance);
+                    }
+                    WalEntry::Link(_) => {}
+                    _ => {}
+                })
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to visit wal records for segment {}: {}",
+                            segment.id(),
+                            e
+                        ),
+                    )
+                })?;
+        }
+
+        // process active WAL records
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let active_segment = self.storage.active_segment().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
+        })?;
+        let mut current_recover_tx_id = 0u64;
+        active_segment
+            .visit_wal_records(|record| match record {
                 WalEntry::Metadata(metadata) => {
                     last_tx_id = metadata.tx_id;
+                    current_recover_tx_id = metadata.tx_id;
+                    self.snapshot.recover_index_tx_metadata(metadata);
                 }
                 WalEntry::Entry(entry) => {
                     recover_balances.insert(entry.account_id, entry.computed_balance);
+                    self.snapshot.recover_index_tx_entry(entry);
                 }
-                WalEntry::Link(_) => {}
+                WalEntry::Link(link) => {
+                    self.snapshot
+                        .recover_index_tx_link(current_recover_tx_id, link);
+                }
                 _ => {}
-            }).map_err(|e| {
+            })
+            .map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
-                    format!(
-                        "failed to visit wal records for segment {}: {}",
-                        segment.id(),
-                        e
-                    ),
+                    format!("failed to visit active wal records: {}", e),
                 )
             })?;
-    }
 
-    // process active WAL records
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let active_segment = self.storage.active_segment().map_err(|e| {
-        std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
-    })?;
-    let mut current_recover_tx_id = 0u64;
-    active_segment.visit_wal_records(|record| match record {
-        WalEntry::Metadata(metadata) => {
-            last_tx_id = metadata.tx_id;
-            current_recover_tx_id = metadata.tx_id;
-            self.snapshot.recover_index_tx_metadata(metadata);
-        }
-        WalEntry::Entry(entry) => {
-            recover_balances.insert(entry.account_id, entry.computed_balance);
-            self.snapshot.recover_index_tx_entry(entry);
-        }
-        WalEntry::Link(link) => {
-            self.snapshot
-                .recover_index_tx_link(current_recover_tx_id, link);
-        }
-        _ => {}
-    }).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("failed to visit active wal records: {}", e),
-        )
-    })?;
-
-    // Rebuild dedup cache from active WAL committed transactions
-    // Re-scan active WAL to populate dedup entries
-    active_segment.visit_wal_records(|record| {
-        if let WalEntry::Metadata(metadata) = record {
-            // Only non-duplicate committed transactions should be in the dedup cache
-            if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
-                let timestamp_ms = metadata.timestamp / 1_000_000; // nanos → ms
-                self.transactor.dedup_cache_mut().recover_entry(
-                    metadata.user_ref,
-                    metadata.tx_id,
-                    timestamp_ms,
-                    now_ms,
-                );
-            }
-        }
-    }).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("failed to re-scan active wal records for dedup: {}", e),
-        )
-    })?;
+        // Rebuild dedup cache from active WAL committed transactions
+        // Re-scan active WAL to populate dedup entries
+        active_segment
+            .visit_wal_records(|record| {
+                if let WalEntry::Metadata(metadata) = record {
+                    // Only non-duplicate committed transactions should be in the dedup cache
+                    if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
+                        let timestamp_ms = metadata.timestamp / 1_000_000; // nanos → ms
+                        self.transactor.dedup_cache_mut().recover_entry(
+                            metadata.user_ref,
+                            metadata.tx_id,
+                            timestamp_ms,
+                            now_ms,
+                        );
+                    }
+                }
+            })
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to re-scan active wal records for dedup: {}", e),
+                )
+            })?;
 
         self.transactor.recover_balances(&recover_balances);
         self.snapshot.recover_balances(&recover_balances);

@@ -35,7 +35,12 @@ fn test_query_block_transaction() {
     match response {
         QueryResponse::Transaction(Some(result)) => {
             assert_eq!(result.entries.len(), 2);
-            assert!(result.entries.iter().any(|e| e.account_id == 1 && e.amount == 500));
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .any(|e| e.account_id == 1 && e.amount == 500)
+            );
         }
         _ => panic!("Expected Transaction response"),
     }

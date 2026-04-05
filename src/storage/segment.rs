@@ -71,7 +71,10 @@ impl Segment {
             .map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
-                    format!("failed to open active wal file at {:?}: {}", wal_file_path, e),
+                    format!(
+                        "failed to open active wal file at {:?}: {}",
+                        wal_file_path, e
+                    ),
                 )
             })?;
 
@@ -90,7 +93,10 @@ impl Segment {
             read_wal_data(&wal_file_path).map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
-                    format!("failed to read active wal data at {:?}: {}", wal_file_path, e),
+                    format!(
+                        "failed to read active wal data at {:?}: {}",
+                        wal_file_path, e
+                    ),
                 )
             })?
         } else {

@@ -52,9 +52,7 @@ impl Segment {
                 WalEntry::Entry(e) => {
                     account_entries.push((e.account_id, e.tx_id));
                 }
-                WalEntry::Link(_)
-                | WalEntry::SegmentHeader(_)
-                | WalEntry::SegmentSealed(_) => {}
+                WalEntry::Link(_) | WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
             }
             offset += 40;
         }
@@ -166,20 +164,29 @@ fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> 
     file.write_all(&count.to_le_bytes()).map_err(|e| {
         std::io::Error::new(
             e.kind(),
-            format!("failed to write entry count to index file at {:?}: {}", path, e),
+            format!(
+                "failed to write entry count to index file at {:?}: {}",
+                path, e
+            ),
         )
     })?;
     for &(a, b) in entries {
         file.write_all(&a.to_le_bytes()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("failed to write entry part A to index file at {:?}: {}", path, e),
+                format!(
+                    "failed to write entry part A to index file at {:?}: {}",
+                    path, e
+                ),
             )
         })?;
         file.write_all(&b.to_le_bytes()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("failed to write entry part B to index file at {:?}: {}", path, e),
+                format!(
+                    "failed to write entry part B to index file at {:?}: {}",
+                    path, e
+                ),
             )
         })?;
     }
@@ -205,7 +212,10 @@ fn read_index_file(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
     file.read_exact(&mut buf).map_err(|e| {
         std::io::Error::new(
             e.kind(),
-            format!("failed to read entry count from index file at {:?}: {}", path, e),
+            format!(
+                "failed to read entry count from index file at {:?}: {}",
+                path, e
+            ),
         )
     })?;
     let count = u64::from_le_bytes(buf) as usize;

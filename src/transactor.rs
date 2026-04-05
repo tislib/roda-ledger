@@ -373,13 +373,7 @@ impl TransactorRunner {
 
     /// Emit a duplicate transaction: TxMetadata (entry_count=0, link_count=1, fail_reason=DUPLICATE)
     /// followed by a TxLink { kind: Duplicate, to_tx_id: original }.
-    fn emit_duplicate(
-        &mut self,
-        tx_id: u64,
-        user_ref: u64,
-        timestamp: u64,
-        original_tx_id: u64,
-    ) {
+    fn emit_duplicate(&mut self, tx_id: u64, user_ref: u64, timestamp: u64, original_tx_id: u64) {
         let link = TxLink {
             entry_type: WalEntryKind::Link as u8,
             link_kind: TxLinkKind::Duplicate as u8,

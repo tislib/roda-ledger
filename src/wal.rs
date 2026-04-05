@@ -109,8 +109,7 @@ impl WalRunner {
             if let Some(entry) = self.inbound.pop() {
                 match &entry {
                     WalEntry::Metadata(m) => {
-                        self.pending_records =
-                            m.entry_count.saturating_add(m.link_count);
+                        self.pending_records = m.entry_count.saturating_add(m.link_count);
                         self.pending_tx_id = m.tx_id;
                     }
                     WalEntry::Entry(_) | WalEntry::Link(_) => {

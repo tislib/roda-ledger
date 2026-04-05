@@ -191,8 +191,7 @@ impl SnapshotRunner {
                         match wal_entry {
                             WalEntry::Metadata(m) => {
                                 self.indexer.insert_tx(m.tx_id, m.entry_count);
-                                self.pending_records =
-                                    m.entry_count.saturating_add(m.link_count);
+                                self.pending_records = m.entry_count.saturating_add(m.link_count);
                                 last_processed_tx_id = m.tx_id;
                             }
                             WalEntry::Entry(e) => {
@@ -205,8 +204,7 @@ impl SnapshotRunner {
                                 );
                                 self.balances[e.account_id as usize]
                                     .store(e.computed_balance, Ordering::Release);
-                                self.pending_records =
-                                    self.pending_records.saturating_sub(1);
+                                self.pending_records = self.pending_records.saturating_sub(1);
                             }
                             WalEntry::Link(l) => {
                                 self.indexer.insert_link(
@@ -214,8 +212,7 @@ impl SnapshotRunner {
                                     l.kind(),
                                     l.to_tx_id,
                                 );
-                                self.pending_records =
-                                    self.pending_records.saturating_sub(1);
+                                self.pending_records = self.pending_records.saturating_sub(1);
                             }
                             WalEntry::SegmentSealed(_) => {}
                             WalEntry::SegmentHeader(_) => {}
@@ -229,11 +226,8 @@ impl SnapshotRunner {
                         let response = match q.kind {
                             QueryKind::GetTransaction { tx_id } => {
                                 let result = self.indexer.get_transaction(tx_id).map(|entries| {
-                                    let links = self
-                                        .indexer
-                                        .get_links(tx_id)
-                                        .cloned()
-                                        .unwrap_or_default();
+                                    let links =
+                                        self.indexer.get_links(tx_id).cloned().unwrap_or_default();
                                     TransactionResult { entries, links }
                                 });
                                 QueryResponse::Transaction(result)

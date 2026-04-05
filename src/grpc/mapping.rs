@@ -71,7 +71,6 @@ impl From<proto::Named> for Operation {
     }
 }
 
-
 impl TryFrom<proto::SubmitOperationRequest> for Operation {
     type Error = tonic::Status;
 

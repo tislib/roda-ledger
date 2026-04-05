@@ -99,7 +99,7 @@ fn test_zero_user_ref_bypasses_dedup() {
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
 
-    let id1 = ledger.submit(Operation::Deposit {
+    let _id1 = ledger.submit(Operation::Deposit {
         account: 1,
         amount: 100,
         user_ref: 0,
@@ -111,11 +111,7 @@ fn test_zero_user_ref_bypasses_dedup() {
     });
     ledger.wait_for_transaction(id2);
 
-    assert_eq!(
-        ledger.get_balance(1),
-        200,
-        "user_ref=0 should bypass dedup"
-    );
+    assert_eq!(ledger.get_balance(1), 200, "user_ref=0 should bypass dedup");
 }
 
 /// After crash+restart, committed transactions are not re-executed.
