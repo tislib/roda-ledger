@@ -117,7 +117,7 @@ Roda-Ledger utilizes a **Core-Per-Stage** model to maximize mechanical sympathy:
 3. **WAL Storer**: Handles high-speed disk persistence.
 4. **Snapshotter**: Periodically captures state for fast recovery.
 
-Detailed docs: [Benchmarks](docs/benchmarks.md) | [Architecture & Design](docs/Design.md) | [Consistency Model](docs/operations_consistency.md)
+Detailed docs: [Benchmarks](docs/architecture/benchmarks.md) | [Architecture & Design](docs/architecture/design.md) | [Consistency Model](docs/architecture/consistency.md)
 
 ## Performance Benchmarks
 
@@ -126,7 +126,7 @@ Detailed docs: [Benchmarks](docs/benchmarks.md) | [Architecture & Design](docs/D
 | **Wallet Deposit** | 198 ns | **5.0 Million tx/s** |
 | **Wallet Transfer** | 151 ns | **6.6 Million tx/s** |
 
-*Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/benchmarks.md](docs/benchmarks.md)*
+*Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/architecture/benchmarks.md](docs/architecture/benchmarks.md)*
 
 ---
 

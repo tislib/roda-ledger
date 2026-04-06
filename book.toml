@@ -1,0 +1,12 @@
+[book]
+title = "Roda-Ledger Documentation"
+authors = ["Taleh Ibrahimli"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "docs/book"
+
+[output.html]
+git-repository-url = "https://github.com/tislib/roda-ledger"
+edit-url-template = "https://github.com/tislib/roda-ledger/edit/master/{path}"
