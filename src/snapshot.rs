@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-
 // ── Message types for the Snapshot stage queue (ADR-008) ─────────────────────
 
 /// Single message type for the WAL→Snapshot queue.

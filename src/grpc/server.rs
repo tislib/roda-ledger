@@ -1,6 +1,7 @@
 use crate::grpc::handler::LedgerHandler;
 use crate::grpc::proto::ledger_server::LedgerServer;
 use crate::ledger::Ledger;
+use spdlog::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -18,7 +19,7 @@ impl GrpcServer {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let handler = LedgerHandler::new(self.ledger);
 
-        println!("gRPC server listening on {}", self.addr);
+        info!("gRPC server listening on {}", self.addr);
 
         let mut builder = Server::builder().add_service(LedgerServer::new(handler));
 

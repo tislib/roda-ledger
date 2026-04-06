@@ -8,7 +8,7 @@ use crate::pipeline_mode::PipelineMode;
 use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +34,8 @@ pub struct TransactorRunner {
     running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
     transaction_buffer: Vec<Transaction>,
+    expected_next_id: u64,
+    pending: BTreeMap<u64, Transaction>,
     entries: Vec<WalEntry>,
     input_retry_count: u64,
     fail_reason: FailReason,
@@ -103,6 +105,8 @@ impl Transactor {
             outbound: self.outbound.clone(),
             balances: std::mem::take(&mut self.balances),
             last_processed_transaction_id: self.last_processed_transaction_id.clone(),
+            expected_next_id: self.last_processed_transaction_id.load(Ordering::Acquire) + 1,
+            pending: BTreeMap::new(),
             rejected_transactions: self.rejected_transactions.clone(),
             running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
@@ -128,6 +132,8 @@ impl TransactorRunner {
             outbound: Arc::new(ArrayQueue::new(1)),
             balances,
             last_processed_transaction_id: Arc::new(Default::default()),
+            expected_next_id: 1,
+            pending: BTreeMap::new(),
             rejected_transactions: Arc::new(Default::default()),
             running: Arc::new(AtomicBool::new(true)),
             pipeline_mode,
@@ -172,18 +178,31 @@ impl TransactorRunner {
 
     fn run_step(&mut self) {
         // collect transactions to process
-        let count = self.inbound.len().min(self.transaction_buffer.capacity());
+        while let Some(tx) = self.inbound.pop() {
+            if tx.id == self.expected_next_id {
+                self.transaction_buffer.push(tx);
+                self.expected_next_id += 1;
+                // drain any buffered transactions that are now in order
+                while let Some(buffered) = self.pending.remove(&self.expected_next_id) {
+                    self.transaction_buffer.push(buffered);
+                    self.expected_next_id += 1;
+                }
+            } else if tx.id > self.expected_next_id {
+                self.pending.insert(tx.id, tx);
+            }
 
-        if count == 0 {
+            // Limit batch size to avoid overly long processing steps
+            if self.transaction_buffer.len() >= self.transaction_buffer.capacity() {
+                break;
+            }
+        }
+
+        if self.transaction_buffer.is_empty() {
             self.pipeline_mode.wait_strategy(self.input_retry_count);
             self.input_retry_count += 1;
             return;
         }
         self.input_retry_count = 0;
-
-        for _ in 0..count {
-            self.transaction_buffer.push(self.inbound.pop().unwrap());
-        }
 
         // single syscall for timestamp for this entire step
         let timestamp = std::time::SystemTime::now()
@@ -216,12 +235,13 @@ impl TransactorRunner {
 
     fn process(&mut self, timestamp: u64) {
         let timestamp_ms = timestamp / 1_000_000; // nanos → ms
-        let mut tx_id = 0;
+        let mut max_tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
             self.fail_reason = FailReason::NONE;
             let operation = &self.transaction_buffer[idx].operation;
 
-            tx_id = self.transaction_buffer[idx].id;
+            let tx_id = self.transaction_buffer[idx].id;
+            max_tx_id = max_tx_id.max(tx_id);
             let user_ref = operation.user_ref();
 
             // --- Deduplication check ---
@@ -365,9 +385,10 @@ impl TransactorRunner {
             }
         }
 
-        if tx_id > 0 {
+        if max_tx_id > 0 {
             self.last_processed_transaction_id
-                .store(tx_id, Ordering::Relaxed);
+                .store(max_tx_id, Ordering::Relaxed);
+            self.expected_next_id = self.expected_next_id.max(max_tx_id + 1);
         }
     }
 

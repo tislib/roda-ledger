@@ -17,6 +17,10 @@ service Ledger {
   // Use GetTransactionStatus or GetTransactionStatuses to poll for finality.
   rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
 
+  // SubmitAndWait blocks until the specified WaitLevel is reached.
+  // Returns the full result including status and fail_reason.
+  rpc SubmitAndWait(SubmitAndWaitRequest) returns (SubmitAndWaitResponse);
+
   // SubmitBatch submits multiple operations in a single round trip.
   // Operations are sequenced and executed in the order provided in the request,
   // however, there is no global order guarantee (meaning other transactions from
@@ -26,6 +30,10 @@ service Ledger {
   // Results are returned in the same order as the input operations.
   // Prefer this over repeated SubmitOperation calls for high-throughput ingestion.
   rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
+
+  // SubmitBatchAndWait blocks until all operations in the batch reach the specified WaitLevel.
+  // Returns the full result including status and fail_reason per operation.
+  rpc SubmitBatchAndWait(SubmitBatchAndWaitRequest) returns (SubmitBatchAndWaitResponse);
 
   // GetBalance returns the current balance for a single account.
   // Balance reflects all transactions that have reached ON_SNAPSHOT stage.
@@ -78,6 +86,7 @@ service Ledger {
 
 // SubmitOperationRequest wraps one of the supported operation types.
 // Exactly one operation field must be set. Setting zero or more than one is an error.
+// Used by the fire-and-forget SubmitOperation RPC.
 message SubmitOperationRequest {
   oneof operation {
     Deposit    deposit    = 1;
@@ -86,6 +95,25 @@ message SubmitOperationRequest {
     Composite  composite  = 4;
     Named      named      = 5;
   }
+}
+
+// SubmitAndWaitRequest wraps an operation with a WaitLevel.
+// Used by the blocking SubmitAndWait RPC.
+message SubmitAndWaitRequest {
+  oneof operation {
+    Deposit    deposit    = 1;
+    Withdrawal withdrawal = 2;
+    Transfer   transfer   = 3;
+    Composite  composite  = 4;
+    Named      named      = 5;
+  }
+  WaitLevel wait_level = 6;
+}
+
+enum WaitLevel {
+  WAIT_LEVEL_PROCESSED   = 0; // if omitted in request, used for async SubmitOperation
+  WAIT_LEVEL_COMMITTED   = 1;
+  WAIT_LEVEL_SNAPSHOT = 2;
 }
 
 // Deposit credits an account from the system source.
@@ -188,18 +216,40 @@ message DebitStep {
 // SubmitOperationResponse is returned after an operation is sequenced.
 // The transaction_id is assigned by the Sequencer and is available immediately —
 // before the operation has been executed, persisted, or snapshotted.
+// Used by the fire-and-forget SubmitOperation RPC.
 message SubmitOperationResponse {
   uint64 transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
 }
 
+// SubmitAndWaitResponse is returned after the operation reaches the requested WaitLevel.
+// Contains the full result including status and fail_reason.
+message SubmitAndWaitResponse {
+  uint64   transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
+  uint32   fail_reason    = 2; // 0 if status == COMMITTED. See FailReason codes.
+}
+
+// SubmitBatchRequest submits multiple operations in a single round trip.
+// Used by the fire-and-forget SubmitBatch RPC.
 message SubmitBatchRequest {
   repeated SubmitOperationRequest operations = 1; // Operations to submit, in order.
                                                   // Each is independent — failure of one
                                                   // does not affect others.
 }
 
+// SubmitBatchResponse returns one result per input operation, same order.
 message SubmitBatchResponse {
   repeated SubmitOperationResponse results = 1; // One result per input operation, same order.
+}
+
+// SubmitBatchAndWaitRequest submits multiple operations and blocks until all reach WaitLevel.
+message SubmitBatchAndWaitRequest {
+  repeated SubmitAndWaitRequest operations = 1; // Operations to submit, in order.
+  WaitLevel                     wait_level = 2; // Pipeline stage to wait for.
+}
+
+// SubmitBatchAndWaitResponse returns the full result per operation after WaitLevel is reached.
+message SubmitBatchAndWaitResponse {
+  repeated SubmitAndWaitResponse results = 1; // One result per input operation, same order.
 }
 
 // ---- Balance messages ----

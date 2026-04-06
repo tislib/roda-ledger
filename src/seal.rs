@@ -92,7 +92,7 @@ impl SealRunner {
             }
             // Check before sleep to ensure that the last seal is done before shutting down
             if !self.running.load(Ordering::Relaxed) {
-                return;
+                break;
             }
             sleep(self.seal_check_internal);
         }

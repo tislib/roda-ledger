@@ -29,7 +29,7 @@ impl Sequencer {
             spin_loop();
             retry_count += 1;
             if retry_count % 10_000 == 0 {
-                yield_now()
+                yield_now();
             }
         }
 

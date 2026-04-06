@@ -2,7 +2,10 @@ use crate::grpc::proto;
 use crate::grpc::proto::ledger_server::Ledger;
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
+use crate::transaction::WaitLevel;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::yield_now;
 use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
@@ -28,6 +31,32 @@ impl Ledger for LedgerHandler {
         }))
     }
 
+    async fn submit_and_wait(
+        &self,
+        request: Request<proto::SubmitAndWaitRequest>,
+    ) -> Result<Response<proto::SubmitAndWaitResponse>, Status> {
+        let req = request.into_inner();
+        let level = proto::WaitLevel::try_from(req.wait_level)
+            .map(WaitLevel::from)
+            .unwrap_or(WaitLevel::Committed);
+        let op = req.try_into()?;
+
+        let tx_id = self.ledger.submit(op);
+        self.wait_for_transaction_level(tx_id, level).await;
+
+        let status = self.ledger.get_transaction_status(tx_id);
+        let fail_reason = if status.is_err() {
+            status.error_reason().as_u8() as u32
+        } else {
+            0
+        };
+
+        Ok(Response::new(proto::SubmitAndWaitResponse {
+            transaction_id: tx_id,
+            fail_reason,
+        }))
+    }
+
     async fn submit_batch(
         &self,
         request: Request<proto::SubmitBatchRequest>,
@@ -42,6 +71,46 @@ impl Ledger for LedgerHandler {
         }
 
         Ok(Response::new(proto::SubmitBatchResponse { results }))
+    }
+
+    async fn submit_batch_and_wait(
+        &self,
+        request: Request<proto::SubmitBatchAndWaitRequest>,
+    ) -> Result<Response<proto::SubmitBatchAndWaitResponse>, Status> {
+        let req = request.into_inner();
+        let level = proto::WaitLevel::try_from(req.wait_level)
+            .map(WaitLevel::from)
+            .unwrap_or(WaitLevel::Committed);
+
+        let mut tx_ids = Vec::with_capacity(req.operations.len());
+        for op_req in req.operations {
+            let op = op_req.try_into()?;
+            tx_ids.push(self.ledger.submit(op));
+        }
+
+        // tx_ids are monotonic — waiting for the last one guarantees all
+        // earlier transactions have reached the same level (or were rejected)
+        if let Some(&last_tx_id) = tx_ids.last() {
+            self.wait_for_transaction_level(last_tx_id, level).await;
+        }
+
+        let results = tx_ids
+            .into_iter()
+            .map(|tx_id| {
+                let status = self.ledger.get_transaction_status(tx_id);
+                let fail_reason = if status.is_err() {
+                    status.error_reason().as_u8() as u32
+                } else {
+                    0
+                };
+                proto::SubmitAndWaitResponse {
+                    transaction_id: tx_id,
+                    fail_reason,
+                }
+            })
+            .collect();
+
+        Ok(Response::new(proto::SubmitBatchAndWaitResponse { results }))
     }
 
     async fn get_balance(
@@ -223,6 +292,31 @@ impl Ledger for LedgerHandler {
                 }))
             }
             _ => Err(Status::internal("query failed")),
+        }
+    }
+}
+
+impl LedgerHandler {
+    pub async fn wait_for_transaction_level(&self, transaction_id: u64, level: WaitLevel) {
+        let start_time = std::time::Instant::now();
+        let timeout = Duration::from_secs(20);
+
+        loop {
+            let reached = match level {
+                WaitLevel::Processed => self.ledger.last_computed_id() >= transaction_id,
+                WaitLevel::Committed => self.ledger.last_committed_id() >= transaction_id,
+                WaitLevel::Snapshotted => self.ledger.last_snapshot_id() >= transaction_id,
+            };
+
+            if reached {
+                return;
+            }
+
+            yield_now().await;
+
+            if start_time.elapsed() >= timeout {
+                return;
+            }
         }
     }
 }
