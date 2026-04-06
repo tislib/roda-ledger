@@ -1,7 +1,7 @@
 use crate::entities::FailReason;
 use crate::grpc::proto;
 use crate::transaction::{
-    CompositeOperation, CompositeOperationFlags, Operation, Step, TransactionStatus,
+    CompositeOperation, CompositeOperationFlags, Operation, Step, TransactionStatus, WaitLevel,
 };
 
 impl From<proto::Deposit> for Operation {
@@ -86,6 +86,21 @@ impl TryFrom<proto::SubmitOperationRequest> for Operation {
     }
 }
 
+impl TryFrom<proto::SubmitAndWaitRequest> for Operation {
+    type Error = tonic::Status;
+
+    fn try_from(req: proto::SubmitAndWaitRequest) -> Result<Self, Self::Error> {
+        match req.operation {
+            Some(proto::submit_and_wait_request::Operation::Deposit(d)) => Ok(d.into()),
+            Some(proto::submit_and_wait_request::Operation::Withdrawal(w)) => Ok(w.into()),
+            Some(proto::submit_and_wait_request::Operation::Transfer(t)) => Ok(t.into()),
+            Some(proto::submit_and_wait_request::Operation::Composite(c)) => Ok(c.into()),
+            Some(proto::submit_and_wait_request::Operation::Named(n)) => Ok(n.into()),
+            None => Err(tonic::Status::invalid_argument("missing operation")),
+        }
+    }
+}
+
 impl From<TransactionStatus> for proto::TransactionStatus {
     fn from(status: TransactionStatus) -> Self {
         match status {
@@ -101,5 +116,15 @@ impl From<TransactionStatus> for proto::TransactionStatus {
 impl From<FailReason> for u32 {
     fn from(reason: FailReason) -> Self {
         reason.as_u8() as u32
+    }
+}
+
+impl From<proto::WaitLevel> for WaitLevel {
+    fn from(level: proto::WaitLevel) -> Self {
+        match level {
+            proto::WaitLevel::Processed => WaitLevel::Processed,
+            proto::WaitLevel::Committed => WaitLevel::Committed,
+            proto::WaitLevel::Snapshot => WaitLevel::Snapshotted,
+        }
     }
 }

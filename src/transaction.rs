@@ -65,6 +65,19 @@ pub struct Transaction {
     pub operation: Operation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitLevel {
+    Processed,
+    Committed,
+    Snapshotted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitResult {
+    pub tx_id: u64,
+    pub fail_reason: FailReason,
+}
+
 impl Transaction {
     pub fn new(operation: Operation) -> Self {
         Self { id: 0, operation }

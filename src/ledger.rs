@@ -6,7 +6,7 @@ use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Storage, StorageConfig};
-use crate::transaction::{Operation, Transaction, TransactionStatus};
+use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 use crate::wal::Wal;
 use crossbeam_queue::ArrayQueue;
@@ -28,6 +28,7 @@ pub struct LedgerConfig {
     pub index_circle2_size: usize,
     pub dedup_enabled: bool,
     pub dedup_window_ms: u64,
+    pub disable_seal: bool,
 }
 
 impl Default for LedgerConfig {
@@ -43,6 +44,7 @@ impl Default for LedgerConfig {
             index_circle2_size: 1 << 21, // 2M entries
             dedup_enabled: true,
             dedup_window_ms: 10_000, // 10 seconds
+            disable_seal: false,
         }
     }
 }
@@ -53,13 +55,9 @@ impl LedgerConfig {
     }
 
     pub fn temp() -> Self {
-        let mut dir = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        dir.push(format!("roda-ledger-{}", nanos));
-        // Directory creation is handled by Storage::new()
+        let mut dir = std::env::current_dir().unwrap();
+        let rand = rand::random::<u64>() % 1_000_000_000;
+        dir.push(format!("temp_{}", rand));
 
         Self {
             storage: StorageConfig {
@@ -70,6 +68,25 @@ impl LedgerConfig {
             },
             log_level: Level::Critical,
             seal_check_internal: Duration::from_millis(10),
+            ..Default::default()
+        }
+    }
+
+    pub fn bench() -> Self {
+        let mut dir = std::env::current_dir().unwrap();
+        let rand = rand::random::<u64>() % 1_000_000_000;
+        dir.push(format!("temp_{}", rand));
+
+        Self {
+            storage: StorageConfig {
+                data_dir: dir.to_string_lossy().to_string(),
+                temporary: true,
+                snapshot_frequency: u32::MAX,
+                wal_segment_size_mb: 2048,
+            },
+            log_level: Level::Critical,
+            seal_check_internal: Duration::from_mins(10),
+            disable_seal: true, // disable seal to avoid unnecessary disk IO to finish the benchmark process faster
             ..Default::default()
         }
     }
@@ -195,7 +212,7 @@ impl Ledger {
     pub fn query(&self, request: QueryRequest) {
         let mut msg = SnapshotMessage::Query(request);
         let mut retry_count = 0u64;
-        loop {
+        while self.running.load(Ordering::Relaxed) {
             match self.query_queue.push(msg) {
                 Ok(_) => return,
                 Err(returned) => {
@@ -226,6 +243,81 @@ impl Ledger {
         rx.recv().expect("query_block: failed to receive response")
     }
 
+    pub fn submit_and_wait(&self, operation: Operation, level: WaitLevel) -> SubmitResult {
+        let tx_id = self.submit(operation);
+        self.wait_for_transaction_level(tx_id, level);
+        self.build_submit_result(tx_id)
+    }
+
+    pub fn submit_batch_and_wait(
+        &self,
+        ops: Vec<Operation>,
+        level: WaitLevel,
+    ) -> Vec<SubmitResult> {
+        let tx_ids: Vec<u64> = ops.into_iter().map(|op| self.submit(op)).collect();
+        if let Some(&last) = tx_ids.last() {
+            self.wait_for_transaction_level(last, level);
+        }
+        tx_ids
+            .into_iter()
+            .map(|tx_id| self.build_submit_result(tx_id))
+            .collect()
+    }
+
+    fn build_submit_result(&self, tx_id: u64) -> SubmitResult {
+        let status = self.get_transaction_status(tx_id);
+        if status.is_err() {
+            SubmitResult {
+                tx_id,
+                fail_reason: status.error_reason(),
+            }
+        } else {
+            SubmitResult {
+                tx_id,
+                fail_reason: crate::entities::FailReason::NONE,
+            }
+        }
+    }
+
+    pub fn wait_for_transaction_level(&self, transaction_id: u64, level: WaitLevel) {
+        let mut retry_count = 0u64;
+        let start_time = std::time::Instant::now();
+        let timeout = Duration::from_secs(10);
+
+        while self.running.load(Ordering::Relaxed) {
+            // On error, return immediately regardless of wait level
+            if self.transactor.last_processed_transaction_id() >= transaction_id
+                && self
+                    .transactor
+                    .transaction_rejection_reason(transaction_id)
+                    .is_some()
+            {
+                return;
+            }
+
+            let reached = match level {
+                WaitLevel::Processed => {
+                    self.transactor.last_processed_transaction_id() >= transaction_id
+                }
+                WaitLevel::Committed => self.wal.last_processed_transaction_id() >= transaction_id,
+                WaitLevel::Snapshotted => {
+                    self.snapshot.last_processed_transaction_id() >= transaction_id
+                }
+            };
+
+            if reached {
+                return;
+            }
+
+            self.config.pipeline_mode.wait_strategy(retry_count);
+            retry_count += 1;
+
+            if start_time.elapsed() >= timeout {
+                return;
+            }
+        }
+    }
+
     pub fn get_rejected_count(&self) -> u64 {
         self.transactor.get_rejected_count()
     }
@@ -238,7 +330,7 @@ impl Ledger {
         let mut retry_count = 0;
         let start_time = std::time::Instant::now();
 
-        loop {
+        while self.running.load(Ordering::Relaxed) {
             let current_snapshot_step = self.snapshot.last_processed_transaction_id();
 
             if current_snapshot_step >= transaction_id {
@@ -262,10 +354,13 @@ impl Ledger {
     }
 
     pub fn wait_for_seal(&self) {
+        if self.config.disable_seal {
+            panic!("wait_for_seal is not supported in the current implementation");
+        }
         self.wait_for_pass();
 
         let mut retry_count = 0;
-        loop {
+        while self.running.load(Ordering::Relaxed) {
             let segment_count = self.storage.last_segment_id() - 1;
             if segment_count == self.seal.last_sealed_segment_id() {
                 return;
@@ -295,11 +390,11 @@ impl Ledger {
         self.handles.push(self.snapshot.start().map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
         })?);
-        self.handles.push(
-            self.seal.start().map_err(|e| {
+        if !self.config.disable_seal {
+            self.handles.push(self.seal.start().map_err(|e| {
                 std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
-            })?,
-        );
+            })?);
+        }
 
         Ok(())
     }

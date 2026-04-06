@@ -123,7 +123,7 @@ fn query_bench(c: &mut Criterion) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("temp_query_bench_{}", nanos)
+        format!("bench_query_bench_{}", nanos)
     };
 
     let cold_tx_count = 100_000u64;
