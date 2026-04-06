@@ -121,10 +121,10 @@ Detailed docs: [Benchmarks](docs/architecture/benchmarks.md) | [Architecture & D
 
 ## Performance Benchmarks
 
-| Operation | Latency (Avg) | Throughput (Avg) |
-| :--- | :--- | :--- |
-| **Wallet Deposit** | 198 ns | **5.0 Million tx/s** |
-| **Wallet Transfer** | 151 ns | **6.6 Million tx/s** |
+| Operation | Latency (Avg) | Throughput (Avg)     |
+| :--- | :--- |:---------------------|
+| **Wallet Deposit** | 198 ns | **2.8 Million tx/s** |
+| **Wallet Transfer** | 151 ns | **2.8 Million tx/s** |
 
 *Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/architecture/benchmarks.md](docs/architecture/benchmarks.md)*
 
