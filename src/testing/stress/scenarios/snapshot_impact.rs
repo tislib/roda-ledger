@@ -41,13 +41,14 @@ impl Scenario for SnapshotImpactScenario {
         }
 
         // Configure ledger with frequent snapshots (every WAL segment seal)
+        let temp_config = LedgerConfig::temp();
         let config = LedgerConfig {
             max_accounts: self.max_accounts() as usize,
             storage: StorageConfig {
                 snapshot_frequency: 1,
-                ..Default::default()
+                ..temp_config.storage
             },
-            ..Default::default()
+            ..temp_config
         };
 
         let mut ledger = Ledger::new(config);

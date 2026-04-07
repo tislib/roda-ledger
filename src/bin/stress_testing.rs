@@ -8,22 +8,9 @@ use roda_ledger::testing::stress::scenarios::spike::SpikeScenario;
 use roda_ledger::testing::stress::scenarios::spike_recovery::SpikeRecoveryScenario;
 use roda_ledger::testing::stress::scenarios::sustain_load::SustainLoadScenario;
 use std::env;
-use std::fs;
-use std::path::Path;
 use std::time::Duration;
 
 fn main() {
-    let data_dir = Path::new("data");
-    if data_dir.exists()
-        && data_dir.is_dir()
-        && fs::read_dir(data_dir)
-            .expect("Failed to read data directory")
-            .next()
-            .is_some()
-    {
-        panic!("data directory exists and is not empty");
-    }
-
     let args: Vec<String> = env::args().collect();
     let specific_scenario_name = args.get(1);
 
