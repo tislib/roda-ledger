@@ -27,7 +27,7 @@ pub trait Scenario {
 
         let mut ledger = Ledger::new(LedgerConfig {
             max_accounts: self.max_accounts() as usize,
-            ..Default::default()
+            ..LedgerConfig::temp()
         });
         ledger.start().unwrap();
         let ledger = Arc::new(ledger);
