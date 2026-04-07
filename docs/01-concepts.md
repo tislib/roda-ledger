@@ -37,7 +37,9 @@ Every operation carries a `user_ref` — a caller-supplied value that serves two
 
 The client submits operations. It never writes transactions directly.
 
-A **transaction** is the ledger's immutable record of what happened. The Transactor converts each submitted operation into a set of internal **credits** and **debits** — the low-level entries that actually modify account balances. These are an internal concept; the caller works only with operations. When an operation is accepted and executed, roda-ledger creates a transaction — a permanent, ordered fact in the log. Transactions are never modified, never deleted, and never reordered.
+A **transaction** is the ledger's immutable record of what happened. When an operation is accepted and executed, roda-ledger creates a transaction — a permanent, ordered fact in the log. Transactions are never modified, never deleted, and never reordered. The caller can query a transaction directly to check its status or inspect its details.
+
+When querying a transaction, the caller sees **entries** — the individual credits and debits the Transactor produced from the original operation — not the operation itself. A `Transfer` becomes two entries: a debit on the sender and a credit on the receiver. A `Composite` becomes one entry per step. The operation is the intent; the entries are the facts.
 
 The client thinks in operations. The ledger thinks in transactions. The Transactor translates between the two.
 
@@ -89,7 +91,9 @@ The transaction is written to the Write-Ahead Log on disk. After this stage, the
 **Stage 4 — Snapshotter**
 The updated balances are written to the snapshot, making them visible to readers via `get_balance`. After this stage, reads reflect this transaction and all transactions before it.
 
-The gap between Stage 2 and Stage 4 is typically tens to hundreds of nanoseconds. The Snapshotter is not a slow checkpoint process — it runs continuously as part of the pipeline.
+The gap between Stage 3 and Stage 4 is typically tens to hundreds of nanoseconds — the Snapshotter runs continuously as part of the pipeline and is not a slow checkpoint process.
+
+The significant gap is between Stage 2 and Stage 3. WAL writes are batched dynamically and flushed to disk via `fdatasync`. The throughput and latency of this step are bounded by sequential disk write speed. The maximum batch buffer size is configurable.
 
 ---
 
@@ -117,13 +121,20 @@ To summarize:
 
 ## Flexibility
 
-roda-ledger is designed around two dimensions of flexibility.
+roda-ledger is designed around two dimensions of flexibility that set it apart from opinionated ledger systems.
 
-**Bring your own logic.** The ledger engine handles ordering, sequencing, durability, and recovery. The caller defines the business rules — what operations are valid, what conditions must hold, what constitutes an error. This logic compiles directly into the ledger. There is no runtime interpretation, no scripting overhead, no plugin interface. The caller's logic runs at the same level as the engine itself.
+**Composite operations.** Beyond the built-in `Deposit`, `Withdrawal`, and `Transfer` operation types, the caller can express arbitrary multi-account logic through `Composite` operations — a caller-defined sequence of `Credit` and `Debit` steps executed atomically as a single transaction. This covers any financial logic that does not fit the named types: split payments, fee deductions, multi-leg settlements, or domain-specific balance rules. The ledger engine handles ordering, durability, and atomicity — the caller defines the steps.
 
-**Choose your guarantee level.** The staged pipeline exposes a dial between performance and consistency. Waiting only for the Transactor gives maximum throughput with in-memory durability. Waiting for the WAL Storer gives crash safety. Waiting for the Snapshotter gives linearizable reads. The caller makes this choice per submission based on what their use case requires.
+**WASM-sandboxed operations (near future).** The `Named` operation type is the extension point for pre-registered WASM modules. The caller uploads compiled logic, registers it under a name, and invokes it by name with parameters. The WASM module executes within a sandboxed API surface — it can credit and debit accounts but cannot escape the ledger's invariants. This brings programmable logic to the ledger without recompiling or redeploying it.
 
-In the near future, WASM support will extend the first dimension further — allowing custom operation logic to be uploaded as compiled WASM modules and executed within a sandboxed API surface, without recompiling the ledger itself.
+**Choose your guarantee level.** The staged pipeline exposes a dial between performance and consistency. The caller chooses how much to wait per submission:
+
+- `submit` — returns a transaction ID immediately, waits for nothing. Maximum throughput.
+- `submit_wait(transactor)` — waits for execution. The caller knows whether the transaction committed or was rejected.
+- `submit_wait(wal)` — waits for durability. The transaction is on disk and survives a crash.
+- `submit_wait(snapshot)` — waits for the balance to be visible. Guarantees linearizable reads via `get_balance`.
+
+The caller makes this choice per submission based on what their use case requires.
 
 ---
 
@@ -131,7 +142,7 @@ In the near future, WASM support will extend the first dimension further — all
 
 Understanding the boundaries is as important as understanding the capabilities.
 
-**Not a general-purpose database.** There is no query language, no secondary indexes, no ad-hoc reads beyond balance lookup by account ID.
+**Not a general-purpose database.** There is no query language, no secondary indexes, no ad-hoc reads beyond balance lookup by account ID or transaction ID.
 
 **Not an authorization layer.** roda-ledger does not authenticate callers or enforce access control. This is the responsibility of the layer above it.
 
@@ -139,4 +150,4 @@ Understanding the boundaries is as important as understanding the capabilities.
 
 **What it does have today.** A gRPC interface and a Docker image. roda-ledger is not only an embedded library — it can run as a standalone service.
 
-**Planned additions.** Raft-based multi-node replication, mTLS authentication, and WASM-sandboxed custom logic.
+**Planned additions.** Raft-based multi-node replication, mTLS authentication, and WASM-sandboxed custom logic.x
