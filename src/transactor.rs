@@ -5,7 +5,6 @@ use crate::entities::{
     WalEntryKind,
 };
 use crate::pipeline::TransactorContext;
-use crate::pipeline_mode::PipelineMode;
 use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction};
 use crossbeam_skiplist::SkipMap;
 use std::collections::{BTreeMap, HashMap};
@@ -16,14 +15,12 @@ use std::thread::JoinHandle;
 pub struct Transactor {
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     balances: Vec<Balance>,
-    pipeline_mode: PipelineMode,
     dedup: DedupCache,
 }
 
 pub struct TransactorRunner {
     balances: Vec<Balance>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
-    pipeline_mode: PipelineMode,
     transaction_buffer: Vec<Transaction>,
     expected_next_id: u64,
     pending: BTreeMap<u64, Transaction>,
@@ -35,18 +32,12 @@ pub struct TransactorRunner {
 }
 
 impl Transactor {
-    pub fn new(
-        max_accounts: usize,
-        pipeline_mode: PipelineMode,
-        dedup_enabled: bool,
-        dedup_window_ms: u64,
-    ) -> Self {
+    pub fn new(max_accounts: usize, dedup_enabled: bool, dedup_window_ms: u64) -> Self {
         let mut accounts = Vec::with_capacity(max_accounts);
         accounts.resize(max_accounts, Balance::default());
         Self {
             rejected_transactions: Arc::new(Default::default()),
             balances: accounts,
-            pipeline_mode,
             dedup: DedupCache::new(dedup_enabled, dedup_window_ms),
         }
     }
@@ -79,7 +70,6 @@ impl Transactor {
         let mut runner = TransactorRunner {
             balances: std::mem::take(&mut self.balances),
             rejected_transactions: self.rejected_transactions.clone(),
-            pipeline_mode: self.pipeline_mode,
             transaction_buffer: Vec::with_capacity(cap),
             entries: Vec::with_capacity(cap),
             expected_next_id: ctx.get_processed_index() + 1,
@@ -97,7 +87,7 @@ impl Transactor {
 
 impl TransactorRunner {
     /// Standalone constructor used by benches (no pipeline / no queues).
-    pub fn new(max_accounts: usize, pipeline_mode: PipelineMode) -> Self {
+    pub fn new(max_accounts: usize) -> Self {
         let mut balances = Vec::with_capacity(max_accounts);
         balances.resize(max_accounts, Balance::default());
         Self {
@@ -105,7 +95,6 @@ impl TransactorRunner {
             expected_next_id: 1,
             pending: BTreeMap::new(),
             rejected_transactions: Arc::new(Default::default()),
-            pipeline_mode,
             transaction_buffer: Vec::with_capacity(1),
             entries: Vec::with_capacity(16),
             input_retry_count: 0,
@@ -168,7 +157,7 @@ impl TransactorRunner {
         }
 
         if self.transaction_buffer.is_empty() {
-            self.pipeline_mode.wait_strategy(self.input_retry_count);
+            ctx.wait_strategy().wait_strategy(self.input_retry_count);
             self.input_retry_count += 1;
             return;
         }

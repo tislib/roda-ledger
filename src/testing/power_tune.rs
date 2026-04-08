@@ -1,4 +1,4 @@
-use crate::ledger::{Ledger, LedgerConfig, PipelineMode};
+use crate::ledger::{Ledger, LedgerConfig, WaitStrategy};
 use crate::transaction::Operation;
 use std::time::Instant;
 
@@ -44,14 +44,14 @@ pub fn run_power_tune(
         match parameter {
             TuneParameter::QueueSize => config.queue_size = val as usize,
             TuneParameter::SpinUntil => {
-                config.pipeline_mode = PipelineMode::Custom {
+                config.wait_strategy = WaitStrategy::Custom {
                     spin_until: val,
-                    yield_until: config.pipeline_mode.thresholds().yield_until,
+                    yield_until: config.wait_strategy.thresholds().yield_until,
                 };
             }
             TuneParameter::YieldUntil => {
-                config.pipeline_mode = PipelineMode::Custom {
-                    spin_until: config.pipeline_mode.thresholds().spin_until,
+                config.wait_strategy = WaitStrategy::Custom {
+                    spin_until: config.wait_strategy.thresholds().spin_until,
                     yield_until: val,
                 };
             }

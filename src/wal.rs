@@ -1,7 +1,6 @@
 use crate::entities::WalEntry;
 use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline::WalContext;
-use crate::pipeline_mode::PipelineMode;
 use crate::snapshot::SnapshotMessage;
 use crate::storage::Storage;
 use std::sync::Arc;
@@ -9,30 +8,11 @@ use std::thread::JoinHandle;
 
 pub struct Wal {
     storage: Arc<Storage>,
-    pipeline_mode: PipelineMode,
-}
-
-pub struct WalRunner {
-    storage: Arc<Storage>,
-    buffer: Vec<WalEntry>,
-    /// Number of entries at the front of `buffer` that form one or more complete
-    /// transactions.  Everything in `buffer[..committed_len]` is safe to write/forward.
-    committed_len: usize,
-    pipeline_mode: PipelineMode,
-    // Transaction state (across fill_buffer calls)
-    /// Total remaining records (entries + links) for the current transaction.
-    pending_records: u8,
-    pending_tx_id: u64,
-    // Segmentation state
-    last_committed_tx_id: u64,
 }
 
 impl Wal {
-    pub fn new(storage: Arc<Storage>, pipeline_mode: PipelineMode) -> Self {
-        Self {
-            storage,
-            pipeline_mode,
-        }
+    pub fn new(storage: Arc<Storage>) -> Self {
+        Self { storage }
     }
 
     pub fn start(&self, ctx: WalContext) -> std::io::Result<JoinHandle<()>> {
@@ -40,7 +20,6 @@ impl Wal {
             storage: self.storage.clone(),
             buffer: Vec::with_capacity(ctx.input_capacity()),
             committed_len: 0,
-            pipeline_mode: self.pipeline_mode,
             pending_records: 0,
             pending_tx_id: 0,
             last_committed_tx_id: 0,
@@ -51,6 +30,20 @@ impl Wal {
                 runner.run(ctx);
             })
     }
+}
+
+pub struct WalRunner {
+    storage: Arc<Storage>,
+    buffer: Vec<WalEntry>,
+    /// Number of entries at the front of `buffer` that form one or more complete
+    /// transactions.  Everything in `buffer[..committed_len]` is safe to write/forward.
+    committed_len: usize,
+    // Transaction state (across fill_buffer calls)
+    /// Total remaining records (entries + links) for the current transaction.
+    pending_records: u8,
+    pending_tx_id: u64,
+    // Segmentation state
+    last_committed_tx_id: u64,
 }
 
 impl WalRunner {
@@ -118,7 +111,7 @@ impl WalRunner {
         while ctx.is_running() {
             // Fill the buffer; skip this iteration if no complete transaction is ready yet.
             if !self.fill_buffer(&ctx) {
-                self.pipeline_mode.wait_strategy(retry_count);
+                ctx.wait_strategy().wait_strategy(retry_count);
                 retry_count += 1;
                 continue;
             }

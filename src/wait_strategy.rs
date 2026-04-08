@@ -2,7 +2,7 @@ use std::hint;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PipelineMode {
+pub enum WaitStrategy {
     LowLatency,
     #[default]
     Balanced,
@@ -18,22 +18,22 @@ pub struct Thresholds {
     pub yield_until: u64,
 }
 
-impl PipelineMode {
+impl WaitStrategy {
     pub fn thresholds(&self) -> Thresholds {
         match self {
-            PipelineMode::LowLatency => Thresholds {
+            WaitStrategy::LowLatency => Thresholds {
                 spin_until: u64::MAX,
                 yield_until: u64::MAX,
             },
-            PipelineMode::Balanced => Thresholds {
+            WaitStrategy::Balanced => Thresholds {
                 spin_until: 32,
                 yield_until: 16384,
             },
-            PipelineMode::LowCpu => Thresholds {
+            WaitStrategy::LowCpu => Thresholds {
                 spin_until: 0,
                 yield_until: 100,
             },
-            PipelineMode::Custom {
+            WaitStrategy::Custom {
                 spin_until,
                 yield_until,
             } => Thresholds {
@@ -45,7 +45,7 @@ impl PipelineMode {
 
     #[inline(always)]
     pub fn wait_strategy(&self, retry_count: u64) {
-        if matches!(self, PipelineMode::LowLatency) {
+        if matches!(self, WaitStrategy::LowLatency) {
             return;
         }
 

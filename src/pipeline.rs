@@ -10,6 +10,7 @@
 //! one stage do not cause false sharing with adjacent indexes.
 
 use crate::entities::WalEntry;
+use crate::wait_strategy::WaitStrategy;
 use crate::snapshot::SnapshotMessage;
 use crate::transaction::Transaction;
 use crossbeam_queue::ArrayQueue;
@@ -42,6 +43,9 @@ pub struct Pipeline {
 
     /// Global shutdown flag. Cleared by `shutdown()` to stop every stage.
     running: CachePadded<AtomicBool>,
+
+    /// Shared wait strategy used by every stage's idle/backpressure loops.
+    wait_strategy: WaitStrategy,
 }
 
 impl Pipeline {
@@ -50,7 +54,11 @@ impl Pipeline {
     /// `small_queue_size` is used for the sequencer→transactor and
     /// wal→snapshot hops, while `wal_queue_size` is used for the
     /// transactor→wal hop which is historically sized much larger.
-    pub fn new(small_queue_size: usize, wal_queue_size: usize) -> Arc<Self> {
+    pub fn new(
+        small_queue_size: usize,
+        wal_queue_size: usize,
+        wait_strategy: WaitStrategy,
+    ) -> Arc<Self> {
         Arc::new(Self {
             sequencer_to_transactor: ArrayQueue::new(small_queue_size),
             transactor_to_wal: ArrayQueue::new(wal_queue_size),
@@ -63,7 +71,13 @@ impl Pipeline {
             seal_index: CachePadded::new(AtomicU32::new(0)),
 
             running: CachePadded::new(AtomicBool::new(true)),
+            wait_strategy,
         })
+    }
+
+    #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.wait_strategy
     }
 
     // ─── context accessors ──────────────────────────────────────────────────
@@ -176,6 +190,11 @@ impl SequencerContext {
     }
 
     #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.pipeline.wait_strategy
+    }
+
+    #[inline(always)]
     pub fn last_id(&self) -> u64 {
         self.pipeline.last_sequenced_id()
     }
@@ -220,6 +239,11 @@ impl TransactorContext {
     pub fn is_running(&self) -> bool {
         self.pipeline.running.load(Ordering::Relaxed)
     }
+
+    #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.pipeline.wait_strategy
+    }
 }
 
 /// Slice of the pipeline visible to the WAL stage.
@@ -257,6 +281,11 @@ impl WalContext {
     pub fn is_running(&self) -> bool {
         self.pipeline.running.load(Ordering::Relaxed)
     }
+
+    #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.pipeline.wait_strategy
+    }
 }
 
 /// Slice of the pipeline visible to the snapshot stage.
@@ -284,6 +313,11 @@ impl SnapshotContext {
     pub fn is_running(&self) -> bool {
         self.pipeline.running.load(Ordering::Relaxed)
     }
+
+    #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.pipeline.wait_strategy
+    }
 }
 
 /// Slice of the pipeline visible to the seal stage.
@@ -305,5 +339,10 @@ impl SealContext {
     #[inline(always)]
     pub fn is_running(&self) -> bool {
         self.pipeline.running.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.pipeline.wait_strategy
     }
 }

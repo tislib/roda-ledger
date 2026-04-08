@@ -92,10 +92,10 @@ The Sequencer calls `on_work()` on every `submit()` before pushing to the queue.
 ensures the pipeline is awake before work arrives, not after. The Sequencer is the natural
 owner of this signal — it is the only stage that receives external input.
 
-### PipelineMode — user-facing configuration
+### WaitStrategy — user-facing configuration
 
 Threshold values are internal to `PressureManager`. Users do not configure raw numbers.
-Instead they choose a `PipelineMode` that expresses intent:
+Instead they choose a `WaitStrategy` that expresses intent:
 
 ```
 LowLatency   Threads spin continuously. Minimum latency, maximum CPU.
@@ -124,7 +124,7 @@ LowCpu        minimal          short             quickly on idle
 `LowLatency` preserves current behaviour exactly — no regression for users who want maximum
 throughput on dedicated hardware.
 
-`PipelineMode` is set in `LedgerConfig`. Default is `Balanced`.
+`WaitStrategy` is set in `LedgerConfig`. Default is `Balanced`.
 
 ### Thread registration
 
@@ -181,7 +181,7 @@ idle time at ~0% CPU. `Balanced` falls between the two.
   if needed
 - `thread::park()` wakeup latency is OS-dependent (~1–10µs on Linux) — only relevant at
   `Idle → High` transitions, which only occur after genuine idle periods
-- Threshold values behind each `PipelineMode` require tuning and stress test validation
+- Threshold values behind each `WaitStrategy` require tuning and stress test validation
   before being finalised
 
 ### Neutral
@@ -217,7 +217,7 @@ shared state needs to be guarded during the wakeup.
 
 **Exposing raw thresholds in config**  
 Allow users to configure `high_to_low`, `low_to_idle` directly. Rejected — these values
-are meaningless without understanding the pipeline internals. `PipelineMode` expresses the
+are meaningless without understanding the pipeline internals. `WaitStrategy` expresses the
 same intent in terms users can reason about.
 
 ---

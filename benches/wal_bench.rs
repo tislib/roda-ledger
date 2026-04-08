@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::ledger::PipelineMode;
+use roda_ledger::ledger::WaitStrategy;
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::storage::{Storage, StorageConfig};
 use roda_ledger::wal::Wal;
@@ -18,7 +18,11 @@ fn wal_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size as u64));
     group.measurement_time(Duration::from_secs(10));
 
-    let pipeline = Pipeline::new(batch_size as usize * 10, batch_size as usize * 10);
+    let pipeline = Pipeline::new(
+        batch_size as usize * 10,
+        batch_size as usize * 10,
+        WaitStrategy::LowLatency,
+    );
 
     let storage = Arc::new(
         Storage::new(StorageConfig {
@@ -27,7 +31,7 @@ fn wal_bench(c: &mut Criterion) {
         })
         .unwrap(),
     );
-    let wal = Wal::new(storage, PipelineMode::LowLatency);
+    let wal = Wal::new(storage);
 
     let handle = wal.start(pipeline.wal_context()).unwrap();
     let push_ctx = pipeline.wal_context();

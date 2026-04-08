@@ -163,7 +163,7 @@ pub fn submit_and_wait(&self, op: Operation, level: WaitLevel) -> SubmitResult {
 When no transactions are advancing, `wait_strategy` backs off using:
 
 ```rust
-self.config.pipeline_mode.wait_strategy(retry_count);
+self.config.wait_strategy.wait_strategy(retry_count);
 retry_count += 1;
 ```
 

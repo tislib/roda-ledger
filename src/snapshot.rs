@@ -2,7 +2,6 @@ use crate::balance::Balance;
 use crate::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
-use crate::pipeline_mode::PipelineMode;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -57,7 +56,6 @@ pub enum QueryResponse {
 
 pub struct Snapshot {
     balances: Arc<Vec<AtomicI64>>,
-    pipeline_mode: PipelineMode,
     indexer: Option<TransactionIndexer>,
 }
 
@@ -65,17 +63,11 @@ struct SnapshotRunner {
     balances: Arc<Vec<AtomicI64>>,
     /// Total remaining records (entries + links) for the current transaction.
     pending_records: u8,
-    pipeline_mode: PipelineMode,
     indexer: TransactionIndexer,
 }
 
 impl Snapshot {
-    pub fn new(
-        account_count: usize,
-        pipeline_mode: PipelineMode,
-        circle1_size: usize,
-        circle2_size: usize,
-    ) -> Self {
+    pub fn new(account_count: usize, circle1_size: usize, circle2_size: usize) -> Self {
         let balances: Arc<Vec<AtomicI64>> =
             Arc::new((0..account_count).map(|_| AtomicI64::new(0)).collect());
 
@@ -83,7 +75,6 @@ impl Snapshot {
 
         Self {
             balances,
-            pipeline_mode,
             indexer: Some(TransactionIndexer::new(
                 circle1_size,
                 circle2_size,
@@ -107,7 +98,6 @@ impl Snapshot {
         let runner = SnapshotRunner {
             balances: self.balances.clone(),
             pending_records: 0,
-            pipeline_mode: self.pipeline_mode,
             indexer: self.indexer.take().unwrap(),
         };
         std::thread::Builder::new()
@@ -220,7 +210,7 @@ impl SnapshotRunner {
                     }
                 }
             } else {
-                self.pipeline_mode.wait_strategy(retry_count);
+                ctx.wait_strategy().wait_strategy(retry_count);
                 retry_count += 1;
             }
         }

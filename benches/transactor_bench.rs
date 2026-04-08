@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::ledger::PipelineMode;
+use roda_ledger::ledger::WaitStrategy;
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::transaction::{Operation, Transaction};
 use roda_ledger::transactor::Transactor;
@@ -12,14 +12,13 @@ fn transactor_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(10));
 
-    let pipeline = Pipeline::new(10_240_000, 10_240_000);
+    let pipeline = Pipeline::new(10_240_000, 10_240_000, WaitStrategy::Balanced);
 
-    let mut transactor = Transactor::new(10_000_000, PipelineMode::Balanced, true, 10000);
+    let mut transactor = Transactor::new(10_000_000, true, 10000);
 
     let handle = transactor.start(pipeline.transactor_context()).unwrap();
 
     let drain_ctx = pipeline.transactor_context();
-    let pipeline_mode = PipelineMode::Balanced;
     let drain_handle = thread::spawn(move || {
         let mut retry_count = 0;
         while drain_ctx.is_running() || !drain_ctx.output().is_empty() {
@@ -27,7 +26,7 @@ fn transactor_bench(c: &mut Criterion) {
                 retry_count = 0;
             }
             retry_count += 1;
-            pipeline_mode.wait_strategy(retry_count);
+            drain_ctx.wait_strategy().wait_strategy(retry_count);
         }
     });
 

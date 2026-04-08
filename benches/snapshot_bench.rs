@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
-use roda_ledger::ledger::PipelineMode;
+use roda_ledger::ledger::WaitStrategy;
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::snapshot::{Snapshot, SnapshotMessage};
 
@@ -14,8 +14,8 @@ fn snapshot_bench(c: &mut Criterion) {
     // The snapshot stage only consumes from wal_to_snapshot, so the
     // transactor→wal queue can be small. We size wal_to_snapshot via the
     // small-queue parameter.
-    let pipeline = Pipeline::new(batch_size as usize * 10, 1);
-    let mut snapshot = Snapshot::new(1_000_000, PipelineMode::LowLatency, 1 << 20, 1 << 21);
+    let pipeline = Pipeline::new(batch_size as usize * 10, 1, WaitStrategy::LowLatency);
+    let mut snapshot = Snapshot::new(1_000_000, 1 << 20, 1 << 21);
 
     let snapshot_ctx = pipeline.snapshot_context();
     let push_ctx = pipeline.snapshot_context();

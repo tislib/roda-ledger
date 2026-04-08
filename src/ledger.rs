@@ -1,6 +1,6 @@
 use crate::balance::Balance;
 use crate::pipeline::Pipeline;
-pub use crate::pipeline_mode::PipelineMode;
+pub use crate::wait_strategy::WaitStrategy;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
@@ -19,7 +19,7 @@ pub struct LedgerConfig {
     pub max_accounts: usize,
     pub queue_size: usize,
     pub storage: StorageConfig,
-    pub pipeline_mode: PipelineMode,
+    pub wait_strategy: WaitStrategy,
     pub log_level: Level,
     pub seal_check_internal: Duration,
     pub index_circle1_size: usize,
@@ -35,7 +35,7 @@ impl Default for LedgerConfig {
             max_accounts: 1_000_000,
             queue_size: 1024,
             storage: StorageConfig::default(),
-            pipeline_mode: PipelineMode::Balanced,
+            wait_strategy: WaitStrategy::Balanced,
             log_level: Level::Info,
             seal_check_internal: Duration::from_secs(1),
             index_circle1_size: 1 << 20, // 1M slots
@@ -112,11 +112,10 @@ impl Ledger {
         let storage = Storage::new(config.storage.clone()).unwrap();
         let storage = Arc::new(storage);
 
-        let pipeline = Pipeline::new(config.queue_size, 1024 * 128);
+        let pipeline = Pipeline::new(config.queue_size, 1024 * 128, config.wait_strategy);
 
         let snapshot = Snapshot::new(
             config.max_accounts,
-            config.pipeline_mode,
             config.index_circle1_size,
             config.index_circle2_size,
         );
@@ -127,11 +126,10 @@ impl Ledger {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
             transactor: Transactor::new(
                 config.max_accounts,
-                config.pipeline_mode,
                 config.dedup_enabled,
                 config.dedup_window_ms,
             ),
-            wal: Wal::new(storage.clone(), config.pipeline_mode),
+            wal: Wal::new(storage.clone()),
             snapshot,
             seal,
             storage,
@@ -193,7 +191,7 @@ impl Ledger {
                 Ok(_) => return,
                 Err(returned) => {
                     msg = returned;
-                    self.config.pipeline_mode.wait_strategy(retry_count);
+                    self.pipeline.wait_strategy().wait_strategy(retry_count);
                     retry_count += 1;
                 }
             }
@@ -281,7 +279,7 @@ impl Ledger {
                 return;
             }
 
-            self.config.pipeline_mode.wait_strategy(retry_count);
+            self.pipeline.wait_strategy().wait_strategy(retry_count);
             retry_count += 1;
 
             if start_time.elapsed() >= timeout {
@@ -309,7 +307,7 @@ impl Ledger {
                 break;
             }
 
-            self.config.pipeline_mode.wait_strategy(retry_count);
+            self.pipeline.wait_strategy().wait_strategy(retry_count);
             retry_count += 1;
 
             if start_time.elapsed() >= duration {
@@ -339,7 +337,7 @@ impl Ledger {
             }
 
             retry_count += 1;
-            self.config.pipeline_mode.wait_strategy(retry_count);
+            self.pipeline.wait_strategy().wait_strategy(retry_count);
         }
     }
 

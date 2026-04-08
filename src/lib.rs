@@ -4,7 +4,7 @@ pub mod dedup;
 pub mod entities;
 pub mod ledger;
 pub mod pipeline;
-pub mod pipeline_mode;
+pub mod wait_strategy;
 mod recover;
 pub mod seal;
 mod sequencer;
