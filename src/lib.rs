@@ -4,7 +4,6 @@ pub mod dedup;
 pub mod entities;
 pub mod ledger;
 pub mod pipeline;
-pub mod wait_strategy;
 mod recover;
 pub mod seal;
 mod sequencer;
@@ -13,6 +12,7 @@ pub mod storage;
 pub mod testing;
 pub mod transaction;
 pub mod transactor;
+pub mod wait_strategy;
 pub mod wal;
 
 mod entries;

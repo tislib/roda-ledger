@@ -10,9 +10,9 @@
 //! one stage do not cause false sharing with adjacent indexes.
 
 use crate::entities::WalEntry;
-use crate::wait_strategy::WaitStrategy;
 use crate::snapshot::SnapshotMessage;
 use crate::transaction::Transaction;
+use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use std::sync::Arc;
@@ -83,23 +83,33 @@ impl Pipeline {
     // ─── context accessors ──────────────────────────────────────────────────
 
     pub fn sequencer_context(self: &Arc<Self>) -> SequencerContext {
-        SequencerContext { pipeline: Arc::clone(self) }
+        SequencerContext {
+            pipeline: Arc::clone(self),
+        }
     }
 
     pub fn transactor_context(self: &Arc<Self>) -> TransactorContext {
-        TransactorContext { pipeline: Arc::clone(self) }
+        TransactorContext {
+            pipeline: Arc::clone(self),
+        }
     }
 
     pub fn wal_context(self: &Arc<Self>) -> WalContext {
-        WalContext { pipeline: Arc::clone(self) }
+        WalContext {
+            pipeline: Arc::clone(self),
+        }
     }
 
     pub fn snapshot_context(self: &Arc<Self>) -> SnapshotContext {
-        SnapshotContext { pipeline: Arc::clone(self) }
+        SnapshotContext {
+            pipeline: Arc::clone(self),
+        }
     }
 
     pub fn seal_context(self: &Arc<Self>) -> SealContext {
-        SealContext { pipeline: Arc::clone(self) }
+        SealContext {
+            pipeline: Arc::clone(self),
+        }
     }
 
     // ─── ledger-side direct readers / submit ────────────────────────────────
@@ -181,7 +191,9 @@ impl SequencerContext {
     /// the caller should stamp on its transaction.
     #[inline(always)]
     pub fn fetch_next_id(&self) -> u64 {
-        self.pipeline.sequencer_index.fetch_add(1, Ordering::Acquire)
+        self.pipeline
+            .sequencer_index
+            .fetch_add(1, Ordering::Acquire)
     }
 
     #[inline(always)]

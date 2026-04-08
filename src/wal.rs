@@ -59,7 +59,9 @@ impl WalRunner {
     /// Returns `true` when there is at least one complete transaction to process.
     fn fill_buffer(&mut self, ctx: &WalContext) -> bool {
         let inbound = ctx.input();
-        let available = inbound.len().min(self.buffer.capacity() - self.buffer.len());
+        let available = inbound
+            .len()
+            .min(self.buffer.capacity() - self.buffer.len());
         for _ in 0..available {
             if let Some(entry) = inbound.pop() {
                 match &entry {

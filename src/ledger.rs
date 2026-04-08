@@ -1,6 +1,5 @@
 use crate::balance::Balance;
 use crate::pipeline::Pipeline;
-pub use crate::wait_strategy::WaitStrategy;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
@@ -8,6 +7,7 @@ use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Storage, StorageConfig};
 use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
+pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
 use spdlog::{Level, LevelFilter, info};
 use std::sync::Arc;
@@ -120,7 +120,11 @@ impl Ledger {
             config.index_circle2_size,
         );
 
-        let seal = Seal::new(config.max_accounts, storage.clone(), config.seal_check_internal);
+        let seal = Seal::new(
+            config.max_accounts,
+            storage.clone(),
+            config.seal_check_internal,
+        );
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
@@ -356,10 +360,11 @@ impl Ledger {
                     std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
                 })?,
         );
-        self.handles
-            .push(self.wal.start(self.pipeline.wal_context()).map_err(|e| {
+        self.handles.push(
+            self.wal.start(self.pipeline.wal_context()).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
-            })?);
+            })?,
+        );
         self.handles.push(
             self.snapshot
                 .start(self.pipeline.snapshot_context())
@@ -368,13 +373,10 @@ impl Ledger {
                 })?,
         );
         if !self.config.disable_seal {
-            self.handles.push(
-                self.seal
-                    .start(self.pipeline.seal_context())
-                    .map_err(|e| {
-                        std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
-                    })?,
-            );
+            self.handles
+                .push(self.seal.start(self.pipeline.seal_context()).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
+                })?);
         }
 
         Ok(())
