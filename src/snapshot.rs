@@ -1,11 +1,11 @@
 use crate::balance::Balance;
 use crate::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
+use crate::pipeline::SnapshotContext;
 use crate::pipeline_mode::PipelineMode;
-use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::JoinHandle;
 // ── Message types for the Snapshot stage queue (ADR-008) ─────────────────────
 
@@ -56,30 +56,22 @@ pub enum QueryResponse {
 }
 
 pub struct Snapshot {
-    inbound: Arc<ArrayQueue<SnapshotMessage>>,
     balances: Arc<Vec<AtomicI64>>,
-    last_processed_transaction_id: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
     indexer: Option<TransactionIndexer>,
 }
 
 struct SnapshotRunner {
-    inbound: Arc<ArrayQueue<SnapshotMessage>>,
     balances: Arc<Vec<AtomicI64>>,
-    last_processed_transaction_id: Arc<AtomicU64>,
     /// Total remaining records (entries + links) for the current transaction.
     pending_records: u8,
-    running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
     indexer: TransactionIndexer,
 }
 
 impl Snapshot {
     pub fn new(
-        inbound: Arc<ArrayQueue<SnapshotMessage>>,
         account_count: usize,
-        running: Arc<AtomicBool>,
         pipeline_mode: PipelineMode,
         circle1_size: usize,
         circle2_size: usize,
@@ -90,10 +82,7 @@ impl Snapshot {
         let account_heads_size = Self::next_power_of_two(account_count);
 
         Self {
-            inbound,
             balances,
-            last_processed_transaction_id: Arc::new(Default::default()),
-            running,
             pipeline_mode,
             indexer: Some(TransactionIndexer::new(
                 circle1_size,
@@ -114,13 +103,10 @@ impl Snapshot {
         power
     }
 
-    pub fn start(&mut self) -> std::io::Result<JoinHandle<()>> {
+    pub fn start(&mut self, ctx: SnapshotContext) -> std::io::Result<JoinHandle<()>> {
         let runner = SnapshotRunner {
-            inbound: self.inbound.clone(),
             balances: self.balances.clone(),
-            last_processed_transaction_id: self.last_processed_transaction_id.clone(),
             pending_records: 0,
-            running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
             indexer: self.indexer.take().unwrap(),
         };
@@ -128,17 +114,8 @@ impl Snapshot {
             .name("snapshot".to_string())
             .spawn(move || {
                 let mut r = runner;
-                r.run();
+                r.run(ctx);
             })
-    }
-
-    pub fn last_processed_transaction_id(&self) -> u64 {
-        self.last_processed_transaction_id.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn store_last_processed_id(&self, id: u64) {
-        self.last_processed_transaction_id
-            .store(id, Ordering::Release);
     }
 
     pub(crate) fn recover_balances(&mut self, balances: &HashMap<u64, Balance>) {
@@ -151,7 +128,6 @@ impl Snapshot {
         if let Some(indexer) = &mut self.indexer {
             indexer.insert_tx(metadata.tx_id, metadata.entry_count);
         }
-        self.store_last_processed_id(metadata.tx_id);
     }
 
     pub(crate) fn recover_index_tx_link(&mut self, tx_id: u64, link: &TxLink) {
@@ -178,11 +154,12 @@ impl Snapshot {
 }
 
 impl SnapshotRunner {
-    pub fn run(&mut self) {
+    pub fn run(&mut self, ctx: SnapshotContext) {
         let mut retry_count = 0;
         let mut last_processed_tx_id = 0;
-        while self.running.load(Ordering::Relaxed) {
-            if let Some(message) = self.inbound.pop() {
+        let inbound = ctx.input();
+        while ctx.is_running() {
+            if let Some(message) = inbound.pop() {
                 retry_count = 0;
 
                 match message {
@@ -217,8 +194,7 @@ impl SnapshotRunner {
                             WalEntry::SegmentHeader(_) => {}
                         }
                         if last_processed_tx_id > 0 && self.pending_records == 0 {
-                            self.last_processed_transaction_id
-                                .store(last_processed_tx_id, Ordering::Release);
+                            ctx.set_processed_index(last_processed_tx_id);
                         }
                     }
                     SnapshotMessage::Query(q) => {

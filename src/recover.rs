@@ -1,18 +1,19 @@
 use crate::entities::{FailReason, WalEntry};
+use crate::pipeline::Pipeline;
 use crate::seal::Seal;
-use crate::sequencer::Sequencer;
 use crate::snapshot::Snapshot;
 use crate::storage::SegmentStaus::SEALED;
 use crate::storage::{Segment, Storage};
 use crate::transactor::Transactor;
 use spdlog::info;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct Recover<'r> {
     transactor: &'r mut Transactor,
     snapshot: &'r mut Snapshot,
     seal: &'r mut Seal,
-    sequencer: &'r Sequencer,
+    pipeline: &'r Arc<Pipeline>,
     storage: &'r Storage,
     segments: Vec<Segment>,
 }
@@ -22,14 +23,14 @@ impl<'r> Recover<'r> {
         transactor: &'r mut Transactor,
         snapshot: &'r mut Snapshot,
         seal: &'r mut Seal,
-        sequencer: &'r Sequencer,
+        pipeline: &'r Arc<Pipeline>,
         storage: &'r Storage,
     ) -> Self {
         Self {
             transactor,
             snapshot,
             seal,
-            sequencer,
+            pipeline,
             storage,
             segments: vec![],
         }
@@ -101,7 +102,7 @@ impl<'r> Recover<'r> {
 
             // process the segments after snapshot
             if segment.status() != SEALED {
-                self.seal.recover_pre_seal(segment).map_err(|e| {
+                let sealed_id = self.seal.recover_pre_seal(segment).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
                         format!(
@@ -111,6 +112,7 @@ impl<'r> Recover<'r> {
                         ),
                     )
                 })?;
+                self.pipeline.set_seal_index(sealed_id);
             }
 
             segment.load().map_err(|e| {
@@ -203,10 +205,10 @@ impl<'r> Recover<'r> {
         self.transactor.recover_balances(&recover_balances);
         self.snapshot.recover_balances(&recover_balances);
 
-        // restore last tx ids
-        self.transactor.store_last_processed_id(last_tx_id);
-        self.snapshot.store_last_processed_id(last_tx_id);
-        self.sequencer.set_next_id(last_tx_id + 1);
+        // Restore last tx ids in the pipeline indexes.
+        self.pipeline.set_compute_index(last_tx_id);
+        self.pipeline.set_snapshot_index(last_tx_id);
+        self.pipeline.set_sequencer_next_id(last_tx_id + 1);
 
         Ok(())
     }

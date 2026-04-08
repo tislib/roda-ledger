@@ -1,10 +1,8 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use crossbeam_queue::ArrayQueue;
 use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry};
 use roda_ledger::ledger::PipelineMode;
+use roda_ledger::pipeline::Pipeline;
 use roda_ledger::snapshot::{Snapshot, SnapshotMessage};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 fn snapshot_bench(c: &mut Criterion) {
     let batch_size = 10_000;
@@ -13,19 +11,17 @@ fn snapshot_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size));
     group.measurement_time(std::time::Duration::from_secs(10));
 
-    let inbound: Arc<ArrayQueue<SnapshotMessage>> =
-        Arc::new(ArrayQueue::new(batch_size as usize * 10));
-    let running = Arc::new(AtomicBool::new(true));
-    let mut snapshot = Snapshot::new(
-        inbound.clone(),
-        1_000_000,
-        running.clone(),
-        PipelineMode::LowLatency,
-        1 << 20,
-        1 << 21,
-    );
+    // The snapshot stage only consumes from wal_to_snapshot, so the
+    // transactor→wal queue can be small. We size wal_to_snapshot via the
+    // small-queue parameter.
+    let pipeline = Pipeline::new(batch_size as usize * 10, 1);
+    let mut snapshot = Snapshot::new(1_000_000, PipelineMode::LowLatency, 1 << 20, 1 << 21);
 
-    let handle = snapshot.start().unwrap();
+    let snapshot_ctx = pipeline.snapshot_context();
+    let push_ctx = pipeline.snapshot_context();
+    let progress_ctx = pipeline.snapshot_context();
+
+    let handle = snapshot.start(snapshot_ctx).unwrap();
     let mut current_id = 0;
 
     group.bench_function("process", |b| {
@@ -44,9 +40,9 @@ fn snapshot_bench(c: &mut Criterion) {
                     crc32c: 0,
                     tag: [0; 8],
                 };
-                // compute CRC for correctness
                 metadata.crc32c = crc32c::crc32c(bytemuck::bytes_of(&metadata));
-                while inbound
+                while push_ctx
+                    .input()
                     .push(SnapshotMessage::Entry(WalEntry::Metadata(metadata)))
                     .is_err()
                 {
@@ -63,7 +59,8 @@ fn snapshot_bench(c: &mut Criterion) {
                         _pad0: [0; 6],
                         computed_balance: 100,
                     };
-                    while inbound
+                    while push_ctx
+                        .input()
                         .push(SnapshotMessage::Entry(WalEntry::Entry(entry)))
                         .is_err()
                     {
@@ -72,14 +69,14 @@ fn snapshot_bench(c: &mut Criterion) {
                 }
             }
             // Wait for all to be processed
-            while snapshot.last_processed_transaction_id() < start_id + batch_size {
+            while progress_ctx.get_processed_index() < start_id + batch_size {
                 std::thread::yield_now();
             }
         });
     });
 
     group.finish();
-    running.store(false, Ordering::Relaxed);
+    pipeline.shutdown();
     let _ = handle.join();
 }
 

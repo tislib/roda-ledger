@@ -3,6 +3,7 @@ pub mod ctl;
 pub mod dedup;
 pub mod entities;
 pub mod ledger;
+pub mod pipeline;
 pub mod pipeline_mode;
 mod recover;
 pub mod seal;

@@ -1,32 +1,23 @@
 use crate::entities::WalEntry;
 use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
+use crate::pipeline::WalContext;
 use crate::pipeline_mode::PipelineMode;
 use crate::snapshot::SnapshotMessage;
 use crate::storage::Storage;
-use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 pub struct Wal {
-    inbound: Arc<ArrayQueue<WalEntry>>,
-    outbound: Arc<ArrayQueue<SnapshotMessage>>,
     storage: Arc<Storage>,
-    last_processed_transaction_id: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
 }
 
 pub struct WalRunner {
-    inbound: Arc<ArrayQueue<WalEntry>>,
-    outbound: Arc<ArrayQueue<SnapshotMessage>>,
     storage: Arc<Storage>,
     buffer: Vec<WalEntry>,
-    last_processed_transaction_id: Arc<AtomicU64>,
     /// Number of entries at the front of `buffer` that form one or more complete
     /// transactions.  Everything in `buffer[..committed_len]` is safe to write/forward.
     committed_len: usize,
-    running: Arc<AtomicBool>,
     pipeline_mode: PipelineMode,
     // Transaction state (across fill_buffer calls)
     /// Total remaining records (entries + links) for the current transaction.
@@ -37,55 +28,28 @@ pub struct WalRunner {
 }
 
 impl Wal {
-    pub fn new(
-        inbound: Arc<ArrayQueue<WalEntry>>,
-        outbound: Arc<ArrayQueue<SnapshotMessage>>,
-        storage: Arc<Storage>,
-        running: Arc<AtomicBool>,
-        pipeline_mode: PipelineMode,
-    ) -> Self {
+    pub fn new(storage: Arc<Storage>, pipeline_mode: PipelineMode) -> Self {
         Self {
-            inbound,
-            outbound,
             storage,
-            last_processed_transaction_id: Arc::new(Default::default()),
-            running,
             pipeline_mode,
         }
     }
 
-    pub fn last_processed_transaction_id(&self) -> u64 {
-        self.last_processed_transaction_id.load(Ordering::Acquire)
-    }
-
-    pub fn move_forward(&self, last_id: u64) {
-        self.last_processed_transaction_id
-            .store(last_id, Ordering::Release);
-    }
-
-    pub fn start(&self) -> std::io::Result<JoinHandle<()>> {
-        let mut runner = self.create_runner();
-        std::thread::Builder::new()
-            .name("wal".to_string())
-            .spawn(move || {
-                runner.run();
-            })
-    }
-
-    fn create_runner(&self) -> WalRunner {
-        WalRunner {
-            inbound: self.inbound.clone(),
-            outbound: self.outbound.clone(),
+    pub fn start(&self, ctx: WalContext) -> std::io::Result<JoinHandle<()>> {
+        let mut runner = WalRunner {
             storage: self.storage.clone(),
-            buffer: Vec::with_capacity(self.inbound.capacity()),
-            last_processed_transaction_id: self.last_processed_transaction_id.clone(),
+            buffer: Vec::with_capacity(ctx.input_capacity()),
             committed_len: 0,
-            running: self.running.clone(),
             pipeline_mode: self.pipeline_mode,
             pending_records: 0,
             pending_tx_id: 0,
             last_committed_tx_id: 0,
-        }
+        };
+        std::thread::Builder::new()
+            .name("wal".to_string())
+            .spawn(move || {
+                runner.run(ctx);
+            })
     }
 }
 
@@ -100,13 +64,11 @@ impl WalRunner {
     /// in a future call.
     ///
     /// Returns `true` when there is at least one complete transaction to process.
-    fn fill_buffer(&mut self) -> bool {
-        let available = self
-            .inbound
-            .len()
-            .min(self.buffer.capacity() - self.buffer.len());
+    fn fill_buffer(&mut self, ctx: &WalContext) -> bool {
+        let inbound = ctx.input();
+        let available = inbound.len().min(self.buffer.capacity() - self.buffer.len());
         for _ in 0..available {
-            if let Some(entry) = self.inbound.pop() {
+            if let Some(entry) = inbound.pop() {
                 match &entry {
                     WalEntry::Metadata(m) => {
                         self.pending_records = m.entry_count.saturating_add(m.link_count);
@@ -132,14 +94,15 @@ impl WalRunner {
 
     /// Push `entry` to the outbound queue, yielding until space is available.
     /// Returns `false` if a shutdown was requested while waiting.
-    fn push_outbound(&mut self, entry: WalEntry) -> bool {
+    fn push_outbound(&mut self, ctx: &WalContext, entry: WalEntry) -> bool {
+        let outbound = ctx.output();
         let mut msg = SnapshotMessage::Entry(entry);
         loop {
-            match self.outbound.push(msg) {
+            match outbound.push(msg) {
                 Ok(_) => return true,
                 Err(returned) => {
                     msg = returned;
-                    if !self.running.load(Ordering::Relaxed) {
+                    if !ctx.is_running() {
                         return false;
                     }
                     std::thread::yield_now();
@@ -148,13 +111,13 @@ impl WalRunner {
         }
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self, ctx: WalContext) {
         let mut retry_count = 0;
         let mut active_segment = self.storage.active_segment().unwrap();
 
-        while self.running.load(Ordering::Relaxed) {
+        while ctx.is_running() {
             // Fill the buffer; skip this iteration if no complete transaction is ready yet.
-            if !self.fill_buffer() {
+            if !self.fill_buffer(&ctx) {
                 self.pipeline_mode.wait_strategy(retry_count);
                 retry_count += 1;
                 continue;
@@ -195,12 +158,11 @@ impl WalRunner {
             let committed: Vec<WalEntry> = self.buffer.drain(..self.committed_len).collect();
             self.committed_len = 0;
             for entry in committed {
-                if !self.push_outbound(entry) {
+                if !self.push_outbound(&ctx, entry) {
                     break;
                 }
             }
-            self.last_processed_transaction_id
-                .store(committed_tx_id, Ordering::Release);
+            ctx.set_processed_index(committed_tx_id);
         }
     }
 }

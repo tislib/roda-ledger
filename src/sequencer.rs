@@ -1,34 +1,36 @@
+use crate::pipeline::SequencerContext;
 use crate::transaction::Transaction;
-use crossbeam_queue::ArrayQueue;
 use std::hint::spin_loop;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::yield_now;
 
+/// Synchronous sequencer stage. Not a thread runner — invoked from
+/// `Ledger::submit`. Queue and next-id index live in `Pipeline`; this struct
+/// is a thin wrapper around `SequencerContext` exposing the submit/recovery
+/// API.
 pub struct Sequencer {
-    next_id: AtomicU64,
-    outbound: Arc<ArrayQueue<Transaction>>,
+    ctx: SequencerContext,
 }
 
 impl Sequencer {
-    pub fn new(outbound: Arc<ArrayQueue<Transaction>>) -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-            outbound,
-        }
+    pub fn new(ctx: SequencerContext) -> Self {
+        Self { ctx }
     }
 
+    /// Stamp the transaction with a freshly sequenced id and push it onto
+    /// the sequencer→transactor queue, blocking (spin/yield) until there is
+    /// space. Returns the assigned id.
     #[inline(always)]
     pub fn submit(&self, mut transaction: Transaction) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Acquire);
+        let id = self.ctx.fetch_next_id();
         transaction.id = id;
 
-        let mut retry_count = 0;
-        while let Err(t) = self.outbound.push(transaction) {
+        let outbound = self.ctx.output();
+        let mut retry_count = 0u64;
+        while let Err(t) = outbound.push(transaction) {
             transaction = t;
             spin_loop();
             retry_count += 1;
-            if retry_count % 10_000 == 0 {
+            if retry_count.is_multiple_of(10_000) {
                 yield_now();
             }
         }
@@ -36,11 +38,7 @@ impl Sequencer {
         id
     }
 
-    pub(crate) fn set_next_id(&self, next_id: u64) {
-        self.next_id.store(next_id, Ordering::Release);
-    }
-
     pub(crate) fn last_id(&self) -> u64 {
-        self.next_id.load(Ordering::Acquire) - 1
+        self.ctx.last_id()
     }
 }
