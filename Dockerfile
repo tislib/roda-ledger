@@ -40,8 +40,8 @@ EXPOSE 50051
 ENV RODA_CONFIG=/app/config.toml
 
 # Create data directory and set volume
-RUN mkdir -p /data
-VOLUME /data
+RUN mkdir -p /app/data
+VOLUME /app/data
 
 # Run the binary against the configured config.toml
 ENTRYPOINT ["/app/roda-ledger"]

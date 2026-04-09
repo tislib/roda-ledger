@@ -11,6 +11,6 @@ dedup_enabled = true
 dedup_window_ms = 10000      # 10 seconds
 
 [ledger.storage]
-data_dir = "/data"
+data_dir = "./data"
 wal_segment_size_mb = 2048
 snapshot_frequency = 2       # take a snapshot every N sealed WAL segments
