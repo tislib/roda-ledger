@@ -1,4 +1,4 @@
-use roda_ledger::ledger::{LedgerConfig, PipelineMode};
+use roda_ledger::ledger::{LedgerConfig, WaitStrategy};
 use roda_ledger::testing::power_tune::{TuneParameter, TuningStrategy, run_power_tune};
 use std::env;
 
@@ -53,7 +53,7 @@ fn main() {
     let mut base_config = LedgerConfig::temp();
     base_config.log_level = spdlog::Level::Critical;
     base_config.queue_size = def_qs;
-    base_config.pipeline_mode = PipelineMode::Custom {
+    base_config.wait_strategy = WaitStrategy::Custom {
         spin_until: def_spin,
         yield_until: def_yield,
     };

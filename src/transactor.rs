@@ -4,35 +4,23 @@ use crate::entities::{
     EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
     WalEntryKind,
 };
-use crate::pipeline_mode::PipelineMode;
+use crate::pipeline::TransactorContext;
 use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction};
-use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use std::collections::{BTreeMap, HashMap};
 use std::hint::spin_loop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 pub struct Transactor {
-    inbound: Arc<ArrayQueue<Transaction>>,
-    outbound: Arc<ArrayQueue<WalEntry>>,
-    last_processed_transaction_id: Arc<AtomicU64>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     balances: Vec<Balance>,
-    running: Arc<AtomicBool>,
-    pipeline_mode: PipelineMode,
     dedup: DedupCache,
 }
 
 pub struct TransactorRunner {
-    inbound: Arc<ArrayQueue<Transaction>>,
-    outbound: Arc<ArrayQueue<WalEntry>>,
     balances: Vec<Balance>,
-    last_processed_transaction_id: Arc<AtomicU64>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
-    running: Arc<AtomicBool>,
-    pipeline_mode: PipelineMode,
     transaction_buffer: Vec<Transaction>,
     expected_next_id: u64,
     pending: BTreeMap<u64, Transaction>,
@@ -44,25 +32,12 @@ pub struct TransactorRunner {
 }
 
 impl Transactor {
-    pub fn new(
-        inbound: Arc<ArrayQueue<Transaction>>,
-        outbound: Arc<ArrayQueue<WalEntry>>,
-        running: Arc<AtomicBool>,
-        max_accounts: usize,
-        pipeline_mode: PipelineMode,
-        dedup_enabled: bool,
-        dedup_window_ms: u64,
-    ) -> Self {
+    pub fn new(max_accounts: usize, dedup_enabled: bool, dedup_window_ms: u64) -> Self {
         let mut accounts = Vec::with_capacity(max_accounts);
         accounts.resize(max_accounts, Balance::default());
         Self {
-            inbound,
-            outbound,
-            last_processed_transaction_id: Arc::new(Default::default()),
             rejected_transactions: Arc::new(Default::default()),
             balances: accounts,
-            running,
-            pipeline_mode,
             dedup: DedupCache::new(dedup_enabled, dedup_window_ms),
         }
     }
@@ -74,15 +49,6 @@ impl Transactor {
                 *slot = *balance;
             }
         }
-    }
-
-    pub(crate) fn store_last_processed_id(&self, id: u64) {
-        self.last_processed_transaction_id
-            .store(id, Ordering::Release);
-    }
-
-    pub fn last_processed_transaction_id(&self) -> u64 {
-        self.last_processed_transaction_id.load(Ordering::Acquire)
     }
 
     pub fn transaction_rejection_reason(&self, transaction_id: u64) -> Option<FailReason> {
@@ -99,19 +65,15 @@ impl Transactor {
         &mut self.dedup
     }
 
-    pub fn start(&mut self) -> std::io::Result<JoinHandle<()>> {
+    pub fn start(&mut self, ctx: TransactorContext) -> std::io::Result<JoinHandle<()>> {
+        let cap = ctx.input_capacity();
         let mut runner = TransactorRunner {
-            inbound: self.inbound.clone(),
-            outbound: self.outbound.clone(),
             balances: std::mem::take(&mut self.balances),
-            last_processed_transaction_id: self.last_processed_transaction_id.clone(),
-            expected_next_id: self.last_processed_transaction_id.load(Ordering::Acquire) + 1,
-            pending: BTreeMap::new(),
             rejected_transactions: self.rejected_transactions.clone(),
-            running: self.running.clone(),
-            pipeline_mode: self.pipeline_mode,
-            transaction_buffer: Vec::with_capacity(self.inbound.capacity()),
-            entries: Vec::with_capacity(self.inbound.capacity()),
+            transaction_buffer: Vec::with_capacity(cap),
+            entries: Vec::with_capacity(cap),
+            expected_next_id: ctx.get_processed_index() + 1,
+            pending: BTreeMap::new(),
             input_retry_count: 0,
             fail_reason: FailReason::NONE,
             position: 0,
@@ -119,24 +81,20 @@ impl Transactor {
         };
         std::thread::Builder::new()
             .name("transactor".to_string())
-            .spawn(move || runner.run())
+            .spawn(move || runner.run(ctx))
     }
 }
 
 impl TransactorRunner {
-    pub fn new(max_accounts: usize, pipeline_mode: PipelineMode) -> Self {
+    /// Standalone constructor used by benches (no pipeline / no queues).
+    pub fn new(max_accounts: usize) -> Self {
         let mut balances = Vec::with_capacity(max_accounts);
         balances.resize(max_accounts, Balance::default());
         Self {
-            inbound: Arc::new(ArrayQueue::new(1)),
-            outbound: Arc::new(ArrayQueue::new(1)),
             balances,
-            last_processed_transaction_id: Arc::new(Default::default()),
             expected_next_id: 1,
             pending: BTreeMap::new(),
             rejected_transactions: Arc::new(Default::default()),
-            running: Arc::new(AtomicBool::new(true)),
-            pipeline_mode,
             transaction_buffer: Vec::with_capacity(1),
             entries: Vec::with_capacity(16),
             input_retry_count: 0,
@@ -170,15 +128,16 @@ impl TransactorRunner {
         self.reset();
     }
 
-    pub fn run(&mut self) {
-        while self.running.load(Ordering::Relaxed) {
-            self.run_step();
+    pub fn run(&mut self, ctx: TransactorContext) {
+        while ctx.is_running() {
+            self.run_step(&ctx);
         }
     }
 
-    fn run_step(&mut self) {
+    fn run_step(&mut self, ctx: &TransactorContext) {
+        let inbound = ctx.input();
         // collect transactions to process
-        while let Some(tx) = self.inbound.pop() {
+        while let Some(tx) = inbound.pop() {
             if tx.id == self.expected_next_id {
                 self.transaction_buffer.push(tx);
                 self.expected_next_id += 1;
@@ -198,7 +157,7 @@ impl TransactorRunner {
         }
 
         if self.transaction_buffer.is_empty() {
-            self.pipeline_mode.wait_strategy(self.input_retry_count);
+            ctx.wait_strategy().wait_strategy(self.input_retry_count);
             self.input_retry_count += 1;
             return;
         }
@@ -210,19 +169,18 @@ impl TransactorRunner {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        self.process(timestamp);
+        let max_tx_id = self.process(timestamp);
 
         // push all accumulated entries to outbound at the end of the step
+        let output = ctx.output();
         let mut i = 0;
         while i < self.entries.len() {
-            let output = self.outbound.as_ref();
-            let running = self.running.as_ref();
             let entry = self.entries[i];
             loop {
                 if output.push(entry).is_ok() {
                     break;
                 }
-                if !running.load(Ordering::Relaxed) {
+                if !ctx.is_running() {
                     return;
                 }
                 spin_loop();
@@ -230,10 +188,16 @@ impl TransactorRunner {
             i += 1;
         }
 
+        if max_tx_id > 0 {
+            ctx.set_processed_index(max_tx_id);
+        }
+
         self.reset();
     }
 
-    fn process(&mut self, timestamp: u64) {
+    /// Process the buffered transactions, producing wal entries in `self.entries`.
+    /// Returns the maximum transaction id observed in this batch (0 if none).
+    fn process(&mut self, timestamp: u64) -> u64 {
         let timestamp_ms = timestamp / 1_000_000; // nanos → ms
         let mut max_tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
@@ -386,10 +350,10 @@ impl TransactorRunner {
         }
 
         if max_tx_id > 0 {
-            self.last_processed_transaction_id
-                .store(max_tx_id, Ordering::Relaxed);
             self.expected_next_id = self.expected_next_id.max(max_tx_id + 1);
         }
+
+        max_tx_id
     }
 
     /// Emit a duplicate transaction: TxMetadata (entry_count=0, link_count=1, fail_reason=DUPLICATE)

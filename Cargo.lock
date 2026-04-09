@@ -1373,6 +1373,7 @@ dependencies = [
  "criterion",
  "crossbeam-queue",
  "crossbeam-skiplist",
+ "crossbeam-utils",
  "lz4_flex",
  "prost",
  "rand",

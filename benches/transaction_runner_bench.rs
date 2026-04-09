@@ -1,5 +1,4 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::ledger::PipelineMode;
 use roda_ledger::transaction::{Operation, Transaction};
 use roda_ledger::transactor::TransactorRunner;
 use std::time::Duration;
@@ -10,7 +9,7 @@ fn transaction_runner_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("transaction_runner");
     group.measurement_time(Duration::from_secs(10));
 
-    let mut runner = TransactorRunner::new(10_000_000, PipelineMode::Balanced);
+    let mut runner = TransactorRunner::new(10_000_000);
     let mut current_id = 0u64;
 
     group.throughput(Throughput::Elements(1));

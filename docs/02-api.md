@@ -36,7 +36,7 @@ max_message_size_bytes = 4194304  # 4MB
 
 [ledger]
 max_accounts    = 1000000
-pipeline_mode   = "balanced"   # low_latency | balanced | low_cpu
+wait_strategy   = "balanced"   # low_latency | balanced | low_cpu
 dedup_enabled   = true
 dedup_window_ms = 10000        # 10 seconds
 
@@ -46,7 +46,7 @@ wal_segment_size_mb  = 2048
 snapshot_frequency   = 2       # take a snapshot every N sealed WAL segments
 ```
 
-**`pipeline_mode` options:**
+**`wait_strategy` options:**
 
 | Mode | Behavior | Use when |
 |---|---|---|
@@ -71,7 +71,7 @@ use roda_ledger::storage::StorageConfig;
 
 let config = LedgerConfig {
 max_accounts: 1_000_000,
-pipeline_mode: PipelineMode::Balanced,
+wait_strategy: WaitStrategy::Balanced,
 dedup_enabled: true,
 dedup_window_ms: 10_000,
 storage: StorageConfig {

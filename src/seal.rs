@@ -1,67 +1,53 @@
 use crate::entities::WalEntry;
+use crate::pipeline::SealContext;
 use crate::storage::SegmentStaus::SEALED;
 use crate::storage::{Segment, Storage};
 use spdlog::{debug, error, warn};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 
 pub struct Seal {
-    last_sealed_id: Arc<AtomicU32>,
     runner: Option<SealRunner>, // will be taken out when start() is called
 }
 
 struct SealRunner {
     storage: Arc<Storage>,
-    running: Arc<AtomicBool>,
     balances: Vec<i64>,
-    last_sealed_id: Arc<AtomicU32>,
     seal_check_internal: Duration,
 }
 
 impl Seal {
-    pub fn new(
-        account_count: usize,
-        storage: Arc<Storage>,
-        running: Arc<AtomicBool>,
-        seal_check_internal: Duration,
-    ) -> Self {
-        let last_sealed_id = Arc::new(AtomicU32::new(0));
+    pub fn new(account_count: usize, storage: Arc<Storage>, seal_check_internal: Duration) -> Self {
         Self {
-            last_sealed_id: last_sealed_id.clone(),
             runner: Some(SealRunner {
-                storage: storage.clone(),
-                running: running.clone(),
+                storage,
                 balances: vec![0; account_count],
-                last_sealed_id: last_sealed_id.clone(),
                 seal_check_internal,
             }),
         }
     }
 
-    pub fn last_sealed_segment_id(&self) -> u32 {
-        self.last_sealed_id.load(Ordering::Acquire)
-    }
-
-    pub fn start(&mut self) -> std::io::Result<JoinHandle<()>> {
+    pub fn start(&mut self, ctx: SealContext) -> std::io::Result<JoinHandle<()>> {
         if let Some(runner) = self.runner.take() {
             std::thread::Builder::new()
                 .name("seal".to_string())
                 .spawn(move || {
                     let mut r = runner;
-                    r.run();
+                    r.run(ctx);
                 })
         } else {
             Err(std::io::Error::other("Seal already started"))
         }
     }
 
-    pub fn recover_pre_seal(&mut self, segment: &mut Segment) -> std::io::Result<()> {
+    /// Pre-seal a segment during recovery. Returns the sealed segment id so the
+    /// caller can publish it to the pipeline's seal index.
+    pub fn recover_pre_seal(&mut self, segment: &mut Segment) -> std::io::Result<u32> {
         if let Some(mut runner) = self.runner.take() {
-            runner.process_seal(segment)?;
+            let id = runner.process_seal(segment)?;
             self.runner = Some(runner);
-            Ok(())
+            Ok(id)
         } else {
             Err(std::io::Error::other("Seal already started"))
         }
@@ -83,34 +69,38 @@ impl Seal {
 }
 
 impl SealRunner {
-    fn run(&mut self) {
+    fn run(&mut self, ctx: SealContext) {
         loop {
             // A long time nothing happened.
-            if let Err(e) = self.seal_pending_segments() {
+            if let Err(e) = self.seal_pending_segments(&ctx) {
                 error!("Seal: failed to seal pending segments: {}", e);
                 sleep(Duration::from_secs(1));
             }
             // Check before sleep to ensure that the last seal is done before shutting down
-            if !self.running.load(Ordering::Relaxed) {
+            if !ctx.is_running() {
                 break;
             }
             sleep(self.seal_check_internal);
         }
     }
 
-    fn seal_pending_segments(&mut self) -> std::io::Result<()> {
+    fn seal_pending_segments(&mut self, ctx: &SealContext) -> std::io::Result<()> {
         let mut pending = self.storage.list_all_segments()?;
         for segment in pending.iter_mut() {
             if segment.status() == SEALED {
                 continue;
             }
-            self.process_seal(segment)?;
+            let id = self.process_seal(segment)?;
+            ctx.set_processed_index(id);
         }
 
         Ok(())
     }
 
-    pub fn process_seal(&mut self, segment: &mut Segment) -> std::io::Result<()> {
+    /// Seal `segment` and update the runner's balance buffer. Returns the
+    /// sealed segment id; the caller is responsible for publishing it to the
+    /// pipeline (either through `SealContext` or directly during recovery).
+    pub fn process_seal(&mut self, segment: &mut Segment) -> std::io::Result<u32> {
         segment.load()?;
         segment.seal()?;
 
@@ -123,11 +113,8 @@ impl SealRunner {
             );
         }
 
-        // 3. Record the last sealed segment id
-        self.last_sealed_id.store(segment.id(), Ordering::Release);
-
         // only the last seal can be taken snapshot
-        // 4. Load wal records and update balances
+        // Load wal records and update balances
         segment.visit_wal_records(|entry| {
             if let WalEntry::Entry(e) = entry {
                 let id = e.account_id as usize;
@@ -139,7 +126,7 @@ impl SealRunner {
             }
         })?;
 
-        // 5. Conditionally write a snapshot
+        // Conditionally write a snapshot
         let snapshot_frequency = self.storage.config().snapshot_frequency;
         if snapshot_frequency > 0 && segment.id().is_multiple_of(snapshot_frequency) {
             let mut snapshot_records: Vec<(u64, i64)> = self
@@ -172,6 +159,6 @@ impl SealRunner {
             );
         }
 
-        Ok(())
+        Ok(segment.id())
     }
 }

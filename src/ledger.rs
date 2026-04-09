@@ -1,6 +1,5 @@
 use crate::balance::Balance;
-use crate::entities::WalEntry;
-pub use crate::pipeline_mode::PipelineMode;
+use crate::pipeline::Pipeline;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
@@ -8,11 +7,10 @@ use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Storage, StorageConfig};
 use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
+pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
-use crossbeam_queue::ArrayQueue;
 use spdlog::{Level, LevelFilter, info};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,7 +19,7 @@ pub struct LedgerConfig {
     pub max_accounts: usize,
     pub queue_size: usize,
     pub storage: StorageConfig,
-    pub pipeline_mode: PipelineMode,
+    pub wait_strategy: WaitStrategy,
     pub log_level: Level,
     pub seal_check_internal: Duration,
     pub index_circle1_size: usize,
@@ -37,7 +35,7 @@ impl Default for LedgerConfig {
             max_accounts: 1_000_000,
             queue_size: 1024,
             storage: StorageConfig::default(),
-            pipeline_mode: PipelineMode::Balanced,
+            wait_strategy: WaitStrategy::Balanced,
             log_level: Level::Info,
             seal_check_internal: Duration::from_secs(1),
             index_circle1_size: 1 << 20, // 1M slots
@@ -99,9 +97,8 @@ pub struct Ledger {
     snapshot: Snapshot,
     seal: Seal,
     storage: Arc<Storage>,
-    running: Arc<AtomicBool>,
+    pipeline: Arc<Pipeline>,
     handles: Vec<JoinHandle<()>>,
-    query_queue: Arc<ArrayQueue<SnapshotMessage>>,
     #[allow(dead_code)]
     config: LedgerConfig,
 }
@@ -115,17 +112,10 @@ impl Ledger {
         let storage = Storage::new(config.storage.clone()).unwrap();
         let storage = Arc::new(storage);
 
-        let sequencer_transactor_queue = Arc::new(ArrayQueue::new(config.queue_size));
-        let transactor_wal_queue: Arc<ArrayQueue<WalEntry>> = Arc::new(ArrayQueue::new(1024 * 128));
-        let wal_snapshot_queue: Arc<ArrayQueue<SnapshotMessage>> =
-            Arc::new(ArrayQueue::new(config.queue_size));
-        let running = Arc::new(AtomicBool::new(true));
+        let pipeline = Pipeline::new(config.queue_size, 1024 * 128, config.wait_strategy);
 
         let snapshot = Snapshot::new(
-            wal_snapshot_queue.clone(),
             config.max_accounts,
-            running.clone(),
-            config.pipeline_mode,
             config.index_circle1_size,
             config.index_circle2_size,
         );
@@ -133,35 +123,23 @@ impl Ledger {
         let seal = Seal::new(
             config.max_accounts,
             storage.clone(),
-            running.clone(),
             config.seal_check_internal,
         );
 
         Self {
-            config: config.clone(),
-            sequencer: Sequencer::new(sequencer_transactor_queue.clone()),
+            sequencer: Sequencer::new(pipeline.sequencer_context()),
             transactor: Transactor::new(
-                sequencer_transactor_queue,
-                transactor_wal_queue.clone(),
-                running.clone(),
                 config.max_accounts,
-                config.pipeline_mode,
                 config.dedup_enabled,
                 config.dedup_window_ms,
             ),
-            wal: Wal::new(
-                transactor_wal_queue,
-                wal_snapshot_queue.clone(),
-                storage.clone(),
-                running.clone(),
-                config.pipeline_mode,
-            ),
+            wal: Wal::new(storage.clone()),
             snapshot,
             seal,
             storage,
-            query_queue: wal_snapshot_queue,
-            running,
+            pipeline,
             handles: Vec::new(),
+            config: config.clone(),
         }
     }
 
@@ -175,17 +153,17 @@ impl Ledger {
     }
 
     pub fn last_sealed_segment_id(&self) -> u32 {
-        self.seal.last_sealed_segment_id()
+        self.pipeline.last_sealed_id()
     }
 
     pub fn get_transaction_status(&self, transaction_id: u64) -> TransactionStatus {
-        if self.transactor.last_processed_transaction_id() < transaction_id {
+        if self.pipeline.last_computed_id() < transaction_id {
             TransactionStatus::Pending
         } else if let Some(reason) = self.transactor.transaction_rejection_reason(transaction_id) {
             TransactionStatus::Error(reason)
-        } else if self.wal.last_processed_transaction_id() < transaction_id {
+        } else if self.pipeline.last_committed_id() < transaction_id {
             TransactionStatus::Computed
-        } else if self.snapshot.last_processed_transaction_id() < transaction_id {
+        } else if self.pipeline.last_snapshot_id() < transaction_id {
             TransactionStatus::Committed
         } else {
             TransactionStatus::OnSnapshot
@@ -193,15 +171,15 @@ impl Ledger {
     }
 
     pub fn last_computed_id(&self) -> u64 {
-        self.transactor.last_processed_transaction_id()
+        self.pipeline.last_computed_id()
     }
 
     pub fn last_committed_id(&self) -> u64 {
-        self.wal.last_processed_transaction_id()
+        self.pipeline.last_committed_id()
     }
 
     pub fn last_snapshot_id(&self) -> u64 {
-        self.snapshot.last_processed_transaction_id()
+        self.pipeline.last_snapshot_id()
     }
 
     /// Push a query into the Snapshot stage queue.
@@ -212,12 +190,12 @@ impl Ledger {
     pub fn query(&self, request: QueryRequest) {
         let mut msg = SnapshotMessage::Query(request);
         let mut retry_count = 0u64;
-        while self.running.load(Ordering::Relaxed) {
-            match self.query_queue.push(msg) {
+        while self.pipeline.is_running() {
+            match self.pipeline.try_push_query(msg) {
                 Ok(_) => return,
                 Err(returned) => {
                     msg = returned;
-                    self.config.pipeline_mode.wait_strategy(retry_count);
+                    self.pipeline.wait_strategy().wait_strategy(retry_count);
                     retry_count += 1;
                 }
             }
@@ -284,9 +262,9 @@ impl Ledger {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(10);
 
-        while self.running.load(Ordering::Relaxed) {
+        while self.pipeline.is_running() {
             // On error, return immediately regardless of wait level
-            if self.transactor.last_processed_transaction_id() >= transaction_id
+            if self.pipeline.last_computed_id() >= transaction_id
                 && self
                     .transactor
                     .transaction_rejection_reason(transaction_id)
@@ -296,20 +274,16 @@ impl Ledger {
             }
 
             let reached = match level {
-                WaitLevel::Processed => {
-                    self.transactor.last_processed_transaction_id() >= transaction_id
-                }
-                WaitLevel::Committed => self.wal.last_processed_transaction_id() >= transaction_id,
-                WaitLevel::Snapshotted => {
-                    self.snapshot.last_processed_transaction_id() >= transaction_id
-                }
+                WaitLevel::Processed => self.pipeline.last_computed_id() >= transaction_id,
+                WaitLevel::Committed => self.pipeline.last_committed_id() >= transaction_id,
+                WaitLevel::Snapshotted => self.pipeline.last_snapshot_id() >= transaction_id,
             };
 
             if reached {
                 return;
             }
 
-            self.config.pipeline_mode.wait_strategy(retry_count);
+            self.pipeline.wait_strategy().wait_strategy(retry_count);
             retry_count += 1;
 
             if start_time.elapsed() >= timeout {
@@ -330,14 +304,14 @@ impl Ledger {
         let mut retry_count = 0;
         let start_time = std::time::Instant::now();
 
-        while self.running.load(Ordering::Relaxed) {
-            let current_snapshot_step = self.snapshot.last_processed_transaction_id();
+        while self.pipeline.is_running() {
+            let current_snapshot_step = self.pipeline.last_snapshot_id();
 
             if current_snapshot_step >= transaction_id {
                 break;
             }
 
-            self.config.pipeline_mode.wait_strategy(retry_count);
+            self.pipeline.wait_strategy().wait_strategy(retry_count);
             retry_count += 1;
 
             if start_time.elapsed() >= duration {
@@ -360,14 +334,14 @@ impl Ledger {
         self.wait_for_pass();
 
         let mut retry_count = 0;
-        while self.running.load(Ordering::Relaxed) {
+        while self.pipeline.is_running() {
             let segment_count = self.storage.last_segment_id() - 1;
-            if segment_count == self.seal.last_sealed_segment_id() {
+            if segment_count == self.pipeline.last_sealed_id() {
                 return;
             }
 
             retry_count += 1;
-            self.config.pipeline_mode.wait_strategy(retry_count);
+            self.pipeline.wait_strategy().wait_strategy(retry_count);
         }
     }
 
@@ -379,21 +353,30 @@ impl Ledger {
                 format!("failed to recover ledger during start: {}", e),
             )
         })?;
-        self.handles.push(self.transactor.start().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
-        })?);
         self.handles.push(
-            self.wal.start().map_err(|e| {
+            self.transactor
+                .start(self.pipeline.transactor_context())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
+                })?,
+        );
+        self.handles.push(
+            self.wal.start(self.pipeline.wal_context()).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
             })?,
         );
-        self.handles.push(self.snapshot.start().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
-        })?);
+        self.handles.push(
+            self.snapshot
+                .start(self.pipeline.snapshot_context())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
+                })?,
+        );
         if !self.config.disable_seal {
-            self.handles.push(self.seal.start().map_err(|e| {
-                std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
-            })?);
+            self.handles
+                .push(self.seal.start(self.pipeline.seal_context()).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
+                })?);
         }
 
         Ok(())
@@ -404,7 +387,7 @@ impl Ledger {
             &mut self.transactor,
             &mut self.snapshot,
             &mut self.seal,
-            &self.sequencer,
+            &self.pipeline,
             &self.storage,
         );
 
@@ -417,7 +400,7 @@ impl Ledger {
 impl Drop for Ledger {
     fn drop(&mut self) {
         info!("Shutting down Ledger...");
-        self.running.store(false, Ordering::Relaxed);
+        self.pipeline.shutdown();
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();
         }

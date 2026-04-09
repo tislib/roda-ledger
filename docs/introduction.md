@@ -50,7 +50,7 @@ Roda-Ledger's documentation is organized into five levels. Start at the top and 
 |---|---|---|
 | 1 | [Concepts](./01-concepts.md) | Mental model, guarantees, invariants. Read this first. |
 | 2 | API | How to submit operations, query balances, and choose consistency levels. |
-| 3 | Architecture | The pipeline model and why it is designed this way. |
+| 3 | Architecture | The wait strategy and why it is designed this way. |
 | 4 | Internals | WAL format, snapshot mechanics, lock-free queue design. |
 | 5 | Contributing | How to set up, run benchmarks, and extend the system. |
 

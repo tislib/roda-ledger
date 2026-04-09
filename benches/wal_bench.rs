@@ -1,11 +1,10 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use crossbeam_queue::ArrayQueue;
-use roda_ledger::ledger::PipelineMode;
+use roda_ledger::ledger::WaitStrategy;
+use roda_ledger::pipeline::Pipeline;
 use roda_ledger::storage::{Storage, StorageConfig};
 use roda_ledger::wal::Wal;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 fn wal_bench(c: &mut Criterion) {
@@ -19,9 +18,11 @@ fn wal_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size as u64));
     group.measurement_time(Duration::from_secs(10));
 
-    let inbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
-    let outbound = Arc::new(ArrayQueue::new(batch_size as usize * 10));
-    let running = Arc::new(AtomicBool::new(true));
+    let pipeline = Pipeline::new(
+        batch_size as usize * 10,
+        batch_size as usize * 10,
+        WaitStrategy::LowLatency,
+    );
 
     let storage = Arc::new(
         Storage::new(StorageConfig {
@@ -30,15 +31,11 @@ fn wal_bench(c: &mut Criterion) {
         })
         .unwrap(),
     );
-    let wal = Wal::new(
-        inbound.clone(),
-        outbound.clone(),
-        storage,
-        running.clone(),
-        PipelineMode::LowLatency,
-    );
+    let wal = Wal::new(storage);
 
-    let handle = wal.start().unwrap();
+    let handle = wal.start(pipeline.wal_context()).unwrap();
+    let push_ctx = pipeline.wal_context();
+    let drain_ctx = pipeline.wal_context();
     let mut current_id = 0;
 
     group.bench_function("append", |b| {
@@ -56,7 +53,8 @@ fn wal_bench(c: &mut Criterion) {
                     crc32c: 0,
                     tag: [0; 8],
                 };
-                while inbound
+                while push_ctx
+                    .input()
                     .push(roda_ledger::entities::WalEntry::Metadata(metadata))
                     .is_err()
                 {
@@ -64,16 +62,16 @@ fn wal_bench(c: &mut Criterion) {
                 }
             }
             // Wait for all to be processed by checking outbound
-            while outbound.len() < batch_size as usize {
+            while drain_ctx.output().len() < batch_size as usize {
                 std::thread::yield_now();
             }
             // Drain outbound for next iteration
-            while outbound.pop().is_some() {}
+            while drain_ctx.output().pop().is_some() {}
         });
     });
 
     group.finish();
-    running.store(false, Ordering::Relaxed);
+    pipeline.shutdown();
     let _ = handle.join();
     let _ = fs::remove_dir_all(&path);
 }

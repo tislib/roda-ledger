@@ -12,6 +12,7 @@ categories = ["concurrency", "data-structures", "ledger"]
 [dependencies]
 crossbeam-queue = "0.3.12"
 crossbeam-skiplist = "0.1"
+crossbeam-utils = "0.8"
 bytemuck = { version = "1.21.0", features = ["derive"] }
 arc-swap = "1"
 tokio = { version = "1.43.0", features = ["full"] }
