@@ -1,5 +1,6 @@
 use roda_ledger::grpc::{GrpcServer, ServerConfig};
 use roda_ledger::ledger::Ledger;
+use spdlog::info;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grpc_addr = server_config.server.socket_addr()?;
 
-    println!(
+    info!(
         "Starting roda-ledger with config from {}: {:?}",
         config_path.display(),
         server_config

@@ -41,8 +41,7 @@ fn create_test_segment(dir: &Path, segment_id: u32, tx_start: u64, num_txs: u32)
         magic: WAL_MAGIC,
         segment_id,
         _pad1: [0; 4],
-        first_tx_id: tx_start,
-        _pad2: [0; 16],
+        _pad2: [0; 24],
     };
     data.extend_from_slice(bytemuck::bytes_of(&header));
 

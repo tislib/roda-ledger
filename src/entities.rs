@@ -70,14 +70,13 @@ pub struct TxMetadata {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct SegmentHeader {
-    pub entry_type: u8,   // 1 @ 0  — WalEntryKind::SegmentHeader
-    pub version: u8,      // 1 @ 1  — WAL_VERSION
-    pub _pad0: [u8; 2],   // 2 @ 2
-    pub magic: u32,       // 4 @ 4  — WAL_MAGIC
-    pub segment_id: u32,  // 4 @ 8  — monotonic, matches filename suffix
-    pub _pad1: [u8; 4],   // 4 @ 12 — align first_tx_id to 16
-    pub first_tx_id: u64, // 8 @ 16 — first tx in this segment
-    pub _pad2: [u8; 16],  // 16 @ 24 — total: 40 bytes
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::SegmentHeader
+    pub version: u8,     // 1 @ 1  — WAL_VERSION
+    pub _pad0: [u8; 2],  // 2 @ 2
+    pub magic: u32,      // 4 @ 4  — WAL_MAGIC
+    pub segment_id: u32, // 4 @ 8  — monotonic, matches filename suffix
+    pub _pad1: [u8; 4],  // 4 @ 12 — align first_tx_id to 16
+    pub _pad2: [u8; 24], // 16 @ 24 — total: 40 bytes
 }
 
 /// Last record before a segment is sealed. 40 bytes.

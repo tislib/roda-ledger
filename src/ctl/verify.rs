@@ -133,7 +133,6 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                         ));
                         ok = false;
                     }
-                    first_tx_id = h.first_tx_id;
                 }
             }
             WalEntry::Metadata(m) => {
@@ -146,6 +145,10 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                 );
                 pending_entries.clear();
                 pending_links.clear();
+
+                if first_tx_id == 0 {
+                    first_tx_id = m.tx_id;
+                }
 
                 if let Some(prev) = last_meta_tx
                     && m.tx_id <= prev
@@ -295,7 +298,7 @@ fn verify_active_wal(storage: &crate::storage::Storage) -> SegmentReport {
 
     // active_segment opens and loads wal.bin already
     let mut record_count = 0u64;
-    let mut first_tx_id = 0u64;
+    let first_tx_id = 0u64;
     let mut last_tx_id = 0u64;
     let mut errors = Vec::new();
     let mut ok = true;
@@ -303,7 +306,7 @@ fn verify_active_wal(storage: &crate::storage::Storage) -> SegmentReport {
     let visit_result = segment.visit_wal_records(|entry| {
         record_count += 1;
         match entry {
-            WalEntry::SegmentHeader(h) => first_tx_id = h.first_tx_id,
+            WalEntry::SegmentHeader(_) => {}
             WalEntry::Metadata(m) => last_tx_id = m.tx_id,
             _ => {}
         }

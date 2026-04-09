@@ -272,7 +272,7 @@ impl Ledger {
                     std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
                 })?,
         );
-        self.handles.push(
+        self.handles.extend(
             self.wal.start(self.pipeline.wal_context()).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
             })?,

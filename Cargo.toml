@@ -43,20 +43,9 @@ grpc = ["dep:tonic", "dep:prost", "dep:tonic-build", "dep:tonic-reflection"]
 [build-dependencies]
 tonic-build = { version = "0.12", optional = true }
 
-[[bench]]
-name = "ledger_bench"
-harness = false
-
-[[bench]]
-name = "wal_bench"
-harness = false
 
 [[bench]]
 name = "transactor_bench"
-harness = false
-
-[[bench]]
-name = "snapshot_bench"
 harness = false
 
 [[bench]]
@@ -64,13 +53,12 @@ name = "transaction_runner_bench"
 harness = false
 
 [[bench]]
-name = "query_bench"
+name = "wal_bench"
 harness = false
 
 [[bench]]
-name = "grpc_bench"
+name = "snapshot_bench"
 harness = false
-required-features = ["grpc"]
 
 [[bin]]
 name = "roda-ledger"
@@ -86,4 +74,7 @@ name = "roda-ctl"
 path = "src/bin/roda_ctl.rs"
 
 [profile.bench]
+debug = true
+
+[profile.release]
 debug = true

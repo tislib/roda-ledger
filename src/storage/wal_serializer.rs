@@ -93,8 +93,7 @@ mod tests {
             magic: 0x524F4441,
             segment_id: 3,
             _pad1: [0; 4],
-            first_tx_id: 100,
-            _pad2: [0; 16],
+            _pad2: [0; 24],
         }
     }
 
