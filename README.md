@@ -2,7 +2,7 @@
 
 ### 🚀 Ultra-High Performance Ledger for Modern Finance
 
-A high-performance, durable, and crash-consistent financial ledger and transaction executor built in Rust, capable of processing **6.6 Million+ transactions per second** with **nanosecond-level latency**.
+A high-performance, durable, and crash-consistent financial ledger and transaction executor built in Rust, capable of processing **2.89 Million+ transactions per second** with **nanosecond-level latency**.
 
 ---
 
@@ -23,7 +23,7 @@ Roda-Ledger is a specialized database engine designed for recording and executin
 Roda-Ledger is built for scale. While traditional databases struggle with the lock contention of high-frequency ledger updates, Roda-Ledger's architecture allows it to outpace everything in its class.
 
 ### The "Plus" (Strengths)
-- **🚀 Industry-Leading Throughput**: Process over **6.6 Million transactions per second** (TPS) on CX33 server at Hetzner.
+- **🚀 Industry-Leading Throughput**: Process over **2.89 Million transactions per second** (TPS) on CX33 server at Hetzner.
 - **⏱️ Predictable Low Latency**: Nanosecond to microsecond level execution times, ensuring your system never bottlenecks.
 - **💾 Strict Durability**: Every transaction is persisted via Write-Ahead Logging (WAL) before confirmation—zero data loss.
 - **⚛️ Atomic Composite Operations**: Perform multi-step transfers (e.g., Transfer + Fee) as a single atomic unit.
@@ -123,10 +123,9 @@ Detailed docs: [Benchmarks](docs/architecture/benchmarks.md) | [Architecture & D
 
 | Operation | Latency (Avg) | Throughput (Avg)     |
 | :--- | :--- |:---------------------|
-| **Wallet Deposit** | 198 ns | **2.8 Million tx/s** |
-| **Wallet Transfer** | 151 ns | **2.8 Million tx/s** |
+| **Wallet Deposit** | 141 ns (mean) | **2.89 Million tx/s** |
 
-*Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/architecture/benchmarks.md](docs/architecture/benchmarks.md)*
+*Latency percentiles: p50=120ns, p90=130ns, p99=1.1µs, p999=1.7µs, p9999=13.2µs. Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/architecture/benchmarks.md](docs/architecture/benchmarks.md)*
 
 ---
 

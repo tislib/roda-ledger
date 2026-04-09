@@ -149,9 +149,7 @@ impl WalRunner {
             // Rotate the segment when the size threshold is exceeded.
             // No pending-entries guard needed here: the buffer contract already
             // guarantees we only ever write complete transactions.
-            if active_segment.current_wal_offset()
-                >= (self.storage.config().wal_segment_size_mb * 1024 * 1024) as usize
-            {
+            if active_segment.current_wal_offset() >= (self.storage.wal_size()) {
                 active_segment.write_entries(&[WalEntry::SegmentSealed(wal_segment_sealed_entry(
                     active_segment.id(),
                     last_written_tx_id,

@@ -1,81 +1,88 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use roda_ledger::config::LedgerConfig;
+use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use roda_ledger::ledger::WaitStrategy;
 use roda_ledger::pipeline::Pipeline;
-use roda_ledger::storage::{Storage, StorageConfig};
+use roda_ledger::storage::Storage;
 use roda_ledger::wal::Wal;
-use std::fs;
+use std::hint::spin_loop;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
+fn make_deposit_entries(tx_id: u64, account_id: u64, amount: u64) -> [WalEntry; 2] {
+    let metadata = TxMetadata {
+        entry_type: WalEntryKind::TxMetadata as u8,
+        entry_count: 1,
+        link_count: 0,
+        fail_reason: FailReason::NONE,
+        crc32c: 0,
+        tx_id,
+        timestamp: 0,
+        user_ref: 0,
+        tag: [0; 8],
+    };
+    let entry = TxEntry {
+        entry_type: WalEntryKind::TxEntry as u8,
+        kind: EntryKind::Credit,
+        _pad0: [0; 6],
+        tx_id,
+        account_id,
+        amount,
+        computed_balance: amount as i64,
+    };
+    [WalEntry::Metadata(metadata), WalEntry::Entry(entry)]
+}
+
 fn wal_bench(c: &mut Criterion) {
-    let batch_size = 10_000;
-
-    let path = "bench_wal_data".to_string();
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-
-    let mut group = c.benchmark_group("wal".to_string());
-    group.throughput(Throughput::Elements(batch_size as u64));
+    let mut group = c.benchmark_group("wal");
+    group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(10));
 
-    let pipeline = Pipeline::with_sizes(
-        batch_size as usize * 10,
-        batch_size as usize * 10,
-        WaitStrategy::LowLatency,
-    );
+    let config = LedgerConfig::bench();
+    let storage = Arc::new(Storage::new(config.storage.clone()).unwrap());
+    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
 
-    let storage = Arc::new(
-        Storage::new(StorageConfig {
-            wal_segment_size_mb: 100,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
     let wal = Wal::new(storage);
+    let handles = wal.start(pipeline.wal_context()).unwrap();
 
-    let handle = wal.start(pipeline.wal_context()).unwrap();
-    let push_ctx = pipeline.wal_context();
-    let drain_ctx = pipeline.wal_context();
-    let mut current_id = 0;
+    // Drain the snapshot output queue
+    let drain_ctx = pipeline.snapshot_context();
+    let drain_handle = thread::spawn(move || {
+        let mut retry_count = 0;
+        while drain_ctx.is_running() || !drain_ctx.input().is_empty() {
+            while drain_ctx.input().pop().is_some() {
+                retry_count = 0;
+            }
+            retry_count += 1;
+            drain_ctx.wait_strategy().retry(retry_count);
+        }
+    });
 
-    group.bench_function("append", |b| {
+    let wal_ctx = pipeline.wal_context();
+    let mut current_id = 0u64;
+
+    group.bench_function("write", |b| {
         b.iter(|| {
-            for _ in 0..batch_size {
-                current_id += 1;
-                let metadata = roda_ledger::entities::TxMetadata {
-                    entry_type: 0,
-                    tx_id: current_id,
-                    timestamp: 0,
-                    user_ref: 0,
-                    entry_count: 0,
-                    link_count: 0,
-                    fail_reason: roda_ledger::entities::FailReason::NONE,
-                    crc32c: 0,
-                    tag: [0; 8],
-                };
-                while push_ctx
-                    .input()
-                    .push(roda_ledger::entities::WalEntry::Metadata(metadata))
-                    .is_err()
-                {
-                    std::thread::yield_now();
+            current_id += 1;
+            let account_id = rand::random::<u64>() % 1_000_000;
+            let entries = make_deposit_entries(current_id, account_id, 100);
+            for entry in entries {
+                let mut e = entry;
+                while let Err(returned) = wal_ctx.input().push(e) {
+                    e = returned;
+                    spin_loop();
                 }
             }
-            // Wait for all to be processed by checking outbound
-            while drain_ctx.output().len() < batch_size as usize {
-                std::thread::yield_now();
-            }
-            // Drain outbound for next iteration
-            while drain_ctx.output().pop().is_some() {}
         });
     });
 
     group.finish();
     pipeline.shutdown();
-    for h in handle {
+    for h in handles {
         let _ = h.join();
     }
-    let _ = fs::remove_dir_all(&path);
+    let _ = drain_handle.join();
 }
 
 criterion_group!(benches, wal_bench);

@@ -49,14 +49,10 @@ pub struct Pipeline {
     wait_strategy: WaitStrategy,
 }
 
-/// Fixed transactor→wal queue size. Historically much larger than the other
-/// hops because the WAL stage batches heavily.
-const WAL_QUEUE_SIZE: usize = 1024 * 128;
-
 impl Pipeline {
     /// Construct a pipeline with empty queues sized from the ledger config.
     pub fn new(config: &LedgerConfig) -> Arc<Self> {
-        Self::with_sizes(config.queue_size, WAL_QUEUE_SIZE, config.wait_strategy)
+        Self::with_sizes(config.queue_size, config.queue_size, config.wait_strategy)
     }
 
     /// Low-level constructor exposed for benches/tests that need to control
