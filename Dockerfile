@@ -8,11 +8,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /usr/src/roda-ledger
 
-# Copy all files
-COPY . .
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
+COPY src ./src
+COPY benches ./benches
+COPY tests ./tests
+COPY examples ./examples
+COPY config.toml ./config.toml
 
 # Build the project with grpc feature in release mode
-RUN cargo build --release --features grpc
+RUN cargo build --release --features grpc --bin roda-ledger
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -24,22 +29,19 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy the binary from the builder stage
+# Copy the binary and the default config from the builder stage
 COPY --from=builder /usr/src/roda-ledger/target/release/roda-ledger /app/roda-ledger
+COPY --from=builder /usr/src/roda-ledger/config.toml /app/config.toml
 
 # Expose the gRPC port
 EXPOSE 50051
 
-# Set default environment variables
-ENV RODA_GRPC_ADDR=0.0.0.0:50051
-ENV RODA_DATA_DIR=/data
-ENV RODA_MAX_ACCOUNTS=1000000
-ENV RODA_SNAPSHOT_INTERVAL=600
-ENV RODA_IN_MEMORY=false
+# Config file path (override by bind-mounting /app/config.toml or setting RODA_CONFIG)
+ENV RODA_CONFIG=/app/config.toml
 
 # Create data directory and set volume
 RUN mkdir -p /data
 VOLUME /data
 
-# Run the binary
+# Run the binary against the configured config.toml
 ENTRYPOINT ["/app/roda-ledger"]

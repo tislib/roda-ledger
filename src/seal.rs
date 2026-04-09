@@ -1,3 +1,4 @@
+use crate::config::LedgerConfig;
 use crate::entities::WalEntry;
 use crate::pipeline::SealContext;
 use crate::storage::SegmentStaus::SEALED;
@@ -18,12 +19,12 @@ struct SealRunner {
 }
 
 impl Seal {
-    pub fn new(account_count: usize, storage: Arc<Storage>, seal_check_internal: Duration) -> Self {
+    pub fn new(config: &LedgerConfig, storage: Arc<Storage>) -> Self {
         Self {
             runner: Some(SealRunner {
                 storage,
-                balances: vec![0; account_count],
-                seal_check_internal,
+                balances: vec![0; config.max_accounts],
+                seal_check_internal: config.seal_check_internal,
             }),
         }
     }

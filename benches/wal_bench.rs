@@ -18,7 +18,7 @@ fn wal_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size as u64));
     group.measurement_time(Duration::from_secs(10));
 
-    let pipeline = Pipeline::new(
+    let pipeline = Pipeline::with_sizes(
         batch_size as usize * 10,
         batch_size as usize * 10,
         WaitStrategy::LowLatency,

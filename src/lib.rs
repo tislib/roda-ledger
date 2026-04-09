@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod config;
 pub mod ctl;
 pub mod dedup;
 pub mod entities;

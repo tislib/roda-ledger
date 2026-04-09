@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::ledger::WaitStrategy;
+use roda_ledger::ledger::{LedgerConfig, WaitStrategy};
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::transaction::{Operation, Transaction};
 use roda_ledger::transactor::Transactor;
@@ -12,9 +12,15 @@ fn transactor_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(10));
 
-    let pipeline = Pipeline::new(10_240_000, 10_240_000, WaitStrategy::Balanced);
+    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
 
-    let mut transactor = Transactor::new(10_000_000, true, 10000);
+    let config = LedgerConfig {
+        max_accounts: 10_000_000,
+        dedup_enabled: true,
+        dedup_window_ms: 10_000,
+        ..LedgerConfig::default()
+    };
+    let mut transactor = Transactor::new(&config);
 
     let handle = transactor.start(pipeline.transactor_context()).unwrap();
 

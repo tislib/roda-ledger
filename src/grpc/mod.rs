@@ -1,7 +1,9 @@
+pub mod config;
 pub mod handler;
 pub mod mapping;
 pub mod server;
 
+pub use config::{GrpcServerSection, ServerConfig, ServerConfigError};
 pub use server::GrpcServer;
 
 pub mod proto {

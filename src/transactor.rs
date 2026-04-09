@@ -1,4 +1,5 @@
 use crate::balance::Balance;
+use crate::config::LedgerConfig;
 use crate::dedup::{DedupCache, DedupResult};
 use crate::entities::{
     EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
@@ -32,13 +33,13 @@ pub struct TransactorRunner {
 }
 
 impl Transactor {
-    pub fn new(max_accounts: usize, dedup_enabled: bool, dedup_window_ms: u64) -> Self {
-        let mut accounts = Vec::with_capacity(max_accounts);
-        accounts.resize(max_accounts, Balance::default());
+    pub fn new(config: &LedgerConfig) -> Self {
+        let mut accounts = Vec::with_capacity(config.max_accounts);
+        accounts.resize(config.max_accounts, Balance::default());
         Self {
             rejected_transactions: Arc::new(Default::default()),
             balances: accounts,
-            dedup: DedupCache::new(dedup_enabled, dedup_window_ms),
+            dedup: DedupCache::new(config.dedup_enabled, config.dedup_window_ms),
         }
     }
 

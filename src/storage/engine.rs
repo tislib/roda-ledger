@@ -1,3 +1,4 @@
+use crate::config::StorageConfig;
 use crate::storage::Segment;
 use crate::storage::layout::parse_segment_id;
 use spdlog::info;
@@ -5,26 +6,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Snapshot file magic: "SNAP" = 0x534E4150
 pub const SNAPSHOT_MAGIC: u32 = 0x534E4150;
-
-#[derive(Clone, Debug)]
-pub struct StorageConfig {
-    pub data_dir: String,
-    pub temporary: bool,
-    pub wal_segment_size_mb: u64,
-    /// How often (in sealed segments) to write a snapshot. 0 = disabled.
-    pub snapshot_frequency: u32,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            data_dir: "data/".to_string(),
-            temporary: false,
-            wal_segment_size_mb: 64,
-            snapshot_frequency: 4,
-        }
-    }
-}
 
 pub struct Storage {
     config: StorageConfig,
