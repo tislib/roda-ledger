@@ -212,7 +212,7 @@ impl SnapshotRunner {
                     }
                 }
             } else {
-                ctx.wait_strategy().wait_strategy(retry_count);
+                ctx.wait_strategy().retry(retry_count);
                 retry_count += 1;
             }
         }
