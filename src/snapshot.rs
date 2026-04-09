@@ -1,4 +1,5 @@
 use crate::balance::Balance;
+use crate::config::LedgerConfig;
 use crate::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
@@ -67,7 +68,8 @@ struct SnapshotRunner {
 }
 
 impl Snapshot {
-    pub fn new(account_count: usize, circle1_size: usize, circle2_size: usize) -> Self {
+    pub fn new(config: &LedgerConfig) -> Self {
+        let account_count = config.max_accounts;
         let balances: Arc<Vec<AtomicI64>> =
             Arc::new((0..account_count).map(|_| AtomicI64::new(0)).collect());
 
@@ -76,8 +78,8 @@ impl Snapshot {
         Self {
             balances,
             indexer: Some(TransactionIndexer::new(
-                circle1_size,
-                circle2_size,
+                config.index_circle1_size,
+                config.index_circle2_size,
                 account_heads_size,
             )),
         }

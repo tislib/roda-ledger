@@ -1,94 +1,19 @@
 use crate::balance::Balance;
+pub use crate::config::{LedgerConfig, StorageConfig};
 use crate::pipeline::Pipeline;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
-use crate::storage::{Storage, StorageConfig};
+use crate::storage::Storage;
 use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
-use spdlog::{Level, LevelFilter, info};
+use spdlog::{LevelFilter, info};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-
-#[derive(Clone, Debug)]
-pub struct LedgerConfig {
-    pub max_accounts: usize,
-    pub queue_size: usize,
-    pub storage: StorageConfig,
-    pub wait_strategy: WaitStrategy,
-    pub log_level: Level,
-    pub seal_check_internal: Duration,
-    pub index_circle1_size: usize,
-    pub index_circle2_size: usize,
-    pub dedup_enabled: bool,
-    pub dedup_window_ms: u64,
-    pub disable_seal: bool,
-}
-
-impl Default for LedgerConfig {
-    fn default() -> Self {
-        Self {
-            max_accounts: 1_000_000,
-            queue_size: 1024,
-            storage: StorageConfig::default(),
-            wait_strategy: WaitStrategy::Balanced,
-            log_level: Level::Info,
-            seal_check_internal: Duration::from_secs(1),
-            index_circle1_size: 1 << 20, // 1M slots
-            index_circle2_size: 1 << 21, // 2M entries
-            dedup_enabled: true,
-            dedup_window_ms: 10_000, // 10 seconds
-            disable_seal: false,
-        }
-    }
-}
-
-impl LedgerConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn temp() -> Self {
-        let mut dir = std::env::current_dir().unwrap();
-        let rand = rand::random::<u64>() % 1_000_000_000;
-        dir.push(format!("temp_{}", rand));
-
-        Self {
-            storage: StorageConfig {
-                data_dir: dir.to_string_lossy().to_string(),
-                temporary: true,
-                snapshot_frequency: 2,
-                wal_segment_size_mb: 2048,
-            },
-            log_level: Level::Critical,
-            seal_check_internal: Duration::from_millis(10),
-            ..Default::default()
-        }
-    }
-
-    pub fn bench() -> Self {
-        let mut dir = std::env::current_dir().unwrap();
-        let rand = rand::random::<u64>() % 1_000_000_000;
-        dir.push(format!("temp_{}", rand));
-
-        Self {
-            storage: StorageConfig {
-                data_dir: dir.to_string_lossy().to_string(),
-                temporary: true,
-                snapshot_frequency: u32::MAX,
-                wal_segment_size_mb: 2048,
-            },
-            log_level: Level::Critical,
-            seal_check_internal: Duration::from_mins(10),
-            disable_seal: true, // disable seal to avoid unnecessary disk IO to finish the benchmark process faster
-            ..Default::default()
-        }
-    }
-}
 
 pub struct Ledger {
     sequencer: Sequencer,
@@ -112,34 +37,21 @@ impl Ledger {
         let storage = Storage::new(config.storage.clone()).unwrap();
         let storage = Arc::new(storage);
 
-        let pipeline = Pipeline::new(config.queue_size, 1024 * 128, config.wait_strategy);
-
-        let snapshot = Snapshot::new(
-            config.max_accounts,
-            config.index_circle1_size,
-            config.index_circle2_size,
-        );
-
-        let seal = Seal::new(
-            config.max_accounts,
-            storage.clone(),
-            config.seal_check_internal,
-        );
+        let pipeline = Pipeline::new(&config);
+        let snapshot = Snapshot::new(&config);
+        let seal = Seal::new(&config, storage.clone());
+        let transactor = Transactor::new(&config);
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
-            transactor: Transactor::new(
-                config.max_accounts,
-                config.dedup_enabled,
-                config.dedup_window_ms,
-            ),
+            transactor,
             wal: Wal::new(storage.clone()),
             snapshot,
             seal,
             storage,
             pipeline,
             handles: Vec::new(),
-            config: config.clone(),
+            config,
         }
     }
 

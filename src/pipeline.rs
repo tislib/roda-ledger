@@ -9,6 +9,7 @@
 //! All atomic indexes are wrapped in `CachePadded` so progress updates from
 //! one stage do not cause false sharing with adjacent indexes.
 
+use crate::config::LedgerConfig;
 use crate::entities::WalEntry;
 use crate::snapshot::SnapshotMessage;
 use crate::transaction::Transaction;
@@ -48,13 +49,19 @@ pub struct Pipeline {
     wait_strategy: WaitStrategy,
 }
 
+/// Fixed transactor→wal queue size. Historically much larger than the other
+/// hops because the WAL stage batches heavily.
+const WAL_QUEUE_SIZE: usize = 1024 * 128;
+
 impl Pipeline {
     /// Construct a pipeline with empty queues sized from the ledger config.
-    ///
-    /// `small_queue_size` is used for the sequencer→transactor and
-    /// wal→snapshot hops, while `wal_queue_size` is used for the
-    /// transactor→wal hop which is historically sized much larger.
-    pub fn new(
+    pub fn new(config: &LedgerConfig) -> Arc<Self> {
+        Self::with_sizes(config.queue_size, WAL_QUEUE_SIZE, config.wait_strategy)
+    }
+
+    /// Low-level constructor exposed for benches/tests that need to control
+    /// the individual queue sizes without building a full `LedgerConfig`.
+    pub fn with_sizes(
         small_queue_size: usize,
         wal_queue_size: usize,
         wait_strategy: WaitStrategy,

@@ -1,53 +1,35 @@
-use roda_ledger::grpc::GrpcServer;
-use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::storage::StorageConfig;
-use spdlog::Level;
+use roda_ledger::grpc::{GrpcServer, ServerConfig};
+use roda_ledger::ledger::Ledger;
 use std::env;
-use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let grpc_addr_str = env::var("RODA_GRPC_ADDR").unwrap_or_else(|_| "0.0.0.0:50051".to_string());
-    let grpc_addr: SocketAddr = grpc_addr_str.parse()?;
+    // Config path precedence: CLI arg > RODA_CONFIG env var > ./config.toml
+    let config_path: PathBuf = env::args()
+        .nth(1)
+        .or_else(|| env::var("RODA_CONFIG").ok())
+        .unwrap_or_else(|| "config.toml".to_string())
+        .into();
 
-    let data_dir = env::var("RODA_DATA_DIR").ok();
-    let max_accounts = env::var("RODA_MAX_ACCOUNTS")
-        .map(|s| s.parse().unwrap_or(1_000_000))
-        .unwrap_or(1_000_000);
-    // How many WAL segment seals between snapshots (0 = never snapshot)
-    let snapshot_frequency = env::var("RODA_SNAPSHOT_FREQUENCY")
-        .map(|s| s.parse().unwrap_or(4u32))
-        .unwrap_or(4u32);
-    let _in_memory = env::var("RODA_IN_MEMORY")
-        .map(|s| s.parse().unwrap_or(false))
-        .unwrap_or(false);
+    let server_config = ServerConfig::from_file(&config_path).map_err(|e| {
+        format!(
+            "failed to load config from {}: {}",
+            config_path.display(),
+            e
+        )
+    })?;
 
-    let log_level_str = env::var("RODA_LOG_LEVEL").unwrap_or_else(|_| "debug".to_string());
-    let log_level = match log_level_str.to_lowercase().as_str() {
-        "trace" => Level::Trace,
-        "debug" => Level::Debug,
-        "info" => Level::Info,
-        "warn" => Level::Warn,
-        "error" => Level::Error,
-        "critical" => Level::Critical,
-        _ => Level::Debug,
-    };
+    let grpc_addr = server_config.server.socket_addr()?;
 
-    let config = LedgerConfig {
-        max_accounts,
-        log_level,
-        storage: StorageConfig {
-            data_dir: data_dir.unwrap_or("data/".to_string()),
-            snapshot_frequency,
-            ..Default::default()
-        },
-        ..LedgerConfig::default()
-    };
+    println!(
+        "Starting roda-ledger with config from {}: {:?}",
+        config_path.display(),
+        server_config
+    );
 
-    println!("Starting roda-ledger with config: {:?}", config);
-
-    let mut ledger = Ledger::new(config);
+    let mut ledger = Ledger::new(server_config.ledger);
     ledger.start().unwrap();
 
     let ledger_arc = Arc::new(ledger);

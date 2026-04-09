@@ -1,14 +1,19 @@
 services:
   roda-ledger:
     build: .
+    # Run the container under a tini-like init so SIGINT/SIGTERM are
+    # forwarded to the ledger binary (it would otherwise be PID 1 and the
+    # kernel wouldn't install default signal handlers for it). Combined
+    # with the tokio signal handler in grpc::server, Ctrl+C and
+    # `docker stop` now shut the server down promptly.
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
     ports:
       - "50051:50051"
     environment:
-      - RODA_GRPC_ADDR=0.0.0.0:50051
-      - RODA_DATA_DIR=/data
-      - RODA_MAX_ACCOUNTS=1000000
-      - RODA_SNAPSHOT_INTERVAL=600
-      - RODA_IN_MEMORY=false
+      - RODA_CONFIG=/app/config.toml
     volumes:
+      - ./config.toml:/app/config.toml:ro
       - ./data:/data
     restart: always
