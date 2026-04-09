@@ -120,8 +120,9 @@ pub struct TxLink {
     pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Link (4)
     pub link_kind: u8,   // 1 @ 1  — TxLinkKind as u8
     pub _pad: [u8; 6],   // 6 @ 2
-    pub to_tx_id: u64,   // 8 @ 8  — referenced transaction
-    pub _pad2: [u8; 24], // 24 @ 16
+    pub tx_id: u64,      // 8 @ 8  — links back to TxMetadata
+    pub to_tx_id: u64,   // 8 @ 16  — referenced transaction
+    pub _pad2: [u8; 16], // 24 @ 16
 } // total: 40 bytes
 
 impl TxLink {
@@ -158,9 +159,9 @@ impl WalEntry {
         match self {
             WalEntry::Metadata(m) => m.tx_id,
             WalEntry::Entry(e) => e.tx_id,
+            WalEntry::Link(e) => e.tx_id,
             WalEntry::SegmentHeader(_) => 0,
             WalEntry::SegmentSealed(_) => 0,
-            WalEntry::Link(_) => 0,
         }
     }
 }

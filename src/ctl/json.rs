@@ -42,6 +42,7 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
                 TxLinkKind::Duplicate => "Duplicate",
                 TxLinkKind::Reversal => "Reversal",
             },
+            "tx_id": l.tx_id,
             "to_tx_id": l.to_tx_id,
         }),
     }
@@ -140,6 +141,7 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
         }
         "TxLink" => {
             let to_tx_id = value["to_tx_id"].as_u64().ok_or("missing to_tx_id")?;
+            let tx_id = value["tx_id"].as_u64().ok_or("missing tx_id")?;
             let kind = match value["kind"].as_str().ok_or("missing kind")? {
                 "Duplicate" => TxLinkKind::Duplicate,
                 "Reversal" => TxLinkKind::Reversal,
@@ -149,8 +151,9 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 entry_type: WalEntryKind::Link as u8,
                 link_kind: kind as u8,
                 _pad: [0; 6],
+                tx_id,
                 to_tx_id,
-                _pad2: [0; 24],
+                _pad2: [0; 16],
             }))
         }
         other => Err(format!("unknown record type: {}", other)),

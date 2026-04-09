@@ -224,7 +224,6 @@ impl Segment {
             SegmentStaus::ACTIVE,
             "Segment is not active, cannot append"
         );
-        let mut file = self.wal_file.as_ref().unwrap();
 
         for entry in entries {
             self.wal_buffer
@@ -237,19 +236,13 @@ impl Segment {
 
     pub(crate) fn syncer(&self) -> Result<Syncer, Error> {
         if let Some(wal_file) = &self.wal_file {
-            let wal_file_clone = wal_file.try_clone().map_err(|e| {
-                Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to clone WAL file: {}", e),
-                )
-            })?;
+            let wal_file_clone = wal_file
+                .try_clone()
+                .map_err(|e| Error::other(format!("Failed to clone WAL file: {}", e)))?;
 
             Ok(Syncer::new(wal_file_clone))
         } else {
-            Err(Error::new(
-                std::io::ErrorKind::Other,
-                "Segment is not loaded, cannot sync",
-            ))
+            Err(Error::other("Segment is not loaded, cannot sync"))
         }
     }
 

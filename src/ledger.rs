@@ -209,7 +209,7 @@ impl Ledger {
     }
 
     pub fn wait_for_transaction(&self, transaction_id: u64) {
-        self.wait_for_transaction_until(transaction_id, Duration::from_secs(10));
+        self.wait_for_transaction_until(transaction_id, Duration::from_secs(100));
     }
 
     pub fn wait_for_transaction_until(&self, transaction_id: u64, duration: Duration) {

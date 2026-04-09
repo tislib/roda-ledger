@@ -364,8 +364,9 @@ impl TransactorRunner {
             entry_type: WalEntryKind::Link as u8,
             link_kind: TxLinkKind::Duplicate as u8,
             _pad: [0; 6],
+            tx_id,
             to_tx_id: original_tx_id,
-            _pad2: [0; 24],
+            _pad2: [0; 16],
         };
 
         let mut meta = TxMetadata {

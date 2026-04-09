@@ -94,8 +94,6 @@ impl WalRunner {
             let inbound = ctx.input();
             let available = inbound.len().min(buffer.capacity() - buffer.len());
 
-            retry_count = 0;
-
             for _ in 0..available {
                 if let Some(entry) = inbound.pop() {
                     active_segment.append_pending_entry(&entry);
@@ -145,15 +143,17 @@ impl WalRunner {
             }
 
             let mut last_sent_tx_id = 0;
-            loop {
-                if let Some(entry) = buffer.pop_front() {
-                    if !self.push_outbound(&ctx, entry) {
-                        break;
-                    }
-                    last_sent_tx_id = entry.tx_id();
-                } else {
+            while let Some(entry) = buffer.pop_front() {
+                last_sent_tx_id = entry.tx_id();
+                if last_sent_tx_id > self.last_committed_tx_id {
+                    // return back
+                    buffer.push_front(entry);
                     break;
                 }
+                if !self.push_outbound(&ctx, entry) {
+                    break;
+                }
+                last_sent_tx_id = entry.tx_id();
             }
             if last_sent_tx_id > 0 {
                 ctx.set_processed_index(last_sent_tx_id);
