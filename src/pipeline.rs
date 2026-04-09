@@ -266,6 +266,7 @@ impl TransactorContext {
 }
 
 /// Slice of the pipeline visible to the WAL stage.
+#[derive(Clone)]
 pub struct WalContext {
     pipeline: Arc<Pipeline>,
 }

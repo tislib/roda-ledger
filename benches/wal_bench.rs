@@ -72,7 +72,9 @@ fn wal_bench(c: &mut Criterion) {
 
     group.finish();
     pipeline.shutdown();
-    let _ = handle.join();
+    for h in handle {
+        let _ = h.join();
+    }
     let _ = fs::remove_dir_all(&path);
 }
 

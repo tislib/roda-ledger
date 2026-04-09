@@ -11,3 +11,4 @@ pub use crate::config::StorageConfig;
 pub use engine::*;
 pub use segment::*;
 pub use snapshot::*;
+pub use syncer::*;
