@@ -1,7 +1,7 @@
 use crate::entities::{SegmentHeader, SegmentSealed, WalEntryKind};
 use crate::storage::{WAL_MAGIC, WAL_VERSION};
 
-pub(crate) fn wal_segment_header_entry(segment_id: u32, first_tx_id: u64) -> SegmentHeader {
+pub(crate) fn wal_segment_header_entry(segment_id: u32) -> SegmentHeader {
     SegmentHeader {
         entry_type: WalEntryKind::SegmentHeader as u8,
         version: WAL_VERSION,
@@ -9,8 +9,7 @@ pub(crate) fn wal_segment_header_entry(segment_id: u32, first_tx_id: u64) -> Seg
         magic: WAL_MAGIC,
         segment_id,
         _pad1: [0; 4],
-        first_tx_id,
-        _pad2: [0; 16],
+        _pad2: [0; 24],
     }
 }
 

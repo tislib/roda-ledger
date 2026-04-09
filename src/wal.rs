@@ -3,6 +3,7 @@ use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline::WalContext;
 use crate::snapshot::SnapshotMessage;
 use crate::storage::{Segment, Storage, Syncer};
+use crate::wait_strategy::WaitStrategy;
 use Ordering::Release;
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
@@ -23,15 +24,15 @@ impl Wal {
     pub fn start(&self, ctx: WalContext) -> std::io::Result<[JoinHandle<()>; 2]> {
         let last_written_tx_id = Arc::new(AtomicU64::new(0));
         let last_committed_tx_id = Arc::new(AtomicU64::new(0));
-        let active_segment: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
+        let active_segment_sync: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
 
-        let mut wal_runner = WalRunner {
-            storage: self.storage.clone(),
-            pending_records: 0,
-            active_segment_sync: active_segment.clone(),
-            last_written_tx_id: last_written_tx_id.clone(),
-            last_committed_tx_id: last_committed_tx_id.clone(),
-        };
+        let mut wal_runner = WalRunner::new(
+            self.storage.clone(),
+            last_written_tx_id.clone(),
+            last_committed_tx_id.clone(),
+            active_segment_sync.clone(),
+            &ctx,
+        );
         let wal_ctx_clone = ctx.clone();
         let wal_th = std::thread::Builder::new()
             .name("wal_write".to_string())
@@ -40,7 +41,7 @@ impl Wal {
             })?;
 
         let mut wal_committer = WalCommitter {
-            active_segment,
+            active_segment: active_segment_sync,
             last_written_tx_id,
             last_committed_tx_id,
         };
@@ -60,9 +61,129 @@ pub struct WalRunner {
     last_written_tx_id: Arc<AtomicU64>,
     last_committed_tx_id: Arc<AtomicU64>,
     active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
+    retry_count: u64,
+    active_segment: Segment,
+    buffer: VecDeque<WalEntry>,
+    last_received_tx_id: u64,
+    wait_strategy: WaitStrategy,
 }
 
 impl WalRunner {
+    pub fn new(
+        storage: Arc<Storage>,
+        last_written_tx_id: Arc<AtomicU64>,
+        last_committed_tx_id: Arc<AtomicU64>,
+        active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
+        ctx: &WalContext,
+    ) -> Self {
+        let mut active_segment = storage.active_segment().unwrap();
+        let syncer = active_segment.syncer().expect("Failed to get syncer");
+        active_segment_sync.store(Arc::new(Some(syncer)));
+        let buffer = VecDeque::with_capacity(ctx.input_capacity());
+        let wait_strategy = ctx.wait_strategy();
+
+        if active_segment.current_wal_offset() == 0 {
+            active_segment.write_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
+                active_segment.id(),
+            ))])
+        }
+
+        Self {
+            storage,
+            pending_records: 0,
+            last_written_tx_id,
+            last_committed_tx_id,
+            active_segment_sync,
+            retry_count: 0,
+            active_segment,
+            buffer,
+            last_received_tx_id: 0,
+            wait_strategy,
+        }
+    }
+
+    pub fn run(&mut self, ctx: WalContext) {
+        while ctx.is_running() {
+            // Receive entries from the inbound queue.
+            let inbound = ctx.input();
+            let available = inbound
+                .len()
+                .min(self.buffer.capacity() - self.buffer.len());
+
+            let mut k = available;
+            while k > 0 || self.pending_records > 0 {
+                if let Some(entry) = inbound.pop() {
+                    self.active_segment.append_pending_entry(&entry);
+                    self.buffer.push_back(entry);
+                    if self.move_pending_entry(&entry) {
+                        self.last_received_tx_id = entry.tx_id();
+                    }
+                }
+                k = k.saturating_sub(1);
+            }
+
+            // if new entries are available, write them to the segment.
+            if available > 0 {
+                self.active_segment.write_pending_entries();
+                self.last_written_tx_id
+                    .store(self.last_received_tx_id, Release);
+            }
+
+            // if there are no movements, skip the rest of the loop.
+            if available == 0 && self.buffer.is_empty() {
+                self.retry_count += 1;
+                self.wait_strategy.retry(self.retry_count);
+                continue;
+            }
+            self.retry_count = 0;
+
+            // Rotate the segment when the size threshold is exceeded.
+            if self.active_segment.current_wal_offset() >= (self.storage.wal_size()) {
+                self.rotate();
+            }
+
+            // Push committed entries to the outbound queue.
+            while let Some(entry) = self.buffer.pop_front() {
+                let tx_id = entry.tx_id();
+                if tx_id > self.last_committed_tx_id.load(Acquire) {
+                    // return back
+                    self.buffer.push_front(entry);
+                    break;
+                }
+                if !self.push_outbound(&ctx, entry) {
+                    break;
+                }
+                ctx.set_processed_index(tx_id);
+            }
+        }
+    }
+
+    fn rotate(&mut self) {
+        let last_written_tx_id = self.last_written_tx_id.load(Acquire);
+
+        self.active_segment
+            .write_entries(&[WalEntry::SegmentSealed(wal_segment_sealed_entry(
+                self.active_segment.id(),
+                last_written_tx_id,
+                self.active_segment.record_count(),
+            ))]);
+
+        self.commit_sync();
+
+        self.active_segment
+            .close()
+            .expect("Failed to close active segment");
+
+        self.storage.next_segment();
+        self.active_segment = self.storage.active_segment().unwrap();
+        self.active_segment
+            .write_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
+                self.active_segment.id(),
+            ))]);
+        let syncer = self.active_segment.syncer().expect("Failed to get syncer");
+        self.active_segment_sync.store(Arc::new(Some(syncer)));
+    }
+
     // Update `pending_records` based on the given entry. 0 means the entry is
     // complete.
     fn move_pending_entry(&mut self, entry: &WalEntry) -> bool {
@@ -97,91 +218,8 @@ impl WalRunner {
         }
     }
 
-    pub fn run(&mut self, ctx: WalContext) {
-        let mut retry_count = 0;
-        let mut active_segment = self.storage.active_segment().unwrap();
-        let syncer = active_segment.syncer().expect("Failed to get syncer");
-        self.active_segment_sync.store(Arc::new(Some(syncer)));
-        let mut buffer = VecDeque::with_capacity(ctx.input_capacity());
-        let mut last_received_tx_id = 0;
-        let wait_strategy = ctx.wait_strategy();
-
-        while ctx.is_running() {
-            // init
-            if active_segment.current_wal_offset() == 0 {
-                let first_tx_id = 0; // fixme remove it from segment header
-                active_segment.write_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
-                    active_segment.id(),
-                    first_tx_id,
-                ))])
-            }
-
-            // Receive entries from the inbound queue.
-            let inbound = ctx.input();
-            let available = inbound.len().min(buffer.capacity() - buffer.len());
-
-            let mut k = available;
-            while k > 0 || self.pending_records > 0 {
-                if let Some(entry) = inbound.pop() {
-                    active_segment.append_pending_entry(&entry);
-                    buffer.push_back(entry);
-                    if self.move_pending_entry(&entry) {
-                        last_received_tx_id = entry.tx_id();
-                    }
-                }
-                k = k.saturating_sub(1);
-            }
-
-            if available > 0 {
-                active_segment.write_pending_entries();
-                self.last_written_tx_id.store(last_received_tx_id, Release);
-            }
-            let last_written_tx_id = self.last_written_tx_id.load(Acquire);
-
-            if available == 0 && buffer.is_empty() {
-                retry_count += 1;
-                wait_strategy.retry(retry_count);
-                continue;
-            }
-            retry_count = 0;
-
-            // Must Wait until commit is done
-            // Rotate the segment when the size threshold is exceeded.
-            // No pending-entries guard needed here: the buffer contract already
-            // guarantees we only ever write complete transactions.
-            if active_segment.current_wal_offset() >= (self.storage.wal_size()) {
-                active_segment.write_entries(&[WalEntry::SegmentSealed(wal_segment_sealed_entry(
-                    active_segment.id(),
-                    last_written_tx_id,
-                    active_segment.record_count(),
-                ))]);
-                self.commit_sync(&mut active_segment);
-                active_segment
-                    .close()
-                    .expect("Failed to close active segment"); // fixme implement retry logic
-                self.storage.next_segment();
-                active_segment = self.storage.active_segment().unwrap();
-                let syncer = active_segment.syncer().expect("Failed to get syncer");
-                self.active_segment_sync.store(Arc::new(Some(syncer)));
-            }
-
-            while let Some(entry) = buffer.pop_front() {
-                let tx_id = entry.tx_id();
-                if tx_id > self.last_committed_tx_id.load(Acquire) {
-                    // return back
-                    buffer.push_front(entry);
-                    break;
-                }
-                if !self.push_outbound(&ctx, entry) {
-                    break;
-                }
-                ctx.set_processed_index(tx_id);
-            }
-        }
-    }
-
-    pub fn commit_sync(&mut self, active_segment: &mut Segment) {
-        let mut syncer = active_segment.syncer().expect("Failed to get syncer");
+    pub fn commit_sync(&mut self) {
+        let mut syncer = self.active_segment.syncer().expect("Failed to get syncer");
         syncer.sync().expect("Failed to sync segment");
         self.last_committed_tx_id
             .store(self.last_written_tx_id.load(Acquire), Release);

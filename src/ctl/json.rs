@@ -9,7 +9,6 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "segment_id": h.segment_id,
             "version": h.version,
             "magic": format!("{:#010x}", h.magic),
-            "first_tx_id": h.first_tx_id,
         }),
         WalEntry::Metadata(m) => serde_json::json!({
             "type": "TxMetadata",
@@ -63,7 +62,6 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 .and_then(|v| v.as_str())
                 .and_then(parse_hex_u32)
                 .unwrap_or(WAL_MAGIC);
-            let first_tx_id = value["first_tx_id"].as_u64().ok_or("missing first_tx_id")?;
             Ok(WalEntry::SegmentHeader(SegmentHeader {
                 entry_type: WalEntryKind::SegmentHeader as u8,
                 version,
@@ -71,8 +69,7 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 magic,
                 segment_id,
                 _pad1: [0; 4],
-                first_tx_id,
-                _pad2: [0; 16],
+                _pad2: [0; 24],
             }))
         }
         "TxMetadata" => {
