@@ -32,7 +32,7 @@ fn transactor_bench(c: &mut Criterion) {
                 retry_count = 0;
             }
             retry_count += 1;
-            drain_ctx.wait_strategy().wait_strategy(retry_count);
+            drain_ctx.wait_strategy().retry(retry_count);
         }
     });
 

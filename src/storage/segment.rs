@@ -111,7 +111,7 @@ impl Segment {
             segment_id,
             wal_file: Some(wal_file),
             status: SegmentStaus::ACTIVE,
-            wal_buffer: vec![0; 16 * 1024 * 1024], // 16MB
+            wal_buffer: Vec::with_capacity(16 * 1024 * 1024),
             wal_data,
             wal_position,
             record_count: 0,
@@ -184,19 +184,26 @@ impl Segment {
         self.status
     }
 
-    pub(crate) fn write_entries(&mut self, entries: &[WalEntry]) {
+    pub(crate) fn append_pending_entry(&mut self, entry: &WalEntry) {
         assert_eq!(
             self.status,
             SegmentStaus::ACTIVE,
             "Segment is not active, cannot append"
         );
-        let mut file = self.wal_file.as_ref().unwrap();
-        self.wal_buffer.clear();
 
-        for entry in entries {
-            self.wal_buffer
-                .extend_from_slice(serialize_wal_records(entry));
-        }
+        self.wal_buffer
+            .extend_from_slice(serialize_wal_records(entry));
+        self.record_count += 1;
+    }
+
+    pub(crate) fn write_pending_entries(&mut self) {
+        assert_eq!(
+            self.status,
+            SegmentStaus::ACTIVE,
+            "Segment is not active, cannot append"
+        );
+
+        let mut file = self.wal_file.as_ref().unwrap();
 
         loop {
             if let Err(e) = file.write_all(&self.wal_buffer) {
@@ -208,7 +215,24 @@ impl Segment {
         }
 
         self.wal_position += self.wal_buffer.len();
+        self.wal_buffer.clear();
+    }
+
+    pub(crate) fn write_entries(&mut self, entries: &[WalEntry]) {
+        assert_eq!(
+            self.status,
+            SegmentStaus::ACTIVE,
+            "Segment is not active, cannot append"
+        );
+        let mut file = self.wal_file.as_ref().unwrap();
+
+        for entry in entries {
+            self.wal_buffer
+                .extend_from_slice(serialize_wal_records(entry));
+        }
         self.record_count += entries.len() as u64;
+
+        self.write_pending_entries();
     }
 
     pub(crate) fn syncer(&self) -> Result<Syncer, Error> {

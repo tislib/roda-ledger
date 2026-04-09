@@ -210,6 +210,8 @@ impl<'r> Recover<'r> {
         self.pipeline.set_snapshot_index(last_tx_id);
         self.pipeline.set_sequencer_next_id(last_tx_id + 1);
 
+        info!("Recovery completed successfully.");
+
         Ok(())
     }
 

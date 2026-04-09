@@ -14,7 +14,7 @@ use crate::storage::layout::{segment_account_index_path, segment_tx_index_path};
 use crate::storage::segment::Segment;
 use crate::storage::wal_serializer::parse_wal_record;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 impl Segment {
@@ -154,14 +154,15 @@ impl Segment {
 ///
 /// Format: `[record_count: 8 bytes LE]` followed by `[u64 LE][u64 LE] × count`.
 fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> {
-    let mut file = File::create(path).map_err(|e| {
+    let file = File::create(path).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("failed to create index file at {:?}: {}", path, e),
         )
     })?;
+    let mut writer = BufWriter::new(file);
     let count = entries.len() as u64;
-    file.write_all(&count.to_le_bytes()).map_err(|e| {
+    writer.write_all(&count.to_le_bytes()).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!(
@@ -171,7 +172,7 @@ fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> 
         )
     })?;
     for &(a, b) in entries {
-        file.write_all(&a.to_le_bytes()).map_err(|e| {
+        writer.write_all(&a.to_le_bytes()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -180,7 +181,7 @@ fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> 
                 ),
             )
         })?;
-        file.write_all(&b.to_le_bytes()).map_err(|e| {
+        writer.write_all(&b.to_le_bytes()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -190,7 +191,13 @@ fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> 
             )
         })?;
     }
-    file.sync_all().map_err(|e| {
+    writer.flush().map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to flush index file at {:?}: {}", path, e),
+        )
+    })?;
+    writer.get_ref().sync_all().map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("failed to sync index file at {:?}: {}", path, e),
@@ -201,15 +208,16 @@ fn write_index_file(path: &Path, entries: &[(u64, u64)]) -> std::io::Result<()> 
 
 /// Read a flat array of `(u64, u64)` pairs from a binary index file.
 fn read_index_file(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
-    let mut file = File::open(path).map_err(|e| {
+    let file = File::open(path).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("failed to open index file at {:?}: {}", path, e),
         )
     })?;
+    let mut reader = BufReader::new(file);
     let mut buf = [0u8; 8];
 
-    file.read_exact(&mut buf).map_err(|e| {
+    reader.read_exact(&mut buf).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!(
@@ -222,7 +230,7 @@ fn read_index_file(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
 
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
-        file.read_exact(&mut buf).map_err(|e| {
+        reader.read_exact(&mut buf).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -232,7 +240,7 @@ fn read_index_file(path: &Path) -> std::io::Result<Vec<(u64, u64)>> {
             )
         })?;
         let a = u64::from_le_bytes(buf);
-        file.read_exact(&mut buf).map_err(|e| {
+        reader.read_exact(&mut buf).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(

@@ -46,7 +46,7 @@ impl WaitStrategy {
     }
 
     #[inline(always)]
-    pub fn wait_strategy(&self, retry_count: u64) {
+    pub fn retry(&self, retry_count: u64) {
         if matches!(self, WaitStrategy::LowLatency) {
             return;
         }

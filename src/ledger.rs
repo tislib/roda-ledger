@@ -107,7 +107,7 @@ impl Ledger {
                 Ok(_) => return,
                 Err(returned) => {
                     msg = returned;
-                    self.pipeline.wait_strategy().wait_strategy(retry_count);
+                    self.pipeline.wait_strategy().retry(retry_count);
                     retry_count += 1;
                 }
             }
@@ -195,7 +195,7 @@ impl Ledger {
                 return;
             }
 
-            self.pipeline.wait_strategy().wait_strategy(retry_count);
+            self.pipeline.wait_strategy().retry(retry_count);
             retry_count += 1;
 
             if start_time.elapsed() >= timeout {
@@ -223,7 +223,7 @@ impl Ledger {
                 break;
             }
 
-            self.pipeline.wait_strategy().wait_strategy(retry_count);
+            self.pipeline.wait_strategy().retry(retry_count);
             retry_count += 1;
 
             if start_time.elapsed() >= duration {
@@ -253,7 +253,7 @@ impl Ledger {
             }
 
             retry_count += 1;
-            self.pipeline.wait_strategy().wait_strategy(retry_count);
+            self.pipeline.wait_strategy().retry(retry_count);
         }
     }
 
@@ -290,6 +290,8 @@ impl Ledger {
                     std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
                 })?);
         }
+
+        info!("Ledger started successfully.");
 
         Ok(())
     }

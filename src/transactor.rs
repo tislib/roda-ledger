@@ -158,7 +158,7 @@ impl TransactorRunner {
         }
 
         if self.transaction_buffer.is_empty() {
-            ctx.wait_strategy().wait_strategy(self.input_retry_count);
+            ctx.wait_strategy().retry(self.input_retry_count);
             self.input_retry_count += 1;
             return;
         }
