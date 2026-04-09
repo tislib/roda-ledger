@@ -2,11 +2,12 @@ use crate::entities::WalEntry;
 use crate::storage::layout::{
     active_wal_path, segment_crc_path, segment_seal_path, segment_wal_path,
 };
+use crate::storage::syncer::Syncer;
 use crate::storage::wal_reader::{read_wal_data, verify_wal_data};
 use crate::storage::wal_serializer::{parse_wal_record, serialize_wal_records};
 use spdlog::warn;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Error, Write};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
@@ -39,7 +40,7 @@ pub struct Segment {
 }
 
 impl Segment {
-    pub(super) fn open(data_dir: String, segment_id: u32) -> Result<Self, std::io::Error> {
+    pub(super) fn open(data_dir: String, segment_id: u32) -> Result<Self, Error> {
         let data_dir_path = Path::new(&data_dir);
         let wal_sealed_file_path = segment_seal_path(data_dir_path, segment_id);
         let status = if wal_sealed_file_path.exists() {
@@ -61,7 +62,7 @@ impl Segment {
         })
     }
 
-    pub(super) fn open_active(data_dir: String, segment_id: u32) -> Result<Self, std::io::Error> {
+    pub(super) fn open_active(data_dir: String, segment_id: u32) -> Result<Self, Error> {
         let data_dir_path = Path::new(&data_dir);
         let wal_file_path = active_wal_path(data_dir_path);
         let wal_file = OpenOptions::new()
@@ -69,7 +70,7 @@ impl Segment {
             .append(true)
             .open(&wal_file_path)
             .map_err(|e| {
-                std::io::Error::new(
+                Error::new(
                     e.kind(),
                     format!(
                         "failed to open active wal file at {:?}: {}",
@@ -79,7 +80,7 @@ impl Segment {
             })?;
 
         let metadata = wal_file.metadata().map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!(
                     "failed to get metadata for active wal file at {:?}: {}",
@@ -91,7 +92,7 @@ impl Segment {
 
         let wal_data = if metadata.len() > 0 {
             read_wal_data(&wal_file_path).map_err(|e| {
-                std::io::Error::new(
+                Error::new(
                     e.kind(),
                     format!(
                         "failed to read active wal data at {:?}: {}",
@@ -118,7 +119,7 @@ impl Segment {
         })
     }
 
-    pub fn load(&mut self) -> Result<(), std::io::Error> {
+    pub fn load(&mut self) -> Result<(), Error> {
         if self.loaded {
             return Ok(());
         }
@@ -129,7 +130,7 @@ impl Segment {
             .append(true)
             .open(&wal_file_path)
             .map_err(|e| {
-                std::io::Error::new(
+                Error::new(
                     e.kind(),
                     format!(
                         "failed to open wal file for segment {} at {:?}: {}",
@@ -139,7 +140,7 @@ impl Segment {
             })?;
 
         let wal_data = read_wal_data(&wal_file_path).map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!(
                     "failed to read wal data for segment {} at {:?}: {}",
@@ -150,7 +151,7 @@ impl Segment {
 
         if self.status == SegmentStaus::SEALED {
             verify_wal_data(&wal_data[..], &wal_crc_file_path, self.segment_id).map_err(|e| {
-                std::io::Error::new(
+                Error::new(
                     e.kind(),
                     format!(
                         "failed to verify wal data for segment {} at {:?}: {}",
@@ -203,23 +204,36 @@ impl Segment {
                 sleep(Duration::from_secs(1));
                 continue;
             }
-            if let Err(e) = file.sync_data() {
-                warn!("Failed to fsync WAL: {}", e);
-                sleep(Duration::from_secs(1));
-                continue;
-            }
-
             break;
         }
 
         self.wal_position += self.wal_buffer.len();
         self.record_count += entries.len() as u64;
     }
+
+    pub(crate) fn syncer(&self) -> Result<Syncer, Error> {
+        if let Some(wal_file) = &self.wal_file {
+            let wal_file_clone = wal_file.try_clone().map_err(|e| {
+                Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to clone WAL file: {}", e),
+                )
+            })?;
+
+            Ok(Syncer::new(wal_file_clone))
+        } else {
+            Err(Error::new(
+                std::io::ErrorKind::Other,
+                "Segment is not loaded, cannot sync",
+            ))
+        }
+    }
+
     pub(crate) fn record_count(&self) -> u64 {
         self.record_count
     }
 
-    pub(crate) fn close(&mut self) -> Result<(), std::io::Error> {
+    pub(crate) fn close(&mut self) -> Result<(), Error> {
         assert_eq!(
             self.status,
             SegmentStaus::ACTIVE,
@@ -233,7 +247,7 @@ impl Segment {
 
         self.status = SegmentStaus::CLOSED;
         file.sync_all().map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!("failed to sync wal file before closing: {}", e),
             )
@@ -244,7 +258,7 @@ impl Segment {
         let active_wal_file_path = active_wal_path(data_dir_path);
         let closed_wal_file_path = segment_wal_path(data_dir_path, self.segment_id);
         std::fs::rename(&active_wal_file_path, &closed_wal_file_path).map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!(
                     "failed to rename active wal file {:?} to {:?}: {}",
@@ -256,7 +270,7 @@ impl Segment {
         Ok(())
     }
 
-    pub(crate) fn seal(&mut self) -> Result<(), std::io::Error> {
+    pub(crate) fn seal(&mut self) -> Result<(), Error> {
         assert_eq!(
             self.status,
             SegmentStaus::CLOSED,
@@ -276,19 +290,19 @@ impl Segment {
         let data_dir_path = Path::new(&self.data_dir);
         let crc_file_path = segment_crc_path(data_dir_path, self.segment_id);
         let mut crc_file = File::create(&crc_file_path).map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!("failed to create crc file at {:?}: {}", crc_file_path, e),
             )
         })?;
         crc_file.write_all(&crc_data).map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!("failed to write crc data to {:?}: {}", crc_file_path, e),
             )
         })?;
         crc_file.sync_all().map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!("failed to sync crc file at {:?}: {}", crc_file_path, e),
             )
@@ -296,13 +310,13 @@ impl Segment {
 
         let seal_file_path = segment_seal_path(data_dir_path, self.segment_id);
         let seal_file = File::create(&seal_file_path).map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!("failed to create seal file at {:?}: {}", seal_file_path, e),
             )
         })?;
         seal_file.sync_all().map_err(|e| {
-            std::io::Error::new(
+            Error::new(
                 e.kind(),
                 format!("failed to sync seal file at {:?}: {}", seal_file_path, e),
             )
@@ -316,11 +330,11 @@ impl Segment {
     pub(crate) fn visit_wal_records(
         &self,
         mut handler: impl FnMut(&WalEntry),
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), Error> {
         assert!(self.loaded, "Segment is not loaded, cannot visit");
 
         if !self.wal_data.len().is_multiple_of(40) {
-            return Err(std::io::Error::new(
+            return Err(Error::new(
                 std::io::ErrorKind::InvalidData,
                 "WAL data is corrupted, cannot read records (is not aligned to 40 bytes)",
             ));
@@ -346,7 +360,7 @@ impl Segment {
     /// Call before `open()` so the segment opens as CLOSED.
     /// Removes `.crc` and `.seal` files, resetting this segment to CLOSED state
     /// so it can be re-sealed.
-    pub(crate) fn force_unseal(&mut self) -> Result<(), std::io::Error> {
+    pub(crate) fn force_unseal(&mut self) -> Result<(), Error> {
         let dir = Path::new(&self.data_dir);
         let crc = segment_crc_path(dir, self.segment_id);
         let seal = segment_seal_path(dir, self.segment_id);

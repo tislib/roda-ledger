@@ -2,7 +2,7 @@ use crate::entities::WalEntry;
 use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline::WalContext;
 use crate::snapshot::SnapshotMessage;
-use crate::storage::Storage;
+use crate::storage::{Segment, Storage};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -129,6 +129,8 @@ impl WalRunner {
 
             active_segment.write_entries(&self.buffer[..self.committed_len]); //fixme move retry logic to here
 
+            self.commit(&mut active_segment);
+
             // Rotate the segment when the size threshold is exceeded.
             // No pending-entries guard needed here: the buffer contract already
             // guarantees we only ever write complete transactions.
@@ -159,5 +161,10 @@ impl WalRunner {
             }
             ctx.set_processed_index(committed_tx_id);
         }
+    }
+
+    pub fn commit(&mut self, active_segment: &mut Segment) {
+        let mut syncer = active_segment.syncer().expect("Failed to get syncer");
+        syncer.sync().expect("Failed to sync segment");
     }
 }

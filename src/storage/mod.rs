@@ -5,6 +5,7 @@ mod segment;
 mod snapshot;
 mod wal_reader;
 mod wal_serializer;
+mod syncer;
 
 pub use crate::config::StorageConfig;
 pub use engine::*;
