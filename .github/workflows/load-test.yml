@@ -79,7 +79,6 @@ jobs:
 
           # Install Rust
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
 
           # Clone repository
           git clone --branch "$BRANCH" --depth 1 https://github.com/$REPO.git /root/roda-ledger
@@ -87,12 +86,12 @@ jobs:
 
           # Build in release mode
           echo "::group::Building"
-          cargo build --package roda-ledger --release --bin load
+          /root/.cargo/bin/cargo build --package roda-ledger --release --bin load
           echo "::endgroup::"
 
           # Run load test
           echo "::group::Load Test Output"
-          cargo run --package roda-ledger --release --bin load -- $ARGS 2>&1 | tee /root/load-test-output.txt
+          /root/.cargo/bin/cargo run --package roda-ledger --release --bin load -- $ARGS 2>&1 | tee /root/load-test-output.txt
           echo "::endgroup::"
           SETUP_EOF
         env:
