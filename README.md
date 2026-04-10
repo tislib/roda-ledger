@@ -2,7 +2,9 @@
 
 ### 🚀 Ultra-High Performance Ledger for Modern Finance
 
-A high-performance, durable, and crash-consistent financial ledger and transaction executor built in Rust, capable of processing **2.89 Million+ transactions per second** with **nanosecond-level latency**.
+A high-performance, durable, and crash-consistent financial ledger and transaction executor built in Rust, capable of processing **2.5 Million+ transactions per second** with **P99 latency of 170ns**.
+
+> **Load Test (50s, 1M accounts, random deposit per op):** 2,488,420 avg TPS | P50 70ns | P99 170ns | P999 12.4µs — [full report](docs/load.md)
 
 ---
 
@@ -23,7 +25,7 @@ Roda-Ledger is a specialized database engine designed for recording and executin
 Roda-Ledger is built for scale. While traditional databases struggle with the lock contention of high-frequency ledger updates, Roda-Ledger's architecture allows it to outpace everything in its class.
 
 ### The "Plus" (Strengths)
-- **🚀 Industry-Leading Throughput**: Process over **2.89 Million transactions per second** (TPS) on CX33 server at Hetzner.
+- **🚀 Industry-Leading Throughput**: Process over **2.5 Million transactions per second** (TPS) with P99 latency of 170ns.
 - **⏱️ Predictable Low Latency**: Nanosecond to microsecond level execution times, ensuring your system never bottlenecks.
 - **💾 Strict Durability**: Every transaction is persisted via Write-Ahead Logging (WAL) before confirmation—zero data loss.
 - **⚛️ Atomic Composite Operations**: Perform multi-step transfers (e.g., Transfer + Fee) as a single atomic unit.
@@ -117,15 +119,16 @@ Roda-Ledger utilizes a **Core-Per-Stage** model to maximize mechanical sympathy:
 3. **WAL Storer**: Handles high-speed disk persistence.
 4. **Snapshotter**: Periodically captures state for fast recovery.
 
-Detailed docs: [Benchmarks](docs/architecture/benchmarks.md) | [Architecture & Design](docs/architecture/design.md) | [Consistency Model](docs/architecture/consistency.md)
+Detailed docs: [Architecture & Design](docs/architecture/design.md) | [Consistency Model](docs/architecture/consistency.md)
 
-## Performance Benchmarks
+## Performance
 
-| Operation | Latency (Avg) | Throughput (Avg)     |
-| :--- | :--- |:---------------------|
-| **Wallet Deposit** | 141 ns (mean) | **2.89 Million tx/s** |
+| Mode      | Avg TPS | P50 | P99 | P999 | In-flight |
+|:----------|--------:|----:|----:|-----:|----------:|
+| **Async** | 2.49M | 70ns | 170ns | 12.4µs | ~30k–44k |
+| **Wait**  | 1.92M | 5.0ms | 6.2ms | 7.7ms | ~0 |
 
-*Latency percentiles: p50=120ns, p90=130ns, p99=1.1µs, p999=1.7µs, p9999=13.2µs. Benchmarks performed with persistence enabled (WAL active) on CX33 server at Hetzner. Full report: [docs/architecture/benchmarks.md](docs/architecture/benchmarks.md)*
+Full load test report: [docs/load.md](docs/load.md)
 
 ---
 
