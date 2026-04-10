@@ -177,11 +177,13 @@ impl TransactorRunner {
         let mut i = 0;
         while i < self.entries.len() {
             let entry = self.entries[i];
+            let mut retry_count = 0;
             loop {
+                retry_count += 1;
                 if output.push(entry).is_ok() {
                     break;
                 }
-                if !ctx.is_running() {
+                if retry_count % 10000 == 0 && !ctx.is_running() {
                     return;
                 }
                 spin_loop();
