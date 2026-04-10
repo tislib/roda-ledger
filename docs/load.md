@@ -1,7 +1,7 @@
 # Load Test Report
 
 **Date:** 2026-04-10
-**Machine:** macOS (Darwin 25.1.0)
+**Machine:** CCX33 server at Hetzner
 **Accounts:** 1,000,000 | **Duration:** 50s | **Operation:** Deposit (random account, fixed amount)
 
 ## Async Mode (default)
