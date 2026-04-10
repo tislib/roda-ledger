@@ -1,15 +1,15 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Flip-flop deduplication cache (ADR-009).
 ///
-/// Maintains two `HashMap<u64, u64>` maps (user_ref → tx_id) that flip on a
+/// Maintains two `FxHashMap<u64, u64>` maps (user_ref → tx_id) that flip on a
 /// configurable time window. A duplicate `user_ref` within the window is
 /// detected and the original `tx_id` is returned.
 ///
 /// Effective window: `window_ms` to `2 × window_ms`.
 pub struct DedupCache {
-    active: HashMap<u64, u64>,
-    previous: HashMap<u64, u64>,
+    active: FxHashMap<u64, u64>,
+    previous: FxHashMap<u64, u64>,
     window_ms: u64,
     window_start: u64,
     enabled: bool,
@@ -26,8 +26,8 @@ pub enum DedupResult {
 impl DedupCache {
     pub fn new(enabled: bool, window_ms: u64) -> Self {
         Self {
-            active: HashMap::new(),
-            previous: HashMap::new(),
+            active: FxHashMap::default(),
+            previous: FxHashMap::default(),
             window_ms,
             window_start: 0,
             enabled,

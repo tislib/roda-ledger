@@ -7,10 +7,11 @@ use crate::wait_strategy::WaitStrategy;
 use Ordering::Release;
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
+use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, yield_now};
 
 pub struct Wal {
     storage: Arc<Storage>,
@@ -118,6 +119,8 @@ impl WalRunner {
                     if self.move_pending_entry(&entry) {
                         self.last_received_tx_id = entry.tx_id();
                     }
+                } else {
+                    spin_loop();
                 }
                 k = k.saturating_sub(1);
             }
@@ -212,7 +215,7 @@ impl WalRunner {
                     if !ctx.is_running() {
                         return false;
                     }
-                    std::thread::yield_now();
+                    yield_now();
                 }
             }
         }
@@ -236,6 +239,8 @@ impl WalCommitter {
     fn run(&mut self, ctx: WalContext) {
         let mut retry_count = 0;
         let wait_strategy = ctx.wait_strategy();
+        let mut sync: Option<Syncer> = None;
+        let mut sync_id = 0;
         while ctx.is_running() {
             if self.last_written_tx_id.load(Acquire) <= self.last_committed_tx_id.load(Acquire) {
                 retry_count += 1;
@@ -243,19 +248,27 @@ impl WalCommitter {
                 continue;
             }
             retry_count = 0;
-            self.commit_sync();
+
+            // loading syncer
+            let active_segment = self.active_segment.load();
+            if let Some(syncer) = active_segment.as_ref()
+                && sync_id != syncer.id()
+            {
+                sync_id = syncer.id();
+                sync = Some(syncer.clone());
+            }
+
+            if let Some(syncer) = sync.as_mut() {
+                self.commit_sync(syncer);
+            }
         }
     }
 
-    pub fn commit_sync(&mut self) {
-        let active_segment = self.active_segment.load();
-        if let Some(syncer) = active_segment.as_ref() {
-            let mut syncer = syncer.clone();
-            let commit_tx_id = self.last_written_tx_id.load(Acquire);
+    pub fn commit_sync(&mut self, syncer: &mut Syncer) {
+        let commit_tx_id = self.last_written_tx_id.load(Acquire);
 
-            syncer.sync().expect("Failed to sync segment");
+        syncer.sync().expect("Failed to sync segment");
 
-            self.last_committed_tx_id.store(commit_tx_id, Release);
-        }
+        self.last_committed_tx_id.store(commit_tx_id, Release);
     }
 }
