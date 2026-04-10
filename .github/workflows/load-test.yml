@@ -70,7 +70,8 @@ jobs:
 
       - name: Setup server and run load test
         run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key root@$SERVER_IP << 'SETUP_EOF'
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key root@$SERVER_IP \
+            "BRANCH='$BRANCH' REPO='$REPO' ARGS='$ARGS' bash -s" << 'SETUP_EOF'
           set -euo pipefail
 
           # Install dependencies
@@ -78,10 +79,10 @@ jobs:
           apt-get install -y -qq build-essential pkg-config libssl-dev git curl
 
           # Install Rust
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q
 
           # Clone repository
-          git clone --branch "$BRANCH" --depth 1 https://github.com/$REPO.git /root/roda-ledger
+          git clone --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" /root/roda-ledger
           cd /root/roda-ledger
 
           # Build in release mode
