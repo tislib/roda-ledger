@@ -11,7 +11,7 @@ struct Args {
     #[arg(short, long, default_value_t = 1_000_000)]
     account_count: u64,
 
-    #[arg(short, long, default_value_t = 10)]
+    #[arg(short, long, default_value_t = 60)]
     duration: u64,
 
     #[arg(short, long, default_value_t = false)]
