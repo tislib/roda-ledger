@@ -49,7 +49,7 @@ fn test_crash_after_wal_before_snapshot() {
         // Wait for WAL commit only (not snapshot)
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if ledger.last_committed_id() >= last_id {
+            if ledger.last_commit_id() >= last_id {
                 break;
             }
             assert!(

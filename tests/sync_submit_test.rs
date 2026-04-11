@@ -25,7 +25,7 @@ mod tests {
                 amount: 1000,
                 user_ref: 0,
             },
-            InternalWaitLevel::Processed,
+            InternalWaitLevel::Computed,
         );
 
         assert!(result.tx_id > 0);
@@ -61,7 +61,7 @@ mod tests {
                 amount: 2000,
                 user_ref: 0,
             },
-            InternalWaitLevel::Snapshotted,
+            InternalWaitLevel::OnSnapshot,
         );
 
         assert!(result.tx_id > 0);
@@ -101,7 +101,7 @@ mod tests {
                 amount: 1,
                 user_ref: 0,
             },
-            InternalWaitLevel::Processed,
+            InternalWaitLevel::Computed,
         );
 
         assert!(result.fail_reason.is_failure());
@@ -119,7 +119,7 @@ mod tests {
                 amount: 1000,
                 user_ref: 0,
             },
-            InternalWaitLevel::Snapshotted,
+            InternalWaitLevel::OnSnapshot,
         );
 
         let result = ledger.submit_and_wait(
@@ -129,7 +129,7 @@ mod tests {
                 amount: 400,
                 user_ref: 0,
             },
-            InternalWaitLevel::Snapshotted,
+            InternalWaitLevel::OnSnapshot,
         );
 
         assert!(result.fail_reason.is_success());
@@ -160,7 +160,7 @@ mod tests {
             },
         ];
 
-        let results = ledger.submit_batch_and_wait(ops, InternalWaitLevel::Snapshotted);
+        let results = ledger.submit_batch_and_wait(ops, InternalWaitLevel::OnSnapshot);
 
         assert_eq!(results.len(), 3);
         for r in &results {
@@ -194,7 +194,7 @@ mod tests {
             },
         ];
 
-        let results = ledger.submit_batch_and_wait(ops, InternalWaitLevel::Snapshotted);
+        let results = ledger.submit_batch_and_wait(ops, InternalWaitLevel::OnSnapshot);
 
         assert_eq!(results.len(), 3);
         assert!(results[0].fail_reason.is_success());
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grpc_submit_and_wait_processed_level() {
+    async fn test_grpc_submit_and_wait_computed_level() {
         let (_ledger, addr) = setup_grpc_server().await;
         let mut client = LedgerClient::connect(format!("http://{}", addr))
             .await
@@ -473,7 +473,7 @@ mod tests {
                     user_ref: 0,
                 }),
             ),
-            wait_level: WaitLevel::Processed as i32,
+            wait_level: WaitLevel::Computed as i32,
         };
 
         let response = client.submit_and_wait(request).await.unwrap().into_inner();

@@ -67,9 +67,9 @@ pub struct Transaction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitLevel {
-    Processed,
+    Computed,
     Committed,
-    Snapshotted,
+    OnSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

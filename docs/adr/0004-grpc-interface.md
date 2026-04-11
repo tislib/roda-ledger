@@ -263,7 +263,7 @@ batch semantics. No path to streaming-equivalent patterns if needed in future.
 
 - ADR-001 — entries-based execution model
 - ADR-003 — `Operation` enum, `Composite`, `CompositeOperationFlags` (`u64` bitfield)
-- `src/ledger.rs` — `Ledger::last_computed_id()`, `last_committed_id()`, `last_snapshot_id()`
+- `src/ledger.rs` — `Ledger::last_compute_id()`, `last_commit_id()`, `last_snapshot_id()`
 - `src/transaction.rs` — `Operation`, `TransactionStatus`, `CompositeOperationFlags`
 - `src/entities.rs` — `FailReason` codes
 - `tonic` — https://github.com/hyperium/tonic

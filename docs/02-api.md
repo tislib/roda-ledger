@@ -249,13 +249,13 @@ if result.fail_reason.is_none() {
 
 **Wait levels:**
 
-| Level | gRPC | Library |
-|---|---|---|
-| Processed | `WAIT_LEVEL_PROCESSED` | `WaitLevel::Processed` |
-| Committed | `WAIT_LEVEL_COMMITTED` | `WaitLevel::Committed` |
+| Level       | gRPC | Library                  |
+|-------------|---|--------------------------|
+| Computed    | `WAIT_LEVEL_COMPUTED` | `WaitLevel::Computed`    |
+| Committed   | `WAIT_LEVEL_COMMITTED` | `WaitLevel::Committed`   |
 | Snapshotted | `WAIT_LEVEL_SNAPSHOT` | `WaitLevel::Snapshotted` |
 
-**`WAIT_LEVEL_PROCESSED`** — The Transactor has executed the operation. Validation has run. If the operation violated any constraint (insufficient funds, zero-sum violation, etc.), `fail_reason` is set and the transaction is permanently rejected. If `fail_reason = 0`, the transaction is accepted and balance changes are live in memory — but not yet durable. A crash at this point would lose the transaction.
+**`WAIT_LEVEL_COMPUTED`** — The Transactor has executed the operation. Validation has run. If the operation violated any constraint (insufficient funds, zero-sum violation, etc.), `fail_reason` is set and the transaction is permanently rejected. If `fail_reason = 0`, the transaction is accepted and balance changes are live in memory — but not yet durable. A crash at this point would lose the transaction.
 
 **`WAIT_LEVEL_COMMITTED`** — The WAL Storer has flushed the transaction to disk. Durability is guaranteed. The transaction will survive a crash and be replayed on restart. Balance changes are not yet visible via `get_balance`.
 
@@ -460,8 +460,8 @@ Response:
 **Rust library:**
 
 ```rust
-let computed   = ledger.last_computed_id();   // processed by Transactor
-let committed  = ledger.last_committed_id();  // flushed to WAL
+let computed   = ledger.last_compute_id();   // processed by Transactor
+let committed  = ledger.last_commit_id();  // flushed to WAL
 let snapshotted = ledger.last_snapshot_id();  // applied to balance cache
 ```
 

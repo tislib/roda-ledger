@@ -97,7 +97,7 @@ fn main() {
             if now.duration_since(last_tick) >= Duration::from_secs(1) {
                 second += 1;
                 let wall = start_time.elapsed();
-                let committed = ledger.last_committed_id();
+                let committed = ledger.last_commit_id();
                 let delta = committed - last_committed;
                 let interval = now.duration_since(last_tick).as_secs_f64();
                 let tps = delta as f64 / interval;

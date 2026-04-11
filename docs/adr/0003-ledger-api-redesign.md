@@ -158,8 +158,8 @@ impl Ledger {
     pub fn get_balance(&self, account_id: u64) -> Balance
     pub fn get_transaction_status(&self, tx_id: u64) -> TransactionStatus
     pub fn wait_for_transaction(&mut self, tx_id: u64)
-    pub fn last_computed_id(&self) -> u64
-    pub fn last_committed_id(&self) -> u64
+    pub fn last_compute_id(&self) -> u64
+    pub fn last_commit_id(&self) -> u64
     pub fn last_snapshot_id(&self) -> u64
 }
 ```

@@ -18,7 +18,7 @@ fn test_balance_always_guaranteed_when_wait_level_is_snapshotted() {
                 amount,
                 user_ref: i as u64,
             },
-            WaitLevel::Snapshotted,
+            WaitLevel::OnSnapshot,
         );
 
         assert!(

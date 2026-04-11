@@ -194,8 +194,8 @@ impl Ledger for LedgerHandler {
         _request: Request<proto::GetPipelineIndexRequest>,
     ) -> Result<Response<proto::GetPipelineIndexResponse>, Status> {
         Ok(Response::new(proto::GetPipelineIndexResponse {
-            computed_index: self.ledger.last_computed_id(),
-            committed_index: self.ledger.last_committed_id(),
+            compute_index: self.ledger.last_compute_id(),
+            commit_index: self.ledger.last_commit_id(),
             snapshot_index: self.ledger.last_snapshot_id(),
         }))
     }
@@ -303,9 +303,9 @@ impl LedgerHandler {
 
         loop {
             let reached = match level {
-                WaitLevel::Processed => self.ledger.last_computed_id() >= transaction_id,
-                WaitLevel::Committed => self.ledger.last_committed_id() >= transaction_id,
-                WaitLevel::Snapshotted => self.ledger.last_snapshot_id() >= transaction_id,
+                WaitLevel::Computed => self.ledger.last_compute_id() >= transaction_id,
+                WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
+                WaitLevel::OnSnapshot => self.ledger.last_snapshot_id() >= transaction_id,
             };
 
             if reached {

@@ -259,8 +259,8 @@ impl Reporter {
         let cpu_usage = process.map(|p| p.cpu_usage()).unwrap_or(0.0);
         let memory_usage = process.map(|p| p.memory()).unwrap_or(0);
 
-        let current_computed = self.ledger.last_computed_id();
-        let current_committed = self.ledger.last_committed_id();
+        let current_computed = self.ledger.last_compute_id();
+        let current_committed = self.ledger.last_commit_id();
         let current_snapshot = self.ledger.last_snapshot_id();
 
         let tick_duration = self.last_tick.elapsed().as_secs_f64();
@@ -296,10 +296,10 @@ impl Reporter {
         let process = self.sys.process(self.pid);
 
         let tx_per_sec = TxStats {
-            compute: self.ledger.last_computed_id() as f64 / total_duration.as_secs_f64(),
-            commit: self.ledger.last_committed_id() as f64 / total_duration.as_secs_f64(),
+            compute: self.ledger.last_compute_id() as f64 / total_duration.as_secs_f64(),
+            commit: self.ledger.last_commit_id() as f64 / total_duration.as_secs_f64(),
             snapshot: self.ledger.last_snapshot_id() as f64 / total_duration.as_secs_f64(),
-            tc: self.ledger.last_computed_id(),
+            tc: self.ledger.last_compute_id(),
         };
 
         let num_buckets = self.metrics.time_series_sum.len();
