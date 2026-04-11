@@ -42,15 +42,15 @@ The caller chooses which stage to wait for — see [API](./02-api.md) for wait l
 Every transaction occupies a fixed position in a globally ordered sequence. Three pipeline indexes divide that sequence into zones at any given moment:
 
 - **`compute_index`** — the furthest transaction the Transactor has executed. Everything to its right is accepted, in memory, serializable. Not yet durable.
-- **`commit_index`** — the furthest transaction flushed to disk. Everything to its right is durable and crash-safe. The **Commit Gap** between `computed_index` and `committed_index` represents transactions that would be lost on a crash — bounded by the WAL's batch flush cycle (~100s µs).
-- **`snapshot_index`** — the furthest transaction visible to `get_balance`. Everything to its right is readable and linearizable. The **Balance Gap** between `committed_index` and `snapshot_index` is typically nanoseconds.
+- **`commit_index`** — the furthest transaction flushed to disk. Everything to its right is durable and crash-safe. The **Commit Gap** between `compute_index` and `commit_index` represents transactions that would be lost on a crash — bounded by the WAL's batch flush cycle (~100s µs).
+- **`snapshot_index`** — the furthest transaction visible to `get_balance`. Everything to its right is readable and linearizable. The **Balance Gap** between `commit_index` and `snapshot_index` is typically nanoseconds.
 
 Two invariants hold at all times:
 
 1. All transactions are monotonically ordered — no gaps, no reordering.
 2. If transaction N is committed, all transactions before N are also committed. The indexes only move forward.
 
-These invariants are what make per-call wait levels meaningful. When you call `submit_wait(wal)`, you are waiting for `committed_index` to pass your transaction ID — and you know with certainty that everything before it is also durable.
+These invariants are what make per-call wait levels meaningful. When you call `submit_wait(wal)`, you are waiting for `commit_index` to pass your transaction ID — and you know with certainty that everything before it is also durable.
 
 ---
 
