@@ -92,6 +92,9 @@ The Snapshotter is the final stage. It takes the committed entries produced by t
 
 **Why a separate stage?** Because reads and writes need to be decoupled. The Transactor's balance cache is the write-side truth — it is private to the Transactor and optimized for write performance. The Snapshotter maintains the read-side truth — the state that `get_balance`, `GetTransaction`, and `GetAccountHistory` query. Separating these two caches means readers never block writers and writers never block readers.
 
+<img src="./resources/snapshotter-flow.png" class="less-wide-image"/>
+<!-- Source: docs/images/wal-flow.excalidraw -->
+
 **What it updates.** Three things:
 - **Balance cache** — the readable balance per account, updated atomically per entry. Once the Snapshotter processes a transaction, `get_balance` reflects it.
 - **Transaction index** — an index mapping transaction ID to its entries. This powers `GetTransaction` for payment status checks and audit.
