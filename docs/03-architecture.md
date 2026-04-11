@@ -73,6 +73,9 @@ The WAL (Write-Ahead Log) stage is responsible for one thing: making transaction
 
 **Why a WAL?** Because memory is volatile. If the process crashes after the Transactor executes a transaction but before it is persisted, that transaction is lost. The WAL ensures that once a transaction is confirmed as `COMMITTED`, it survives crashes and power loss.
 
+<img src="./resources/wal-flow.png" class="less-wide-image"/>
+<!-- Source: docs/images/wal-flow.excalidraw -->
+
 **Why batching?** Writing one transaction to disk at a time would be slow — each write would require a separate `fdatasync` call, and `fdatasync` latency is dominated by disk hardware, typically hundreds of microseconds. Instead, the WAL stage batches transactions dynamically: it accumulates whatever transactions the Transactor has produced since the last flush, writes them all in a single sequential write, and calls `fdatasync` once for the batch. This amortizes the disk latency across many transactions, dramatically improving throughput at the cost of a small, bounded increase in commit latency.
 
 **Why sequential writes?** Sequential disk writes are the fastest possible disk operation — orders of magnitude faster than random writes. The WAL is append-only by design, which guarantees sequential access patterns regardless of workload.
