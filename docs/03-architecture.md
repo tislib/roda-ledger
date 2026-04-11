@@ -41,8 +41,8 @@ The caller chooses which stage to wait for — see [API](./02-api.md) for wait l
 
 Every transaction occupies a fixed position in a globally ordered sequence. Three pipeline indexes divide that sequence into zones at any given moment:
 
-- **`computed_index`** — the furthest transaction the Transactor has executed. Everything to its right is accepted, in memory, serializable. Not yet durable.
-- **`committed_index`** — the furthest transaction flushed to disk. Everything to its right is durable and crash-safe. The **Commit Gap** between `computed_index` and `committed_index` represents transactions that would be lost on a crash — bounded by the WAL's batch flush cycle (~100s µs).
+- **`compute_index`** — the furthest transaction the Transactor has executed. Everything to its right is accepted, in memory, serializable. Not yet durable.
+- **`commit_index`** — the furthest transaction flushed to disk. Everything to its right is durable and crash-safe. The **Commit Gap** between `computed_index` and `committed_index` represents transactions that would be lost on a crash — bounded by the WAL's batch flush cycle (~100s µs).
 - **`snapshot_index`** — the furthest transaction visible to `get_balance`. Everything to its right is readable and linearizable. The **Balance Gap** between `committed_index` and `snapshot_index` is typically nanoseconds.
 
 Two invariants hold at all times:
@@ -134,7 +134,7 @@ The Snapshotter processes a single input queue carrying two message types:
 <img src="./resources/snapshotter-flow.png" style="width: 100%;" />
 
 - **WalEntry** — updates the appropriate index or balance cache based on entry type. Once a full transaction is processed, `last_processed_tx_id` advances and `get_balance` reflects it.
-- **QueryRequest** — executes inline against current state (`GetTransaction`, `GetAccountHistory`) and calls the response callback. Because queries and WAL entries share the same FIFO queue, a query submitted after a transaction always sees that transaction's state — read-your-own-writes for free.
+- **QueryRequest** — executes inline against current state (`GetTransaction`, `GetAccountHistory`) and calls the response callback.
 
 The Snapshotter does no computation — balances are pre-computed by the Transactor and stored in entries. The gap between `COMMITTED` and `ON_SNAPSHOT` is typically nanoseconds.
 
@@ -143,8 +143,6 @@ The Snapshotter does no computation — balances are pre-computed by the Transac
 ## Inter-stage communication
 
 Stages communicate exclusively through **SPSC lock-free queues** — one producer, one consumer, no locks, no CAS contention. Each stage owns its data completely.
-
-Queue sizes are tuned to the pipeline's asymmetry: the Transactor-to-WAL queue is large (131k entries) because the WAL is the slow stage — the buffer absorbs bursts without stalling the Transactor.
 
 **Backpressure** propagates naturally: WAL pressure fills the Transactor-to-WAL queue, stalling the Transactor, which fills the Sequencer-to-Transactor queue, which eventually stalls `submit()`. No explicit flow control needed.
 
