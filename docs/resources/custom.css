@@ -1,0 +1,11 @@
+.wide-image {
+  margin-left: -200px;
+  width: calc(100% + 400px) !important;
+  max-width: none!important;
+}
+
+.less-wide-image {
+  margin-left: -100px;
+  width: calc(100% + 200px) !important;
+  max-width: none!important;
+}

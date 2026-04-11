@@ -10,3 +10,4 @@ build-dir = "docs/book"
 [output.html]
 git-repository-url = "https://github.com/tislib/roda-ledger"
 edit-url-template = "https://github.com/tislib/roda-ledger/edit/master/{path}"
+additional-css = ["docs/resources/custom.css"]
