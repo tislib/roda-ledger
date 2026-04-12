@@ -80,6 +80,10 @@ The three pipeline indexes — `compute_index`, `commit_index`, `snapshot_index`
 
 ---
 
+## Documentation
+
+Full documentation: [tislib.net/roda-ledger](https://tislib.net/roda-ledger/)
+
 ## Operations
 
 Four built-in operation types cover common financial workflows:
