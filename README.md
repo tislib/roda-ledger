@@ -80,10 +80,6 @@ The three pipeline indexes — `compute_index`, `commit_index`, `snapshot_index`
 
 ---
 
-## Documentation
-
-Full documentation: [tislib.net/roda-ledger](https://tislib.net/roda-ledger/)
-
 ## Operations
 
 Four built-in operation types cover common financial workflows:
@@ -121,6 +117,7 @@ roda-ledger is a specialized engine. It is deliberately not general-purpose.
 ---
 
 ## Documentation
+Full documentation: [tislib.net/roda-ledger](https://tislib.net/roda-ledger/)
 
 | Level | Document | What it covers |
 |---|---|---|
