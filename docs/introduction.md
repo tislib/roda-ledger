@@ -17,7 +17,7 @@ Get a ledger running in under a minute.
 ### 1. Start the server
 
 ```bash
-docker run -p 50051:50051 -v $(pwd)/data:/data tislib/roda-ledger:latest
+docker run -p 50051:50051 -v $(pwd)/data:/app/data tislib/roda-ledger:latest
 ```
 
 That's it. The ledger is running, persisting data to `./data`, and listening for gRPC connections on port `50051`.
