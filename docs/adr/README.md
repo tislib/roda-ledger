@@ -14,3 +14,4 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-008](0008-transaction-account-index.md)     | Transaction Index and Query Serving | Accepted |
 | [ADR-009](0009-tx-link-dedup-reversal.md)        | Transaction Links, Deduplication, and Reversal | Accepted |
 | [ADR-010](0010-sync-submit.md)                  | Sync Submit | Accepted |
+| [ADR-011](0011-wal-write-commit-separation.md)  | WAL Write/Commit Separation | Accepted |
