@@ -2,7 +2,7 @@
 
 **A financial ledger engine that treats correctness guarantees as a choice, not a constraint — and performance as a consequence of good design, not a tradeoff.**
 
-roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic. Today with composite operations, tomorrow with WASM-sandboxed custom logic. Get 2.79 million transactions per second out of the box.
+roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic via composite operations, with WASM custom logic on the roadmap. Get 2.49 million transactions per second out of the box.
 
 ---
 
@@ -14,7 +14,7 @@ Most ledger systems make you pick two out of three:
 - **Programmable** — but slow, closed-source, expensive (Thought Machine Vault)
 - **Correct** — but not a ledger, no financial primitives (general-purpose databases)
 
-roda-ledger pursues all three. It does this through a staged pipeline where each stage runs on a dedicated thread, adds a specific guarantee, and exposes its progress as an observable index. The pipeline is the architecture — not an implementation detail.
+roda-ledger pursues all three. It does this through a staged pipeline where each stage runs on a dedicated thread, adds a specific guarantee, and exposes its progress as an observable index.
 
 ---
 
@@ -22,12 +22,7 @@ roda-ledger pursues all three. It does this through a staged pipeline where each
 
 Benchmarks on bare metal, WAL persistence enabled:
 
-| Operation | Throughput | Avg latency |
-|---|---|---|
-| Deposit (async) | **2.79M tx/s** | 357 ns |
-| Transfer (async) | **1.70M tx/s** | 588 ns |
-
-> Load test (50s, 1M accounts, random deposit): 2.49M avg TPS · P50 70ns · P99 170ns · P999 12.4µs — [full report](docs/load.md)
+> Load test (50s, 1M accounts): **2.49M tx/s** avg · P50 70ns · P99 170ns · P999 12.4µs — [full report](docs/load.md)
 
 ---
 
@@ -117,7 +112,7 @@ roda-ledger is a specialized engine. It is deliberately not general-purpose.
 - **Single node** — no replication today. Raft-based multi-node is planned.
 - **Fixed account space** — `max_accounts` is pre-allocated at startup. O(1) balance access always, memory committed upfront.
 - **No query language** — balance lookup by account ID only. No ad-hoc reads.
-- **No auth** — roda-ledger trusts its caller. Authentication belongs in the layer above it.
+- **No auth** — no authentication or authorization today. mTLS is planned. roda-ledger trusts its caller; access control belongs in the layer above it.
 
 ---
 
