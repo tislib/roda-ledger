@@ -6,7 +6,7 @@ It is built for engineers who need a ledger they can trust. Not a general-purpos
 
 It is also designed to get out of your way. Common operations — deposits, withdrawals, transfers — work out of the box. Custom multi-account logic is expressed through Composite operations without touching the engine. How much durability you need is your call, per submission: fire and forget for maximum throughput, or wait for disk confirmation when it matters. Run it as a Docker service in minutes, or embed it as a library. The ledger adapts to your use case, not the other way around.
 
-**2.79 million transactions per second. Sub-microsecond latency. WAL-backed durability. Zero torn writes.**
+**2.49 million transactions per second. Sub-microsecond latency. WAL-backed durability. Zero torn writes.**
 
 ---
 
@@ -44,16 +44,15 @@ Stop the container and start it again — the balance is still there. That is th
 
 ## Where to Go Next
 
-Roda-Ledger's documentation is organized into five levels. Start at the top and go as deep as your use case requires.
+Roda-Ledger's documentation is organized into four levels. Start at the top and go as deep as your use case requires.
 
 | Level | Document | What it covers |
 |---|---|---|
 | 1 | [Concepts](./01-concepts.md) | Mental model, guarantees, invariants. Read this first. |
-| 2 | API | How to submit operations, query balances, and choose consistency levels. |
-| 3 | Architecture | The wait strategy and why it is designed this way. |
-| 4 | Internals | WAL format, snapshot mechanics, lock-free queue design. |
-| 5 | Contributing | How to set up, run benchmarks, and extend the system. |
+| 2 | [API](./02-api.md) | Operations, wait levels, gRPC reference. |
+| 3 | [Architecture](./03-architecture.md) | Pipeline design, stage internals, recovery. |
+| 4 | [Contributing](./05-contributing.md) | How to set up, run benchmarks, and extend the system. |
 
 If you want to understand what roda-ledger guarantees and why, start with **[Concepts](./01-concepts.md)**.
 
-If you want to integrate it into your system, start with **API**.
+If you want to integrate it into your system, start with **[API](./02-api.md)**.

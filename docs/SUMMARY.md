@@ -7,7 +7,8 @@
 - [Concepts](01-concepts.md)
 - [API](02-api.md)
 - [Architecture](03-architecture.md)
-- [Internals](04-internals.md)
+
+[//]: # (- [Internals]&#40;04-internals.md&#41;)
 - [Load Testing](load.md)
 
 ---
