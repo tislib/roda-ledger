@@ -76,6 +76,3 @@ path = "src/bin/roda_ctl.rs"
 
 [profile.bench]
 debug = true
-
-[profile.release]
-debug = true
