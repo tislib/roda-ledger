@@ -168,6 +168,10 @@ impl Pipeline {
         self.sequencer_index.store(next_id, Ordering::Release);
     }
 
+    pub(crate) fn set_commit_index(&self, next_id: u64) {
+        self.commit_index.store(next_id, Ordering::Release);
+    }
+
     pub(crate) fn set_seal_index(&self, id: u32) {
         self.seal_index.store(id, Ordering::Release);
     }

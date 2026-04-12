@@ -208,6 +208,7 @@ impl<'r> Recover<'r> {
         // Restore last tx ids in the pipeline indexes.
         self.pipeline.set_compute_index(last_tx_id);
         self.pipeline.set_snapshot_index(last_tx_id);
+        self.pipeline.set_commit_index(last_tx_id);
         self.pipeline.set_sequencer_next_id(last_tx_id + 1);
 
         info!("Recovery completed successfully.");

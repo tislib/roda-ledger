@@ -29,7 +29,7 @@ Benchmarks on bare metal, WAL persistence enabled:
 ## Quick start
 
 ```bash
-docker run -p 50051:50051 -v $(pwd)/data:/data tislib/roda-ledger:latest
+docker run -p 50051:50051 -v $(pwd)/data:/app/data tislib/roda-ledger:latest
 ```
 
 Deposit to an account:

@@ -13,16 +13,16 @@ For a full understanding of what operations, transactions, and wait levels mean,
 Start the server with Docker:
 
 ```bash
-docker run -p 50051:50051 -v $(pwd)/data:/data tislib/roda-ledger:latest
+docker run -p 50051:50051 -v $(pwd)/data:/app/data tislib/roda-ledger:latest
 ```
 
 To customize the server, mount a TOML config file:
 
 ```bash
 docker run -p 50051:50051 \
-  -v $(pwd)/data:/data \
-  -v $(pwd)/config.toml:/config.toml \
-  tislib/roda-ledger:latest --config /config.toml
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/config.toml:/app/config.toml \
+  tislib/roda-ledger:latest
 ```
 
 **`config.toml` — full reference:**
@@ -70,16 +70,16 @@ use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::storage::StorageConfig;
 
 let config = LedgerConfig {
-max_accounts: 1_000_000,
-wait_strategy: WaitStrategy::Balanced,
-dedup_enabled: true,
-dedup_window_ms: 10_000,
-storage: StorageConfig {
-data_dir: "./data".to_string(),
-wal_segment_size_mb: 2048,
-snapshot_frequency: 2,
-temporary: false,
-},
+    max_accounts: 1_000_000,
+    wait_strategy: WaitStrategy::Balanced,
+    dedup_enabled: true,
+    dedup_window_ms: 10_000,
+    storage: StorageConfig {
+        data_dir: "./data".to_string(),
+        wal_segment_size_mb: 2048,
+        snapshot_frequency: 2,
+        temporary: false,
+    },
 ..LedgerConfig::default()
 };
 
