@@ -53,7 +53,7 @@ fn test_wal_segment_rotation() {
 
         // Wait until the last transaction is committed to WAL
         loop {
-            if ledger.last_committed_id() >= last_tx_id {
+            if ledger.last_commit_id() >= last_tx_id {
                 break;
             }
             std::thread::yield_now();
@@ -162,7 +162,7 @@ fn test_crc_sidecar_format() {
         }
 
         loop {
-            if ledger.last_committed_id() >= last_tx_id {
+            if ledger.last_commit_id() >= last_tx_id {
                 let _a = ledger.last_sealed_segment_id();
                 break;
             }

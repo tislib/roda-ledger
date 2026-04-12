@@ -69,11 +69,11 @@ impl Ledger {
     }
 
     pub fn get_transaction_status(&self, transaction_id: u64) -> TransactionStatus {
-        if self.pipeline.last_computed_id() < transaction_id {
+        if self.pipeline.last_compute_id() < transaction_id {
             TransactionStatus::Pending
         } else if let Some(reason) = self.transactor.transaction_rejection_reason(transaction_id) {
             TransactionStatus::Error(reason)
-        } else if self.pipeline.last_committed_id() < transaction_id {
+        } else if self.pipeline.last_commit_id() < transaction_id {
             TransactionStatus::Computed
         } else if self.pipeline.last_snapshot_id() < transaction_id {
             TransactionStatus::Committed
@@ -82,12 +82,12 @@ impl Ledger {
         }
     }
 
-    pub fn last_computed_id(&self) -> u64 {
-        self.pipeline.last_computed_id()
+    pub fn last_compute_id(&self) -> u64 {
+        self.pipeline.last_compute_id()
     }
 
-    pub fn last_committed_id(&self) -> u64 {
-        self.pipeline.last_committed_id()
+    pub fn last_commit_id(&self) -> u64 {
+        self.pipeline.last_commit_id()
     }
 
     pub fn last_snapshot_id(&self) -> u64 {
@@ -176,7 +176,7 @@ impl Ledger {
 
         while self.pipeline.is_running() {
             // On error, return immediately regardless of wait level
-            if self.pipeline.last_computed_id() >= transaction_id
+            if self.pipeline.last_compute_id() >= transaction_id
                 && self
                     .transactor
                     .transaction_rejection_reason(transaction_id)
@@ -186,9 +186,9 @@ impl Ledger {
             }
 
             let reached = match level {
-                WaitLevel::Processed => self.pipeline.last_computed_id() >= transaction_id,
-                WaitLevel::Committed => self.pipeline.last_committed_id() >= transaction_id,
-                WaitLevel::Snapshotted => self.pipeline.last_snapshot_id() >= transaction_id,
+                WaitLevel::Computed => self.pipeline.last_compute_id() >= transaction_id,
+                WaitLevel::Committed => self.pipeline.last_commit_id() >= transaction_id,
+                WaitLevel::OnSnapshot => self.pipeline.last_snapshot_id() >= transaction_id,
             };
 
             if reached {

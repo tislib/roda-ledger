@@ -42,12 +42,12 @@ All business logic, balance checks, and state transitions happen in the **Transa
 
 Consistency in Roda-Ledger is viewed through the progress of a transaction through the pipeline. A transaction's status is defined by its position relative to three global indices:
 
-1. **Compute Index (`last_computed_id`)**:
+1. **Compute Index (`last_compute_id`)**:
    - The Transactor has processed the transaction.
    - The result is reflected in the Transactor's hot memory cache.
    - **Guarantee**: Read-your-writes (if querying the Transactor's state).
 
-2. **Commit Index (`last_committed_id`)**:
+2. **Commit Index (`last_commit_id`)**:
    - The WAL Storer has persisted the transaction (and its resulting entries) to disk.
    - **Guarantee**: Durability. Even if the system crashes now, the transaction will be recovered.
 

@@ -173,8 +173,8 @@ the same adaptive pressure management used throughout the pipeline.
 **gRPC server** — async, tokio-native:
 
 The gRPC server does not use `wait_for_transaction`. Instead, a single
-background tokio task continuously polls `last_computed_id()`,
-`last_committed_id()`, and `last_snapshot_id()`. When any value advances,
+background tokio task continuously polls `last_compute_id()`,
+`last_commit_id()`, and `last_snapshot_id()`. When any value advances,
 it wakes all waiters whose `tx_id` is now satisfied at their requested level.
 
 This means:
@@ -186,7 +186,7 @@ This means:
 
 ### Pipeline stages untouched
 
-`last_computed_id()`, `last_committed_id()`, and `last_snapshot_id()` are
+`last_compute_id()`, `last_commit_id()`, and `last_snapshot_id()` are
 read-only observations of existing monotonic counters already maintained by
 each pipeline stage. No changes to Transactor, WAL, or Snapshotter internals.
 The wait mechanism is entirely in the Ledger and gRPC layers.
@@ -332,7 +332,7 @@ handle_rejection(result.fail_reason);
 - `WaitLevel` has no `ASYNC` variant — `submit()` covers fire-and-forget
 - Batch submit follows the same pattern — no new mechanism needed
 - gRPC `SubmitOperation` unchanged — existing clients unaffected
-- `last_computed_id()`, `last_committed_id()`, `last_snapshot_id()` are
+- `last_compute_id()`, `last_commit_id()`, `last_snapshot_id()` are
   read-only observations — no pipeline stage modifications required
 
 ---

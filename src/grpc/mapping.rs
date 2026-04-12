@@ -122,9 +122,9 @@ impl From<FailReason> for u32 {
 impl From<proto::WaitLevel> for WaitLevel {
     fn from(level: proto::WaitLevel) -> Self {
         match level {
-            proto::WaitLevel::Processed => WaitLevel::Processed,
+            proto::WaitLevel::Computed => WaitLevel::Computed,
             proto::WaitLevel::Committed => WaitLevel::Committed,
-            proto::WaitLevel::Snapshot => WaitLevel::Snapshotted,
+            proto::WaitLevel::Snapshot => WaitLevel::OnSnapshot,
         }
     }
 }

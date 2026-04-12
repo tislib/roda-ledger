@@ -132,11 +132,11 @@ impl Pipeline {
             .saturating_sub(1)
     }
 
-    pub fn last_computed_id(&self) -> u64 {
+    pub fn last_compute_id(&self) -> u64 {
         self.compute_index.load(Ordering::Acquire)
     }
 
-    pub fn last_committed_id(&self) -> u64 {
+    pub fn last_commit_id(&self) -> u64 {
         self.commit_index.load(Ordering::Acquire)
     }
 

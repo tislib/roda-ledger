@@ -111,7 +111,7 @@ message SubmitAndWaitRequest {
 }
 
 enum WaitLevel {
-  WAIT_LEVEL_PROCESSED   = 0; // if omitted in request, used for async SubmitOperation
+  WAIT_LEVEL_COMPUTED   = 0; // if omitted in request, used for async SubmitOperation
   WAIT_LEVEL_COMMITTED   = 1;
   WAIT_LEVEL_SNAPSHOT = 2;
 }
@@ -344,8 +344,8 @@ enum TransactionStatus {
 message GetPipelineIndexRequest {}
 
 // GetPipelineIndexResponse returns the highest transaction_id fully processed
-// by each pipeline stage. Maps directly to Ledger::last_computed_id(),
-// last_committed_id(), and last_snapshot_id() in library mode.
+// by each pipeline stage. Maps directly to Ledger::last_compute_id(),
+// last_commit_id(), and last_snapshot_id() in library mode.
 //
 // Common use cases:
 //   Health check:          all three indexes should be advancing
@@ -355,13 +355,13 @@ message GetPipelineIndexRequest {}
 message GetPipelineIndexResponse {
   // computed_index: highest transaction_id processed by the Transactor.
   // Business logic has run. Balance changes are in memory but not yet durable.
-  // Maps to Ledger::last_computed_id().
-  uint64 computed_index = 1;
+  // Maps to Ledger::last_compute_id().
+  uint64 compute_index = 1;
 
   // committed_index: highest transaction_id flushed to WAL.
   // All transactions at or below this index are durable and crash-safe.
-  // Maps to Ledger::last_committed_id().
-  uint64 committed_index = 2;
+  // Maps to Ledger::last_commit_id().
+  uint64 commit_index = 2;
 
   // snapshot_index: highest transaction_id applied to the balance cache.
   // GetBalance reflects all transactions at or below this index.

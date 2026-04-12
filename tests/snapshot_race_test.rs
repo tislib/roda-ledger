@@ -96,7 +96,7 @@ fn test_race_post_seal_transaction_double_counted_on_restart() {
         // Also wait for the filler transactions to be committed so WAL is consistent.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if ledger.last_committed_id() >= last_filler_id {
+            if ledger.last_commit_id() >= last_filler_id {
                 break;
             }
             assert!(
