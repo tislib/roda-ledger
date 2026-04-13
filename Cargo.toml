@@ -40,6 +40,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [features]
 default = []
 grpc = ["dep:tonic", "dep:prost", "dep:tonic-build", "dep:tonic-reflection"]
+e2e_tests = ["grpc"]
 
 [build-dependencies]
 tonic-build = { version = "0.12", optional = true }

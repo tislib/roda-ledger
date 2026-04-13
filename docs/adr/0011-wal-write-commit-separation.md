@@ -1,7 +1,7 @@
 # ADR-011: WAL Write/Commit Separation
 
 **Status:** Accepted  
-**Date:** 2026-04-13  
+**Date:** 2026-04-09
 **Author:** Taleh Ibrahimli  
 
 **Amends:**

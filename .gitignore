@@ -22,3 +22,4 @@ data/
 
 # mdBook build output
 docs/book/
+.DS_Store
