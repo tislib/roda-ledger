@@ -1,0 +1,126 @@
+name: E2E Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Profile from profiles.toml (e.g. single_node, three_node_cluster)"
+        required: false
+        default: "single_node"
+
+env:
+  HETZNER_SERVER_NAME: "e2e-test-${{ github.run_id }}"
+  HETZNER_SERVER_TYPE: ccx23
+  HETZNER_IMAGE: ubuntu-24.04
+  HETZNER_LOCATION: fsn1
+
+jobs:
+  e2e-test:
+    name: Run E2E Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install hcloud CLI
+        run: |
+          curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz | tar xz
+          sudo mv hcloud /usr/local/bin/
+
+      - name: Create SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/e2e_test_key -N "" -q
+          echo "SSH_PUBLIC_KEY=$(cat ~/.ssh/e2e_test_key.pub)" >> $GITHUB_ENV
+
+      - name: Upload SSH key to Hetzner
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          KEY_RESPONSE=$(hcloud ssh-key create \
+            --name "e2e-test-${{ github.run_id }}" \
+            --public-key "$SSH_PUBLIC_KEY" \
+            --output json)
+          echo "SSH_KEY_ID=$(echo "$KEY_RESPONSE" | jq -r '.id // .ssh_key.id')" >> $GITHUB_ENV
+
+      - name: Create Hetzner server
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          SERVER_RESPONSE=$(hcloud server create \
+            --name "$HETZNER_SERVER_NAME" \
+            --type "$HETZNER_SERVER_TYPE" \
+            --image "$HETZNER_IMAGE" \
+            --location "$HETZNER_LOCATION" \
+            --ssh-key "e2e-test-${{ github.run_id }}" \
+            --output json)
+          SERVER_IP=$(echo "$SERVER_RESPONSE" | jq -r '.server.public_net.ipv4.ip')
+          echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
+          echo "Server created at $SERVER_IP"
+
+      - name: Wait for server to be reachable
+        run: |
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i ~/.ssh/e2e_test_key root@$SERVER_IP "echo ok" 2>/dev/null; then
+              echo "Server is reachable"
+              exit 0
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 10
+          done
+          echo "::error::Server not reachable after 5 minutes"
+          exit 1
+
+      - name: Setup server and run E2E tests
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/e2e_test_key root@$SERVER_IP \
+            "BRANCH='$BRANCH' REPO='$REPO' bash -s" << 'SETUP_EOF'
+          set -euo pipefail
+
+          # Install dependencies
+          apt-get update -qq
+          apt-get install -y -qq build-essential pkg-config libssl-dev protobuf-compiler git curl
+
+          # Install Rust
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q
+
+          # Clone repository
+          git clone --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" /root/roda-ledger
+          cd /root/roda-ledger
+
+          # Run E2E tests with Process backend
+          echo "::group::E2E Test Output"
+          E2E_BACKEND=process /root/.cargo/bin/cargo test \
+            --test e2e_tests \
+            --features "e2e_tests,grpc" \
+            --release \
+            -- --nocapture 2>&1 | tee /root/e2e-test-output.txt
+          echo "::endgroup::"
+          SETUP_EOF
+        env:
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+
+      - name: Retrieve results
+        if: always()
+        run: |
+          mkdir -p results
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/e2e_test_key \
+            root@$SERVER_IP:/root/e2e-test-output.txt results/e2e-test-output.txt 2>/dev/null || \
+            echo "No output file to retrieve" > results/e2e-test-output.txt
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results-${{ github.run_id }}
+          path: results/
+          retention-days: 90
+
+      - name: Destroy Hetzner server
+        if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          echo "Destroying server $HETZNER_SERVER_NAME..."
+          hcloud server delete "$HETZNER_SERVER_NAME" || true
+          echo "Cleaning up SSH key..."
+          hcloud ssh-key delete "e2e-test-${{ github.run_id }}" || true
+          echo "Cleanup complete"
