@@ -1,0 +1,5 @@
+[single_node]
+nodes = 1
+
+[three_node_cluster]
+nodes = 3
