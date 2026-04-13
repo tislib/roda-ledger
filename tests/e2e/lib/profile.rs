@@ -1,22 +1,37 @@
 //! Server profile loading from `profiles.toml`.
 //!
-//! A profile describes how many nodes to start. Profiles are declared once
-//! in `tests/e2e/lib/profiles.toml` and referenced by name in each test.
+//! A profile is the single source of truth for node count and all server/ledger
+//! configuration. Backends read the profile — no hardcoded config values in
+//! backend or context code.
+//!
+//! Runtime-specific values (`host`, `port`, `data_dir`) are declared in the
+//! profile as defaults. Backends override them at startup (e.g. free port,
+//! temp directory).
 
+use roda_ledger::config::{LedgerConfig, StorageConfig};
+use roda_ledger::grpc::config::GrpcServerSection;
+use roda_ledger::wait_strategy::WaitStrategy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Raw deserialization target matching profiles.toml layout.
 #[derive(Debug, Deserialize)]
 struct ProfileDef {
     nodes: usize,
+    #[serde(default)]
+    server: GrpcServerSection,
+    #[serde(default)]
+    ledger: LedgerConfig,
 }
 
-/// A server profile — determines how many nodes the test boots.
+/// A server profile — node count + full server and ledger configuration.
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub name: String,
     pub nodes: usize,
+    pub server: GrpcServerSection,
+    pub ledger: LedgerConfig,
 }
 
 fn load_profiles() -> HashMap<String, Profile> {
@@ -33,6 +48,8 @@ fn load_profiles() -> HashMap<String, Profile> {
             let profile = Profile {
                 name: name.clone(),
                 nodes: def.nodes,
+                server: def.server,
+                ledger: def.ledger,
             };
             (name, profile)
         })
@@ -46,4 +63,60 @@ pub fn profile(name: &str) -> Profile {
         .get(name)
         .unwrap_or_else(|| panic!("unknown profile: {name}"))
         .clone()
+}
+
+impl Profile {
+    /// Build a `LedgerConfig` for one node, overriding `data_dir` with a
+    /// fresh temp directory. The caller owns the temp dir lifecycle.
+    pub fn ledger_config_with_temp_dir(&self) -> LedgerConfig {
+        let mut dir = std::env::current_dir().unwrap();
+        let rand = rand::random::<u64>() % 1_000_000_000;
+        dir.push(format!("temp_{}", rand));
+
+        let mut config = self.ledger.clone();
+        config.storage = StorageConfig {
+            data_dir: dir.to_string_lossy().to_string(),
+            temporary: true,
+            wal_segment_size_mb: self.ledger.storage.wal_segment_size_mb,
+            snapshot_frequency: self.ledger.storage.snapshot_frequency,
+        };
+        config
+    }
+
+    /// Render a `config.toml` string for the Process backend, with the
+    /// given runtime overrides for host, port, and data_dir.
+    pub fn render_config_toml(&self, host: &str, port: u16, data_dir: &str) -> String {
+        format!(
+            r#"[server]
+host = "{host}"
+port = {port}
+max_connections = {max_conn}
+max_message_size_bytes = {max_msg}
+
+[ledger]
+max_accounts = {max_accounts}
+wait_strategy = "{wait_strategy}"
+dedup_enabled = {dedup_enabled}
+dedup_window_ms = {dedup_window_ms}
+
+[ledger.storage]
+data_dir = "{data_dir}"
+wal_segment_size_mb = {wal_seg}
+snapshot_frequency = {snap_freq}
+"#,
+            max_conn = self.server.max_connections,
+            max_msg = self.server.max_message_size_bytes,
+            max_accounts = self.ledger.max_accounts,
+            wait_strategy = match self.ledger.wait_strategy {
+                WaitStrategy::LowLatency => "low_latency",
+                WaitStrategy::Balanced => "balanced",
+                WaitStrategy::LowCpu => "low_cpu",
+                WaitStrategy::Custom { .. } => "balanced",
+            },
+            dedup_enabled = self.ledger.dedup_enabled,
+            dedup_window_ms = self.ledger.dedup_window_ms,
+            wal_seg = self.ledger.storage.wal_segment_size_mb,
+            snap_freq = self.ledger.storage.snapshot_frequency,
+        )
+    }
 }

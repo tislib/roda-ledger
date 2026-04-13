@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod backend_inline;
+pub mod backend_process;
 pub mod context;
 #[macro_use]
 pub mod macros;

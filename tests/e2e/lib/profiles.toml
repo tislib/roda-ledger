@@ -1,5 +1,40 @@
 [single_node]
 nodes = 1
 
+[single_node.server]
+host = "0.0.0.0"
+port = 50051
+max_connections = 1000
+max_message_size_bytes = 4194304  # 4MB
+
+[single_node.ledger]
+max_accounts = 1000000
+wait_strategy = "balanced"   # low_latency | balanced | low_cpu
+dedup_enabled = true
+dedup_window_ms = 10000      # 10 seconds
+
+[single_node.ledger.storage]
+data_dir = "./data"
+wal_segment_size_mb = 2048
+snapshot_frequency = 2       # take a snapshot every N sealed WAL segments
+
+
 [three_node_cluster]
 nodes = 3
+
+[three_node_cluster.server]
+host = "0.0.0.0"
+port = 50051
+max_connections = 1000
+max_message_size_bytes = 4194304
+
+[three_node_cluster.ledger]
+max_accounts = 1000000
+wait_strategy = "balanced"
+dedup_enabled = true
+dedup_window_ms = 10000
+
+[three_node_cluster.ledger.storage]
+data_dir = "./data"
+wal_segment_size_mb = 2048
+snapshot_frequency = 2

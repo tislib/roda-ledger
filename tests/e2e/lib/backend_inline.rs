@@ -4,13 +4,15 @@
 //! exposes a `LedgerClient` for the test to talk to. Fastest startup,
 //! easiest debugging, but cannot test crash recovery or process isolation.
 
+use crate::e2e::lib::profile::Profile;
 use roda_ledger::grpc::proto::ledger_client::LedgerClient;
 use roda_ledger::grpc::server::GrpcServer;
-use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::ledger::Ledger;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 use tonic::transport::Channel;
 
 /// Handle for a single in-process ledger node with gRPC front-end.
@@ -26,12 +28,13 @@ pub struct InlineNode {
 }
 
 impl InlineNode {
-    /// Boot one inline node: start ledger, spawn gRPC server, connect client.
-    pub async fn start() -> Self {
-        let config = LedgerConfig {
-            seal_check_internal: std::time::Duration::from_millis(10),
-            ..LedgerConfig::temp()
-        };
+    /// Boot one inline node using config from the profile.
+    pub async fn start(profile: &Profile) -> Self {
+        // Build LedgerConfig from profile, with a fresh temp data_dir.
+        let mut config = profile.ledger_config_with_temp_dir();
+        // Internal tuning: fast sealing for tests.
+        config.seal_check_internal = Duration::from_millis(10);
+
         let mut ledger = Ledger::new(config);
         ledger.start().expect("failed to start inline ledger node");
         let ledger = Arc::new(ledger);

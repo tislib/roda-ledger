@@ -6,6 +6,7 @@
 
 use crate::e2e::lib::backend::E2EBackend;
 use crate::e2e::lib::backend_inline::InlineNode;
+use crate::e2e::lib::backend_process::ProcessNode;
 use crate::e2e::lib::profile::Profile;
 use roda_ledger::grpc::proto::ledger_client::LedgerClient;
 use roda_ledger::grpc::proto::{
@@ -21,8 +22,7 @@ use tonic::transport::Channel;
 
 pub(crate) enum NodeHandle {
     Inline(InlineNode),
-    #[allow(dead_code)]
-    Process,
+    Process(ProcessNode),
     #[allow(dead_code)]
     Docker,
     #[allow(dead_code)]
@@ -47,8 +47,8 @@ impl E2EContext {
     pub async fn new(profile: Profile) -> Self {
         let backend = E2EBackend::from_env();
         let nodes = match backend {
-            E2EBackend::Inline => Self::start_inline_nodes(profile.nodes).await,
-            E2EBackend::Process => todo!("Process backend not yet implemented"),
+            E2EBackend::Inline => Self::start_inline_nodes(&profile).await,
+            E2EBackend::Process => Self::start_process_nodes(&profile).await,
             E2EBackend::Docker => todo!("Docker backend not yet implemented"),
             E2EBackend::Cloud => todo!("Cloud backend not yet implemented"),
         };
@@ -62,10 +62,20 @@ impl E2EContext {
 
     // -- Inline backend bootstrap -------------------------------------------
 
-    async fn start_inline_nodes(count: usize) -> Vec<NodeHandle> {
-        let mut nodes = Vec::with_capacity(count);
-        for _ in 0..count {
-            nodes.push(NodeHandle::Inline(InlineNode::start().await));
+    async fn start_inline_nodes(profile: &Profile) -> Vec<NodeHandle> {
+        let mut nodes = Vec::with_capacity(profile.nodes);
+        for _ in 0..profile.nodes {
+            nodes.push(NodeHandle::Inline(InlineNode::start(profile).await));
+        }
+        nodes
+    }
+
+    // -- Process backend bootstrap ------------------------------------------
+
+    async fn start_process_nodes(profile: &Profile) -> Vec<NodeHandle> {
+        let mut nodes = Vec::with_capacity(profile.nodes);
+        for _ in 0..profile.nodes {
+            nodes.push(NodeHandle::Process(ProcessNode::start(profile).await));
         }
         nodes
     }
@@ -75,6 +85,7 @@ impl E2EContext {
     fn client(&self, node: usize) -> LedgerClient<Channel> {
         match &self.nodes[node] {
             NodeHandle::Inline(n) => n.client(),
+            NodeHandle::Process(n) => n.client(),
             _ => panic!("client() not supported on this backend"),
         }
     }
