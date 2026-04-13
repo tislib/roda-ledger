@@ -630,7 +630,11 @@ fn test_query_sealed_segment_after_restart() {
     // GetAccountHistory: account 1 received deposits at i=0,10,20,...
     // With 20k txs and 10 accounts, account 1 has ~2000 deposits.
     let history = query_account_history(&ledger, 1, 0, 50);
-    assert_eq!(history.len(), 50, "should return exactly the requested limit");
+    assert_eq!(
+        history.len(),
+        50,
+        "should return exactly the requested limit"
+    );
     assert!(history.iter().all(|e| e.account_id == 1));
     // Newest first
     for w in history.windows(2) {
