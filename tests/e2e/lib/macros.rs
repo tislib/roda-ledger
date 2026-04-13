@@ -50,30 +50,36 @@ macro_rules! wait_level {
 #[macro_export]
 macro_rules! deposit {
     ($ctx:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.deposit(0, $account, $amount, wait_level!($level)).await
+        $ctx.deposit(0, $account, $amount, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.deposit($node, $account, $amount, wait_level!($level)).await
+        $ctx.deposit($node, $account, $amount, wait_level!($level))
+            .await
     };
 }
 
 #[macro_export]
 macro_rules! withdraw {
     ($ctx:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.withdraw(0, $account, $amount, wait_level!($level)).await
+        $ctx.withdraw(0, $account, $amount, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.withdraw($node, $account, $amount, wait_level!($level)).await
+        $ctx.withdraw($node, $account, $amount, wait_level!($level))
+            .await
     };
 }
 
 #[macro_export]
 macro_rules! transfer {
     ($ctx:expr, from: $from:expr, to: $to:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.transfer(0, $from, $to, $amount, wait_level!($level)).await
+        $ctx.transfer(0, $from, $to, $amount, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, from: $from:expr, to: $to:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.transfer($node, $from, $to, $amount, wait_level!($level)).await
+        $ctx.transfer($node, $from, $to, $amount, wait_level!($level))
+            .await
     };
 }
 

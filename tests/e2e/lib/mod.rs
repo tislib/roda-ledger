@@ -10,6 +10,7 @@ pub mod backend_process;
 pub mod context;
 #[macro_use]
 pub mod macros;
+pub mod matrix_test;
 pub mod profile;
 
 pub use backend::E2EBackend;

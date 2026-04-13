@@ -16,6 +16,9 @@ use roda_ledger::grpc::proto::{
 use tokio::time::{Duration, sleep};
 use tonic::transport::Channel;
 
+/// Max operations per gRPC batch to stay within message size limits.
+const BATCH_CHUNK_SIZE: usize = 50_000;
+
 // ---------------------------------------------------------------------------
 // Node handle — one per backend node
 // ---------------------------------------------------------------------------
@@ -211,6 +214,104 @@ impl E2EContext {
             .transaction_id
     }
 
+    /// Deposit to multiple accounts. Each entry is `(account_id, amount)`.
+    /// Large batches are chunked to stay within gRPC message limits.
+    /// Returns the last transaction id.
+    pub async fn deposit_all(&self, node: usize, deposits: &[(u64, u64)], wait_level: i32) -> u64 {
+        let mut last_tx_id = 0u64;
+
+        for chunk in deposits.chunks(BATCH_CHUNK_SIZE) {
+            let mut client = self.client(node);
+            let operations = chunk
+                .iter()
+                .map(|(account, amount)| SubmitAndWaitRequest {
+                    operation: Some(
+                        roda_ledger::grpc::proto::submit_and_wait_request::Operation::Deposit(
+                            Deposit {
+                                account: *account,
+                                amount: *amount,
+                                user_ref: 0,
+                            },
+                        ),
+                    ),
+                    wait_level: 0,
+                })
+                .collect();
+
+            let response = client
+                .submit_batch_and_wait(SubmitBatchAndWaitRequest {
+                    operations,
+                    wait_level,
+                })
+                .await
+                .expect("deposit_all RPC failed")
+                .into_inner();
+
+            last_tx_id = response
+                .results
+                .last()
+                .expect("empty batch response")
+                .transaction_id;
+        }
+
+        last_tx_id
+    }
+
+    /// Submit a batch of transfers. Each entry is `(from, to, amount)`.
+    /// Large batches are chunked to stay within gRPC message limits.
+    /// Returns `(last_tx_id, rejected_count)`.
+    pub async fn transfer_batch(
+        &self,
+        node: usize,
+        transfers: &[(u64, u64, u64)],
+        wait_level: i32,
+    ) -> (u64, usize) {
+        let mut last_tx_id = 0u64;
+        let mut total_rejected = 0usize;
+
+        for chunk in transfers.chunks(BATCH_CHUNK_SIZE) {
+            let mut client = self.client(node);
+            let operations = chunk
+                .iter()
+                .map(|(from, to, amount)| SubmitAndWaitRequest {
+                    operation: Some(
+                        roda_ledger::grpc::proto::submit_and_wait_request::Operation::Transfer(
+                            Transfer {
+                                from: *from,
+                                to: *to,
+                                amount: *amount,
+                                user_ref: 0,
+                            },
+                        ),
+                    ),
+                    wait_level: 0,
+                })
+                .collect();
+
+            let response = client
+                .submit_batch_and_wait(SubmitBatchAndWaitRequest {
+                    operations,
+                    wait_level,
+                })
+                .await
+                .expect("transfer_batch RPC failed")
+                .into_inner();
+
+            total_rejected += response
+                .results
+                .iter()
+                .filter(|r| r.fail_reason != 0)
+                .count();
+            last_tx_id = response
+                .results
+                .last()
+                .expect("empty batch response")
+                .transaction_id;
+        }
+
+        (last_tx_id, total_rejected)
+    }
+
     // -- Reading ------------------------------------------------------------
 
     /// Get the balance for an account via gRPC `GetBalance`.
@@ -227,17 +328,49 @@ impl E2EContext {
         response.balance
     }
 
-    /// Get the sum of all account balances via gRPC `GetBalances`.
-    pub async fn get_balance_sum(&self, node: usize, max_accounts: u64) -> i64 {
-        let mut client = self.client(node);
-        let account_ids: Vec<u64> = (0..max_accounts).collect();
-        let response = client
-            .get_balances(GetBalancesRequest { account_ids })
-            .await
-            .expect("get_balances RPC failed")
-            .into_inner();
+    /// Get balances for multiple accounts via gRPC `GetBalances`.
+    /// Large ranges are chunked. Returns a vec of `(account_id, balance)`.
+    pub async fn get_balances(&self, node: usize, account_ids: &[u64]) -> Vec<(u64, i64)> {
+        let mut result = Vec::with_capacity(account_ids.len());
 
-        response.balances.iter().sum()
+        for chunk in account_ids.chunks(BATCH_CHUNK_SIZE) {
+            let mut client = self.client(node);
+            let response = client
+                .get_balances(GetBalancesRequest {
+                    account_ids: chunk.to_vec(),
+                })
+                .await
+                .expect("get_balances RPC failed")
+                .into_inner();
+
+            for (id, bal) in chunk.iter().zip(response.balances.iter()) {
+                result.push((*id, *bal));
+            }
+        }
+
+        result
+    }
+
+    /// Get the sum of all account balances via gRPC `GetBalances`.
+    /// Large ranges are chunked to stay within gRPC message limits.
+    pub async fn get_balance_sum(&self, node: usize, max_accounts: u64) -> i64 {
+        let mut total: i64 = 0;
+
+        for chunk_start in (0..max_accounts).step_by(BATCH_CHUNK_SIZE) {
+            let chunk_end = (chunk_start + BATCH_CHUNK_SIZE as u64).min(max_accounts);
+            let account_ids: Vec<u64> = (chunk_start..chunk_end).collect();
+
+            let mut client = self.client(node);
+            let response = client
+                .get_balances(GetBalancesRequest { account_ids })
+                .await
+                .expect("get_balances RPC failed")
+                .into_inner();
+
+            total += response.balances.iter().sum::<i64>();
+        }
+
+        total
     }
 
     /// Get the last committed transaction id via gRPC `GetPipelineIndex`.
@@ -268,6 +401,32 @@ impl E2EContext {
                 panic!(
                     "wait_until_committed timed out: tx_id={}, last_committed={}",
                     tx_id, committed
+                );
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Poll `GetPipelineIndex` until `snapshot_index >= tx_id`.
+    pub async fn wait_for_snapshot(&self, node: usize, tx_id: u64) {
+        let timeout = Duration::from_secs(20);
+        let start = tokio::time::Instant::now();
+
+        loop {
+            let mut client = self.client(node);
+            let response = client
+                .get_pipeline_index(GetPipelineIndexRequest {})
+                .await
+                .expect("get_pipeline_index RPC failed")
+                .into_inner();
+
+            if response.snapshot_index >= tx_id {
+                return;
+            }
+            if start.elapsed() >= timeout {
+                panic!(
+                    "wait_for_snapshot timed out: tx_id={}, snapshot_index={}",
+                    tx_id, response.snapshot_index
                 );
             }
             sleep(Duration::from_millis(10)).await;

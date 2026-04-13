@@ -8,7 +8,7 @@ max_connections = 1000
 max_message_size_bytes = 4194304  # 4MB
 
 [single_node.ledger]
-max_accounts = 1000000
+max_accounts = 2000000
 wait_strategy = "balanced"   # low_latency | balanced | low_cpu
 dedup_enabled = true
 dedup_window_ms = 10000      # 10 seconds
@@ -29,7 +29,7 @@ max_connections = 1000
 max_message_size_bytes = 4194304
 
 [three_node_cluster.ledger]
-max_accounts = 1000000
+max_accounts = 2000000
 wait_strategy = "balanced"
 dedup_enabled = true
 dedup_window_ms = 10000
