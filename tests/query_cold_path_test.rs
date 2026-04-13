@@ -4,6 +4,7 @@ use roda_ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use roda_ledger::storage::{Storage, StorageConfig};
 use roda_ledger::transaction::Operation;
 use std::fs;
+use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
@@ -65,6 +66,20 @@ fn cold_ledger_config(dir: &str) -> LedgerConfig {
     LedgerConfig {
         storage: cold_storage_config(dir),
         seal_check_internal: Duration::from_millis(1),
+        ..Default::default()
+    }
+}
+
+/// Large segment, no seal — keeps all data in wal.bin without rotation.
+fn no_rotation_config(dir: &str) -> LedgerConfig {
+    LedgerConfig {
+        storage: StorageConfig {
+            data_dir: dir.to_string(),
+            wal_segment_size_mb: 2048,
+            snapshot_frequency: 0,
+            ..Default::default()
+        },
+        disable_seal: true,
         ..Default::default()
     }
 }
@@ -452,4 +467,180 @@ fn test_continuous_queries_during_rotation_no_data_loss() {
     let res = r.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
 
     assert_eq!(res.entries.len(), 2);
+}
+
+// ── Query on active segment (wal.bin) after restart ─────────────────────────
+
+#[test]
+fn test_query_active_segment_after_restart() {
+    let dir = unique_dir("query_active_restart");
+
+    let mut tx_ids = Vec::new();
+    {
+        let mut ledger = Ledger::new(no_rotation_config(&dir));
+        ledger.start().unwrap();
+
+        for i in 0..10u64 {
+            tx_ids.push(ledger.submit(Operation::Deposit {
+                account: 5,
+                amount: 100 + i,
+                user_ref: i,
+            }));
+        }
+        ledger.wait_for_transaction(*tx_ids.last().unwrap());
+    }
+    // Ledger dropped — data lives in wal.bin (active segment, never rotated)
+
+    // Reopen from the same directory
+    let mut ledger = Ledger::new(no_rotation_config(&dir));
+    ledger.start().unwrap();
+
+    // GetTransaction: every submitted tx must be recovered from wal.bin
+    for &tx_id in &tx_ids {
+        let result = query_transaction(&ledger, tx_id);
+        assert!(
+            result.is_some(),
+            "tx {} should be found on active segment after restart",
+            tx_id
+        );
+        assert_eq!(result.unwrap().len(), 2, "deposit produces 2 entries");
+    }
+
+    // GetAccountHistory: account 5 was credited 10 times
+    let history = query_account_history(&ledger, 5, 0, 100);
+    assert_eq!(
+        history.len(),
+        10,
+        "account 5 should have 10 entries after restart"
+    );
+    assert!(history.iter().all(|e| e.account_id == 5));
+    // Newest first
+    for w in history.windows(2) {
+        assert!(w[0].tx_id > w[1].tx_id);
+    }
+
+    drop(ledger);
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ── Query on closed-but-not-sealed segment ──────────────────────────────────
+
+#[test]
+fn test_query_closed_unsealed_segment_after_restart() {
+    let dir = unique_dir("query_closed_unsealed");
+
+    let mut tx_ids = Vec::new();
+    {
+        let mut ledger = Ledger::new(no_rotation_config(&dir));
+        ledger.start().unwrap();
+
+        for i in 0..10u64 {
+            tx_ids.push(ledger.submit(Operation::Deposit {
+                account: 7,
+                amount: 200 + i,
+                user_ref: i,
+            }));
+        }
+        ledger.wait_for_transaction(*tx_ids.last().unwrap());
+    }
+    // Ledger dropped — wal.bin exists with all data
+
+    // Simulate manual close: rename wal.bin → wal_000001.bin
+    // (segment 1 is the first active segment id assigned by Storage::new on a fresh dir)
+    let wal_active = Path::new(&dir).join("wal.bin");
+    let wal_closed = Path::new(&dir).join("wal_000001.bin");
+    fs::rename(&wal_active, &wal_closed).expect("should rename active wal to closed");
+
+    // No .seal file exists → segment is CLOSED but not SEALED
+    assert!(
+        !Path::new(&dir).join("wal_000001.seal").exists(),
+        "segment must not be sealed"
+    );
+
+    // Reopen with seal disabled so it stays unsealed
+    let mut ledger = Ledger::new(no_rotation_config(&dir));
+    ledger.start().unwrap();
+
+    // GetTransaction on closed unsealed segment
+    for &tx_id in &tx_ids {
+        let result = query_transaction(&ledger, tx_id);
+        assert!(
+            result.is_some(),
+            "tx {} should be found on closed unsealed segment",
+            tx_id
+        );
+    }
+
+    // GetAccountHistory on closed unsealed segment
+    let history = query_account_history(&ledger, 7, 0, 100);
+    assert_eq!(
+        history.len(),
+        10,
+        "account 7 should have 10 entries from closed unsealed segment"
+    );
+    assert!(history.iter().all(|e| e.account_id == 7));
+
+    drop(ledger);
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ── Query on sealed segment after restart ───────────────────────────────────
+
+#[test]
+fn test_query_sealed_segment_after_restart() {
+    let dir = unique_dir("query_sealed_restart");
+
+    let mut sampled_tx_ids = Vec::new();
+    {
+        let mut ledger = Ledger::new(cold_ledger_config(&dir));
+        ledger.start().unwrap();
+
+        let mut last_id = 0;
+        for i in 0..20_000u64 {
+            let id = ledger.submit(Operation::Deposit {
+                account: 1 + (i % 10),
+                amount: 100 + i,
+                user_ref: i,
+            });
+            // Sample a few tx_ids spread across segments
+            if i % 4_000 == 0 {
+                sampled_tx_ids.push(id);
+            }
+            last_id = id;
+        }
+        ledger.wait_for_transaction(last_id);
+        ledger.wait_for_seal();
+    }
+    // All segments sealed — .seal files exist on disk
+
+    // Reopen from the same directory
+    let mut ledger = Ledger::new(cold_ledger_config(&dir));
+    ledger.start().unwrap();
+
+    // GetTransaction: sampled tx_ids must be recovered from sealed segments
+    for &tx_id in &sampled_tx_ids {
+        let result = query_transaction(&ledger, tx_id);
+        assert!(
+            result.is_some(),
+            "tx {} should be found on sealed segment after restart",
+            tx_id
+        );
+    }
+
+    // GetAccountHistory: account 1 received deposits at i=0,10,20,...
+    // With 20k txs and 10 accounts, account 1 has ~2000 deposits.
+    let history = query_account_history(&ledger, 1, 0, 50);
+    assert_eq!(
+        history.len(),
+        50,
+        "should return exactly the requested limit"
+    );
+    assert!(history.iter().all(|e| e.account_id == 1));
+    // Newest first
+    for w in history.windows(2) {
+        assert!(w[0].tx_id > w[1].tx_id);
+    }
+
+    drop(ledger);
+    fs::remove_dir_all(&dir).ok();
 }
