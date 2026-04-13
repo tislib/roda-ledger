@@ -122,15 +122,22 @@ impl<'r> Recover<'r> {
                 )
             })?;
 
+            let mut segment_recover_tx_id = 0u64;
             segment
                 .visit_wal_records(|record| match record {
                     WalEntry::Metadata(metadata) => {
                         last_tx_id = metadata.tx_id;
+                        segment_recover_tx_id = metadata.tx_id;
+                        self.snapshot.recover_index_tx_metadata(metadata);
                     }
                     WalEntry::Entry(entry) => {
                         recover_balances.insert(entry.account_id, entry.computed_balance);
+                        self.snapshot.recover_index_tx_entry(entry);
                     }
-                    WalEntry::Link(_) => {}
+                    WalEntry::Link(link) => {
+                        self.snapshot
+                            .recover_index_tx_link(segment_recover_tx_id, link);
+                    }
                     _ => {}
                 })
                 .map_err(|e| {
