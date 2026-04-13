@@ -93,6 +93,11 @@ impl E2EContext {
         }
     }
 
+    /// Get a cloned gRPC client for direct use (e.g. in spawned tasks).
+    pub fn raw_client(&self, node: usize) -> LedgerClient<Channel> {
+        self.client(node)
+    }
+
     // -- Actions ------------------------------------------------------------
 
     /// Submit a deposit via gRPC `SubmitAndWait`. Returns the transaction id.
@@ -386,6 +391,42 @@ impl E2EContext {
     }
 
     // -- Runtime intervention -----------------------------------------------
+
+    /// Kill a node (SIGKILL). Only supported on Process backend.
+    /// The node cannot serve requests until `restart_node()` is called.
+    pub fn kill_node(&mut self, node: usize) {
+        match &mut self.nodes[node] {
+            NodeHandle::Process(n) => n.kill(),
+            NodeHandle::Inline(_) => panic!("kill_node() not supported on Inline backend"),
+            _ => panic!("kill_node() not supported on this backend"),
+        }
+    }
+
+    /// Restart a node after `kill_node()`. Reuses the same data directory —
+    /// the server recovers from WAL on startup.
+    pub async fn restart_node(&mut self, node: usize) {
+        match &mut self.nodes[node] {
+            NodeHandle::Process(n) => n.restart().await,
+            NodeHandle::Inline(_) => panic!("restart_node() not supported on Inline backend"),
+            _ => panic!("restart_node() not supported on this backend"),
+        }
+    }
+
+    /// Get the current pipeline index (compute, commit, snapshot) for a node.
+    pub async fn get_pipeline_index(&self, node: usize) -> (u64, u64, u64) {
+        let mut client = self.client(node);
+        let response = client
+            .get_pipeline_index(GetPipelineIndexRequest {})
+            .await
+            .expect("get_pipeline_index RPC failed")
+            .into_inner();
+
+        (
+            response.compute_index,
+            response.commit_index,
+            response.snapshot_index,
+        )
+    }
 
     /// Poll `GetPipelineIndex` until `commit_index >= tx_id`.
     pub async fn wait_until_committed(&self, node: usize, tx_id: u64) {

@@ -14,14 +14,16 @@ use tonic::transport::Channel;
 
 /// Handle for a single roda-ledger server running as a child process.
 pub struct ProcessNode {
-    /// The spawned server process.
-    child: Child,
+    /// The spawned server process (None after kill, before restart).
+    child: Option<Child>,
     /// gRPC client connected to this node.
-    client: LedgerClient<Channel>,
-    /// Listen address.
+    client: Option<LedgerClient<Channel>>,
+    /// Listen address (stable across kill/restart — same port reused).
     pub addr: SocketAddr,
-    /// Temp data directory (removed on drop).
+    /// Temp data directory (persists across kill/restart, removed on drop).
     data_dir: PathBuf,
+    /// Path to config.toml inside data_dir.
+    config_path: PathBuf,
 }
 
 impl ProcessNode {
@@ -44,24 +46,28 @@ impl ProcessNode {
         let config_path = data_dir.join("config.toml");
         std::fs::write(&config_path, &config_content).unwrap();
 
-        // -- Spawn server binary ------------------------------------------------
-        let binary = env!("CARGO_BIN_EXE_roda-ledger");
-        let child = Command::new(binary)
-            .arg(&config_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn roda-ledger binary at {}: {}", binary, e));
-
-        // -- Wait for server to become ready (poll with retries) ----------------
+        // -- Spawn and connect --------------------------------------------------
+        let child = Self::spawn_server(&config_path);
         let client = Self::wait_for_ready(addr).await;
 
         Self {
-            child,
-            client,
+            child: Some(child),
+            client: Some(client),
             addr,
             data_dir,
+            config_path,
         }
+    }
+
+    /// Spawn the server binary with the given config path.
+    fn spawn_server(config_path: &PathBuf) -> Child {
+        let binary = env!("CARGO_BIN_EXE_roda-ledger");
+        Command::new(binary)
+            .arg(config_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn roda-ledger binary at {}: {}", binary, e))
     }
 
     /// Poll until the server accepts a gRPC connection, with timeout.
@@ -85,16 +91,47 @@ impl ProcessNode {
     }
 
     /// Get a clone of the gRPC client (cheap — shares the underlying channel).
+    ///
+    /// Panics if the node has been killed and not yet restarted.
     pub fn client(&self) -> LedgerClient<Channel> {
-        self.client.clone()
+        self.client
+            .as_ref()
+            .expect("node is killed — call restart() first")
+            .clone()
+    }
+
+    /// Kill the server process (SIGKILL). Data directory is preserved.
+    /// The node cannot serve requests until `restart()` is called.
+    pub fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.client = None;
+    }
+
+    /// Restart the server process after a `kill()`. Reuses the same
+    /// data directory and config — the server recovers from WAL on startup.
+    pub async fn restart(&mut self) {
+        assert!(
+            self.child.is_none(),
+            "restart() called on a running node — call kill() first"
+        );
+
+        let child = Self::spawn_server(&self.config_path);
+        let client = Self::wait_for_ready(self.addr).await;
+        self.child = Some(child);
+        self.client = Some(client);
     }
 }
 
 impl Drop for ProcessNode {
     fn drop(&mut self) {
-        // Kill the server process.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Kill the server process if still running.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
 
         // Clean up temp directory (includes config.toml and data files).
         let _ = std::fs::remove_dir_all(&self.data_dir);
