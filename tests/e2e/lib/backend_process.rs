@@ -58,8 +58,8 @@ impl ProcessNode {
         let binary = env!("CARGO_BIN_EXE_roda-ledger");
         Command::new(binary)
             .arg(config_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn roda-ledger binary at {}: {}", binary, e))
     }
