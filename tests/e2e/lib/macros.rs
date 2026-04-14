@@ -14,10 +14,6 @@
 // ---------------------------------------------------------------------------
 
 /// Create an `E2EContext` for the given profile.
-///
-/// ```ignore
-/// let ctx = e2e_ctx!(profile: single_node);
-/// ```
 #[macro_export]
 macro_rules! e2e_ctx {
     (profile: $profile:ident) => {
@@ -26,10 +22,9 @@ macro_rules! e2e_ctx {
 }
 
 // ---------------------------------------------------------------------------
-// Wait level mapping — maps DSL identifiers to proto WaitLevel i32 values
+// Wait level mapping
 // ---------------------------------------------------------------------------
 
-/// Maps a DSL wait-level identifier to `roda_ledger::grpc::proto::WaitLevel` i32.
 #[macro_export]
 macro_rules! wait_level {
     (committed) => {
@@ -95,6 +90,32 @@ macro_rules! batch_deposit {
     };
 }
 
+/// Deposit to multiple accounts in a batch. `deposits` is `&[(account, amount)]`.
+#[macro_export]
+macro_rules! deposit_all {
+    ($ctx:expr, $deposits:expr, wait: $level:ident) => {
+        $ctx.deposit_all(0, $deposits, wait_level!($level)).await
+    };
+    ($ctx:expr, node: $node:expr, $deposits:expr, wait: $level:ident) => {
+        $ctx.deposit_all($node, $deposits, wait_level!($level))
+            .await
+    };
+}
+
+/// Submit a batch of transfers. `transfers` is `&[(from, to, amount)]`.
+/// Returns `(last_tx_id, rejected_count)`.
+#[macro_export]
+macro_rules! transfer_batch {
+    ($ctx:expr, $transfers:expr, wait: $level:ident) => {
+        $ctx.transfer_batch(0, $transfers, wait_level!($level))
+            .await
+    };
+    ($ctx:expr, node: $node:expr, $transfers:expr, wait: $level:ident) => {
+        $ctx.transfer_batch($node, $transfers, wait_level!($level))
+            .await
+    };
+}
+
 // ===========================================================================
 // 2. Verifications
 // ===========================================================================
@@ -107,6 +128,13 @@ macro_rules! assert_balance {
             $expected,
             "balance mismatch for account {}",
             $account
+        )
+    };
+    ($ctx:expr, account: $account:expr, eq: $expected:expr, $($arg:tt)+) => {
+        assert_eq!(
+            $ctx.get_balance(0, $account).await,
+            $expected,
+            $($arg)+
         )
     };
     ($ctx:expr, node: $node:expr, account: $account:expr, eq: $expected:expr) => {
@@ -178,6 +206,16 @@ macro_rules! get_balance {
 }
 
 #[macro_export]
+macro_rules! get_pipeline_index {
+    ($ctx:expr) => {
+        $ctx.get_pipeline_index(0).await
+    };
+    ($ctx:expr, node: $node:expr) => {
+        $ctx.get_pipeline_index($node).await
+    };
+}
+
+#[macro_export]
 macro_rules! get_transaction {
     ($ctx:expr, $tx_id:expr) => {
         todo!("get_transaction! not yet implemented")
@@ -203,23 +241,34 @@ macro_rules! get_segments {
 // ===========================================================================
 
 #[macro_export]
-macro_rules! kill {
+macro_rules! kill_node {
+    ($ctx:expr) => {
+        $ctx.kill_node(0)
+    };
     ($ctx:expr, node: $node:expr) => {
-        todo!("kill! not yet implemented")
+        $ctx.kill_node($node)
     };
 }
 
 #[macro_export]
-macro_rules! restart {
+macro_rules! restart_node {
+    ($ctx:expr) => {
+        $ctx.restart_node(0).await
+    };
     ($ctx:expr, node: $node:expr) => {
-        todo!("restart! not yet implemented")
+        $ctx.restart_node($node).await
     };
 }
 
 #[macro_export]
 macro_rules! kill_and_restart {
+    ($ctx:expr) => {
+        $ctx.kill_node(0);
+        $ctx.restart_node(0).await
+    };
     ($ctx:expr, node: $node:expr) => {
-        todo!("kill_and_restart! not yet implemented")
+        $ctx.kill_node($node);
+        $ctx.restart_node($node).await
     };
 }
 

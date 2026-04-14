@@ -25,40 +25,23 @@ async fn matrix_transfer_grid() {
 
     const ITERATION_COUNT: u64 = 100;
 
-    // ======================================================================
     // Step 1 — Fund all accounts
-    // ======================================================================
-
-    ctx.deposit_all(0, &grid.deposits, wait_level!(on_snapshot))
-        .await;
+    deposit_all!(ctx, &grid.deposits, wait: on_snapshot);
 
     for &(account, _) in &grid.deposits {
-        let bal = ctx.get_balance(0, account).await;
-        assert_eq!(
-            bal, grid.initial_balance as i64,
-            "step 1: account {}",
-            account
-        );
+        assert_balance!(ctx, account: account, eq: grid.initial_balance as i64,
+            "step 1: account {}", account);
     }
 
-    // ======================================================================
     // Step 2 — Bulk transfer run (no intermediate checks)
-    // ======================================================================
-
-    let mut last_tx_id = 0u64;
     let mut total_rejected = 0usize;
 
     for _ in 0..ITERATION_COUNT {
-        let (tx_id, rejected) = ctx
-            .transfer_batch(0, &grid.transfers, wait_level!(committed))
-            .await;
-        last_tx_id = tx_id;
+        let (_tx_id, rejected) = transfer_batch!(ctx, &grid.transfers, wait: committed);
         total_rejected += rejected;
     }
 
-    ctx.wait_for_snapshot(0, last_tx_id).await;
-
-    // Verify balances.
+    // Read balances at snapshot level after committed transfers.
     let balances = ctx.get_balances(0, &grid.account_ids).await;
     assert_eq!(balances.len(), grid.account_ids.len());
     for (account, actual) in &balances {
@@ -67,23 +50,15 @@ async fn matrix_transfer_grid() {
         assert_eq!(*actual, expected, "step 2: account ({},{})", r, c);
     }
 
-    // Global zero-sum.
     let sum = ctx.get_balance_sum(0, grid.grid_accounts() + 1).await;
     assert_eq!(sum, 0, "step 2: zero-sum violated, sum={}", sum);
-
     assert_eq!(total_rejected, 0, "step 2: {} rejections", total_rejected);
 
-    // ======================================================================
     // Step 3 — Checked transfer run (verify after each iteration)
-    // ======================================================================
-
     for iter in 1..=ITERATION_COUNT {
         let t = ITERATION_COUNT + iter;
 
-        let (_tx_id, rejected) = ctx
-            .transfer_batch(0, &grid.transfers, wait_level!(on_snapshot))
-            .await;
-
+        let (_tx_id, rejected) = transfer_batch!(ctx, &grid.transfers, wait: on_snapshot);
         assert_eq!(rejected, 0, "step 3 iter {}: {} rejections", iter, rejected);
 
         let balances = ctx.get_balances(0, &grid.account_ids).await;
@@ -119,27 +94,17 @@ async fn matrix_concurrent_transfer_grid() {
     const ITERATION_COUNT: u64 = 100;
     const CONCURRENCY: usize = 8;
 
-    // ======================================================================
     // Step 1 — Fund all accounts
-    // ======================================================================
-
     ctx.deposit_all(0, &grid.deposits, wait_level!(on_snapshot))
         .await;
 
     let balances = ctx.get_balances(0, &grid.account_ids).await;
     assert_eq!(balances.len(), grid.account_ids.len());
     for (account, actual) in &balances {
-        assert_eq!(
-            *actual, grid.initial_balance as i64,
-            "step 1: account {}",
-            account
-        );
+        assert_balance!(ctx, account: *account, eq: *actual, "step 1: account {}", account);
     }
 
-    // ======================================================================
     // Step 2 — All iterations fired concurrently
-    // ======================================================================
-
     let transfers = Arc::new(grid.transfers.clone());
     let mut handles = Vec::new();
 
@@ -173,13 +138,9 @@ async fn matrix_concurrent_transfer_grid() {
 
     let sum = ctx.get_balance_sum(0, grid.grid_accounts() + 1).await;
     assert_eq!(sum, 0, "step 2: zero-sum violated, sum={}", sum);
-
     assert_eq!(total_rejected, 0, "step 2: {} rejections", total_rejected);
 
-    // ======================================================================
     // Step 3 — Per-iteration check, chunks fired concurrently within each
-    // ======================================================================
-
     let chunk_size = grid.transfers.len().div_ceil(CONCURRENCY);
     let transfer_chunks: Vec<Vec<(u64, u64, u64)>> = grid
         .transfers
@@ -191,7 +152,6 @@ async fn matrix_concurrent_transfer_grid() {
         let t = ITERATION_COUNT + iter;
 
         let mut handles = Vec::new();
-
         for chunk in &transfer_chunks {
             let ctx = ctx.clone();
             let chunk = chunk.clone();
@@ -210,7 +170,6 @@ async fn matrix_concurrent_transfer_grid() {
         }
 
         ctx.wait_for_snapshot(0, iter_last_tx_id).await;
-
         assert_eq!(
             iter_rejected, 0,
             "step 3 iter {}: {} rejections",
