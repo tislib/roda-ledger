@@ -45,40 +45,48 @@ macro_rules! wait_level {
 #[macro_export]
 macro_rules! deposit {
     ($ctx:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.deposit(0, $account, $amount, wait_level!($level)).await
+        $ctx.deposit(0, $account, $amount, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.deposit($node, $account, $amount, wait_level!($level)).await
+        $ctx.deposit($node, $account, $amount, wait_level!($level))
+            .await
     };
 }
 
 #[macro_export]
 macro_rules! withdraw {
     ($ctx:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.withdraw(0, $account, $amount, wait_level!($level)).await
+        $ctx.withdraw(0, $account, $amount, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, account: $account:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.withdraw($node, $account, $amount, wait_level!($level)).await
+        $ctx.withdraw($node, $account, $amount, wait_level!($level))
+            .await
     };
 }
 
 #[macro_export]
 macro_rules! transfer {
     ($ctx:expr, from: $from:expr, to: $to:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.transfer(0, $from, $to, $amount, wait_level!($level)).await
+        $ctx.transfer(0, $from, $to, $amount, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, from: $from:expr, to: $to:expr, amount: $amount:expr, wait: $level:ident) => {
-        $ctx.transfer($node, $from, $to, $amount, wait_level!($level)).await
+        $ctx.transfer($node, $from, $to, $amount, wait_level!($level))
+            .await
     };
 }
 
 #[macro_export]
 macro_rules! batch_deposit {
     ($ctx:expr, account: $account:expr, amount: $amount:expr, count: $count:expr, wait: $level:ident) => {
-        $ctx.batch_deposit(0, $account, $amount, $count, wait_level!($level)).await
+        $ctx.batch_deposit(0, $account, $amount, $count, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, account: $account:expr, amount: $amount:expr, count: $count:expr, wait: $level:ident) => {
-        $ctx.batch_deposit($node, $account, $amount, $count, wait_level!($level)).await
+        $ctx.batch_deposit($node, $account, $amount, $count, wait_level!($level))
+            .await
     };
 }
 
@@ -89,7 +97,8 @@ macro_rules! deposit_all {
         $ctx.deposit_all(0, $deposits, wait_level!($level)).await
     };
     ($ctx:expr, node: $node:expr, $deposits:expr, wait: $level:ident) => {
-        $ctx.deposit_all($node, $deposits, wait_level!($level)).await
+        $ctx.deposit_all($node, $deposits, wait_level!($level))
+            .await
     };
 }
 
@@ -98,10 +107,12 @@ macro_rules! deposit_all {
 #[macro_export]
 macro_rules! transfer_batch {
     ($ctx:expr, $transfers:expr, wait: $level:ident) => {
-        $ctx.transfer_batch(0, $transfers, wait_level!($level)).await
+        $ctx.transfer_batch(0, $transfers, wait_level!($level))
+            .await
     };
     ($ctx:expr, node: $node:expr, $transfers:expr, wait: $level:ident) => {
-        $ctx.transfer_batch($node, $transfers, wait_level!($level)).await
+        $ctx.transfer_batch($node, $transfers, wait_level!($level))
+            .await
     };
 }
 
@@ -158,18 +169,26 @@ macro_rules! assert_balance_sum {
 
 #[macro_export]
 macro_rules! assert_wal_checksum {
-    ($ctx:expr) => { todo!("assert_wal_checksum! not yet implemented") };
-    ($ctx:expr, node: $node:expr) => { todo!("assert_wal_checksum! not yet implemented") };
+    ($ctx:expr) => {
+        todo!("assert_wal_checksum! not yet implemented")
+    };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("assert_wal_checksum! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! assert_wal_valid {
-    ($ctx:expr, node: $node:expr) => { todo!("assert_wal_valid! not yet implemented") };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("assert_wal_valid! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! assert_tx_status {
-    ($ctx:expr, $tx_id:expr, $status:ident) => { todo!("assert_tx_status! not yet implemented") };
+    ($ctx:expr, $tx_id:expr, $status:ident) => {
+        todo!("assert_tx_status! not yet implemented")
+    };
 }
 
 // ===========================================================================
@@ -198,7 +217,9 @@ macro_rules! get_pipeline_index {
 
 #[macro_export]
 macro_rules! get_transaction {
-    ($ctx:expr, $tx_id:expr) => { todo!("get_transaction! not yet implemented") };
+    ($ctx:expr, $tx_id:expr) => {
+        todo!("get_transaction! not yet implemented")
+    };
 }
 
 #[macro_export]
@@ -210,7 +231,9 @@ macro_rules! get_last_committed_id {
 
 #[macro_export]
 macro_rules! get_segments {
-    ($ctx:expr, node: $node:expr) => { todo!("get_segments! not yet implemented") };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("get_segments! not yet implemented")
+    };
 }
 
 // ===========================================================================
@@ -251,22 +274,30 @@ macro_rules! kill_and_restart {
 
 #[macro_export]
 macro_rules! slow_cpu {
-    ($ctx:expr, node: $node:expr, factor: $factor:expr) => { todo!("slow_cpu! not yet implemented") };
+    ($ctx:expr, node: $node:expr, factor: $factor:expr) => {
+        todo!("slow_cpu! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! slow_disk {
-    ($ctx:expr, node: $node:expr, latency_ms: $ms:expr) => { todo!("slow_disk! not yet implemented") };
+    ($ctx:expr, node: $node:expr, latency_ms: $ms:expr) => {
+        todo!("slow_disk! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! limit_memory {
-    ($ctx:expr, node: $node:expr, mb: $mb:expr) => { todo!("limit_memory! not yet implemented") };
+    ($ctx:expr, node: $node:expr, mb: $mb:expr) => {
+        todo!("limit_memory! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! restore {
-    ($ctx:expr, node: $node:expr) => { todo!("restore! not yet implemented") };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("restore! not yet implemented")
+    };
 }
 
 #[macro_export]
@@ -292,25 +323,35 @@ macro_rules! wait_until_committed {
 
 #[macro_export]
 macro_rules! assert_segment_sealed {
-    ($ctx:expr, node: $node:expr, segment_id: $id:expr) => { todo!("assert_segment_sealed! not yet implemented") };
+    ($ctx:expr, node: $node:expr, segment_id: $id:expr) => {
+        todo!("assert_segment_sealed! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! assert_segment_count {
-    ($ctx:expr, node: $node:expr, gte: $min:expr) => { todo!("assert_segment_count! not yet implemented") };
+    ($ctx:expr, node: $node:expr, gte: $min:expr) => {
+        todo!("assert_segment_count! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! assert_snapshot_valid {
-    ($ctx:expr, node: $node:expr) => { todo!("assert_snapshot_valid! not yet implemented") };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("assert_snapshot_valid! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! assert_pipeline_caught_up {
-    ($ctx:expr, node: $node:expr) => { todo!("assert_pipeline_caught_up! not yet implemented") };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("assert_pipeline_caught_up! not yet implemented")
+    };
 }
 
 #[macro_export]
 macro_rules! assert_index_valid {
-    ($ctx:expr, node: $node:expr) => { todo!("assert_index_valid! not yet implemented") };
+    ($ctx:expr, node: $node:expr) => {
+        todo!("assert_index_valid! not yet implemented")
+    };
 }

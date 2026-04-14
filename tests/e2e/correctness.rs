@@ -66,11 +66,19 @@ async fn matrix_transfer_grid() {
         for (account, actual) in &balances {
             let (r, c) = grid.grid_position(*account);
             let expected = grid.expected_balance(r, c, t);
-            assert_eq!(*actual, expected, "step 3 iter {}: account ({},{})", iter, r, c);
+            assert_eq!(
+                *actual, expected,
+                "step 3 iter {}: account ({},{})",
+                iter, r, c
+            );
         }
 
         let sum = ctx.get_balance_sum(0, grid.grid_accounts() + 1).await;
-        assert_eq!(sum, 0, "step 3 iter {}: zero-sum violated, sum={}", iter, sum);
+        assert_eq!(
+            sum, 0,
+            "step 3 iter {}: zero-sum violated, sum={}",
+            iter, sum
+        );
     }
 }
 
@@ -162,17 +170,29 @@ async fn matrix_concurrent_transfer_grid() {
         }
 
         ctx.wait_for_snapshot(0, iter_last_tx_id).await;
-        assert_eq!(iter_rejected, 0, "step 3 iter {}: {} rejections", iter, iter_rejected);
+        assert_eq!(
+            iter_rejected, 0,
+            "step 3 iter {}: {} rejections",
+            iter, iter_rejected
+        );
 
         let balances = ctx.get_balances(0, &grid.account_ids).await;
         assert_eq!(balances.len(), grid.account_ids.len());
         for (account, actual) in &balances {
             let (r, c) = grid.grid_position(*account);
             let expected = grid.expected_balance(r, c, t);
-            assert_eq!(*actual, expected, "step 3 iter {}: account ({},{})", iter, r, c);
+            assert_eq!(
+                *actual, expected,
+                "step 3 iter {}: account ({},{})",
+                iter, r, c
+            );
         }
 
         let sum = ctx.get_balance_sum(0, grid.grid_accounts() + 1).await;
-        assert_eq!(sum, 0, "step 3 iter {}: zero-sum violated, sum={}", iter, sum);
+        assert_eq!(
+            sum, 0,
+            "step 3 iter {}: zero-sum violated, sum={}",
+            iter, sum
+        );
     }
 }

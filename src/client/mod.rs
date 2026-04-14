@@ -137,13 +137,7 @@ impl LedgerClient {
     }
 
     /// Submit a transfer (fire-and-forget). Returns the transaction ID.
-    pub async fn transfer(
-        &self,
-        from: u64,
-        to: u64,
-        amount: u64,
-        user_ref: u64,
-    ) -> Result<u64> {
+    pub async fn transfer(&self, from: u64, to: u64, amount: u64, user_ref: u64) -> Result<u64> {
         let mut client = self.inner.clone();
         let resp = client
             .submit_operation(proto::SubmitOperationRequest {
@@ -254,22 +248,21 @@ impl LedgerClient {
     /// Submit a batch of deposit operations (fire-and-forget).
     /// Each entry is `(account, amount, user_ref)`.
     /// Returns one transaction ID per operation.
-    pub async fn deposit_batch(
-        &self,
-        deposits: &[(u64, u64, u64)],
-    ) -> Result<Vec<u64>> {
+    pub async fn deposit_batch(&self, deposits: &[(u64, u64, u64)]) -> Result<Vec<u64>> {
         let mut client = self.inner.clone();
         let operations = deposits
             .iter()
-            .map(|(account, amount, user_ref)| proto::SubmitOperationRequest {
-                operation: Some(proto::submit_operation_request::Operation::Deposit(
-                    proto::Deposit {
-                        account: *account,
-                        amount: *amount,
-                        user_ref: *user_ref,
-                    },
-                )),
-            })
+            .map(
+                |(account, amount, user_ref)| proto::SubmitOperationRequest {
+                    operation: Some(proto::submit_operation_request::Operation::Deposit(
+                        proto::Deposit {
+                            account: *account,
+                            amount: *amount,
+                            user_ref: *user_ref,
+                        },
+                    )),
+                },
+            )
             .collect();
 
         let resp = client
@@ -393,10 +386,7 @@ impl LedgerClient {
     // -- Transaction status -------------------------------------------------
 
     /// Get the status of a single transaction.
-    pub async fn get_transaction_status(
-        &self,
-        transaction_id: u64,
-    ) -> Result<(i32, u32)> {
+    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<(i32, u32)> {
         let mut client = self.inner.clone();
         let resp = client
             .get_transaction_status(proto::GetStatusRequest { transaction_id })

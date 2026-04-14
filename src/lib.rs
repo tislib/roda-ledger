@@ -16,9 +16,9 @@ pub mod transactor;
 pub mod wait_strategy;
 pub mod wal;
 
-mod entries;
 #[cfg(feature = "grpc")]
 pub mod client;
+mod entries;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 pub mod index;

@@ -206,10 +206,15 @@ impl E2EContext {
         wait_level: i32,
         retries: usize,
     ) {
-        let handles =
-            self.deposit_batch_concurrent_detached(
-                node, account, amount, batch_count, batch_size, wait_level, retries,
-            );
+        let handles = self.deposit_batch_concurrent_detached(
+            node,
+            account,
+            amount,
+            batch_count,
+            batch_size,
+            wait_level,
+            retries,
+        );
 
         let mut max_tx_id = 0u64;
         for handle in handles {
@@ -260,7 +265,12 @@ impl E2EContext {
 
                 loop {
                     let _permit = sem.acquire().await.unwrap();
-                    eprintln!("begin batch {} ({} of {})", batch_idx, batch_idx * batch_size, batch_count * batch_size);
+                    eprintln!(
+                        "begin batch {} ({} of {})",
+                        batch_idx,
+                        batch_idx * batch_size,
+                        batch_count * batch_size
+                    );
                     let result = current_client.deposit_batch_and_wait(&deposits, wl).await;
                     drop(_permit);
 
@@ -272,7 +282,10 @@ impl E2EContext {
                         Err(e) => {
                             attempts_left -= 1;
                             if attempts_left == 0 {
-                                panic!("batch {} exhausted {} retries, last error: {}", batch_idx, retries, e);
+                                panic!(
+                                    "batch {} exhausted {} retries, last error: {}",
+                                    batch_idx, retries, e
+                                );
                             }
                             let jitter_ms = (batch_idx as u64 * 7 + 13) % 500;
                             sleep(Duration::from_millis(2000 + jitter_ms)).await;
