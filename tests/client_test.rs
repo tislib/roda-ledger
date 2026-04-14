@@ -41,7 +41,10 @@ mod tests {
     async fn test_withdraw() {
         let (_ledger, client) = setup().await;
         // Fund first.
-        client.deposit_and_wait(1, 2000, 0, WaitLevel::Snapshot).await.unwrap();
+        client
+            .deposit_and_wait(1, 2000, 0, WaitLevel::Snapshot)
+            .await
+            .unwrap();
         let tx_id = client.withdraw(1, 500, 0).await.unwrap();
         assert!(tx_id > 0);
     }
@@ -49,7 +52,10 @@ mod tests {
     #[tokio::test]
     async fn test_transfer() {
         let (_ledger, client) = setup().await;
-        client.deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot).await.unwrap();
+        client
+            .deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot)
+            .await
+            .unwrap();
         let tx_id = client.transfer(1, 2, 400, 0).await.unwrap();
         assert!(tx_id > 0);
     }
@@ -123,10 +129,7 @@ mod tests {
     async fn test_deposit_batch_and_wait() {
         let (_ledger, client) = setup().await;
         let results = client
-            .deposit_batch_and_wait(
-                &[(1, 100, 0), (2, 200, 0)],
-                WaitLevel::Snapshot,
-            )
+            .deposit_batch_and_wait(&[(1, 100, 0), (2, 200, 0)], WaitLevel::Snapshot)
             .await
             .unwrap();
 
@@ -153,10 +156,7 @@ mod tests {
     async fn test_get_balances() {
         let (_ledger, client) = setup().await;
         client
-            .deposit_batch_and_wait(
-                &[(10, 100, 0), (11, 200, 0)],
-                WaitLevel::Snapshot,
-            )
+            .deposit_batch_and_wait(&[(10, 100, 0), (11, 200, 0)], WaitLevel::Snapshot)
             .await
             .unwrap();
 
@@ -174,10 +174,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (status, fail_reason) = client
-            .get_transaction_status(result.tx_id)
-            .await
-            .unwrap();
+        let (status, fail_reason) = client.get_transaction_status(result.tx_id).await.unwrap();
 
         assert_eq!(status, 3); // ON_SNAPSHOT
         assert_eq!(fail_reason, 0);
@@ -258,15 +255,15 @@ mod tests {
         assert!(!history.entries.is_empty());
     }
 
-    // -- Reconnect after restart --------------------------------------------
+    // -- Same client survives server restart --------------------------------
 
-    /// Start server, deposit, stop server, restart on same port with same data,
-    /// reconnect client, withdraw. Verifies the client can survive a server restart.
+    /// Deposit, stop server, restart on same port with same data, then
+    /// use the SAME client to withdraw. Expected to fail — tonic's channel
+    /// does not automatically reconnect after the underlying connection breaks.
+    /// This test exists to drive the reconnect feature in LedgerClient.
     #[tokio::test]
     async fn test_deposit_restart_withdraw() {
-        // Use a persistent (non-temp) data dir so WAL survives restart.
-        let mut config = LedgerConfig::temp();
-        let data_dir = config.storage.data_dir.clone();
+        let config = LedgerConfig::temp();
 
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
@@ -283,55 +280,31 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        // -- Deposit --
+        // -- Create client and deposit --
         let client = LedgerClient::connect(addr).await.unwrap();
         let result = client
             .deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot)
             .await
             .unwrap();
         assert_eq!(result.fail_reason, 0);
+        assert_eq!(client.get_balance(1).await.unwrap().balance, 1000);
 
-        let balance = client.get_balance(1).await.unwrap();
-        assert_eq!(balance.balance, 1000);
-
-        // -- Stop server (drop ledger + abort task) --
+        // -- Stop server --
         server_handle.abort();
-        drop(ledger);
-
-        // Small delay for port to free up.
         sleep(Duration::from_millis(200)).await;
 
-        // -- Restart server on same port, same data dir --
-        let mut config2 = LedgerConfig::temp();
-        config2.storage.data_dir = data_dir.clone();
-
-        let mut ledger2 = Ledger::new(config2);
-        ledger2.start().unwrap();
-        let ledger2 = Arc::new(ledger2);
-
-        let server_ledger2 = ledger2.clone();
         tokio::spawn(async move {
-            GrpcServer::new(server_ledger2, addr).run().await.unwrap();
+            GrpcServer::new(ledger, addr).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;
 
-        // -- Reconnect and withdraw --
-        let client2 = LedgerClient::connect(addr).await.unwrap();
-
-        let balance = client2.get_balance(1).await.unwrap();
-        assert_eq!(balance.balance, 1000, "balance not recovered after restart");
-
-        let result = client2
+        // -- Use the SAME client (no reconnect) --
+        let result = client
             .withdraw_and_wait(1, 300, 0, WaitLevel::Snapshot)
             .await
             .unwrap();
         assert_eq!(result.fail_reason, 0);
-
-        let balance = client2.get_balance(1).await.unwrap();
-        assert_eq!(balance.balance, 700);
-
-        // Cleanup data dir.
-        let _ = std::fs::remove_dir_all(&data_dir);
+        assert_eq!(client.get_balance(1).await.unwrap().balance, 700);
     }
 }

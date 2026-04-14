@@ -11,7 +11,7 @@ max_message_size_bytes = 4194304  # 4MB
 max_accounts = 2000000
 wait_strategy = "balanced"   # low_latency | balanced | low_cpu
 dedup_enabled = true
-dedup_window_ms = 10000      # 10 seconds
+dedup_window_ms = 10000000      # 10000 seconds
 
 [single_node.ledger.storage]
 data_dir = "./data"

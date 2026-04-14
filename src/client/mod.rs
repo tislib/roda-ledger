@@ -80,6 +80,7 @@ pub struct AccountHistory {
 ///
 /// Wraps the tonic-generated client with ergonomic methods.
 /// All methods take `&self` — the underlying channel is cloneable.
+#[derive(Clone)]
 pub struct LedgerClient {
     inner: TonicLedgerClient<Channel>,
 }
@@ -296,6 +297,48 @@ impl LedgerClient {
                         account: *account,
                         amount: *amount,
                         user_ref: *user_ref,
+                    },
+                )),
+                wait_level: 0,
+            })
+            .collect();
+
+        let resp = client
+            .submit_batch_and_wait(proto::SubmitBatchAndWaitRequest {
+                operations,
+                wait_level: wait_level as i32,
+            })
+            .await?
+            .into_inner();
+
+        Ok(resp
+            .results
+            .iter()
+            .map(|r| SubmitResult {
+                tx_id: r.transaction_id,
+                fail_reason: r.fail_reason,
+            })
+            .collect())
+    }
+
+    /// Submit a batch of transfer operations and wait for the given level.
+    /// Each entry is `(from, to, amount)`.
+    /// Returns one `SubmitResult` per operation.
+    pub async fn transfer_batch_and_wait(
+        &self,
+        transfers: &[(u64, u64, u64)],
+        wait_level: proto::WaitLevel,
+    ) -> Result<Vec<SubmitResult>> {
+        let mut client = self.inner.clone();
+        let operations = transfers
+            .iter()
+            .map(|(from, to, amount)| proto::SubmitAndWaitRequest {
+                operation: Some(proto::submit_and_wait_request::Operation::Transfer(
+                    proto::Transfer {
+                        from: *from,
+                        to: *to,
+                        amount: *amount,
+                        user_ref: 0,
                     },
                 )),
                 wait_level: 0,
