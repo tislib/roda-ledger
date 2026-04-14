@@ -37,13 +37,11 @@ max_message_size_bytes = 4194304  # 4MB
 [ledger]
 max_accounts    = 1000000
 wait_strategy   = "balanced"   # low_latency | balanced | low_cpu
-dedup_enabled   = true
-dedup_window_ms = 10000        # 10 seconds
 
 [ledger.storage]
-data_dir             = "/data"
-wal_segment_size_mb  = 2048
-snapshot_frequency   = 2       # take a snapshot every N sealed WAL segments
+data_dir                       = "/data"
+transaction_count_per_segment  = 10000000  # 10M transactions per segment
+snapshot_frequency             = 2         # take a snapshot every N sealed WAL segments
 ```
 
 **`wait_strategy` options:**
@@ -72,15 +70,13 @@ use roda_ledger::storage::StorageConfig;
 let config = LedgerConfig {
     max_accounts: 1_000_000,
     wait_strategy: WaitStrategy::Balanced,
-    dedup_enabled: true,
-    dedup_window_ms: 10_000,
     storage: StorageConfig {
         data_dir: "./data".to_string(),
-        wal_segment_size_mb: 2048,
+        transaction_count_per_segment: 10_000_000,
         snapshot_frequency: 2,
         temporary: false,
     },
-..LedgerConfig::default()
+    ..LedgerConfig::default()
 };
 
 let mut ledger = Ledger::new(config);
@@ -161,7 +157,7 @@ let tx_id = ledger.submit(Operation::Transfer {
 
 Every operation carries a `user_ref` — a `uint64` supplied by the caller. It serves two purposes:
 
-- **Idempotency key** — when deduplication is enabled (default) and `user_ref > 0`, if the same `user_ref` appears within the `dedup_window_ms` window, the second submission is detected as a duplicate. It is sequenced and recorded, but linked to the original via a `TxLinkRecord { kind: DUPLICATE }` rather than re-executed. This prevents double-processing on client retries. Pass `user_ref = 0` to opt out of the idempotency check entirely.
+- **Idempotency key** — when `user_ref > 0`, if the same `user_ref` appears within the active window (the last `transaction_count_per_segment` transactions), the second submission is detected as a duplicate. It is sequenced and recorded, but linked to the original via a `TxLinkRecord { kind: DUPLICATE }` rather than re-executed. This prevents double-processing on client retries. Deduplication is always on and cannot be disabled. Pass `user_ref = 0` to opt out of the idempotency check for individual transactions.
 - **Correlation reference** — stored in the WAL alongside the transaction. Use it to link to your own database record — an order ID, payment ID, or any external reference.
 
 ---

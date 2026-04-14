@@ -15,17 +15,16 @@ fn unique_dir(name: &str) -> String {
 #[test]
 fn test_sealing_at_rotation_boundary() {
     let dir = unique_dir("sealing_at_boundary");
-    let wal_size_mb = 1;
-    let wal_size_bytes = wal_size_mb * 1024 * 1024;
-    let wal_entry_size = 40;
+    let tx_count_per_segment: u64 = 100;
 
-    let record_count = wal_size_bytes / (3 * wal_entry_size) + 1;
+    // Submit enough transactions to exceed the segment limit
+    let record_count = tx_count_per_segment + 1;
 
     {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: wal_size_mb as u64,
+                transaction_count_per_segment: tx_count_per_segment,
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),
@@ -75,18 +74,16 @@ fn test_sealing_at_rotation_boundary() {
 #[test]
 fn test_sealing_below_rotation_boundary() {
     let dir = unique_dir("sealing_below_boundary");
-    let wal_size_mb = 1;
-    let wal_size_bytes = wal_size_mb * 1024 * 1024;
-    let wal_entry_size = 40;
+    let tx_count_per_segment: u64 = 100;
 
-    // Test 2: record_count = wal_size / (3 * wal_entry_size) - 1
-    let record_count = (wal_size_bytes / (3 * wal_entry_size)) - 1;
+    // Test 2: submit fewer transactions than the segment limit
+    let record_count = tx_count_per_segment - 1;
 
     {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: wal_size_mb as u64,
+                transaction_count_per_segment: tx_count_per_segment,
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),

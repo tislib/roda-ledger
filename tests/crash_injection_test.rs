@@ -16,7 +16,7 @@ fn make_config(dir: &str) -> LedgerConfig {
     LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.to_string(),
-            wal_segment_size_mb: 1,
+            transaction_count_per_segment: 10_000,
             snapshot_frequency: 1,
             ..Default::default()
         },
@@ -229,7 +229,7 @@ fn test_crash_with_partial_active_wal() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 2048, // large segment to keep everything in active wal
+                transaction_count_per_segment: 10_000_000, // large count to keep everything in active wal
                 snapshot_frequency: 0,     // no snapshots
                 ..Default::default()
             },
@@ -263,7 +263,7 @@ fn test_crash_with_partial_active_wal() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 2048,
+                transaction_count_per_segment: 10_000_000,
                 snapshot_frequency: 0,
                 ..Default::default()
             },

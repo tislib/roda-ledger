@@ -5,9 +5,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-// 1MB WAL segments + snapshot every 2 seals → ~10 seals, ~5 snapshots
-// 160K txns × 2 records × ~33 bytes ≈ 10.6MB → ~10 WAL segment seals
-const SMALL_SEGMENT_MB: u64 = 1;
+// 100 tx/segment + snapshot every seal → many seals, many snapshots
+const SMALL_SEGMENT_TX_COUNT: u64 = 100;
 const SNAP_FREQUENCY: u32 = 1;
 const NUM_TRANSACTIONS: u64 = 160_000;
 const ACCOUNT_ID: u64 = 7;
@@ -17,7 +16,7 @@ fn make_config(dir: &str) -> LedgerConfig {
     LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.to_string(),
-            wal_segment_size_mb: SMALL_SEGMENT_MB,
+            transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
             snapshot_frequency: SNAP_FREQUENCY,
             ..Default::default()
         },

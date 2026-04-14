@@ -78,8 +78,8 @@ impl Snapshot {
         Self {
             balances,
             indexer: Some(TransactionIndexer::new(
-                config.index_circle1_size,
-                config.index_circle2_size,
+                config.index_circle1_size(),
+                config.index_circle2_size(),
                 account_heads_size,
             )),
         }

@@ -17,7 +17,7 @@ pub struct StorageConfig {
     /// Not part of config.toml — only set programmatically (e.g. `LedgerConfig::temp`).
     #[serde(skip)]
     pub temporary: bool,
-    pub wal_segment_size_mb: u64,
+    pub transaction_count_per_segment: u64,
     /// How often (in sealed segments) to write a snapshot. 0 = disabled.
     pub snapshot_frequency: u32,
 }
@@ -27,7 +27,7 @@ impl Default for StorageConfig {
         Self {
             data_dir: "data/".to_string(),
             temporary: false,
-            wal_segment_size_mb: 64,
+            transaction_count_per_segment: 10_000_000,
             snapshot_frequency: 4,
         }
     }
@@ -38,8 +38,6 @@ impl Default for StorageConfig {
 pub struct LedgerConfig {
     pub max_accounts: usize,
     pub wait_strategy: WaitStrategy,
-    pub dedup_enabled: bool,
-    pub dedup_window_ms: u64,
     pub storage: StorageConfig,
 
     // ---- Fields not exposed via config.toml (internal tuning / runtime) ----
@@ -49,10 +47,6 @@ pub struct LedgerConfig {
     pub log_level: Level,
     #[serde(skip, default = "default_seal_check_internal")]
     pub seal_check_internal: Duration,
-    #[serde(skip, default = "default_index_circle1_size")]
-    pub index_circle1_size: usize,
-    #[serde(skip, default = "default_index_circle2_size")]
-    pub index_circle2_size: usize,
     #[serde(skip)]
     pub disable_seal: bool,
 }
@@ -62,12 +56,6 @@ fn default_log_level() -> Level {
 }
 fn default_seal_check_internal() -> Duration {
     Duration::from_secs(1)
-}
-fn default_index_circle1_size() -> usize {
-    1 << 20
-}
-fn default_index_circle2_size() -> usize {
-    1 << 21
 }
 
 impl Default for LedgerConfig {
@@ -79,10 +67,6 @@ impl Default for LedgerConfig {
             wait_strategy: WaitStrategy::Balanced,
             log_level: default_log_level(),
             seal_check_internal: default_seal_check_internal(),
-            index_circle1_size: default_index_circle1_size(),
-            index_circle2_size: default_index_circle2_size(),
-            dedup_enabled: true,
-            dedup_window_ms: 10_000,
             disable_seal: false,
         }
     }
@@ -91,6 +75,18 @@ impl Default for LedgerConfig {
 impl LedgerConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Index circle 1 size: covers the active segment (one active window).
+    /// Rounded up to the next power of two as required by `TransactionIndexer`.
+    pub fn index_circle1_size(&self) -> usize {
+        (self.storage.transaction_count_per_segment as usize).next_power_of_two()
+    }
+
+    /// Index circle 2 size: covers active + previous segment (matches dedup window).
+    /// Rounded up to the next power of two as required by `TransactionIndexer`.
+    pub fn index_circle2_size(&self) -> usize {
+        (self.storage.transaction_count_per_segment as usize * 2).next_power_of_two()
     }
 
     pub fn temp() -> Self {
@@ -103,7 +99,7 @@ impl LedgerConfig {
                 data_dir: dir.to_string_lossy().to_string(),
                 temporary: true,
                 snapshot_frequency: 2,
-                wal_segment_size_mb: 2048,
+                transaction_count_per_segment: 10_000_000,
             },
             log_level: Level::Critical,
             seal_check_internal: Duration::from_millis(10),
@@ -121,7 +117,7 @@ impl LedgerConfig {
                 data_dir: dir.to_string_lossy().to_string(),
                 temporary: true,
                 snapshot_frequency: u32::MAX,
-                wal_segment_size_mb: 2048,
+                transaction_count_per_segment: 10_000_000,
             },
             log_level: Level::Critical,
             seal_check_internal: Duration::from_mins(10),

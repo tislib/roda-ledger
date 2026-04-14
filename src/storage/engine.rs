@@ -91,9 +91,6 @@ impl Storage {
         self.last_segment_id.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn wal_size(&self) -> usize {
-        (self.config.wal_segment_size_mb * 1024 * 1024) as usize
-    }
 }
 
 impl Drop for Storage {

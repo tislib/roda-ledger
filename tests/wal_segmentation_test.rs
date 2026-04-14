@@ -34,7 +34,7 @@ fn test_wal_segment_rotation() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),
@@ -103,7 +103,7 @@ fn test_wal_segment_rotation() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),
@@ -144,7 +144,7 @@ fn test_crc_sidecar_format() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),

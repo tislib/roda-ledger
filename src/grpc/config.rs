@@ -107,12 +107,10 @@ mod tests {
             [ledger]
             max_accounts = 1000000
             wait_strategy = "balanced"
-            dedup_enabled = true
-            dedup_window_ms = 10000
 
             [ledger.storage]
             data_dir = "/data"
-            wal_segment_size_mb = 2048
+            transaction_count_per_segment = 10000000
             snapshot_frequency = 2
         "#;
 
@@ -124,16 +122,14 @@ mod tests {
 
         assert_eq!(cfg.ledger.max_accounts, 1_000_000);
         assert_eq!(cfg.ledger.wait_strategy, WaitStrategy::Balanced);
-        assert!(cfg.ledger.dedup_enabled);
-        assert_eq!(cfg.ledger.dedup_window_ms, 10_000);
 
         assert_eq!(cfg.ledger.storage.data_dir, "/data");
-        assert_eq!(cfg.ledger.storage.wal_segment_size_mb, 2048);
+        assert_eq!(cfg.ledger.storage.transaction_count_per_segment, 10_000_000);
         assert_eq!(cfg.ledger.storage.snapshot_frequency, 2);
 
-        // Internal fields not exposed via toml should fall back to defaults.
-        assert_eq!(cfg.ledger.index_circle1_size, 1 << 20);
-        assert_eq!(cfg.ledger.index_circle2_size, 1 << 21);
+        // Derived index sizes based on transaction_count_per_segment (rounded to next power of two).
+        assert_eq!(cfg.ledger.index_circle1_size(), 16_777_216); // next_power_of_two(10M)
+        assert_eq!(cfg.ledger.index_circle2_size(), 33_554_432); // next_power_of_two(20M)
         assert!(!cfg.ledger.disable_seal);
     }
 

@@ -21,7 +21,7 @@ fn test_10m_mixed_workload() {
     let config = LedgerConfig {
         max_accounts,
         storage: StorageConfig {
-            wal_segment_size_mb: 64,
+            transaction_count_per_segment: 10_000_000,
             snapshot_frequency: 4,
             ..StorageConfig::default()
         },
@@ -120,7 +120,7 @@ fn test_20_crash_recovery_cycles() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 1,
                 ..Default::default()
             },
@@ -156,7 +156,7 @@ fn test_20_crash_recovery_cycles() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 1,
                 ..Default::default()
             },

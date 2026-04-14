@@ -153,10 +153,6 @@ impl<'r> Recover<'r> {
         }
 
         // process active WAL records
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let active_segment = self.storage.active_segment().map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
         })?;
@@ -167,6 +163,15 @@ impl<'r> Recover<'r> {
                     last_tx_id = metadata.tx_id;
                     current_recover_tx_id = metadata.tx_id;
                     self.snapshot.recover_index_tx_metadata(metadata);
+
+                    // Only non-duplicate committed transactions should be in the dedup cache
+                    if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
+                        self.transactor.dedup_cache_mut().recover_entry(
+                            metadata.user_ref,
+                            metadata.tx_id,
+                            last_tx_id,
+                        );
+                    }
                 }
                 WalEntry::Entry(entry) => {
                     recover_balances.insert(entry.account_id, entry.computed_balance);
@@ -182,30 +187,6 @@ impl<'r> Recover<'r> {
                 std::io::Error::new(
                     e.kind(),
                     format!("failed to visit active wal records: {}", e),
-                )
-            })?;
-
-        // Rebuild dedup cache from active WAL committed transactions
-        // Re-scan active WAL to populate dedup entries
-        active_segment
-            .visit_wal_records(|record| {
-                if let WalEntry::Metadata(metadata) = record {
-                    // Only non-duplicate committed transactions should be in the dedup cache
-                    if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
-                        let timestamp_ms = metadata.timestamp / 1_000_000; // nanos → ms
-                        self.transactor.dedup_cache_mut().recover_entry(
-                            metadata.user_ref,
-                            metadata.tx_id,
-                            timestamp_ms,
-                            now_ms,
-                        );
-                    }
-                }
-            })
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("failed to re-scan active wal records for dedup: {}", e),
                 )
             })?;
 
