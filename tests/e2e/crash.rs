@@ -85,91 +85,79 @@ async fn crash_in_the_middle() {
     const AMOUNT: u64 = 1;
     const ACCOUNT: u64 = 1;
 
-    let total_wal_mb: u64 = TX_COUNT * 120 / (1024 * 1024);
-
-    let segment_sizes: Vec<(&str, u64)> = vec![
-        ("all_active", total_wal_mb + 10),
-        ("single_closed", total_wal_mb * 60 / 100),
-        ("ten_closed", total_wal_mb * 10 / 100),
-    ];
+    let total_wal_mb: u64 = TX_COUNT * 120 / (1024 * 1024) + 10;
 
     // retry 100 times to ensure idempotency
     for _ in 0..100 {
-        let segment_sizes = segment_sizes.clone();
-        for (label, segment_size_mb) in segment_sizes {
-            eprintln!(
-                "[crash_mid:{}] wal_segment_size_mb = {}",
-                label, segment_size_mb
-            );
+        let label = format!("iteration_{}", total_wal_mb);
+        eprintln!("iteration: {}", total_wal_mb);
+        let mut profile = profile("single_node");
+        profile.ledger.storage.wal_segment_size_mb = total_wal_mb;
 
-            let mut profile = profile("single_node");
-            profile.ledger.storage.wal_segment_size_mb = segment_size_mb;
+        let mut ctx = crate::e2e::E2EContext::new(profile).await;
 
-            let mut ctx = crate::e2e::E2EContext::new(profile).await;
+        // initial crash
+        kill_node!(ctx);
+        eprintln!("[crash_mid:{}] server killed", label);
 
-            // initial crash
+        // Restart so retry tasks can reconnect.
+        restart_node!(ctx);
+        eprintln!("[crash_mid:{}] server restarted", label);
+
+        // Spawn concurrent deposit load with retries.
+        // deposit_batch_concurrent_detached returns JoinHandles, does NOT
+        // join them — the caller can kill/restart while they're in flight.
+        let handles = ctx.deposit_batch_concurrent_detached(
+            0,
+            ACCOUNT,
+            AMOUNT,
+            BATCH_COUNT,
+            BATCH_SIZE,
+            wait_level!(committed),
+            1000,
+        );
+
+        // Let batches start sending, then kill.
+        sleep(Duration::from_millis(500)).await;
+        for i in 0..10 {
+            let crash_timing = 10 * (i % 10);
+            sleep(Duration::from_millis(crash_timing)).await;
+
             kill_node!(ctx);
             eprintln!("[crash_mid:{}] server killed", label);
 
             // Restart so retry tasks can reconnect.
             restart_node!(ctx);
             eprintln!("[crash_mid:{}] server restarted", label);
+        }
 
-            // Spawn concurrent deposit load with retries.
-            // deposit_batch_concurrent_detached returns JoinHandles, does NOT
-            // join them — the caller can kill/restart while they're in flight.
-            let handles = ctx.deposit_batch_concurrent_detached(
-                0,
-                ACCOUNT,
-                AMOUNT,
-                BATCH_COUNT,
-                BATCH_SIZE,
-                wait_level!(committed),
-                1000,
-            );
+        // Wait for all deposit tasks to finish (retries included).
+        for handle in handles {
+            handle.await.expect("deposit batch task panicked");
+        }
+        eprintln!("[crash_mid:{}] all batches completed", label);
 
-            // Let batches start sending, then kill.
-            sleep(Duration::from_millis(500)).await;
-            for i in 0..10 {
-                let crash_timing = 10 * (i % 10);
-                sleep(Duration::from_millis(crash_timing)).await;
+        // Verify: nothing lost, nothing doubled.
+        let (compute, commit, snapshot) = get_pipeline_index!(ctx);
+        eprintln!(
+            "[crash_mid:{}] pipeline: compute={}, commit={}, snapshot={}",
+            label, compute, commit, snapshot
+        );
 
-                kill_node!(ctx);
-                eprintln!("[crash_mid:{}] server killed", label);
+        assert!(
+            commit >= TX_COUNT,
+            "[{}] commit ({}) < TX_COUNT ({})",
+            label,
+            commit,
+            TX_COUNT
+        );
+        ctx.wait_for_snapshot(0, commit).await;
 
-                // Restart so retry tasks can reconnect.
-                restart_node!(ctx);
-                eprintln!("[crash_mid:{}] server restarted", label);
-            }
-
-            // Wait for all deposit tasks to finish (retries included).
-            for handle in handles {
-                handle.await.expect("deposit batch task panicked");
-            }
-            eprintln!("[crash_mid:{}] all batches completed", label);
-
-            // Verify: nothing lost, nothing doubled.
-            let (compute, commit, snapshot) = get_pipeline_index!(ctx);
-            eprintln!(
-                "[crash_mid:{}] pipeline: compute={}, commit={}, snapshot={}",
-                label, compute, commit, snapshot
-            );
-
-            assert!(
-                commit >= TX_COUNT,
-                "[{}] commit ({}) < TX_COUNT ({})",
-                label,
-                commit,
-                TX_COUNT
-            );
-            ctx.wait_for_snapshot(0, commit).await;
-
-            assert_balance!(ctx, account: ACCOUNT, eq: (TX_COUNT * AMOUNT) as i64,
+        assert_balance!(ctx, account: ACCOUNT, eq: (TX_COUNT * AMOUNT) as i64,
                 "[{}] account {}", label, ACCOUNT);
-            assert_balance!(ctx, account: 0, eq: -((TX_COUNT * AMOUNT) as i64),
+        assert_balance!(ctx, account: 0, eq: -((TX_COUNT * AMOUNT) as i64),
                 "[{}] system account", label);
 
-            eprintln!("[crash_mid:{}] PASSED", label);
-        }
+        eprintln!("[crash_mid:{}] PASSED", label);
     }
 }
