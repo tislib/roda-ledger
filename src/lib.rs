@@ -18,5 +18,7 @@ pub mod wal;
 
 mod entries;
 #[cfg(feature = "grpc")]
+pub mod client;
+#[cfg(feature = "grpc")]
 pub mod grpc;
 pub mod index;
