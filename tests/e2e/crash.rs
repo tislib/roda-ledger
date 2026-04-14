@@ -88,9 +88,9 @@ async fn crash_in_the_middle() {
     let total_wal_mb: u64 = TX_COUNT * 120 / (1024 * 1024) + 10;
 
     // retry 100 times to ensure idempotency
-    for _ in 0..100 {
-        let label = format!("iteration_{}", total_wal_mb);
-        eprintln!("iteration: {}", total_wal_mb);
+    for i in 0..100 {
+        let label = format!("iteration_{}", i);
+        eprintln!("iteration: {}", i);
         let mut profile = profile("single_node");
         profile.ledger.storage.wal_segment_size_mb = total_wal_mb;
 
