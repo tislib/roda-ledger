@@ -5,7 +5,7 @@ use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
-use crate::storage::Storage;
+use crate::storage::{Segment, Storage};
 use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
@@ -259,6 +259,15 @@ impl Ledger {
 
     pub fn start(&mut self) -> std::io::Result<()> {
         info!("Starting Ledger stages...");
+
+        // Crash recovery: must run BEFORE normal recovery.
+        Recover::crash_recover_if_needed(&self.storage).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed crash recovery during start: {}", e),
+            )
+        })?;
+
         self.recover().map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -317,6 +326,11 @@ impl Drop for Ledger {
         self.pipeline.shutdown();
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();
+        }
+
+        // Signal clean shutdown so the next start can distinguish a crash.
+        if let Err(e) = Segment::create_wal_stop(&self.storage.config().data_dir) {
+            spdlog::error!("failed to create wal.stop marker: {}", e);
         }
     }
 }
