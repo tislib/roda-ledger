@@ -37,7 +37,7 @@ fn test_sealing_at_rotation_boundary() {
             ledger.submit(Operation::Deposit {
                 account: 1,
                 amount: 100,
-                user_ref: i as u64,
+                user_ref: i,
             });
         }
 
@@ -96,7 +96,7 @@ fn test_sealing_below_rotation_boundary() {
             ledger.submit(Operation::Deposit {
                 account: 1,
                 amount: 100,
-                user_ref: i as u64,
+                user_ref: i,
             });
         }
 
