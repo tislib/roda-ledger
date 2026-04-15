@@ -45,7 +45,7 @@ fn test_race_post_seal_transaction_double_counted_on_restart() {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
                 transaction_count_per_segment: 100, // small segments → seal happens quickly
-                snapshot_frequency: 1,  // snapshot on every seal
+                snapshot_frequency: 1,              // snapshot on every seal
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),

@@ -132,8 +132,12 @@ impl<'r> Recover<'r> {
                     // Check whether enough records remain for this tx.
                     let records_left = (data.len() - offset) / ENTRY_SIZE - 1;
                     if records_left < expected {
-                        return Self::handle_broken_tx(data, tx_start, last_good,
-                            "not enough follower records");
+                        return Self::handle_broken_tx(
+                            data,
+                            tx_start,
+                            last_good,
+                            "not enough follower records",
+                        );
                     }
 
                     // Validate follower kinds and collect slices for CRC.
@@ -142,9 +146,7 @@ impl<'r> Recover<'r> {
                     let mut followers_ok = true;
                     for _ in 0..expected {
                         let fk = data[foff];
-                        if fk != WalEntryKind::TxEntry as u8
-                            && fk != WalEntryKind::Link as u8
-                        {
+                        if fk != WalEntryKind::TxEntry as u8 && fk != WalEntryKind::Link as u8 {
                             followers_ok = false;
                             break;
                         }
@@ -153,8 +155,12 @@ impl<'r> Recover<'r> {
                     }
 
                     if !followers_ok {
-                        return Self::handle_broken_tx(data, tx_start, last_good,
-                            "unexpected follower record kind");
+                        return Self::handle_broken_tx(
+                            data,
+                            tx_start,
+                            last_good,
+                            "unexpected follower record kind",
+                        );
                     }
 
                     // ── CRC verification ─────────────────────────────
@@ -166,11 +172,15 @@ impl<'r> Recover<'r> {
                     }
 
                     if digest != meta.crc32c {
-                        return Self::handle_broken_tx(data, tx_start, last_good,
+                        return Self::handle_broken_tx(
+                            data,
+                            tx_start,
+                            last_good,
                             &format!(
                                 "CRC mismatch (stored={:#010x}, computed={:#010x})",
                                 meta.crc32c, digest
-                            ));
+                            ),
+                        );
                     }
 
                     // Transaction is valid.
@@ -180,8 +190,12 @@ impl<'r> Recover<'r> {
 
                 // ── Orphan entry/link or unknown kind ───────────────────
                 _ => {
-                    return Self::handle_broken_tx(data, offset, last_good,
-                        &format!("unexpected record kind {}", kind));
+                    return Self::handle_broken_tx(
+                        data,
+                        offset,
+                        last_good,
+                        &format!("unexpected record kind {}", kind),
+                    );
                 }
             }
         }
@@ -234,8 +248,7 @@ impl<'r> Recover<'r> {
                 if off + ENTRY_SIZE > data.len() {
                     return false;
                 }
-                let meta: TxMetadata =
-                    bytemuck::pod_read_unaligned(&data[off..off + ENTRY_SIZE]);
+                let meta: TxMetadata = bytemuck::pod_read_unaligned(&data[off..off + ENTRY_SIZE]);
                 let expected = meta.entry_count as usize + meta.link_count as usize;
                 let records_available = (data.len() - off) / ENTRY_SIZE - 1;
 
@@ -250,9 +263,7 @@ impl<'r> Recover<'r> {
                 let mut follower_slices: Vec<&[u8]> = Vec::with_capacity(expected);
                 for _ in 0..expected {
                     let fk = data[foff];
-                    if fk != WalEntryKind::TxEntry as u8
-                        && fk != WalEntryKind::Link as u8
-                    {
+                    if fk != WalEntryKind::TxEntry as u8 && fk != WalEntryKind::Link as u8 {
                         followers_ok = false;
                         break;
                     }

@@ -230,7 +230,7 @@ fn test_crash_with_partial_active_wal() {
             storage: StorageConfig {
                 data_dir: dir.clone(),
                 transaction_count_per_segment: 10_000_000, // large count to keep everything in active wal
-                snapshot_frequency: 0,     // no snapshots
+                snapshot_frequency: 0,                     // no snapshots
                 ..Default::default()
             },
             seal_check_internal: Duration::from_millis(1),

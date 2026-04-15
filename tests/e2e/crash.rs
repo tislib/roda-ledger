@@ -32,7 +32,10 @@ async fn simple_crash_recovery() {
     ];
 
     for (label, transaction_count_per_segment) in segment_configs {
-        eprintln!("[{}] transaction_count_per_segment = {}", label, transaction_count_per_segment);
+        eprintln!(
+            "[{}] transaction_count_per_segment = {}",
+            label, transaction_count_per_segment
+        );
 
         let mut profile = profile("single_node");
         profile.ledger.storage.transaction_count_per_segment = transaction_count_per_segment;

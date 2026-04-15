@@ -90,7 +90,6 @@ impl Storage {
     pub fn next_segment(&self) {
         self.last_segment_id.fetch_add(1, Ordering::AcqRel);
     }
-
 }
 
 impl Drop for Storage {
