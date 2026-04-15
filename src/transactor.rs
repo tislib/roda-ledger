@@ -39,7 +39,7 @@ impl Transactor {
         Self {
             rejected_transactions: Arc::new(Default::default()),
             balances: accounts,
-            dedup: DedupCache::new(config.dedup_enabled, config.dedup_window_ms),
+            dedup: DedupCache::new(config.storage.transaction_count_per_segment),
         }
     }
 
@@ -78,7 +78,7 @@ impl Transactor {
             input_retry_count: 0,
             fail_reason: FailReason::NONE,
             position: 0,
-            dedup: std::mem::replace(&mut self.dedup, DedupCache::new(false, 0)),
+            dedup: std::mem::replace(&mut self.dedup, DedupCache::new(0)),
         };
         std::thread::Builder::new()
             .name("transactor".to_string())
@@ -101,7 +101,7 @@ impl TransactorRunner {
             input_retry_count: 0,
             fail_reason: FailReason::NONE,
             position: 0,
-            dedup: DedupCache::new(false, 0),
+            dedup: DedupCache::new(0),
         }
     }
 
@@ -201,7 +201,6 @@ impl TransactorRunner {
     /// Process the buffered transactions, producing wal entries in `self.entries`.
     /// Returns the maximum transaction id observed in this batch (0 if none).
     fn process(&mut self, timestamp: u64) -> u64 {
-        let timestamp_ms = timestamp / 1_000_000; // nanos → ms
         let mut max_tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
             self.fail_reason = FailReason::NONE;
@@ -212,7 +211,7 @@ impl TransactorRunner {
             let user_ref = operation.user_ref();
 
             // --- Deduplication check ---
-            match self.dedup.check(user_ref, timestamp_ms) {
+            match self.dedup.check(user_ref, tx_id) {
                 DedupResult::Duplicate(original_tx_id) => {
                     self.emit_duplicate(tx_id, user_ref, timestamp, original_tx_id);
                     self.rejected_transactions

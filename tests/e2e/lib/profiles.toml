@@ -10,12 +10,10 @@ max_message_size_bytes = 4194304  # 4MB
 [single_node.ledger]
 max_accounts = 2000000
 wait_strategy = "balanced"   # low_latency | balanced | low_cpu
-dedup_enabled = true
-dedup_window_ms = 10000000      # 10000 seconds
 
 [single_node.ledger.storage]
 data_dir = "./data"
-wal_segment_size_mb = 2048
+transaction_count_per_segment = 10000000  # 10M transactions per segment
 snapshot_frequency = 2       # take a snapshot every N sealed WAL segments
 
 
@@ -31,10 +29,8 @@ max_message_size_bytes = 4194304
 [three_node_cluster.ledger]
 max_accounts = 2000000
 wait_strategy = "balanced"
-dedup_enabled = true
-dedup_window_ms = 10000
 
 [three_node_cluster.ledger.storage]
 data_dir = "./data"
-wal_segment_size_mb = 2048
+transaction_count_per_segment = 10000000
 snapshot_frequency = 2

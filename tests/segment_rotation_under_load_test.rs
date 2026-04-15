@@ -23,7 +23,7 @@ fn test_rapid_rotation_many_segments() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 2,
                 ..Default::default()
             },
@@ -85,7 +85,7 @@ fn test_rapid_rotation_many_segments() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 2,
                 ..Default::default()
             },
@@ -113,7 +113,7 @@ fn test_concurrent_writes_during_rotation() {
     let config = LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.clone(),
-            wal_segment_size_mb: 1,
+            transaction_count_per_segment: 100,
             snapshot_frequency: 2,
             ..Default::default()
         },
@@ -170,7 +170,7 @@ fn test_seal_crc_integrity() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 0, // no snapshots, focus on WAL
                 ..Default::default()
             },
@@ -249,7 +249,7 @@ fn test_snapshot_at_segment_boundary() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 2,
                 ..Default::default()
             },
@@ -309,7 +309,7 @@ fn test_snapshot_at_segment_boundary() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                wal_segment_size_mb: 1,
+                transaction_count_per_segment: 100,
                 snapshot_frequency: 2,
                 ..Default::default()
             },

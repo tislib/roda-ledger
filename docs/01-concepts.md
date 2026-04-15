@@ -33,7 +33,7 @@ An **operation** is the client's intent. roda-ledger provides four operation typ
 - **Transfer** — moves an amount from one account to another
 - **Composite** — a caller-defined sequence of `Credit` and `Debit` steps, executed atomically. This is the escape hatch for logic that does not fit the named operation types.
 
-Every operation carries a `user_ref` — a caller-supplied value that serves two purposes: an idempotency key to prevent duplicate processing, and a reference stored alongside the transaction for correlation or auditing.
+Every operation carries a `user_ref` — a caller-supplied value that serves two purposes: an idempotency key to prevent duplicate processing, and a reference stored alongside the transaction for correlation or auditing. Idempotency is described in detail below.
 
 The client submits operations. It never writes transactions directly.
 
@@ -116,6 +116,18 @@ To summarize:
 | Write | Always linearizable | Single Transactor, in-memory latest state |
 | Read (default) | Eventually consistent | `get_balance` returns balance + `last_tx_id` |
 | Read (explicit wait) | Linearizable | `submit_wait(snapshot)` then `get_balance` |
+
+---
+
+## Idempotency and the Active Window
+
+Duplicate protection is always on — it cannot be disabled. When `user_ref > 0`, the ledger guarantees that submitting the same `user_ref` twice within the **active window** produces a single committed transaction. The second submission is recorded as a duplicate, linked to the original, and rejected with `DUPLICATE` — the caller always recovers the original `tx_id`.
+
+The **active window** is the range of the last N transactions, where N equals the configured segment transaction count (`transaction_count_per_segment`). This is the same boundary that controls WAL segment rotation. Because the deduplication cache uses a flip-flop mechanism (active + previous), the effective coverage is N to 2N transactions — at least one full segment worth, at most two.
+
+The window is defined by transaction count, not wall-clock time. This makes idempotency guarantees deterministic regardless of throughput or load spikes — the same number of transactions always provides the same protection, whether they arrive in one second or one hour.
+
+`user_ref = 0` opts out of the idempotency check for that individual transaction. This is the mechanism, not a global toggle — there is no configuration to disable deduplication system-wide.
 
 ---
 

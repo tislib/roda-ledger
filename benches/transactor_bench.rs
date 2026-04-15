@@ -16,8 +16,6 @@ fn transactor_bench(c: &mut Criterion) {
 
     let config = LedgerConfig {
         max_accounts: 10_000_000,
-        dedup_enabled: true,
-        dedup_window_ms: 10_000,
         ..LedgerConfig::default()
     };
     let mut transactor = Transactor::new(&config);

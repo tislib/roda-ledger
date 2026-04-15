@@ -1,6 +1,6 @@
 use crate::entities::WalEntry;
 use crate::storage::layout::{
-    active_wal_path, segment_crc_path, segment_seal_path, segment_wal_path,
+    active_wal_path, segment_crc_path, segment_seal_path, segment_wal_path, wal_stop_path,
 };
 use crate::storage::syncer::Syncer;
 use crate::storage::wal_reader::{read_wal_data, verify_wal_data};
@@ -88,7 +88,6 @@ impl Segment {
                 ),
             )
         })?;
-        // fix me, verify wal data and find if any transaction is broken or partially written in tail
 
         let wal_data = if metadata.len() > 0 {
             read_wal_data(&wal_file_path).map_err(|e| {
@@ -369,6 +368,66 @@ impl Segment {
 
     pub(crate) fn current_wal_offset(&self) -> usize {
         self.wal_position
+    }
+
+    pub(crate) fn wal_data_len(&self) -> usize {
+        self.wal_data.len()
+    }
+
+    /// Returns a copy of the raw WAL data for external processing.
+    pub(crate) fn wal_data_copy(&self) -> Vec<u8> {
+        self.wal_data.clone()
+    }
+
+    /// Truncates the active WAL file to `new_len` bytes.
+    pub(crate) fn truncate_wal(&mut self, new_len: u64) -> Result<(), Error> {
+        let data_dir_path = Path::new(&self.data_dir);
+        let wal_file_path = active_wal_path(data_dir_path);
+        let file = OpenOptions::new().write(true).open(&wal_file_path)?;
+        file.set_len(new_len)?;
+        file.sync_all()?;
+
+        // Re-read the truncated data so visit_wal_records sees the correct state.
+        if new_len > 0 {
+            self.wal_data = read_wal_data(&wal_file_path)?;
+        } else {
+            self.wal_data.clear();
+        }
+        self.wal_position = new_len as usize;
+        Ok(())
+    }
+
+    // ── wal.stop marker (physical abstraction) ──────────────────────────────
+
+    /// Returns `true` if the `wal.stop` marker exists in the data directory.
+    pub(crate) fn has_wal_stop(data_dir: &str) -> bool {
+        wal_stop_path(Path::new(data_dir)).exists()
+    }
+
+    /// Returns `true` if the active WAL file (`wal.bin`) exists in the data directory.
+    pub(crate) fn has_active_wal(data_dir: &str) -> bool {
+        active_wal_path(Path::new(data_dir)).exists()
+    }
+
+    /// Creates the `wal.stop` marker to signal a clean shutdown.
+    /// Silently succeeds if the data directory no longer exists.
+    pub(crate) fn create_wal_stop(data_dir: &str) -> Result<(), Error> {
+        let dir = Path::new(data_dir);
+        if !dir.exists() {
+            return Ok(());
+        }
+        let path = wal_stop_path(dir);
+        File::create(&path)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Removes the `wal.stop` marker.
+    pub(crate) fn delete_wal_stop(data_dir: &str) -> Result<(), Error> {
+        let path = wal_stop_path(Path::new(data_dir));
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
     }
 
     // ── Public helpers for CLI tooling (ADR-007) ─────────────────────────────

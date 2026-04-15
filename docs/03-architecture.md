@@ -91,7 +91,7 @@ The WAL runs as **two concurrent threads** communicating through shared atomics:
 
 The Writer never blocks waiting for `fdatasync` — it continues writing while the Committer syncs. Entries only flow to the Snapshotter after the Committer confirms durability. This decoupling is why the WAL sustains high write throughput despite the inherent latency of `fdatasync` (~100s µs, disk-bound).
 
-The WAL is **segmented** — divided into files of configurable size. When a segment is full, the Writer rotates to a new one. Sealed segments are complete, consistent units used for recovery.
+The WAL is **segmented** — divided into files based on transaction count (`transaction_count_per_segment`). When the transaction count in the active segment reaches the configured limit, the Writer rotates to a new one. Segment files are dynamically sized on disk — a segment with many complex (multi-entry) transactions will be larger than one with simple deposits — but the transaction count per segment is always fixed and predictable. Sealed segments are complete, consistent units used for recovery.
 
 ---
 
@@ -105,7 +105,7 @@ A segment moves through three states:
 | `CLOSED` | `segment_NNN.wal` | WAL Writer rotated away. Immutable, awaiting Seal. |
 | `SEALED` | `segment_NNN.wal` + `.crc` + `.seal` | Verified, safe for recovery. May have snapshot. |
 
-**ACTIVE → CLOSED:** size threshold hit → WAL Writer writes `SegmentSealed` entry, `fdatasync`, renames `wal.bin` to `segment_NNN.wal`, opens new `wal.bin`.
+**ACTIVE → CLOSED:** transaction count threshold hit → WAL Writer writes `SegmentSealed` entry, `fdatasync`, renames `wal.bin` to `segment_NNN.wal`, opens new `wal.bin`.
 
 **CLOSED → SEALED:** Seal process picks it up on a timer, computes CRC32, writes `.crc` and `.seal` sidecar files.
 
@@ -122,6 +122,28 @@ The Seal process runs on a configurable timer. For each unsealed segment it: loa
 <img src="./resources/seal-flow.png" style="width: 100%;" />
 
 Snapshots are not written on every seal — only every `snapshot_frequency` segments (default: 2). The snapshot captures all non-zero balances at that point and is the base for recovery.
+
+---
+
+## Active Window, Idempotency, and Hot Indexes
+
+The **active window** is the central sizing concept in roda-ledger. It is defined as the last N transactions where N = `transaction_count_per_segment`. Three subsystems are derived from this single value:
+
+### Segment rotation
+
+WAL segment rotation triggers when the transaction count in the active segment reaches `transaction_count_per_segment`. This makes the active window predictable — operators always know exactly how many transactions fit in the active segment, regardless of transaction complexity or entry counts.
+
+### Idempotency (deduplication)
+
+The Transactor maintains a flip-flop deduplication cache — two HashMaps (`active` and `previous`) mapping `user_ref → tx_id`. When `tx_id` crosses a segment boundary, the maps flip: `active` becomes `previous`, and a new `active` begins. This gives an effective deduplication window of N to 2N transactions.
+
+The flip is driven by transaction ID, not wall-clock time. Under a burst of 1M transactions per second the window covers the same number of transactions as under 100 transactions per second. Idempotency guarantees are deterministic.
+
+Deduplication is always on — there is no config toggle. `user_ref = 0` skips the check on a per-transaction basis, but the cache is always active.
+
+### Hot indexes
+
+The Snapshotter maintains two circular indexes for serving `GetTransaction` and `GetAccountHistory` queries on recent data, hot index is keeping last N transactions where N is active window size.
 
 ---
 

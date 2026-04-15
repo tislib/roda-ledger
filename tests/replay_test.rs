@@ -6,9 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Force segment rotation and snapshot:
-///   1MB segments + snapshot_frequency=1 ensures snapshot after first seal.
-///   35K txs × 2 records × 33 bytes ≈ 2.3MB → at least 2 seals.
-const SMALL_SEGMENT_MB: u64 = 1;
+///   100 tx/segment + snapshot_frequency=1 ensures snapshot after first seal.
+const SMALL_SEGMENT_TX_COUNT: u64 = 100;
 const SNAP_EVERY_SEAL: u32 = 1;
 
 #[test]
@@ -27,7 +26,7 @@ fn test_replay_functionality() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
-                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
                 snapshot_frequency: SNAP_EVERY_SEAL,
                 ..Default::default()
             },
@@ -62,7 +61,7 @@ fn test_replay_functionality() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
-                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
                 snapshot_frequency: 100,
                 ..Default::default()
             },
@@ -104,7 +103,7 @@ fn test_replay_functionality() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
-                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
                 snapshot_frequency: 100,
                 ..Default::default()
             },

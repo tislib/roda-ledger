@@ -66,6 +66,7 @@ pub struct WalRunner {
     active_segment: Segment,
     buffer: VecDeque<WalEntry>,
     last_received_tx_id: u64,
+    segment_start_tx_id: u64,
     wait_strategy: WaitStrategy,
 }
 
@@ -99,6 +100,7 @@ impl WalRunner {
             active_segment,
             buffer,
             last_received_tx_id: 0,
+            segment_start_tx_id: 0,
             wait_strategy,
         }
     }
@@ -118,6 +120,9 @@ impl WalRunner {
                     self.buffer.push_back(entry);
                     if self.move_pending_entry(&entry) {
                         self.last_received_tx_id = entry.tx_id();
+                        if self.segment_start_tx_id == 0 {
+                            self.segment_start_tx_id = entry.tx_id();
+                        }
                     }
                 } else {
                     spin_loop();
@@ -140,8 +145,13 @@ impl WalRunner {
             }
             self.retry_count = 0;
 
-            // Rotate the segment when the size threshold is exceeded.
-            if self.active_segment.current_wal_offset() >= (self.storage.wal_size()) {
+            // Rotate the segment when the transaction count threshold is exceeded.
+            let tx_per_seg = self.storage.config().transaction_count_per_segment;
+            if self.last_received_tx_id > 0
+                && self.segment_start_tx_id > 0
+                && tx_per_seg > 0
+                && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg
+            {
                 self.rotate();
             }
 
@@ -185,6 +195,7 @@ impl WalRunner {
             ))]);
         let syncer = self.active_segment.syncer().expect("Failed to get syncer");
         self.active_segment_sync.store(Arc::new(Some(syncer)));
+        self.segment_start_tx_id = 0; // will be set on next tx arrival
     }
 
     // Update `pending_records` based on the given entry. 0 means the entry is

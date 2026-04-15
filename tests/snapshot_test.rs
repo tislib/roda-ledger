@@ -5,9 +5,9 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-/// Force snapshot creation: very small WAL segments (1MB) + snapshot every seal.
-/// With 35K transactions × 2 records × 33 bytes ≈ 2.3MB → at least 2 seals → snapshot.
-const SMALL_SEGMENT_MB: u64 = 1;
+/// Force snapshot creation: very small WAL segments (100 tx/segment) + snapshot every seal.
+/// With 35K transactions → many seals → snapshot.
+const SMALL_SEGMENT_TX_COUNT: u64 = 100;
 const SNAP_EVERY_SEAL: u32 = 1;
 
 #[test]
@@ -24,7 +24,7 @@ fn test_snapshot_creation() {
     let config = LedgerConfig {
         storage: StorageConfig {
             data_dir: temp_dir.clone(),
-            wal_segment_size_mb: SMALL_SEGMENT_MB,
+            transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
             snapshot_frequency: SNAP_EVERY_SEAL,
             ..Default::default()
         },
@@ -162,7 +162,7 @@ fn test_snapshot_restore_correct_balances() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
-                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
                 snapshot_frequency: SNAP_EVERY_SEAL,
                 ..Default::default()
             },
@@ -193,7 +193,7 @@ fn test_snapshot_restore_correct_balances() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
-                wal_segment_size_mb: SMALL_SEGMENT_MB,
+                transaction_count_per_segment: SMALL_SEGMENT_TX_COUNT,
                 snapshot_frequency: SNAP_EVERY_SEAL,
                 ..Default::default()
             },

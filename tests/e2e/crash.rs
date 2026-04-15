@@ -25,19 +25,20 @@ async fn simple_crash_recovery() {
     const AMOUNT: u64 = 1;
     const ACCOUNT: u64 = 1;
 
-    let total_wal_mb: u64 = TX_COUNT * 120 / (1024 * 1024);
-
-    let segment_sizes: Vec<(&str, u64)> = vec![
-        ("all_active", total_wal_mb + 10),
-        ("single_closed", total_wal_mb * 60 / 100),
-        ("ten_closed", total_wal_mb * 10 / 100),
+    let segment_configs: Vec<(&str, u64)> = vec![
+        ("all_active", TX_COUNT + 10),
+        ("single_closed", TX_COUNT * 60 / 100),
+        ("ten_closed", TX_COUNT * 10 / 100),
     ];
 
-    for (label, segment_size_mb) in segment_sizes {
-        eprintln!("[{}] wal_segment_size_mb = {}", label, segment_size_mb);
+    for (label, transaction_count_per_segment) in segment_configs {
+        eprintln!(
+            "[{}] transaction_count_per_segment = {}",
+            label, transaction_count_per_segment
+        );
 
         let mut profile = profile("single_node");
-        profile.ledger.storage.wal_segment_size_mb = segment_size_mb;
+        profile.ledger.storage.transaction_count_per_segment = transaction_count_per_segment;
 
         let mut ctx = crate::e2e::E2EContext::new(profile).await;
 
@@ -85,14 +86,12 @@ async fn crash_in_the_middle() {
     const AMOUNT: u64 = 1;
     const ACCOUNT: u64 = 1;
 
-    let total_wal_mb: u64 = TX_COUNT * 120 / (1024 * 1024) + 10;
-
     // retry 100 times to ensure idempotency
     for i in 0..100 {
         let label = format!("iteration_{}", i);
         eprintln!("iteration: {}", i);
         let mut profile = profile("single_node");
-        profile.ledger.storage.wal_segment_size_mb = total_wal_mb;
+        profile.ledger.storage.transaction_count_per_segment = TX_COUNT + 10;
 
         let mut ctx = crate::e2e::E2EContext::new(profile).await;
 

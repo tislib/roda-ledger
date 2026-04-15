@@ -6,6 +6,13 @@ pub(super) fn active_wal_path(data_dir: &Path) -> PathBuf {
     data_dir.join("wal.bin")
 }
 
+/// Returns the path of the WAL stop marker: `{data_dir}/wal.stop`.
+/// Presence indicates a clean shutdown; absence with an existing `wal.bin`
+/// signals a crash.
+pub(crate) fn wal_stop_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("wal.stop")
+}
+
 /// Returns the path of a sealed WAL segment binary: `{data_dir}/wal_{id:06}.bin`.
 pub(super) fn segment_wal_path(data_dir: &Path, id: u32) -> PathBuf {
     data_dir.join(format!("wal_{:06}.bin", id))

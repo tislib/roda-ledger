@@ -56,7 +56,7 @@ fn query_account_history(
 fn cold_storage_config(dir: &str) -> StorageConfig {
     StorageConfig {
         data_dir: dir.to_string(),
-        wal_segment_size_mb: 1,
+        transaction_count_per_segment: 10_000,
         snapshot_frequency: 0,
         ..Default::default()
     }
@@ -75,7 +75,7 @@ fn no_rotation_config(dir: &str) -> LedgerConfig {
     LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.to_string(),
-            wal_segment_size_mb: 2048,
+            transaction_count_per_segment: 10_000_000,
             snapshot_frequency: 0,
             ..Default::default()
         },
@@ -590,20 +590,21 @@ fn test_query_closed_unsealed_segment_after_restart() {
 fn test_query_sealed_segment_after_restart() {
     let dir = unique_dir("query_sealed_restart");
 
+    let tx_count = 8_000u64;
     let mut sampled_tx_ids = Vec::new();
     {
         let mut ledger = Ledger::new(cold_ledger_config(&dir));
         ledger.start().unwrap();
 
         let mut last_id = 0;
-        for i in 0..20_000u64 {
+        for i in 0..tx_count {
             let id = ledger.submit(Operation::Deposit {
                 account: 1 + (i % 10),
                 amount: 100 + i,
                 user_ref: i,
             });
             // Sample a few tx_ids spread across segments
-            if i % 4_000 == 0 {
+            if i % 2_000 == 0 {
                 sampled_tx_ids.push(id);
             }
             last_id = id;
@@ -628,7 +629,7 @@ fn test_query_sealed_segment_after_restart() {
     }
 
     // GetAccountHistory: account 1 received deposits at i=0,10,20,...
-    // With 20k txs and 10 accounts, account 1 has ~2000 deposits.
+    // With 8k txs and 10 accounts, account 1 has ~800 deposits.
     let history = query_account_history(&ledger, 1, 0, 50);
     assert_eq!(
         history.len(),

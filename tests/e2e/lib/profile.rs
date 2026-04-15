@@ -77,7 +77,7 @@ impl Profile {
         config.storage = StorageConfig {
             data_dir: dir.to_string_lossy().to_string(),
             temporary: true,
-            wal_segment_size_mb: self.ledger.storage.wal_segment_size_mb,
+            transaction_count_per_segment: self.ledger.storage.transaction_count_per_segment,
             snapshot_frequency: self.ledger.storage.snapshot_frequency,
         };
         config
@@ -96,12 +96,10 @@ max_message_size_bytes = {max_msg}
 [ledger]
 max_accounts = {max_accounts}
 wait_strategy = "{wait_strategy}"
-dedup_enabled = {dedup_enabled}
-dedup_window_ms = {dedup_window_ms}
 
 [ledger.storage]
 data_dir = "{data_dir}"
-wal_segment_size_mb = {wal_seg}
+transaction_count_per_segment = {tx_per_seg}
 snapshot_frequency = {snap_freq}
 "#,
             max_conn = self.server.max_connections,
@@ -113,9 +111,7 @@ snapshot_frequency = {snap_freq}
                 WaitStrategy::LowCpu => "low_cpu",
                 WaitStrategy::Custom { .. } => "balanced",
             },
-            dedup_enabled = self.ledger.dedup_enabled,
-            dedup_window_ms = self.ledger.dedup_window_ms,
-            wal_seg = self.ledger.storage.wal_segment_size_mb,
+            tx_per_seg = self.ledger.storage.transaction_count_per_segment,
             snap_freq = self.ledger.storage.snapshot_frequency,
         )
     }
