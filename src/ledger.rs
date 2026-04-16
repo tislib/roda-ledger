@@ -6,7 +6,7 @@ use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Segment, Storage};
-use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
+use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
@@ -56,8 +56,11 @@ impl Ledger {
     }
 
     pub fn submit(&self, operation: Operation) -> u64 {
-        let transaction = Transaction::new(operation);
-        self.sequencer.submit(transaction)
+        self.sequencer.submit(operation)
+    }
+
+    pub fn submit_batch(&self, operations: Vec<Operation>) -> u64 {
+        self.sequencer.submit_batch(operations)
     }
 
     pub fn get_balance(&self, account_id: u64) -> Balance {

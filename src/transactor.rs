@@ -6,7 +6,7 @@ use crate::entities::{
     WalEntryKind,
 };
 use crate::pipeline::TransactorContext;
-use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction};
+use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction, TransactionInput};
 use crossbeam_skiplist::SkipMap;
 use std::collections::{BTreeMap, HashMap};
 use std::hint::spin_loop;
@@ -138,22 +138,52 @@ impl TransactorRunner {
     fn run_step(&mut self, ctx: &TransactorContext) {
         let inbound = ctx.input();
         // collect transactions to process
-        while let Some(tx) = inbound.pop() {
-            if tx.id == self.expected_next_id {
-                self.transaction_buffer.push(tx);
-                self.expected_next_id += 1;
-                // drain any buffered transactions that are now in order
-                while let Some(buffered) = self.pending.remove(&self.expected_next_id) {
-                    self.transaction_buffer.push(buffered);
-                    self.expected_next_id += 1;
-                }
-            } else if tx.id > self.expected_next_id {
-                self.pending.insert(tx.id, tx);
-            }
+        while let Some(txi) = inbound.pop() {
+            match txi {
+                TransactionInput::Single(tx) => {
+                    if tx.id == self.expected_next_id {
+                        self.transaction_buffer.push(tx);
+                        self.expected_next_id += 1;
+                        // drain any buffered transactions that are now in order
+                        while let Some(buffered) = self.pending.remove(&self.expected_next_id) {
+                            self.transaction_buffer.push(buffered);
+                            self.expected_next_id += 1;
+                        }
+                    } else if tx.id > self.expected_next_id {
+                        self.pending.insert(tx.id, tx);
+                    }
 
-            // Limit batch size to avoid overly long processing steps
-            if self.transaction_buffer.len() >= self.transaction_buffer.capacity() {
-                break;
+                    // Limit batch size to avoid overly long processing steps
+                    if self.transaction_buffer.len() >= self.transaction_buffer.capacity() {
+                        break;
+                    }
+                }
+                TransactionInput::Batch(tbx) => {
+                    if tbx.start_tx_id == self.expected_next_id {
+                        for (i, op) in tbx.operations.into_iter().enumerate() {
+                            let mut tx = Transaction::new(op);
+                            tx.id = tbx.start_tx_id + i as u64;
+                            self.transaction_buffer.push(tx);
+                            self.expected_next_id += 1;
+                            // drain any buffered transactions that are now in order
+                            while let Some(buffered) = self.pending.remove(&self.expected_next_id) {
+                                self.transaction_buffer.push(buffered);
+                                self.expected_next_id += 1;
+                            }
+                        }
+                    } else if tbx.start_tx_id > self.expected_next_id {
+                        for (i, op) in tbx.operations.into_iter().enumerate() {
+                            let mut tx = Transaction::new(op);
+                            tx.id = tbx.start_tx_id + i as u64;
+                            self.pending.insert(tx.id, tx);
+                        }
+                    }
+
+                    // Limit batch size to avoid overly long processing steps
+                    if self.transaction_buffer.len() >= self.transaction_buffer.capacity() {
+                        break;
+                    }
+                }
             }
         }
 

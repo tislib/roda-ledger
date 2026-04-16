@@ -12,7 +12,7 @@
 use crate::config::LedgerConfig;
 use crate::entities::WalEntry;
 use crate::snapshot::SnapshotMessage;
-use crate::transaction::Transaction;
+use crate::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 /// publish through it.
 pub struct Pipeline {
     // ---- inter-stage queues ----
-    sequencer_to_transactor: ArrayQueue<Transaction>,
+    sequencer_to_transactor: ArrayQueue<TransactionInput>,
     transactor_to_wal: ArrayQueue<WalEntry>,
     wal_to_snapshot: ArrayQueue<SnapshotMessage>,
 
@@ -190,17 +190,17 @@ pub struct SequencerContext {
 
 impl SequencerContext {
     #[inline(always)]
-    pub fn output(&self) -> &ArrayQueue<Transaction> {
+    pub fn output(&self) -> &ArrayQueue<TransactionInput> {
         &self.pipeline.sequencer_to_transactor
     }
 
     /// Atomically fetch and increment the sequencer index. Returns the id
     /// the caller should stamp on its transaction.
     #[inline(always)]
-    pub fn fetch_next_id(&self) -> u64 {
+    pub fn fetch_next_id(&self, count: u64) -> u64 {
         self.pipeline
             .sequencer_index
-            .fetch_add(1, Ordering::Acquire)
+            .fetch_add(count, Ordering::Acquire)
     }
 
     #[inline(always)]
@@ -230,7 +230,7 @@ pub struct TransactorContext {
 
 impl TransactorContext {
     #[inline(always)]
-    pub fn input(&self) -> &ArrayQueue<Transaction> {
+    pub fn input(&self) -> &ArrayQueue<TransactionInput> {
         &self.pipeline.sequencer_to_transactor
     }
 

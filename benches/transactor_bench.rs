@@ -1,7 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use roda_ledger::ledger::{LedgerConfig, WaitStrategy};
 use roda_ledger::pipeline::Pipeline;
-use roda_ledger::transaction::{Operation, Transaction};
+use roda_ledger::transaction::{Operation, Transaction, TransactionInput};
 use roda_ledger::transactor::Transactor;
 use std::hint::spin_loop;
 use std::thread;
@@ -47,8 +47,8 @@ fn transactor_bench(c: &mut Criterion) {
                 user_ref: 0,
             });
             tx.id = current_id;
-            while let Err(returned_tx) = push_ctx.input().push(tx) {
-                tx = returned_tx;
+            while let Err(returned_tx) = push_ctx.input().push(TransactionInput::Single(tx)) {
+                tx = returned_tx.single();
                 spin_loop();
             }
         });

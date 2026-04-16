@@ -2,7 +2,7 @@ use crate::grpc::proto;
 use crate::grpc::proto::ledger_server::Ledger;
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use crate::transaction::WaitLevel;
+use crate::transaction::{Operation, WaitLevel};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
@@ -62,12 +62,22 @@ impl Ledger for LedgerHandler {
         request: Request<proto::SubmitBatchRequest>,
     ) -> Result<Response<proto::SubmitBatchResponse>, Status> {
         let req = request.into_inner();
-        let mut results = Vec::with_capacity(req.operations.len());
+        let len = req.operations.len();
+        let mut results = Vec::with_capacity(len);
+        let mut operations: Vec<Operation> = Vec::with_capacity(len);
 
         for op_req in req.operations {
             let op = op_req.try_into()?;
-            let transaction_id = self.ledger.submit(op);
-            results.push(proto::SubmitOperationResponse { transaction_id });
+            operations.push(op);
+        }
+
+        let start_transaction_id = self.ledger.submit_batch(operations);
+
+        for i in 0..len {
+            let tx_id = start_transaction_id + i as u64;
+            results.push(proto::SubmitOperationResponse {
+                transaction_id: tx_id,
+            });
         }
 
         Ok(Response::new(proto::SubmitBatchResponse { results }))
@@ -82,20 +92,22 @@ impl Ledger for LedgerHandler {
             .map(WaitLevel::from)
             .unwrap_or(WaitLevel::Committed);
 
-        let mut tx_ids = Vec::with_capacity(req.operations.len());
+        let len = req.operations.len();
+        let mut operations: Vec<Operation> = Vec::with_capacity(len);
+
         for op_req in req.operations {
             let op = op_req.try_into()?;
-            tx_ids.push(self.ledger.submit(op));
+            operations.push(op);
         }
+
+        let start_transaction_id = self.ledger.submit_batch(operations);
 
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
-        if let Some(&last_tx_id) = tx_ids.last() {
-            self.wait_for_transaction_level(last_tx_id, level).await;
-        }
+        let last_tx_id = start_transaction_id + (len - 1) as u64;
+        self.wait_for_transaction_level(last_tx_id, level).await;
 
-        let results = tx_ids
-            .into_iter()
+        let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
                 let status = self.ledger.get_transaction_status(tx_id);
                 let fail_reason = if status.is_err() {

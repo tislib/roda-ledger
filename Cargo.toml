@@ -75,5 +75,14 @@ path = "src/bin/power_tune.rs"
 name = "roda-ctl"
 path = "src/bin/roda_ctl.rs"
 
+[[bin]]
+name = "load"
+path = "src/bin/load.rs"
+
+[[bin]]
+name = "load_grpc"
+path = "src/bin/load_grpc.rs"
+required-features = ["grpc"]
+
 [profile.bench]
 debug = true

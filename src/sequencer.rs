@@ -1,5 +1,5 @@
 use crate::pipeline::SequencerContext;
-use crate::transaction::Transaction;
+use crate::transaction::{Operation, Transaction, TransactionBatch, TransactionInput};
 use std::hint::spin_loop;
 use std::thread::yield_now;
 
@@ -20,14 +20,15 @@ impl Sequencer {
     /// the sequencer→transactor queue, blocking (spin/yield) until there is
     /// space. Returns the assigned id.
     #[inline(always)]
-    pub fn submit(&self, mut transaction: Transaction) -> u64 {
-        let id = self.ctx.fetch_next_id();
+    pub fn submit(&self, operation: Operation) -> u64 {
+        let mut transaction = Transaction::new(operation);
+        let id = self.ctx.fetch_next_id(1);
         transaction.id = id;
 
         let outbound = self.ctx.output();
         let mut retry_count = 0u64;
-        while let Err(t) = outbound.push(transaction) {
-            transaction = t;
+        while let Err(t) = outbound.push(TransactionInput::Single(transaction)) {
+            transaction = t.single();
             spin_loop();
             retry_count += 1;
             if retry_count.is_multiple_of(10_000) {
@@ -36,6 +37,28 @@ impl Sequencer {
         }
 
         id
+    }
+
+    #[inline(always)]
+    pub fn submit_batch(&self, operations: Vec<Operation>) -> u64 {
+        let start_id = self.ctx.fetch_next_id(operations.len() as u64);
+        let mut transaction_batch = TransactionBatch {
+            start_tx_id: start_id,
+            operations,
+        };
+
+        let outbound = self.ctx.output();
+        let mut retry_count = 0u64;
+        while let Err(t) = outbound.push(TransactionInput::Batch(transaction_batch)) {
+            transaction_batch = t.batch();
+            spin_loop();
+            retry_count += 1;
+            if retry_count.is_multiple_of(10_000) {
+                yield_now();
+            }
+        }
+
+        start_id
     }
 
     pub(crate) fn last_id(&self) -> u64 {
