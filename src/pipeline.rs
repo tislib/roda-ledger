@@ -12,7 +12,7 @@
 use crate::config::LedgerConfig;
 use crate::entities::WalEntry;
 use crate::snapshot::SnapshotMessage;
-use crate::transaction::{Transaction, TransactionInput};
+use crate::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;

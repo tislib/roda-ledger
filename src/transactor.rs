@@ -160,11 +160,9 @@ impl TransactorRunner {
                 }
                 TransactionInput::Batch(tbx) => {
                     if tbx.start_tx_id == self.expected_next_id {
-                        let mut i = 0;
-                        for op in tbx.operations {
+                        for (i, op) in tbx.operations.into_iter().enumerate() {
                             let mut tx = Transaction::new(op);
-                            tx.id = tbx.start_tx_id + i;
-                            i += 1;
+                            tx.id = tbx.start_tx_id + i as u64;
                             self.transaction_buffer.push(tx);
                             self.expected_next_id += 1;
                             // drain any buffered transactions that are now in order
@@ -174,11 +172,9 @@ impl TransactorRunner {
                             }
                         }
                     } else if tbx.start_tx_id > self.expected_next_id {
-                        let mut i = 0;
-                        for op in tbx.operations {
+                        for (i, op) in tbx.operations.into_iter().enumerate() {
                             let mut tx = Transaction::new(op);
-                            tx.id = tbx.start_tx_id + i;
-                            i += 1;
+                            tx.id = tbx.start_tx_id + i as u64;
                             self.pending.insert(tx.id, tx);
                         }
                     }

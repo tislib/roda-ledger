@@ -6,7 +6,7 @@ use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::storage::{Segment, Storage};
-use crate::transaction::{Operation, SubmitResult, Transaction, TransactionStatus, WaitLevel};
+use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
