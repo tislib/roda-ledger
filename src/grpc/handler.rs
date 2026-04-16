@@ -107,7 +107,7 @@ impl Ledger for LedgerHandler {
         let last_tx_id = start_transaction_id + (len - 1) as u64;
         self.wait_for_transaction_level(last_tx_id, level).await;
 
-        let results = (start_transaction_id..last_tx_id)
+        let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
                 let status = self.ledger.get_transaction_status(tx_id);
                 let fail_reason = if status.is_err() {

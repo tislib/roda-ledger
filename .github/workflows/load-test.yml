@@ -93,7 +93,7 @@ jobs:
           # Run load test
           echo "::group::Load Test Output"
           /root/.cargo/bin/cargo run --package roda-ledger --release --bin load 2>&1 | tee /root/load-test-output.txt
-          /root/.cargo/bin/cargo run --package roda-ledger --release --bin load_grpc 2>&1 | tee /root/load-test-output.txt
+          /root/.cargo/bin/cargo run --package roda-ledger --release --bin load_grpc --features="grpc" 2>&1 | tee /root/load-test-output.txt
           echo "::endgroup::"
           SETUP_EOF
         env:
