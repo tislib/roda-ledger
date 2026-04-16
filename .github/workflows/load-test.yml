@@ -76,7 +76,7 @@ jobs:
 
           # Install dependencies
           apt-get update -qq
-          apt-get install -y -qq build-essential pkg-config libssl-dev git curl
+          apt-get install -y -qq build-essential pkg-config libssl-dev git curl protobuf-compiler
 
           # Install Rust
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q
