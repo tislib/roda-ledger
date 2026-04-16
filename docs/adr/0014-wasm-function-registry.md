@@ -96,6 +96,12 @@ fn get_balance(account_id: u64) -> i64;
 Transactor's balance Vec directly. They cannot fail individually. The zero-sum invariant is
 enforced after execution completes, as with all operations.
 
+**Negative balance handling is the responsibility of user code.** If the function requires
+overdraft protection, it must call `get_balance` before or after applying credits/debits and
+return a non-zero `Status` to trigger rollback. The ledger does not enforce negative balance
+checks inside WASM functions — this is intentional, as some use cases (liability accounts,
+internal system accounts) legitimately require negative balances.
+
 Integer-only interface — no memory sharing, no pointers, no strings. All WASM value types
 map directly to native types.
 
@@ -112,8 +118,8 @@ Every WASM function must export a single entry point with exactly 8 `i64` parame
 // Rust
 #[no_mangle]
 pub extern "C" fn execute(
-    param1: i64, param2: i64, param3: i64, param4: i64,
-    param5: i64, param6: i64, param7: i64, param8: i64,
+   param1: i64, param2: i64, param3: i64, param4: i64,
+   param5: i64, param6: i64, param7: i64, param8: i64,
 ) -> u8;
 ```
 
@@ -305,18 +311,18 @@ pub type HandlerMap = HashMap<String, FunctionCaller>;
 
 ```rust
 impl WasmRuntime {
-    // Validates binary and checks execute(i64×8)->u8 export. Does not register.
-    pub fn validate(&self, binary: &[u8]) -> Result<(), WasmError>;
+    // Validates binary — checks execute(i64×8)->u8 export is present and well-formed.
+    // Called by Ledger before writing binary to disk during register_function.
+    pub fn validate(&self, binary: &[u8]) -> Result<(), std::io::Error>;
 
-    // Validates, compiles, inserts handler, increments update_seq.
-    // Returns new version number.
-    pub fn register_function(&self, name: &str, binary: &[u8]) -> Result<u16, WasmError>;
+    // Validates CRC32C and binary content, compiles, inserts FunctionCaller into HandlerMap.
+    // Increments update_seq. crc32c is stored in FunctionCaller for use in TxMetadata.tag.
+    // Called by Snapshot stage when WalEntry::FunctionRegistered is committed.
+    pub fn load_function(&self, name: &str, binary: &[u8], crc32c: u32) -> Result<(), std::io::Error>;
 
-    // Removes handler from map, increments update_seq.
-    pub fn unregister_function(&self, name: &str) -> Result<(), WasmError>;
-
-    // Loads compiled handler from binary (used by Snapshot stage during WAL replay/recovery).
-    pub fn load_function(&self, name: &str, binary: &[u8]) -> Result<(), WasmError>;
+    // Removes handler from HandlerMap. Increments update_seq.
+    // Called by Snapshot stage when WalEntry::FunctionRegistered { crc32c: 0 } is committed.
+    pub fn unload_function(&self, name: &str) -> Result<(), std::io::Error>;
 
     // Returns current update sequence number.
     pub fn last_update_seq(&self) -> u32;
@@ -325,6 +331,11 @@ impl WasmRuntime {
     pub fn get_handler_map(&self) -> HandlerMap;
 }
 ```
+
+`WasmRuntime` has no knowledge of disk, WAL, or pipeline. It only manages compiled handlers
+in memory. `validate` is called by `Ledger` before disk write. `load_function` is called by
+the Snapshot stage after WAL commit — it validates CRC and binary, then compiles and stores
+the handler with its CRC32C for embedding in `TxMetadata.tag` during execution.
 
 One `Engine` per `Ledger` — shared, thread-safe, JIT compiled once per function at registration.
 One `Store` per execution — created inside `FunctionCaller`, dropped immediately after.
@@ -365,24 +376,30 @@ fn run_step(&mut self, ctx: &TransactorContext) {
 ### Registration Flow
 
 ```
-ledger.register_function(name, binary, override)
+ledger.register_function(name, binary, override)        ← Ledger owns this flow
   → if function exists and override=false → return error
   → wasm_runtime.validate(binary) → check execute(i64×8)->u8 export
   → storage/functions.rs: write functions/{name}_v{N}.wasm to disk
-  → write WalEntry::FunctionRegistered directly to active WAL segment
+  → push WalEntry::FunctionRegistered onto pipeline WAL input queue
   → return version number to caller
 ```
 
 ```
 Snapshot stage receives WalEntry::FunctionRegistered
-  → read binary from disk via storage/functions.rs
-  → wasm_runtime.load_function(name, binary)
+  → storage/functions.rs: read functions/{name}_v{version}.wasm from disk → binary
+  → wasm_runtime.load_function(name, binary, entry.crc32c)
+      → verify CRC32C(binary) == crc32c → reject if mismatch
+      → validate binary (execute(i64×8)->u8 export)
       → compile via Engine
-      → insert FunctionCaller into HandlerMap
+      → insert FunctionCaller { crc32c, handler } into HandlerMap
       → increment update_seq
 ```
 
 Transactor picks up on next cycle — `update_seq` changed → clone handlers → ready.
+
+**Terminology:**
+- `register_function` — Ledger operation: validation + disk write + WAL entry. Async.
+- `load_function` — WasmRuntime operation: compiles binary, inserts handler into memory. Called by Snapshot on commit.
 
 ---
 
@@ -421,29 +438,25 @@ Auditors cross-reference with `FunctionRegistered` records to resolve name and v
 ### Unregister Flow
 
 ```
-ledger.unregister_function(name)
+ledger.unregister_function(name)                        ← Ledger owns this flow
   → storage/functions.rs: truncate functions/{name}_v{N}.wasm to 0 bytes
-  → write WalEntry::FunctionRegistered { crc32c: 0, name, version+1 }
-  → wasm_runtime.unregister_function(name)
-      → remove FunctionCaller from HandlerMap
-      → increment update_seq
-  → return
+  → push WalEntry::FunctionRegistered { crc32c: 0, name, version+1 } onto pipeline WAL input queue
+  → return  ← handler still active until WAL entry is committed
 ```
 
 ```
 Snapshot stage receives WalEntry::FunctionRegistered { crc32c: 0 }
-  → wasm_runtime.unregister_function(name)
-      → remove FunctionCaller from HandlerMap (idempotent — already removed above)
+  → wasm_runtime.unload_function(name)
+      → remove FunctionCaller from HandlerMap
       → increment update_seq
 ```
 
-The handler is removed synchronously before returning to the caller — not deferred to the
-Snapshot stage. The Snapshot stage call is idempotent: removing an already-absent key is a
-no-op. `update_seq` increments twice — once on the direct call, once on Snapshot processing.
-The Transactor picks up both changes correctly since it only checks whether seq has advanced.
-
 Transactor picks up on next cycle — handler gone → subsequent `Named { name }` →
 `Status::INVALID_OPERATION`.
+
+**Terminology:**
+- `unregister_function` — Ledger operation: disk truncation + WAL entry. Async.
+- `unload_function` — WasmRuntime operation: removes handler from memory. Called by Snapshot on commit.
 
 Two signals always agree after unregistration:
 - WAL record `crc32c = 0`
@@ -500,12 +513,14 @@ Sidecar .crc (16 bytes):
 
 **Recovery:**
 
-1. Load `function_snapshot_{N}.bin` → rebuild FunctionRegistry
-2. Replay WAL records after snapshot → apply any `FunctionRegistered` records
-3. For each active function: verify CRC32C of `.wasm` file on disk
-4. Compile each active function via `WasmRuntime::compile` → modules ready
-5. Publish registry to `Arc<RwLock<FunctionRegistry>>`
-6. Increment `last_function_registration_sequence` once
+1. Load `function_snapshot_{N}.bin` → for each function record with `crc32c != 0`:
+   - Read `functions/{name}_v{version}.wasm` from disk → binary
+   - `wasm_runtime.load_function(name, binary, snapshot.crc32c)`
+     → verifies CRC and binary internally, aborts recovery on mismatch
+2. Replay WAL `FunctionRegistered` records after snapshot:
+   - If `crc32c != 0` → read binary from disk → `wasm_runtime.load_function(name, binary, entry.crc32c)`
+   - If `crc32c == 0` → `wasm_runtime.unload_function(name)`
+3. `update_seq` reflects final state after all loads/unloads
 
 ---
 
@@ -516,8 +531,8 @@ marked deprecated in code and documentation.
 
 ```rust
 #[deprecated(
-    since = "0.2.0",
-    note = "use Operation::Named with a registered WASM function"
+   since = "0.2.0",
+   note = "use Operation::Named with a registered WASM function"
 )]
 Composite(Box<CompositeOperation>)
 ```
