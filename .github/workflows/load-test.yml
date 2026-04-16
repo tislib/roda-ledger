@@ -10,7 +10,7 @@ on:
 
 env:
   HETZNER_SERVER_NAME: "load-test-${{ github.run_id }}"
-  HETZNER_SERVER_TYPE: ccx23
+  HETZNER_SERVER_TYPE: cpx42
   HETZNER_IMAGE: ubuntu-24.04
   HETZNER_LOCATION: fsn1
 
