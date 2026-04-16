@@ -8,6 +8,7 @@
 - ADR-003 — deprecates `Operation::Composite`, implements `Operation::Named` execution path
 - ADR-001 — adds `WalEntryKind::FunctionRegistered` (kind=5)
 - ADR-006 — adds `function_snapshot_{N}.bin` to storage layout
+- ADR-001, ADR-003, ADR-009, ADR-010 — renames `fail_reason` to `status` across all structs, APIs, and documentation (see Decision: Rename fail_reason to status)
 
 ---
 
@@ -55,29 +56,48 @@ wasmer rejected — API instability, weaker safety guarantees for untrusted code
 
 ---
 
+### Decision: Rename fail_reason to status
+
+`fail_reason` is renamed to `status` across the entire project. This is a breaking change
+applied as part of this ADR.
+
+**Rationale:** `fail_reason` implies failure is the primary case. `status` is more accurate —
+it represents the outcome of a transaction, which may be success (`0`) or a specific condition
+code. This aligns with how the field is actually used: success is `status = 0`, any non-zero
+value is a condition that caused the transaction not to proceed.
+
+**Scope of rename:**
+- `TxMetadata.fail_reason` → `TxMetadata.status`
+- `FailReason` type → `Status`
+- `FailReason::NONE` → `Status::NONE`
+- `FailReason::INSUFFICIENT_FUNDS` → `Status::INSUFFICIENT_FUNDS`
+- All other `FailReason` constants follow the same pattern
+- gRPC `fail_reason` fields → `status`
+- All ADR references updated
+- `transaction.fail_reason` → `transaction.status`
+
+The `u8` representation, value ranges (0=success, 1-127 standard, 128-255 user-defined),
+and all existing constant values are unchanged. This is a rename only.
+
+---
+
 ### Host API Surface
 
-The WASM function can only call four host functions. Nothing else is exposed:
+The WASM function can only call three host functions. Nothing else is exposed:
 
 ```rust
 // namespace: "ledger"
-fn credit(account_id: u64, amount: u64);              // guaranteed, no return
-fn debit(account_id: u64, amount: u64);               // guaranteed, no return
+fn credit(account_id: u64, amount: u64);   // guaranteed, no return
+fn debit(account_id: u64, amount: u64);    // guaranteed, no return
 fn get_balance(account_id: u64) -> i64;
-fn check_negative_balance(account_id: u64) -> i32;    // 1 if balance < 0, 0 otherwise
 ```
 
 **`credit` and `debit` return nothing.** They are guaranteed operations — they update the
-Transactor's balance Vec directly. They cannot fail individually. Failure is expressed through
-`check_negative_balance` or via the zero-sum invariant enforced after execution.
+Transactor's balance Vec directly. They cannot fail individually. The zero-sum invariant is
+enforced after execution completes, as with all operations.
 
-**`check_negative_balance`** is the mechanism for overdraft protection. The function calls it
-after applying credits/debits to determine whether to proceed or signal failure by returning a
-non-zero fail reason. This gives the function full control over balance validation without
-exposing unsafe escape hatches.
-
-Integer-only interface — no memory sharing beyond the params array, no pointers, no strings. All
-WASM value types map directly to native types.
+Integer-only interface — no memory sharing, no pointers, no strings. All WASM value types
+map directly to native types.
 
 The host functions close over the Transactor's balance Vec during execution — same mutable
 reference used by all built-in operations.
@@ -94,7 +114,7 @@ Every WASM function must export a single entry point with exactly 8 `i64` parame
 pub extern "C" fn execute(
     param1: i64, param2: i64, param3: i64, param4: i64,
     param5: i64, param6: i64, param7: i64, param8: i64,
-) -> i32;
+) -> u8;
 ```
 
 ```typescript
@@ -102,7 +122,7 @@ pub extern "C" fn execute(
 export function execute(
     param1: i64, param2: i64, param3: i64, param4: i64,
     param5: i64, param6: i64, param7: i64, param8: i64,
-): i32;
+): u8;
 ```
 
 **Why exactly 8 params:** Fixed arity eliminates the need for linear memory pointer/length
@@ -110,11 +130,11 @@ passing. 8 `i64` values cover all practical financial use cases — account IDs,
 flags, timestamps. Unused params are passed as 0. This keeps the ABI simple, safe, and
 verifiable at registration time.
 
-**Return value:** `0` = success. Any non-zero value is a `FailReason` — the same `u8` type
-used throughout the system. Values 0–127 map to standard `FailReason` constants. Values 128–255
-are user-defined custom reasons, consistent with the existing `FailReason` design.
+**Return value:** `0` = success. Any non-zero value is a `Status` — the same `u8` type
+used throughout the system. Values 0–127 map to standard `Status` constants. Values 128–255
+are user-defined custom reasons, consistent with the existing design.
 
-**Atomicity:** Functions execute atomically. If the function returns a non-zero fail reason,
+**Atomicity:** Functions execute atomically. If the function returns a non-zero status,
 all credits and debits applied during execution are rolled back. The Transactor's rollback
 mechanism is identical to that used for built-in operations.
 
@@ -129,7 +149,6 @@ extern "C" {
     fn credit(account_id: u64, amount: u64);
     fn debit(account_id: u64, amount: u64);
     fn get_balance(account_id: u64) -> i64;
-    fn check_negative_balance(account_id: u64) -> i32;
 }
 
 // param1 = sender account
@@ -141,7 +160,7 @@ extern "C" {
 pub extern "C" fn execute(
     param1: i64, param2: i64, param3: i64, param4: i64,
     param5: i64, _: i64, _: i64, _: i64,
-) -> i32 {
+) -> u8 {
     let sender   = param1 as u64;
     let receiver = param2 as u64;
     let fee_acct = param3 as u64;
@@ -152,12 +171,8 @@ pub extern "C" fn execute(
         credit(sender, amount + fee);
         debit(receiver, amount);
         debit(fee_acct, fee);
-
-        if check_negative_balance(sender) != 0 {
-            return 1; // INSUFFICIENT_FUNDS
-        }
     }
-    0
+    0 // success
 }
 ```
 
@@ -172,13 +187,10 @@ declare function debit(account_id: u64, amount: u64): void;
 @external("ledger", "get_balance")
 declare function get_balance(account_id: u64): i64;
 
-@external("ledger", "check_negative_balance")
-declare function check_negative_balance(account_id: u64): i32;
-
 export function execute(
     param1: i64, param2: i64, param3: i64, param4: i64,
     param5: i64, _p6: i64, _p7: i64, _p8: i64,
-): i32 {
+): u8 {
     const sender   = param1 as u64;
     const receiver = param2 as u64;
     const feeAcct  = param3 as u64;
@@ -189,10 +201,7 @@ export function execute(
     debit(receiver, amount);
     debit(feeAcct, fee);
 
-    if (check_negative_balance(sender) != 0) {
-        return 1; // INSUFFICIENT_FUNDS
-    }
-    return 0;
+    return 0; // success
 }
 ```
 
@@ -207,12 +216,11 @@ This is enforced architecturally:
 - No WASM threads, no atomics
 - wasmtime fuel metering can limit execution cycles
 
-**With Raft replication (ADR-015):** only the leader executes WASM functions. Entries produced
-by execution are replicated as binary WAL data to followers. Followers apply entries directly
-without re-executing the function. When a leader switch occurs, the new leader executes all
-subsequent `Named` operations from that point forward. User-supplied params are not stored or
-replayed — the function is trusted to be deterministic given the same params, but re-execution
-is not required for correctness because entries (not operations) are what is replicated.
+**Future Raft replication:** when distributed replication is added, only the leader will
+execute WASM functions. Entries produced by execution will be replicated as binary WAL data
+to followers. Followers will apply entries directly without re-executing the function.
+Determinism is required for this model to be correct — non-deterministic functions would
+produce divergent entries across replicas.
 
 ---
 
@@ -243,17 +251,23 @@ recovery markers.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct FunctionRegistered {
-    pub entry_type:  u8,        // 1 @ 0  — WalEntryKind::FunctionRegistered (5)
-    pub version:     u8,        // 1 @ 1  — monotonic per name, starts at 1
-    pub name_len:    u8,        // 1 @ 2  — byte length of name (max 16)
-    pub status:      u8,        // 1 @ 3  — 0=active, 1=unregistered
-    pub crc32c:      u32,       // 4 @ 4  — CRC32C of WASM binary
-    pub name:        [u8; 16],  // 16 @ 8 — function name, UTF-8, null-padded
-    pub _pad:        [u8; 16],  // 16 @ 24
-}                               // total: 40 bytes
+    pub entry_type: u8,        // 1 @ 0  — WalEntryKind::FunctionRegistered (5)
+    pub _pad0:      u8,        // 1 @ 1
+    pub version:    u16,       // 2 @ 2  — monotonic per name, starts at 1, max 65535
+    pub crc32c:     u32,       // 4 @ 4  — CRC32C of WASM binary; 0 = unregistered
+    pub name:       [u8; 32],  // 32 @ 8 — snake_case, UTF-8, null-padded, max 32 bytes
+}                              // total: 40 bytes
 ```
 
-Function name is capped at 16 bytes — names are identifiers, not descriptions.
+**Name constraints:** snake_case, ASCII alphanumeric + underscore, must start with a letter.
+Validated at registration time. Max 32 bytes — sufficient for any meaningful Rust function name.
+Null-padded to fill the field. No length field needed — scan to first null byte.
+
+**`crc32c = 0` signals unregistered.** Two signals always agree:
+- WAL record has `crc32c = 0`
+- File on disk is 0 bytes (empty file)
+
+On recovery, if they disagree, the WAL record is the source of truth.
 
 File path is derived deterministically from name and version:
 ```
@@ -262,138 +276,180 @@ functions/{name}_v{version}.wasm
 
 No path stored in WAL — always reconstructible from name and version.
 
-The `status` field supports unregistration without a separate record type — a
-`FunctionRegistered` record with `status=1` marks the function as dead.
-
 ---
 
-### WasmRuntime Struct
+### WasmRuntime
 
-All wasmtime concerns are encapsulated in a dedicated `src/wasm_runtime.rs` module:
+`WasmRuntime` is `Arc<WasmRuntime>` in the pipeline — shared between the Ledger facade,
+Snapshot stage, and Transactor. All wasmtime concerns are encapsulated in `src/wasm_runtime.rs`.
 
 ```rust
 pub struct WasmRuntime {
-    engine: wasmtime::Engine,
+    engine:     wasmtime::Engine,
+    handlers:   RwLock<HandlerMap>,        // name → FunctionCaller
+    update_seq: AtomicU32,                 // starts at 0, increments on every change
 }
 
+/// Carries both the CRC32C of the WASM binary and the callable handler.
+/// CRC32C is embedded in TxMetadata.tag at execution time — single map lookup
+/// gives both the audit identifier and the callable, zero extra lookups.
+pub struct FunctionCaller {
+    pub crc32c:  u32,
+    pub handler: Arc<dyn Fn([i64; 8]) -> u8 + Send + Sync>,
+}
+
+pub type HandlerMap = HashMap<String, FunctionCaller>;
+```
+
+**Public API:**
+
+```rust
 impl WasmRuntime {
-    pub fn new() -> Self;
-    pub fn compile(&self, binary: &[u8]) -> Result<wasmtime::Module, WasmError>;
-    pub fn execute(
-        &self,
-        module: &wasmtime::Module,
-        params: [i64; 8],
-        balances: &mut Vec<Balance>,
-    ) -> Result<(), FailReason>;
-    pub fn validate_exports(module: &wasmtime::Module) -> Result<(), WasmError>;
+    // Validates binary and checks execute(i64×8)->u8 export. Does not register.
+    pub fn validate(&self, binary: &[u8]) -> Result<(), WasmError>;
+
+    // Validates, compiles, inserts handler, increments update_seq.
+    // Returns new version number.
+    pub fn register_function(&self, name: &str, binary: &[u8]) -> Result<u16, WasmError>;
+
+    // Removes handler from map, increments update_seq.
+    pub fn unregister_function(&self, name: &str) -> Result<(), WasmError>;
+
+    // Loads compiled handler from binary (used by Snapshot stage during WAL replay/recovery).
+    pub fn load_function(&self, name: &str, binary: &[u8]) -> Result<(), WasmError>;
+
+    // Returns current update sequence number.
+    pub fn last_update_seq(&self) -> u32;
+
+    // Returns owned clone of handler map. Called by Transactor on seq change.
+    pub fn get_handler_map(&self) -> HandlerMap;
 }
 ```
 
-One `Engine` per `Ledger` — shared, thread-safe, JIT compiled once at registration.
-One `Module` per registered function version — compiled at registration, stored in registry.
-One `Store` per execution — created per `Named` operation, dropped immediately after.
+One `Engine` per `Ledger` — shared, thread-safe, JIT compiled once per function at registration.
+One `Store` per execution — created inside `FunctionCaller`, dropped immediately after.
 
-`Engine` is `Send + Sync`. `Module` is `Send + Sync`. `Store` is per-execution only.
+`Engine` is `Send + Sync`. `WasmRuntime` is `Send + Sync`. `FunctionCaller` is `Send + Sync`.
+
+**Function storage** is handled by `src/storage/functions.rs` — separate from `WasmRuntime`.
+`WasmRuntime` receives binary data; it does not read or write disk directly.
 
 ---
 
-### FunctionRegistry and Transactor Hot Cache
+### Transactor Hot Cache
 
-```rust
-// Shared between registration path and Transactor
-pub struct FunctionRegistry {
-    functions: HashMap<String, Vec<FunctionVersion>>,
-}
+The Transactor holds an owned local copy of `HandlerMap`. It never acquires the `RwLock`
+during transaction execution — zero lock contention on the hot path.
 
-pub struct FunctionVersion {
-    pub version:  u8,
-    pub crc32c:   u32,
-    pub module:   wasmtime::Module,   // compiled, ready to execute
-    pub status:   FunctionStatus,
-}
-
-pub enum FunctionStatus {
-    Active,
-    Unregistered,
-}
-```
-
-**Shared state via pipeline:**
-
-```rust
-// In Pipeline — cache-padded atomic, shared between registration path and Transactor
-last_function_registration_sequence: CachePadded<AtomicU64>
-function_registry: Arc<RwLock<FunctionRegistry>>
-```
-
-**Transactor hot cache:**
-
-The Transactor maintains its own local copy of `FunctionRegistry`. It never reads from
-`Arc<RwLock<FunctionRegistry>>` during transaction execution — that would introduce lock
-contention on the hot path.
-
-On every processing cycle the Transactor checks `last_function_registration_sequence`. If it
-has advanced since the last check, the Transactor clones the registry from
-`Arc<RwLock<FunctionRegistry>>` into its local copy. This clone happens outside the
-transaction processing loop — never mid-transaction.
+On every **cycle** (not every step) the Transactor checks `wasm_runtime.last_update_seq()`.
+If the seq has advanced, it calls `wasm_runtime.get_handler_map()` which acquires a read lock,
+clones the map, and returns. The clone is rare — only on function registration or unregistration.
 
 ```rust
 // Transactor cycle (simplified)
 fn run_step(&mut self, ctx: &TransactorContext) {
-    // Check for new function registrations
-    let seq = ctx.last_function_registration_sequence();
-    if seq > self.local_function_seq {
-        let registry = ctx.function_registry().read().unwrap();
-        self.local_functions = registry.clone();
-        self.local_function_seq = seq;
+    // Per-cycle check — single atomic load, no lock
+    let seq = ctx.wasm_runtime().last_update_seq();
+    if seq != self.local_handler_seq {
+        self.local_handlers = ctx.wasm_runtime().get_handler_map(); // owned clone
+        self.local_handler_seq = seq;
     }
 
-    // Process transactions using local_functions — no locks
+    // Process transactions using local_handlers — no locks, no Arc overhead
     // ...
 }
 ```
 
-The Transactor always reads from `local_functions`. Zero lock contention on the execution path.
+---
+
+### Registration Flow
+
+```
+ledger.register_function(name, binary, override)
+  → if function exists and override=false → return error
+  → wasm_runtime.validate(binary) → check execute(i64×8)->u8 export
+  → storage/functions.rs: write functions/{name}_v{N}.wasm to disk
+  → write WalEntry::FunctionRegistered directly to active WAL segment
+  → return version number to caller
+```
+
+```
+Snapshot stage receives WalEntry::FunctionRegistered
+  → read binary from disk via storage/functions.rs
+  → wasm_runtime.load_function(name, binary)
+      → compile via Engine
+      → insert FunctionCaller into HandlerMap
+      → increment update_seq
+```
+
+Transactor picks up on next cycle — `update_seq` changed → clone handlers → ready.
 
 ---
 
-### Execution Path
+### Execution Flow
 
 ```
 Operation::Named { name, params: [i64; 8], user_ref }
   → Transactor receives
   → dedup check on user_ref (same as all operations)
-  → lookup FunctionVersion from local_functions (no lock)
-  → if not found or status=Unregistered → FailReason::INVALID_OPERATION
-  → meta(tx_id, "NAMED   ", user_ref, timestamp)
-  → WasmRuntime::execute(module, params, &mut self.balances)
-      → create Store with host functions closing over balances
-      → call execute(p1..p8)
-      → WASM calls credit/debit/get_balance/check_negative_balance via host
+  → lookup FunctionCaller from local_handlers by name
+  → if not found → Status::INVALID_OPERATION
+  → build tag: [b'f', b'n', b'w', b'\n', crc32c[0..4]]
+      caller.crc32c identifies exactly which function version executed
+      cross-reference with FunctionRegistered WAL records for full audit
+  → meta(tx_id, tag, user_ref, timestamp)
+  → (caller.handler)(params) → returns u8
+      → WASM calls credit/debit/get_balance via host functions
+      → host functions update self.balances directly
       → entries accumulate in Transactor as normal
-      → function returns i32
-  → if return != 0 → rollback, FailReason::from_u8(return_value)
+  → if return != 0 → rollback, Status::from_u8(return_value)
   → zero-sum invariant verified (as always)
   → entries written to WAL
 ```
 
+Tag format in WAL output (`roda-ctl unpack`):
+```json
+{"type":"TxMetadata","tx_id":441001,"tag":"fnw\\n4a2f1c3d",...}
+```
+
+`"fnw\n"` — human-readable marker identifying a Named/WASM call.
+`4a2f1c3d` — CRC32C of the WASM binary, identifies exact version executed.
+Auditors cross-reference with `FunctionRegistered` records to resolve name and version.
+
 ---
 
-### Unregister Function
+### Unregister Flow
 
 ```
-gRPC UnregisterFunction(name)
-  → lookup latest version in registry
-  → write WAL record FunctionRegistered { status: 1 (unregistered), same name/version/crc }
-  → Snapshot stage updates registry: mark version as Unregistered
-  → Pipeline atomicLastFunctionRegistrationSequence incremented
-  → Transactor picks up on next cycle: local_functions updated
-  → subsequent Named { name } → FailReason::INVALID_OPERATION
+ledger.unregister_function(name)
+  → storage/functions.rs: truncate functions/{name}_v{N}.wasm to 0 bytes
+  → write WalEntry::FunctionRegistered { crc32c: 0, name, version+1 }
+  → wasm_runtime.unregister_function(name)
+      → remove FunctionCaller from HandlerMap
+      → increment update_seq
+  → return
 ```
 
-Unregistration does not delete the `.wasm` file from disk — the WAL record and file remain
-as audit trail. A subsequent `RegisterFunction` with `override=true` adds a new version
-(version+1) and marks it active. Old versions remain in the registry with their status intact.
+```
+Snapshot stage receives WalEntry::FunctionRegistered { crc32c: 0 }
+  → wasm_runtime.unregister_function(name)
+      → remove FunctionCaller from HandlerMap (idempotent — already removed above)
+      → increment update_seq
+```
+
+The handler is removed synchronously before returning to the caller — not deferred to the
+Snapshot stage. The Snapshot stage call is idempotent: removing an already-absent key is a
+no-op. `update_seq` increments twice — once on the direct call, once on Snapshot processing.
+The Transactor picks up both changes correctly since it only checks whether seq has advanced.
+
+Transactor picks up on next cycle — handler gone → subsequent `Named { name }` →
+`Status::INVALID_OPERATION`.
+
+Two signals always agree after unregistration:
+- WAL record `crc32c = 0`
+- File on disk is 0 bytes — truncated, not deleted, audit trail preserved
+
+WAL record is the source of truth on recovery if signals disagree.
 
 **Override flag on RegisterFunction:**
 
@@ -431,12 +487,10 @@ Header (36 bytes):
   pad(19)
 
 Body (per function, 40 bytes each, LZ4 compressed):
-  name_len(1)
-  name(16)          UTF-8, null-padded
-  version(1)        latest version number
-  status(1)         0=active, 1=unregistered
-  crc32c(4)         CRC32C of WASM binary
-  _pad(17)
+  name(32)          snake_case, UTF-8, null-padded
+  version(2)        latest version number, u16
+  crc32c(4)         CRC32C of WASM binary; 0 = unregistered
+  _pad(2)
 
 Sidecar .crc (16 bytes):
   file_crc32c(4)
@@ -511,7 +565,6 @@ message FunctionInfo {
   string name    = 1;
   uint32 version = 2;
   uint32 crc32c  = 3;
-  bool   active  = 4;
 }
 ```
 
@@ -542,8 +595,10 @@ The `functions/` directory lives alongside `data/`. Path:
 
 ```
 src/
-  wasm_runtime.rs       ← WasmRuntime struct, Engine, execute, validate_exports
-  function_registry.rs  ← FunctionRegistry, FunctionVersion, FunctionStatus
+  wasm_runtime.rs          ← WasmRuntime, FunctionCaller, HandlerMap
+  storage/
+    functions.rs           ← read/write .wasm files, CRC32C, truncate on unregister
+    ...existing files...
   ...existing files...
 
 Cargo.toml additions:
@@ -559,30 +614,33 @@ Cargo.toml additions:
 - User-defined financial logic without recompiling or redeploying the ledger
 - Sandboxed — WASM cannot escape the host API
 - Auditable — every registration is a WAL record with CRC, every invocation produces standard entries
-- Versioned — multiple versions per function, override path, unregistration
+- Versioned — multiple versions per function, override path, clean unregistration
 - Language agnostic — Rust, AssemblyScript, C, Zig, any WASM target
 - Atomicity guaranteed — failure causes full rollback, identical to built-in operations
 - Transactor hot path lock-free — local cache, sequence check only
-- Raft-compatible — leader executes, entries replicated, followers apply directly
+- Future Raft compatible — leader executes, entries replicated, followers apply directly
 - `Composite` deprecated — one extensibility model, not two
 - Single WAL source of truth — function registration ordered relative to transactions
-- `check_negative_balance` gives functions explicit overdraft control
+- Dual-signal unregistration — WAL `crc32c=0` + 0-byte file, WAL wins on conflict
+- No `name_len` or status flag fields — simpler struct, less surface area
+- 32-byte name — sufficient for any meaningful snake_case Rust function name
+- `fail_reason` → `status` rename — clearer semantics project-wide
 
 ### Negative
 
 - wasmtime JIT compilation at registration — ~10-100ms per function (one-time cost)
 - `Store` creation per Named operation — small allocation on hot path
-- 16-byte name limit — intentional but constraining for verbose naming
 - 8-param limit — covers all practical cases but not unlimited flexibility
 - `Composite` deprecated but not removed — temporary API surface debt
 - `functions/` directory adds operational surface to manage
+- `fail_reason` → `status` is a breaking rename across all structs, APIs, and proto fields
 
 ### Neutral
 
 - Registration bypasses Transactor — correct, consistent with crash recovery markers
 - Function snapshot is a separate file — consistent with balance snapshot separation
 - `WasmRuntime` is a separate struct/module — clean separation of concerns
-- Unregistered functions remain on disk — audit trail preserved
+- Unregistered function files truncated to 0 bytes — audit trail preserved, no deletion
 
 ---
 
@@ -592,7 +650,7 @@ Cargo.toml additions:
 - ADR-003 — Operation enum, Composite deprecation, Named reserved
 - ADR-004 — gRPC interface, Named operation proto
 - ADR-006 — WAL segment lifecycle, storage layout, snapshot format
-- ADR-009 — FailReason, user-defined range 128-255
+- ADR-009 — Status (formerly FailReason), user-defined range 128-255
 - ADR-011 — WAL write/commit separation, active segment direct write
 - ADR-013 — transaction-count-based segments, active window
 - wasmtime — https://github.com/bytecodealliance/wasmtime
