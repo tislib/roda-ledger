@@ -81,7 +81,7 @@ impl WalRunner {
         let mut active_segment = storage.active_segment().unwrap();
         let syncer = active_segment.syncer().expect("Failed to get syncer");
         active_segment_sync.store(Arc::new(Some(syncer)));
-        let buffer = VecDeque::with_capacity(ctx.input_capacity());
+        let buffer = VecDeque::with_capacity(ctx.input_capacity() * 16);
         let wait_strategy = ctx.wait_strategy();
 
         if active_segment.current_wal_offset() == 0 {
