@@ -142,7 +142,7 @@ pub enum TransactionInput {
 }
 
 impl TransactionInput {
-    pub(crate) fn single(self) -> Transaction {
+    pub fn single(self) -> Transaction {
         match self {
             TransactionInput::Single(tx) => tx,
             TransactionInput::Batch(_) => {
@@ -151,7 +151,7 @@ impl TransactionInput {
         }
     }
 
-    pub(crate) fn batch(self) -> TransactionBatch {
+    pub fn batch(self) -> TransactionBatch {
         match self {
             TransactionInput::Batch(batch) => batch,
             TransactionInput::Single(_) => {
