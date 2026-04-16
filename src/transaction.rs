@@ -130,3 +130,33 @@ impl TransactionStatus {
         }
     }
 }
+
+pub struct TransactionBatch {
+    pub start_tx_id: u64,
+    pub operations: Vec<Operation>, // each operation will become a separate transaction
+}
+
+pub enum TransactionInput {
+    Single(Transaction),
+    Batch(TransactionBatch),
+}
+
+impl TransactionInput {
+    pub(crate) fn single(self) -> Transaction {
+        match self {
+            TransactionInput::Single(tx) => tx,
+            TransactionInput::Batch(_) => {
+                unreachable!("Batch transactions cannot be converted to single")
+            }
+        }
+    }
+
+    pub(crate) fn batch(self) -> TransactionBatch {
+        match self {
+            TransactionInput::Batch(batch) => batch,
+            TransactionInput::Single(_) => {
+                unreachable!("Single transactions cannot be converted to batch")
+            }
+        }
+    }
+}
