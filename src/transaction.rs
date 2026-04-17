@@ -23,7 +23,9 @@ pub enum Operation {
     Composite(Box<CompositeOperation>),
     Named {
         name: String,
-        params: Vec<i64>,
+        /// ADR-014 fixed arity — exactly 8 `i64` positional parameters.
+        /// Unused slots are conventionally passed as `0`.
+        params: [i64; 8],
         user_ref: u64,
     },
 }

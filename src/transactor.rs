@@ -584,16 +584,9 @@ impl TransactorRunner {
                         .borrow_mut()
                         .meta(tx_id, build_wasm_tag(crc), user_ref, timestamp);
 
-                    // 2. Pack params (Vec<i64> → fixed [i64; 8], short ones
-                    //    pad with 0).
-                    let mut params_arr = [0i64; 8];
-                    for (i, p) in params.into_iter().take(8).enumerate() {
-                        params_arr[i] = p;
-                    }
-
-                    // 3. Hand off to the engine. The engine's host imports
+                    // 2. Hand off to the engine. The engine's host imports
                     //    will mutate the same `self.state` via Rc<RefCell<>>.
-                    match self.wasm_engine.execute(&name, params_arr, tx_id) {
+                    match self.wasm_engine.execute(&name, params, tx_id) {
                         None => {
                             self.state
                                 .borrow_mut()
@@ -751,7 +744,7 @@ mod wasm_named_tests {
             1,
             Operation::Named {
                 name: "missing".into(),
-                params: vec![0; 8],
+                params: [0; 8],
                 user_ref: 0,
             },
         );
@@ -775,7 +768,7 @@ mod wasm_named_tests {
             10,
             Operation::Named {
                 name: "wasm_transfer".into(),
-                params: vec![2, 100, 3, 0, 0, 0, 0, 0],
+                params: [2, 100, 3, 0, 0, 0, 0, 0],
                 user_ref: 42,
             },
         );
@@ -794,7 +787,7 @@ mod wasm_named_tests {
             1,
             Operation::Named {
                 name: "wasm_reject".into(),
-                params: vec![4, 50, 5, 0, 0, 0, 0, 0],
+                params: [4, 50, 5, 0, 0, 0, 0, 0],
                 user_ref: 7,
             },
         );
@@ -821,7 +814,7 @@ mod wasm_named_tests {
             1,
             Operation::Named {
                 name: "wasm_read_bal".into(),
-                params: vec![7, 0, 0, 0, 0, 0, 0, 0],
+                params: [7, 0, 0, 0, 0, 0, 0, 0],
                 user_ref: 0,
             },
         );

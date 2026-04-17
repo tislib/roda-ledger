@@ -158,11 +158,14 @@ message Composite {
   uint64 user_ref     = 3; // Opaque external reference. See Deposit.user_ref.
 }
 
-// Named invokes a registered operation by name with positional parameters.
-// This is tied to the WASM roadmap (ADR-008).
+// Named invokes a registered WASM function (ADR-014).
+// The function ABI is fixed-arity: exactly 8 `i64` positional parameters.
+// Proto3 has no fixed-length array type, so `params` stays `repeated int64`
+// on the wire; the server coerces to `[i64; 8]` by zero-padding short
+// lists and dropping anything beyond the first 8 values.
 message Named {
-  string         name     = 1; // Operation name.
-  repeated int64 params   = 2; // Positional parameters, packed.
+  string         name     = 1; // Operation name (snake_case, max 32 bytes).
+  repeated int64 params   = 2; // 0..=8 positional parameters; short lists are zero-padded.
   uint64         user_ref = 3; // Opaque external reference. See Deposit.user_ref.
 }
 

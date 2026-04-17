@@ -1,23 +1,23 @@
 //! WasmRuntime — ADR-014 WASM Function Registry runtime.
 //!
-//! Two layers, both lock-free on the hot path:
+//! Two layers:
 //!
-//! - [`WasmRuntime`] — shared (`Arc`) registry of compiled modules. Validates
-//!   binaries, compiles them with wasmtime, and tracks an `update_seq` so
-//!   downstream consumers can passively refresh their local caches.
+//! - [`WasmRuntime`] — shared (`Arc`) registry. Owns the wasmtime [`Engine`],
+//!   the map of compiled [`Module`]s keyed by name, and **the** `Linker`
+//!   with the three host imports already wired. All three are built exactly
+//!   once per `Ledger`. Registration work (compile + signature check +
+//!   insert) happens only on `load_function` — never on the hot path.
 //!
 //! - [`WasmRuntimeEngine`] — per-Transactor execution layer. Owns:
-//!   - one wasmtime [`Engine`] (shared via `Arc<WasmRuntime>` — no clones);
-//!   - **one** [`Linker`] built once with the three host imports
-//!     (`ledger.credit` / `ledger.debit` / `ledger.get_balance`) wired to
-//!     call straight into the Transactor's [`TransactorState`] via
-//!     `Rc<RefCell<>>`;
-//!   - the local handler-map snapshot and its watermark — moved here from
-//!     the Transactor so the host has zero WASM bookkeeping.
+//!   - a long-lived `Store<HostStoreData>` — **not** re-created per call;
+//!   - a lazy per-name [`FunctionCaller`] cache holding a pre-resolved
+//!     [`TypedFunc`] so each `execute` is just a store-data write + a
+//!     typed call. Zero instantiation, zero linker lookup on the hot path.
+//!   - the cache is invalidated as a whole whenever `WasmRuntime::update_seq`
+//!     advances, and the Store is recycled at the same time to keep
+//!     wasmtime's per-Store instance count bounded.
 //!
-//! No `unsafe`, no raw pointers, no generic traits. The engine is bound
-//! directly to `Rc<RefCell<TransactorState>>` because that's its only
-//! caller; the simpler, monomorphic API outweighs the abstraction tax.
+//! No `unsafe`, no raw pointers, no generics.
 
 use crate::transactor::TransactorState;
 use std::cell::RefCell;
@@ -36,82 +36,41 @@ pub const HOST_MODULE: &str = "ledger";
 /// The fixed arity of the `execute` export (i64 × N).
 pub const EXECUTE_ARITY: usize = 8;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FunctionCaller — opaque, ready-to-run registration
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One compiled, ready-to-run registration. Stored in the [`HandlerMap`].
-///
-/// Opaque abstraction: callers see only [`FunctionCaller::crc32c`] and
-/// [`FunctionCaller::execute`]. The compiled `Module` and the `execute`
-/// export name never leave this module.
-#[derive(Clone)]
-pub struct FunctionCaller {
-    /// CRC32C of the raw WASM binary. Embedded in `TxMetadata.tag` on
-    /// invocation so auditors can cross-reference the exact binary executed.
-    crc32c: u32,
-    /// Compiled module. `wasmtime::Module` is cheap to clone (`Arc` inside).
-    module: Module,
-}
-
-impl FunctionCaller {
-    /// CRC32C of the raw WASM binary. Cheap getter.
-    #[inline]
-    pub fn crc32c(&self) -> u32 {
-        self.crc32c
-    }
-
-    /// Run the registered function's `execute` export against a
-    /// caller-supplied wasmtime `Store` / `Linker` pair. Returns the `u8`
-    /// status: `0` = success, `1..=127` standard reason, `128..=255`
-    /// user-defined per ADR-014. Any wasmtime-level failure (link,
-    /// instantiate, or trap) is reported as [`INVALID_OPERATION_STATUS`].
-    pub fn execute<T>(
-        &self,
-        store: &mut Store<T>,
-        linker: &Linker<T>,
-        params: [i64; 8],
-    ) -> u8 {
-        let instance = match linker.instantiate(&mut *store, &self.module) {
-            Ok(i) => i,
-            Err(_) => return INVALID_OPERATION_STATUS,
-        };
-        let exec_fn: TypedFunc<(i64, i64, i64, i64, i64, i64, i64, i64), i32> =
-            match instance.get_typed_func(&mut *store, EXECUTE_FN) {
-                Ok(f) => f,
-                Err(_) => return INVALID_OPERATION_STATUS,
-            };
-        match exec_fn.call(
-            store,
-            (
-                params[0], params[1], params[2], params[3], params[4], params[5], params[6],
-                params[7],
-            ),
-        ) {
-            Ok(r) => (r as u32 & 0xFF) as u8,
-            Err(_) => INVALID_OPERATION_STATUS,
-        }
-    }
-}
-
-/// Status returned by [`FunctionCaller::execute`] when the wasmtime layer
-/// itself fails (link error, instantiation failure, trap). Numerically
-/// equal to `FailReason::INVALID_OPERATION` so the Transactor can map it
-/// through the same standard-status pipeline.
+/// Status returned when the wasmtime layer itself fails (link,
+/// instantiation, trap). Numerically equal to
+/// `FailReason::INVALID_OPERATION` so the Transactor can map it through the
+/// same standard-status pipeline.
 pub const INVALID_OPERATION_STATUS: u8 = 5;
 
-pub type HandlerMap = HashMap<String, FunctionCaller>;
+/// Typed handle to the WASM `execute` export. Used by both the shared
+/// signature check and the per-engine caller cache.
+type ExecTypedFunc = TypedFunc<(i64, i64, i64, i64, i64, i64, i64, i64), i32>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmRuntime — shared compiled-module registry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Shared wasmtime state for the ledger. One `WasmRuntime` per `Ledger`,
-/// wrapped in `Arc` and shared between the Ledger facade, the Snapshot
-/// stage, and every `WasmRuntimeEngine`.
+/// One registered function in the shared registry. Holds the compiled
+/// `Module` (cheap — `Arc` inside) and its CRC32C.
+#[derive(Clone)]
+struct Registered {
+    crc32c: u32,
+    module: Module,
+}
+
+type Registry = HashMap<String, Registered>;
+
+/// Shared wasmtime state for the ledger. One per `Ledger`, wrapped in
+/// `Arc` and shared with every `WasmRuntimeEngine`. Owns:
+/// - the wasmtime [`Engine`];
+/// - a single [`Linker<HostStoreData>`] with the three host imports
+///   registered at construction — reused by every engine's
+///   `Linker::instantiate` call;
+/// - the registry of compiled [`Module`]s keyed by name.
 pub struct WasmRuntime {
     engine: Engine,
-    handlers: RwLock<HandlerMap>,
+    linker: Linker<HostStoreData>,
+    handlers: RwLock<Registry>,
     update_seq: AtomicU32,
 }
 
@@ -123,17 +82,18 @@ impl WasmRuntime {
 
     /// Construct a new runtime with the provided engine.
     pub fn with_engine(engine: Engine) -> Self {
+        let linker = build_host_linker(&engine);
         Self {
             engine,
-            handlers: RwLock::new(HandlerMap::new()),
+            linker,
+            handlers: RwLock::new(Registry::new()),
             update_seq: AtomicU32::new(0),
         }
     }
 
     /// Validate a WASM binary against the registry ABI. Does NOT install
-    /// the function. Used by `Ledger::register_function` before writing
-    /// to disk. Checks: parses, exports `execute`, signature is exactly
-    /// eight `i64` params + one `i32` result.
+    /// the function. Checks: parses, exports `execute`, signature is
+    /// exactly eight `i64` params + one `i32` result.
     pub fn validate(&self, binary: &[u8]) -> io::Result<()> {
         let module = Module::from_binary(&self.engine, binary)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -141,9 +101,9 @@ impl WasmRuntime {
         Ok(())
     }
 
-    /// Compile a binary, verify its CRC32C matches, and insert the
-    /// resulting `FunctionCaller` into the handler map. Increments
-    /// `update_seq` so every consumer's next refresh picks it up.
+    /// Compile a binary, verify its CRC32C matches, and insert it into
+    /// the registry. Increments `update_seq` so every engine's next
+    /// refresh picks it up.
     pub fn load_function(&self, name: &str, binary: &[u8], crc32c: u32) -> io::Result<()> {
         validate_name(name)?;
 
@@ -165,15 +125,15 @@ impl WasmRuntime {
             .handlers
             .write()
             .map_err(|_| io::Error::other("handlers lock poisoned"))?;
-        guard.insert(name.to_string(), FunctionCaller { crc32c, module });
+        guard.insert(name.to_string(), Registered { crc32c, module });
         drop(guard);
 
         self.update_seq.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
-    /// Remove a function from the handler map. Not an error if the name
-    /// is unknown — recovery may legitimately replay such a record.
+    /// Remove a function from the registry. Not an error if the name is
+    /// unknown — recovery may legitimately replay such a record.
     pub fn unload_function(&self, name: &str) -> io::Result<()> {
         let mut guard = self
             .handlers
@@ -186,21 +146,13 @@ impl WasmRuntime {
     }
 
     /// Current update sequence — used by [`WasmRuntimeEngine::refresh`] to
-    /// decide whether to clone a fresh handler-map snapshot.
+    /// decide whether to invalidate its caller cache.
     #[inline]
     pub fn last_update_seq(&self) -> u32 {
         self.update_seq.load(Ordering::Acquire)
     }
 
-    /// Return an owned clone of the handler map.
-    pub fn get_handler_map(&self) -> HandlerMap {
-        self.handlers
-            .read()
-            .expect("handlers lock poisoned")
-            .clone()
-    }
-
-    /// True iff a function with the given name is currently loaded.
+    /// True iff a function with the given name is currently registered.
     pub fn contains(&self, name: &str) -> bool {
         self.handlers
             .read()
@@ -208,7 +160,7 @@ impl WasmRuntime {
             .contains_key(name)
     }
 
-    /// Number of currently-loaded functions.
+    /// Number of currently-registered functions.
     pub fn len(&self) -> usize {
         self.handlers.read().expect("handlers lock poisoned").len()
     }
@@ -217,10 +169,20 @@ impl WasmRuntime {
         self.len() == 0
     }
 
-    /// Access the underlying engine. The same `Engine` is used by every
-    /// `WasmRuntimeEngine`; no clones, no per-call allocations.
+    /// Access the underlying engine.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Internal: fetch a named module + its crc by cloning from the
+    /// registry (cheap — `Module` is `Arc`-backed). Used by
+    /// [`WasmRuntimeEngine`] on cache miss.
+    fn get(&self, name: &str) -> Option<(u32, Module)> {
+        self.handlers
+            .read()
+            .expect("handlers lock poisoned")
+            .get(name)
+            .map(|r| (r.crc32c, r.module.clone()))
     }
 }
 
@@ -230,131 +192,215 @@ impl Default for WasmRuntime {
     }
 }
 
+/// Build the shared [`Linker`] with the three ADR-014 host imports
+/// (`ledger.credit` / `ledger.debit` / `ledger.get_balance`) routed to
+/// `HostStoreData.state` via `Rc<RefCell<TransactorState>>`. Called exactly
+/// once per `WasmRuntime`.
+fn build_host_linker(engine: &Engine) -> Linker<HostStoreData> {
+    let mut linker: Linker<HostStoreData> = Linker::new(engine);
+
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "credit",
+            |caller: Caller<'_, HostStoreData>, account_id: u64, amount: u64| {
+                let d = caller.data();
+                d.state.borrow_mut().credit(d.tx_id, account_id, amount);
+            },
+        )
+        .expect("register ledger.credit");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "debit",
+            |caller: Caller<'_, HostStoreData>, account_id: u64, amount: u64| {
+                let d = caller.data();
+                d.state.borrow_mut().debit(d.tx_id, account_id, amount);
+            },
+        )
+        .expect("register ledger.debit");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "get_balance",
+            |caller: Caller<'_, HostStoreData>, account_id: u64| -> i64 {
+                caller.data().state.borrow().get_balance(account_id)
+            },
+        )
+        .expect("register ledger.get_balance");
+
+    linker
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FunctionCaller — minimal pre-resolved call record
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Minimal pre-resolved call record. Stores **only** the typed export
+/// handle; the `Module` and `Linker` that produced it are not kept here
+/// — they live in [`WasmRuntime`].
+///
+/// Built once at cache-miss time via [`FunctionCaller::new`] (which does
+/// the expensive `instantiate` + `get_typed_func` work), then reused for
+/// every subsequent call on the same engine's `Store` until the cache is
+/// invalidated.
+#[derive(Clone)]
+pub struct FunctionCaller {
+    exec_fn: ExecTypedFunc,
+}
+
+impl FunctionCaller {
+    /// Instantiate `module` against the caller-supplied `store` using the
+    /// shared `linker`'s pre-registered host imports, then resolve the
+    /// typed `execute` handle. All the expensive work happens here — the
+    /// hot path never touches the linker or instance again.
+    fn new(
+        linker: &Linker<HostStoreData>,
+        module: &Module,
+        store: &mut Store<HostStoreData>,
+    ) -> Result<Self, wasmtime::Error> {
+        let instance = linker.instantiate(&mut *store, module)?;
+        let exec_fn: ExecTypedFunc = instance.get_typed_func(&mut *store, EXECUTE_FN)?;
+        Ok(Self { exec_fn })
+    }
+
+    /// Invoke the cached typed function. Returns the `u8` status: `0` =
+    /// success, otherwise ADR-014 standard / user-defined ranges; a
+    /// wasmtime trap surfaces as [`INVALID_OPERATION_STATUS`].
+    ///
+    /// **Does not** touch the linker, instance, or module — all three
+    /// were resolved in [`Self::new`]. The per-call sequence is just:
+    /// `TypedFunc::call` plus the caller's own Store-data update.
+    #[inline]
+    pub fn execute(&self, store: &mut Store<HostStoreData>, params: [i64; 8]) -> u8 {
+        match self.exec_fn.call(
+            store,
+            (
+                params[0], params[1], params[2], params[3], params[4], params[5], params[6],
+                params[7],
+            ),
+        ) {
+            Ok(r) => (r as u32 & 0xFF) as u8,
+            Err(_) => INVALID_OPERATION_STATUS,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmRuntimeEngine — per-Transactor execution layer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Internal `Store` data: a clone of the shared `Rc<RefCell<TransactorState>>`
-/// (the `Rc` clone is just a refcount bump) plus the current transaction id.
-struct HostStoreData {
+/// Data carried inside the engine's `Store`. `state` is set once at Store
+/// construction and never changes; `tx_id` is rewritten before every
+/// [`FunctionCaller::execute`] call via `Store::data_mut`.
+pub struct HostStoreData {
     state: Rc<RefCell<TransactorState>>,
     tx_id: u64,
 }
 
-/// Per-Transactor WASM execution layer. Owns its `Linker` and looks up
-/// compiled modules from the shared [`WasmRuntime`] registry. Single
-/// consumer (the Transactor), so no generic / trait indirection — the
-/// engine is hard-wired to [`TransactorState`] and routes the three host
-/// imports straight into its `credit` / `debit` / `get_balance` methods.
+/// One cache slot: the function's CRC32C plus its pre-resolved
+/// [`FunctionCaller`].
+#[derive(Clone)]
+struct CacheEntry {
+    crc32c: u32,
+    caller: FunctionCaller,
+}
+
+/// Per-Transactor WASM execution layer. Holds a long-lived `Store` and a
+/// lazy `name → FunctionCaller` cache keyed on the shared registry's
+/// `update_seq` watermark.
 ///
-/// Construction-time work happens **once**:
-/// - the wasmtime [`Linker`] is built and the three host imports are
-///   registered exactly once;
-/// - the shared `Rc<RefCell<TransactorState>>` is captured.
-///
-/// Per-call work is just `Store::new(engine, HostStoreData)` — cheap; the
-/// `Engine` is shared via `Arc` and `Rc::clone` is a refcount bump.
+/// Per-call cost on a cache hit: one `HashMap::get`, one `Store::data_mut`
+/// write, one `TypedFunc::call`. No instantiation, no linker touch.
 pub struct WasmRuntimeEngine {
     runtime: Arc<WasmRuntime>,
     state: Rc<RefCell<TransactorState>>,
-    local_handlers: HandlerMap,
-    local_handler_seq: u32,
-    linker: Linker<HostStoreData>,
+    store: Store<HostStoreData>,
+    cache: HashMap<String, CacheEntry>,
+    cache_seq: u32,
 }
 
 impl WasmRuntimeEngine {
-    /// Build a new engine bound to `runtime`. Wires the three host imports
-    /// (`ledger.credit`, `ledger.debit`, `ledger.get_balance`) into a
-    /// single owned [`Linker`]. Panics if any registration fails — that
-    /// indicates a bug in this module (e.g. duplicate name), not a runtime
-    /// condition.
+    /// Build a new per-Transactor engine. Creates the long-lived `Store`
+    /// carrying `Rc::clone(&state)` and an initial `tx_id = 0`.
     pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<TransactorState>>) -> Self {
-        let mut linker: Linker<HostStoreData> = Linker::new(runtime.engine());
-
-        linker
-            .func_wrap(
-                HOST_MODULE,
-                "credit",
-                |caller: Caller<'_, HostStoreData>, account_id: u64, amount: u64| {
-                    let d = caller.data();
-                    d.state.borrow_mut().credit(d.tx_id, account_id, amount);
-                },
-            )
-            .expect("register ledger.credit");
-        linker
-            .func_wrap(
-                HOST_MODULE,
-                "debit",
-                |caller: Caller<'_, HostStoreData>, account_id: u64, amount: u64| {
-                    let d = caller.data();
-                    d.state.borrow_mut().debit(d.tx_id, account_id, amount);
-                },
-            )
-            .expect("register ledger.debit");
-        linker
-            .func_wrap(
-                HOST_MODULE,
-                "get_balance",
-                |caller: Caller<'_, HostStoreData>, account_id: u64| -> i64 {
-                    caller.data().state.borrow().get_balance(account_id)
-                },
-            )
-            .expect("register ledger.get_balance");
-
+        let store = Store::new(
+            runtime.engine(),
+            HostStoreData {
+                state: Rc::clone(&state),
+                tx_id: 0,
+            },
+        );
         Self {
             runtime,
             state,
-            local_handlers: HandlerMap::new(),
-            local_handler_seq: u32::MAX,
-            linker,
+            store,
+            cache: HashMap::new(),
+            cache_seq: u32::MAX, // forces first refresh to be a no-op (no runtime changes yet)
         }
     }
 
-    /// CRC32C of a registered function, or `None` if not loaded. Performs
-    /// the same passive refresh of the local handler cache as
-    /// [`Self::execute`].
-    pub fn crc32c_of(&mut self, name: &str) -> Option<u32> {
-        self.local_handlers.get(name).map(|c| c.crc32c())
-    }
-
-    /// True iff `name` is currently loaded after a passive refresh.
-    pub fn contains(&mut self, name: &str) -> bool {
-        self.local_handlers.contains_key(name)
-    }
-
-    /// Execute `name` with the given `params` and `tx_id`. Returns:
-    /// - `None` — function is not loaded.
-    /// - `Some(u8)` — the function's `u8` status (0 = success; otherwise
-    ///   per ADR-014 standard / user-defined ranges; wasmtime-level
-    ///   failures surface as [`INVALID_OPERATION_STATUS`]).
+    /// Invalidate the caller cache and rebuild the `Store` iff the
+    /// shared registry's `update_seq` has advanced. Steady state is a
+    /// single atomic load.
     ///
-    /// Builds a per-call `Store<HostStoreData>` carrying an `Rc::clone` of
-    /// the shared state plus the current `tx_id`. The host imports
-    /// registered in [`Self::new`] read those out of the store on each
-    /// call and route into `state.borrow_mut().credit/debit/get_balance`.
-    pub fn execute(&mut self, name: &str, params: [i64; 8], tx_id: u64) -> Option<u8> {
-        let caller = self.local_handlers.get(name).cloned()?;
-
-        let mut store = Store::new(
-            self.runtime.engine(),
-            HostStoreData {
-                state: Rc::clone(&self.state),
-                tx_id,
-            },
-        );
-
-        Some(caller.execute(&mut store, &self.linker, params))
-    }
-
-    /// Passively refresh the cached handler map iff `WasmRuntime` advanced
-    /// its `update_seq`. Cheap atomic load on the steady path.
+    /// Rebuilding the `Store` on each invalidation keeps wasmtime's
+    /// per-Store instance count bounded no matter how many names have
+    /// been registered and replaced over time.
     #[inline]
     pub fn refresh(&mut self) {
         let seq = self.runtime.last_update_seq();
-        if seq != self.local_handler_seq {
-            self.local_handlers = self.runtime.get_handler_map();
-            self.local_handler_seq = seq;
+        if seq != self.cache_seq {
+            self.cache.clear();
+            self.store = Store::new(
+                self.runtime.engine(),
+                HostStoreData {
+                    state: Rc::clone(&self.state),
+                    tx_id: 0,
+                },
+            );
+            self.cache_seq = seq;
         }
+    }
+
+    /// Resolve `name` into the cache and return its CRC32C, or `None` if
+    /// the function is not registered.
+    ///
+    /// On cache miss this performs `Linker::instantiate` + `get_typed_func`
+    /// once — the only wasmtime instantiation work in the whole path.
+    /// Every subsequent [`Self::execute`] for the same name is a pure
+    /// cache hit.
+    pub fn crc32c_of(&mut self, name: &str) -> Option<u32> {
+        if let Some(entry) = self.cache.get(name) {
+            return Some(entry.crc32c);
+        }
+        let (crc32c, module) = self.runtime.get(name)?;
+        let caller = FunctionCaller::new(&self.runtime.linker, &module, &mut self.store).ok()?;
+        self.cache
+            .insert(name.to_string(), CacheEntry { crc32c, caller });
+        Some(crc32c)
+    }
+
+    /// True iff `name` is currently loaded (after a passive cache check
+    /// and, if needed, registry lookup).
+    pub fn contains(&mut self, name: &str) -> bool {
+        self.crc32c_of(name).is_some()
+    }
+
+    /// Execute `name` with the given `params` and `tx_id`. Returns:
+    /// - `None` — function is not loaded in the cache or the registry.
+    /// - `Some(u8)` — the function's status (0 = success; otherwise
+    ///   per-ADR-014 standard / user-defined ranges; wasmtime traps
+    ///   surface as [`INVALID_OPERATION_STATUS`]).
+    ///
+    /// Hot path: `HashMap::get` → `Store::data_mut` → `TypedFunc::call`.
+    pub fn execute(&mut self, name: &str, params: [i64; 8], tx_id: u64) -> Option<u8> {
+        // TypedFunc is Clone (cheap: internal handle), not Copy. Clone out of
+        // the cache so we don't hold an immutable borrow on `self.cache`
+        // while we mutably borrow `self.store`.
+        let caller = self.cache.get(name).map(|e| e.caller.clone())?;
+        self.store.data_mut().tx_id = tx_id;
+        Some(caller.execute(&mut self.store, params))
     }
 }
 
@@ -568,19 +614,6 @@ mod tests {
     }
 
     #[test]
-    fn handler_map_clones_are_independent() {
-        let rt = WasmRuntime::new();
-        let bin = noop_wat();
-        rt.load_function("noop", &bin, crc32c::crc32c(&bin))
-            .unwrap();
-        let map = rt.get_handler_map();
-        assert_eq!(map.len(), 1);
-        rt.unload_function("noop").unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(rt.len(), 0);
-    }
-
-    #[test]
     fn validate_name_accepts_ok_names() {
         validate_name("a").unwrap();
         validate_name("fee_calculation").unwrap();
@@ -606,16 +639,16 @@ mod tests {
     }
 
     #[test]
-    fn overwriting_a_name_still_works() {
+    fn registry_contains_and_len_track_load_unload() {
         let rt = WasmRuntime::new();
+        assert!(rt.is_empty());
         let bin = noop_wat();
         rt.load_function("noop", &bin, crc32c::crc32c(&bin))
             .unwrap();
-        let bin2 = transfer_wat();
-        rt.load_function("noop", &bin2, crc32c::crc32c(&bin2))
-            .unwrap();
-        let caller = rt.get_handler_map().get("noop").cloned().unwrap();
-        assert_eq!(caller.crc32c, crc32c::crc32c(&bin2));
-        assert_eq!(rt.last_update_seq(), 2);
+        assert!(rt.contains("noop"));
+        assert_eq!(rt.len(), 1);
+        rt.unload_function("noop").unwrap();
+        assert!(!rt.contains("noop"));
+        assert!(rt.is_empty());
     }
 }

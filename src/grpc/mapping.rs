@@ -63,9 +63,17 @@ impl From<proto::Composite> for Operation {
 
 impl From<proto::Named> for Operation {
     fn from(n: proto::Named) -> Self {
+        // ADR-014: `Operation::Named::params` is a fixed-arity `[i64; 8]`.
+        // Proto3 has no fixed-length array type, so the wire form stays
+        // `repeated int64` and we coerce here: slots beyond 8 are dropped,
+        // missing slots are zero-padded.
+        let mut params = [0i64; 8];
+        for (i, p) in n.params.into_iter().take(8).enumerate() {
+            params[i] = p;
+        }
         Operation::Named {
             name: n.name,
-            params: n.params,
+            params,
             user_ref: n.user_ref,
         }
     }

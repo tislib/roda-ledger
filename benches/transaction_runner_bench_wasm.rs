@@ -48,7 +48,7 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
             let dst = rand::random::<u64>() % 10_000_000;
             let mut tx = Transaction::new(Operation::Named {
                 name: "wasm_transfer".into(),
-                params: vec![src as i64, 100, dst as i64, 0, 0, 0, 0, 0],
+                params: [src as i64, 100, dst as i64, 0, 0, 0, 0, 0],
                 user_ref: 0,
             });
             tx.id = current_id;
@@ -66,7 +66,7 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
                     let dst = rand::random::<u64>() % 10_000_000;
                     let mut tx = Transaction::new(Operation::Named {
                         name: "wasm_transfer".into(),
-                        params: vec![src as i64, 100, dst as i64, 0, 0, 0, 0, 0],
+                        params: [src as i64, 100, dst as i64, 0, 0, 0, 0, 0],
                         user_ref: 0,
                     });
                     tx.id = current_id;
