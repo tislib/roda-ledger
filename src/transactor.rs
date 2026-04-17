@@ -7,43 +7,272 @@ use crate::entities::{
 };
 use crate::pipeline::TransactorContext;
 use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction, TransactionInput};
+use crate::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
 use crossbeam_skiplist::SkipMap;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::hint::spin_loop;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TransactorState — shared inter-state buffer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-step computation state shared between the Transactor's built-in
+/// operation handlers and `WasmRuntimeEngine`'s host imports for
+/// `Operation::Named`.
+///
+/// Wrapped in `Rc<RefCell<>>` and held by **both** [`TransactorRunner`]
+/// (for direct mutation by `Transfer`/`Deposit`/etc.) and
+/// [`WasmRuntimeEngine`] (whose `ledger.{credit,debit,get_balance}` host
+/// functions call back into the same state). Single-threaded transactor
+/// loop → single borrow at any time → `RefCell` is sound.
+///
+/// Fields:
+/// - `balances` — mutable account balances vector indexed by `account_id`.
+/// - `entries`  — accumulating WAL entry buffer for the current step.
+/// - `fail_reason` — current transaction's failure flag (`NONE` = ok).
+/// - `position` — index into `entries` of the current `TxMetadata`; used
+///   by `verify()` and `rollback()` to scope their iteration to the
+///   entries belonging to the in-flight transaction.
+pub struct TransactorState {
+    pub balances: Vec<Balance>,
+    pub entries: Vec<WalEntry>,
+    pub fail_reason: FailReason,
+    pub position: usize,
+}
+
+impl TransactorState {
+    pub fn new(max_accounts: usize) -> Self {
+        let mut balances = Vec::with_capacity(max_accounts);
+        balances.resize(max_accounts, Balance::default());
+        Self {
+            balances,
+            entries: Vec::with_capacity(16),
+            fail_reason: FailReason::NONE,
+            position: 0,
+        }
+    }
+
+    pub fn from_balances(balances: Vec<Balance>, entries_capacity: usize) -> Self {
+        Self {
+            balances,
+            entries: Vec::with_capacity(entries_capacity),
+            fail_reason: FailReason::NONE,
+            position: 0,
+        }
+    }
+
+    pub fn recover_balances(&mut self, balances: &HashMap<u64, Balance>) {
+        for (account_id, balance) in balances {
+            if let Some(slot) = self.balances.get_mut(*account_id as usize) {
+                *slot = *balance;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn meta(&mut self, tx_id: u64, tag: [u8; 8], user_ref: u64, timestamp: u64) {
+        self.entries.push(WalEntry::Metadata(TxMetadata {
+            entry_type: WalEntryKind::TxMetadata as u8,
+            entry_count: 0,
+            link_count: 0,
+            fail_reason: FailReason::NONE,
+            crc32c: 0,
+            tx_id,
+            timestamp,
+            user_ref,
+            tag,
+        }));
+    }
+
+    #[inline]
+    pub fn fail(&mut self, reason: FailReason) {
+        self.fail_reason = reason;
+    }
+
+    #[inline]
+    pub fn clear_fail(&mut self) {
+        self.fail_reason = FailReason::NONE;
+    }
+
+    pub fn verify(&mut self) -> FailReason {
+        if self.fail_reason.is_failure() {
+            return self.fail_reason;
+        }
+
+        let mut sum_credits: u128 = 0;
+        let mut sum_debits: u128 = 0;
+        for entry in self.entries.iter().skip(self.position + 1) {
+            if let WalEntry::Entry(e) = entry {
+                match e.kind {
+                    EntryKind::Credit => sum_credits += e.amount as u128,
+                    EntryKind::Debit => sum_debits += e.amount as u128,
+                }
+            }
+        }
+        if sum_credits != sum_debits {
+            self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
+        }
+        self.fail_reason
+    }
+
+    pub fn rollback(&mut self) {
+        for entry in self.entries.iter().skip(self.position + 1) {
+            if let WalEntry::Entry(e) = entry
+                && let Some(balance) = self.balances.get_mut(e.account_id as usize)
+            {
+                match e.kind {
+                    EntryKind::Credit => {
+                        *balance = balance.saturating_add(e.amount as i64);
+                    }
+                    EntryKind::Debit => {
+                        *balance = balance.saturating_sub(e.amount as i64);
+                    }
+                }
+            }
+        }
+        self.entries.truncate(self.position + 1);
+    }
+
+    pub fn emit_duplicate(
+        &mut self,
+        tx_id: u64,
+        user_ref: u64,
+        timestamp: u64,
+        original_tx_id: u64,
+    ) {
+        let link = TxLink {
+            entry_type: WalEntryKind::Link as u8,
+            link_kind: TxLinkKind::Duplicate as u8,
+            _pad: [0; 6],
+            tx_id,
+            to_tx_id: original_tx_id,
+            _pad2: [0; 16],
+        };
+
+        let mut meta = TxMetadata {
+            entry_type: WalEntryKind::TxMetadata as u8,
+            entry_count: 0,
+            link_count: 1,
+            fail_reason: FailReason::DUPLICATE,
+            crc32c: 0,
+            tx_id,
+            timestamp,
+            user_ref,
+            tag: *b"DUPLICAT",
+        };
+
+        meta.crc32c = 0;
+        let digest = crc32c::crc32c(bytemuck::bytes_of(&meta));
+        let digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&link));
+        meta.crc32c = digest;
+
+        self.entries.push(WalEntry::Metadata(meta));
+        self.entries.push(WalEntry::Link(link));
+        self.position += 2;
+    }
+
+    /// Reset per-step state. Balances persist across steps.
+    pub fn reset_step(&mut self) {
+        self.entries.clear();
+        self.fail_reason = FailReason::NONE;
+        self.position = 0;
+    }
+}
+
+// ── Host-callable surface (also used by built-in ops directly) ─────────────
+
+impl TransactorState {
+    #[inline]
+    pub fn credit(&mut self, tx_id: u64, account_id: u64, amount: u64) {
+        if self.fail_reason.is_failure() {
+            return;
+        }
+        if let Some(balance) = self.balances.get_mut(account_id as usize) {
+            *balance = balance.saturating_sub(amount as i64);
+            self.entries.push(WalEntry::Entry(TxEntry {
+                entry_type: WalEntryKind::TxEntry as u8,
+                tx_id,
+                account_id,
+                amount,
+                kind: EntryKind::Credit,
+                _pad0: [0; 6],
+                computed_balance: *balance,
+            }));
+        } else {
+            self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
+        }
+    }
+
+    #[inline]
+    pub fn debit(&mut self, tx_id: u64, account_id: u64, amount: u64) {
+        if self.fail_reason.is_failure() {
+            return;
+        }
+        if let Some(balance) = self.balances.get_mut(account_id as usize) {
+            *balance = balance.saturating_add(amount as i64);
+            self.entries.push(WalEntry::Entry(TxEntry {
+                entry_type: WalEntryKind::TxEntry as u8,
+                tx_id,
+                account_id,
+                amount,
+                kind: EntryKind::Debit,
+                _pad0: [0; 6],
+                computed_balance: *balance,
+            }));
+        } else {
+            self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
+        }
+    }
+
+    #[inline]
+    pub fn get_balance(&self, account_id: u64) -> Balance {
+        self.balances.get(account_id as usize).copied().unwrap_or(0)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transactor / TransactorRunner
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `wasm_runtime::WasmRuntimeEngine` is hard-wired to `TransactorState`
+// (no trait, no generic). Its host imports call `state.borrow_mut()
+// .credit/.debit/.get_balance` directly — same methods the built-in
+// operation handlers use, so the two paths cannot diverge in semantics.
 
 pub struct Transactor {
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     balances: Vec<Balance>,
     dedup: DedupCache,
+    wasm_runtime: Arc<WasmRuntime>,
 }
 
 pub struct TransactorRunner {
-    balances: Vec<Balance>,
     rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     transaction_buffer: Vec<Transaction>,
     expected_next_id: u64,
     pending: BTreeMap<u64, Transaction>,
-    entries: Vec<WalEntry>,
     input_retry_count: u64,
-    fail_reason: FailReason,
-    position: usize,
     dedup: DedupCache,
+    state: Rc<RefCell<TransactorState>>,
+    wasm_engine: WasmRuntimeEngine,
 }
 
 impl Transactor {
-    pub fn new(config: &LedgerConfig) -> Self {
+    pub fn new(config: &LedgerConfig, wasm_runtime: Arc<WasmRuntime>) -> Self {
         let mut accounts = Vec::with_capacity(config.max_accounts);
         accounts.resize(config.max_accounts, Balance::default());
         Self {
             rejected_transactions: Arc::new(Default::default()),
             balances: accounts,
             dedup: DedupCache::new(config.storage.transaction_count_per_segment),
+            wasm_runtime,
         }
     }
 
-    // --- Replay accessors (called from recover) ---
     pub(crate) fn recover_balances(&mut self, balances: &HashMap<u64, Balance>) {
         for (account_id, balance) in balances {
             if let Some(slot) = self.balances.get_mut(*account_id as usize) {
@@ -68,41 +297,55 @@ impl Transactor {
 
     pub fn start(&mut self, ctx: TransactorContext) -> std::io::Result<JoinHandle<()>> {
         let cap = ctx.input_capacity();
-        let mut runner = TransactorRunner {
-            balances: std::mem::take(&mut self.balances),
-            rejected_transactions: self.rejected_transactions.clone(),
-            transaction_buffer: Vec::with_capacity(cap),
-            entries: Vec::with_capacity(cap),
-            expected_next_id: ctx.get_processed_index() + 1,
-            pending: BTreeMap::new(),
-            input_retry_count: 0,
-            fail_reason: FailReason::NONE,
-            position: 0,
-            dedup: std::mem::replace(&mut self.dedup, DedupCache::new(0)),
-        };
+        let balances = std::mem::take(&mut self.balances);
+        let rejected_transactions = self.rejected_transactions.clone();
+        let dedup = std::mem::replace(&mut self.dedup, DedupCache::new(0));
+        let wasm_runtime = self.wasm_runtime.clone();
+        let expected_next_id = ctx.get_processed_index() + 1;
+        // `Rc<RefCell<>>` and `WasmRuntimeEngine` are `!Send`; build them
+        // inside the spawned thread so nothing non-`Send` ever crosses the
+        // thread boundary.
         std::thread::Builder::new()
             .name("transactor".to_string())
-            .spawn(move || runner.run(ctx))
+            .spawn(move || {
+                let state = Rc::new(RefCell::new(TransactorState::from_balances(balances, cap)));
+                let wasm_engine = WasmRuntimeEngine::new(wasm_runtime, Rc::clone(&state));
+                let mut runner = TransactorRunner {
+                    rejected_transactions,
+                    transaction_buffer: Vec::with_capacity(cap),
+                    expected_next_id,
+                    pending: BTreeMap::new(),
+                    input_retry_count: 0,
+                    dedup,
+                    state,
+                    wasm_engine,
+                };
+                runner.run(ctx);
+            })
     }
 }
 
 impl TransactorRunner {
     /// Standalone constructor used by benches (no pipeline / no queues).
-    pub fn new(max_accounts: usize) -> Self {
-        let mut balances = Vec::with_capacity(max_accounts);
-        balances.resize(max_accounts, Balance::default());
+    pub fn new(max_accounts: usize, wasm_runtime: Arc<WasmRuntime>) -> Self {
+        let state = Rc::new(RefCell::new(TransactorState::new(max_accounts)));
+        let wasm_engine = WasmRuntimeEngine::new(wasm_runtime, Rc::clone(&state));
         Self {
-            balances,
             expected_next_id: 1,
             pending: BTreeMap::new(),
             rejected_transactions: Arc::new(Default::default()),
             transaction_buffer: Vec::with_capacity(1),
-            entries: Vec::with_capacity(16),
             input_retry_count: 0,
-            fail_reason: FailReason::NONE,
-            position: 0,
             dedup: DedupCache::new(0),
+            state,
+            wasm_engine,
         }
+    }
+
+    /// Read-only access to the shared in-flight state. Intended for tests
+    /// and bench setup; not used on the hot path.
+    fn state(&self) -> &Rc<RefCell<TransactorState>> {
+        &self.state
     }
 
     /// Process a batch of transactions directly, bypassing inbound/outbound queues.
@@ -114,6 +357,8 @@ impl TransactorRunner {
         for tx in txs {
             self.transaction_buffer.push(tx);
         }
+        // One refresh per direct-batch cycle, same discipline as `run_step`.
+        self.wasm_engine.refresh();
         self.process(timestamp);
         self.reset();
     }
@@ -125,6 +370,8 @@ impl TransactorRunner {
             .unwrap_or_default()
             .as_nanos() as u64;
         self.transaction_buffer.push(tx);
+        // One refresh per direct-submit cycle, same discipline as `run_step`.
+        self.wasm_engine.refresh();
         self.process(timestamp);
         self.reset();
     }
@@ -137,14 +384,12 @@ impl TransactorRunner {
 
     fn run_step(&mut self, ctx: &TransactorContext) {
         let inbound = ctx.input();
-        // collect transactions to process
         while let Some(txi) = inbound.pop() {
             match txi {
                 TransactionInput::Single(tx) => {
                     if tx.id == self.expected_next_id {
                         self.transaction_buffer.push(tx);
                         self.expected_next_id += 1;
-                        // drain any buffered transactions that are now in order
                         while let Some(buffered) = self.pending.remove(&self.expected_next_id) {
                             self.transaction_buffer.push(buffered);
                             self.expected_next_id += 1;
@@ -152,8 +397,6 @@ impl TransactorRunner {
                     } else if tx.id > self.expected_next_id {
                         self.pending.insert(tx.id, tx);
                     }
-
-                    // Limit batch size to avoid overly long processing steps
                     if self.transaction_buffer.len() >= self.transaction_buffer.capacity() {
                         break;
                     }
@@ -165,7 +408,6 @@ impl TransactorRunner {
                             tx.id = tbx.start_tx_id + i as u64;
                             self.transaction_buffer.push(tx);
                             self.expected_next_id += 1;
-                            // drain any buffered transactions that are now in order
                             while let Some(buffered) = self.pending.remove(&self.expected_next_id) {
                                 self.transaction_buffer.push(buffered);
                                 self.expected_next_id += 1;
@@ -178,8 +420,6 @@ impl TransactorRunner {
                             self.pending.insert(tx.id, tx);
                         }
                     }
-
-                    // Limit batch size to avoid overly long processing steps
                     if self.transaction_buffer.len() >= self.transaction_buffer.capacity() {
                         break;
                     }
@@ -194,19 +434,20 @@ impl TransactorRunner {
         }
         self.input_retry_count = 0;
 
-        // single syscall for timestamp for this entire step
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
 
+        self.wasm_engine.refresh();
         let max_tx_id = self.process(timestamp);
 
         // push all accumulated entries to outbound at the end of the step
         let output = ctx.output();
+        let entries_len = self.state.borrow().entries.len();
         let mut i = 0;
-        while i < self.entries.len() {
-            let entry = self.entries[i];
+        while i < entries_len {
+            let entry = self.state.borrow().entries[i];
             let mut retry_count = 0;
             loop {
                 retry_count += 1;
@@ -228,41 +469,45 @@ impl TransactorRunner {
         self.reset();
     }
 
-    /// Process the buffered transactions, producing wal entries in `self.entries`.
-    /// Returns the maximum transaction id observed in this batch (0 if none).
+    /// Process the buffered transactions, producing wal entries in the
+    /// shared `state.entries`. Returns the maximum transaction id observed
+    /// in this batch (0 if none).
     fn process(&mut self, timestamp: u64) -> u64 {
         let mut max_tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
-            self.fail_reason = FailReason::NONE;
-            let operation = &self.transaction_buffer[idx].operation;
-
+            self.state.borrow_mut().clear_fail();
             let tx_id = self.transaction_buffer[idx].id;
             max_tx_id = max_tx_id.max(tx_id);
-            let user_ref = operation.user_ref();
+            let user_ref = self.transaction_buffer[idx].operation.user_ref();
 
             // --- Deduplication check ---
             match self.dedup.check(user_ref, tx_id) {
                 DedupResult::Duplicate(original_tx_id) => {
-                    self.emit_duplicate(tx_id, user_ref, timestamp, original_tx_id);
+                    self.state
+                        .borrow_mut()
+                        .emit_duplicate(tx_id, user_ref, timestamp, original_tx_id);
                     self.rejected_transactions
                         .insert(tx_id, FailReason::DUPLICATE);
-                    // position already advanced by emit_duplicate
                     continue;
                 }
                 DedupResult::Proceed => {}
             }
 
-            // --- Normal operation processing ---
-            match operation.clone() {
+            // Clone the operation out so we don't hold a borrow on
+            // self.transaction_buffer while mutating self.state below.
+            let operation = self.transaction_buffer[idx].operation.clone();
+
+            match operation {
                 Operation::Deposit {
                     user_ref,
                     account,
                     amount,
                     ..
                 } => {
-                    self.meta(tx_id, *b"DEPOSIT\0", user_ref, timestamp);
-                    self.debit(tx_id, account, amount);
-                    self.credit(tx_id, SYSTEM_ACCOUNT_ID, amount);
+                    let mut s = self.state.borrow_mut();
+                    s.meta(tx_id, *b"DEPOSIT\0", user_ref, timestamp);
+                    s.debit(tx_id, account, amount);
+                    s.credit(tx_id, SYSTEM_ACCOUNT_ID, amount);
                 }
                 Operation::Withdrawal {
                     user_ref,
@@ -270,12 +515,13 @@ impl TransactorRunner {
                     amount,
                     ..
                 } => {
-                    self.meta(tx_id, *b"WITHDRAW", user_ref, timestamp);
-                    if self.get_balance(account) < amount as i64 {
-                        self.fail(FailReason::INSUFFICIENT_FUNDS);
+                    let mut s = self.state.borrow_mut();
+                    s.meta(tx_id, *b"WITHDRAW", user_ref, timestamp);
+                    if s.get_balance(account) < amount as i64 {
+                        s.fail(FailReason::INSUFFICIENT_FUNDS);
                     } else {
-                        self.credit(tx_id, account, amount);
-                        self.debit(tx_id, SYSTEM_ACCOUNT_ID, amount);
+                        s.credit(tx_id, account, amount);
+                        s.debit(tx_id, SYSTEM_ACCOUNT_ID, amount);
                     }
                 }
                 Operation::Transfer {
@@ -285,25 +531,27 @@ impl TransactorRunner {
                     amount,
                     ..
                 } => {
-                    self.meta(tx_id, *b"TRANSFER", user_ref, timestamp);
+                    let mut s = self.state.borrow_mut();
+                    s.meta(tx_id, *b"TRANSFER", user_ref, timestamp);
                     if from == to {
                         // no-op
-                    } else if self.get_balance(from) < amount as i64 {
-                        self.fail(FailReason::INSUFFICIENT_FUNDS);
+                    } else if s.get_balance(from) < amount as i64 {
+                        s.fail(FailReason::INSUFFICIENT_FUNDS);
                     } else {
-                        self.credit(tx_id, from, amount);
-                        self.debit(tx_id, to, amount);
+                        s.credit(tx_id, from, amount);
+                        s.debit(tx_id, to, amount);
                     }
                 }
                 Operation::Composite(op) => {
-                    self.meta(tx_id, *b"COMPOSIT", op.user_ref, timestamp);
+                    let mut s = self.state.borrow_mut();
+                    s.meta(tx_id, *b"COMPOSIT", op.user_ref, timestamp);
                     for step in &op.steps {
                         match step {
                             Step::Credit { account_id, amount } => {
-                                self.credit(tx_id, *account_id, *amount);
+                                s.credit(tx_id, *account_id, *amount);
                             }
                             Step::Debit { account_id, amount } => {
-                                self.debit(tx_id, *account_id, *amount);
+                                s.debit(tx_id, *account_id, *amount);
                             }
                         }
                     }
@@ -312,30 +560,64 @@ impl TransactorRunner {
                         .flags
                         .contains(CompositeOperationFlags::CHECK_NEGATIVE_BALANCE)
                     {
-                        for i in (self.position + 1)..self.entries.len() {
-                            if let WalEntry::Entry(e) = self.entries[i]
-                                && self.get_balance(e.account_id) < 0
+                        let position = s.position;
+                        let entries_len = s.entries.len();
+                        for i in (position + 1)..entries_len {
+                            if let WalEntry::Entry(e) = s.entries[i]
+                                && s.get_balance(e.account_id) < 0
                             {
-                                self.fail(FailReason::INSUFFICIENT_FUNDS);
+                                s.fail(FailReason::INSUFFICIENT_FUNDS);
                                 break;
                             }
                         }
                     }
                 }
-                Operation::Named { .. } => {
-                    panic!("Named operations not implemented yet");
+                Operation::Named {
+                    name,
+                    params,
+                    user_ref,
+                } => {
+                    // 1. Resolve crc up-front so we can emit meta with the
+                    //    correct ADR-014 tag (zero crc when missing).
+                    let crc = self.wasm_engine.crc32c_of(&name).unwrap_or(0);
+                    self.state
+                        .borrow_mut()
+                        .meta(tx_id, build_wasm_tag(crc), user_ref, timestamp);
+
+                    // 2. Pack params (Vec<i64> → fixed [i64; 8], short ones
+                    //    pad with 0).
+                    let mut params_arr = [0i64; 8];
+                    for (i, p) in params.into_iter().take(8).enumerate() {
+                        params_arr[i] = p;
+                    }
+
+                    // 3. Hand off to the engine. The engine's host imports
+                    //    will mutate the same `self.state` via Rc<RefCell<>>.
+                    match self.wasm_engine.execute(&name, params_arr, tx_id) {
+                        None => {
+                            self.state
+                                .borrow_mut()
+                                .fail(FailReason::INVALID_OPERATION);
+                        }
+                        Some(0) => {} // success
+                        Some(status) => {
+                            self.state
+                                .borrow_mut()
+                                .fail(FailReason::from_u8(status));
+                        }
+                    }
                 }
             }
 
-            let fail_reason = self.verify();
-            let meta_idx = self.position;
+            // ── Verify + commit/rollback bookkeeping ──────────────────────
+            let mut s = self.state.borrow_mut();
+            let fail_reason = s.verify();
+            let meta_idx = s.position;
 
             if fail_reason.is_failure() {
-                // rollback balance changes for entries after meta, truncate to meta+1
-                self.rollback();
+                s.rollback();
 
-                // go back and update meta at position to mark as failed
-                if let Some(WalEntry::Metadata(m)) = self.entries.get_mut(meta_idx) {
+                if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.fail_reason = fail_reason;
                     m.entry_count = 0;
                     m.link_count = 0;
@@ -344,40 +626,34 @@ impl TransactorRunner {
                     m.crc32c = digest;
                 }
 
+                drop(s);
                 self.rejected_transactions.insert(tx_id, fail_reason);
-
-                // Record in dedup (even failed txs get deduped)
                 self.dedup.insert(user_ref, tx_id);
-
-                // advance: meta only
-                self.position += 1;
+                self.state.borrow_mut().position += 1;
             } else {
-                let entry_count = self.entries.len() - meta_idx - 1;
+                let entry_count = s.entries.len() - meta_idx - 1;
 
-                // update meta with entry_count, then calculate crc over meta + entries
-                if let Some(WalEntry::Metadata(m)) = self.entries.get_mut(meta_idx) {
+                if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.entry_count = entry_count as u8;
                     m.crc32c = 0;
                 }
-                let mut digest = if let Some(WalEntry::Metadata(m)) = self.entries.get(meta_idx) {
+                let mut digest = if let Some(WalEntry::Metadata(m)) = s.entries.get(meta_idx) {
                     crc32c::crc32c(bytemuck::bytes_of(m))
                 } else {
                     0
                 };
-                for i in (meta_idx + 1)..self.entries.len() {
-                    if let WalEntry::Entry(e) = &self.entries[i] {
+                for i in (meta_idx + 1)..s.entries.len() {
+                    if let WalEntry::Entry(e) = &s.entries[i] {
                         digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(e));
                     }
                 }
-                if let Some(WalEntry::Metadata(m)) = self.entries.get_mut(meta_idx) {
+                if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.crc32c = digest;
                 }
 
-                // Record in dedup
+                drop(s);
                 self.dedup.insert(user_ref, tx_id);
-
-                // advance: meta + entries
-                self.position += 1 + entry_count;
+                self.state.borrow_mut().position += 1 + entry_count;
             }
         }
 
@@ -388,160 +664,184 @@ impl TransactorRunner {
         max_tx_id
     }
 
-    /// Emit a duplicate transaction: TxMetadata (entry_count=0, link_count=1, fail_reason=DUPLICATE)
-    /// followed by a TxLink { kind: Duplicate, to_tx_id: original }.
-    fn emit_duplicate(&mut self, tx_id: u64, user_ref: u64, timestamp: u64, original_tx_id: u64) {
-        let link = TxLink {
-            entry_type: WalEntryKind::Link as u8,
-            link_kind: TxLinkKind::Duplicate as u8,
-            _pad: [0; 6],
-            tx_id,
-            to_tx_id: original_tx_id,
-            _pad2: [0; 16],
-        };
-
-        let mut meta = TxMetadata {
-            entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 0,
-            link_count: 1,
-            fail_reason: FailReason::DUPLICATE,
-            crc32c: 0,
-            tx_id,
-            timestamp,
-            user_ref,
-            tag: *b"DUPLICAT",
-        };
-
-        // CRC covers meta + link
-        meta.crc32c = 0;
-        let digest = crc32c::crc32c(bytemuck::bytes_of(&meta));
-        let digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&link));
-        meta.crc32c = digest;
-
-        self.entries.push(WalEntry::Metadata(meta));
-        self.entries.push(WalEntry::Link(link));
-        self.position += 2; // meta + link
-    }
-
-    #[inline]
-    fn meta(&mut self, tx_id: u64, tag: [u8; 8], user_ref: u64, timestamp: u64) {
-        self.entries.push(WalEntry::Metadata(TxMetadata {
-            entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 0,
-            link_count: 0,
-            fail_reason: FailReason::NONE,
-            crc32c: 0,
-            tx_id,
-            timestamp,
-            user_ref,
-            tag,
-        }));
-    }
-
-    #[inline]
-    fn credit(&mut self, tx_id: u64, account_id: u64, amount: u64) {
-        if self.fail_reason.is_failure() {
-            return;
-        }
-
-        if let Some(balance) = self.balances.get_mut(account_id as usize) {
-            *balance = balance.saturating_sub(amount as i64);
-            self.entries.push(WalEntry::Entry(TxEntry {
-                entry_type: WalEntryKind::TxEntry as u8,
-                tx_id,
-                account_id,
-                amount,
-                kind: EntryKind::Credit,
-                _pad0: [0; 6],
-                computed_balance: *balance,
-            }));
-        } else {
-            self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
-        }
-    }
-
-    #[inline]
-    fn debit(&mut self, tx_id: u64, account_id: u64, amount: u64) {
-        if self.fail_reason.is_failure() {
-            return;
-        }
-
-        if let Some(balance) = self.balances.get_mut(account_id as usize) {
-            *balance = balance.saturating_add(amount as i64);
-            self.entries.push(WalEntry::Entry(TxEntry {
-                entry_type: WalEntryKind::TxEntry as u8,
-                tx_id,
-                account_id,
-                amount,
-                kind: EntryKind::Debit,
-                _pad0: [0; 6],
-                computed_balance: *balance,
-            }));
-        } else {
-            self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
-        }
-    }
-
-    #[inline]
-    fn get_balance(&self, account_id: u64) -> Balance {
-        self.balances.get(account_id as usize).copied().unwrap_or(0)
-    }
-
-    #[inline]
-    fn fail(&mut self, reason: FailReason) {
-        self.fail_reason = reason;
-    }
-
-    fn verify(&mut self) -> FailReason {
-        if self.fail_reason.is_failure() {
-            return self.fail_reason;
-        }
-
-        let mut sum_credits: u128 = 0;
-        let mut sum_debits: u128 = 0;
-
-        for entry in self.entries.iter().skip(self.position + 1) {
-            if let WalEntry::Entry(e) = entry {
-                match e.kind {
-                    EntryKind::Credit => sum_credits += e.amount as u128,
-                    EntryKind::Debit => sum_debits += e.amount as u128,
-                }
-            }
-        }
-
-        if sum_credits != sum_debits {
-            self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
-        }
-
-        self.fail_reason
-    }
-
-    fn rollback(&mut self) {
-        // revert balance changes for entries after the meta at self.position
-        for entry in self.entries.iter().skip(self.position + 1) {
-            if let WalEntry::Entry(e) = entry
-                && let Some(balance) = self.balances.get_mut(e.account_id as usize)
-            {
-                match e.kind {
-                    EntryKind::Credit => {
-                        *balance = balance.saturating_add(e.amount as i64);
-                    }
-                    EntryKind::Debit => {
-                        *balance = balance.saturating_sub(e.amount as i64);
-                    }
-                }
-            }
-        }
-
-        // keep meta at self.position, remove entries after it
-        self.entries.truncate(self.position + 1);
-    }
-
     fn reset(&mut self) {
         self.transaction_buffer.clear();
-        self.entries.clear();
         self.input_retry_count = 0;
-        self.fail_reason = FailReason::NONE;
-        self.position = 0;
+        self.state.borrow_mut().reset_step();
+    }
+}
+
+/// Build the 8-byte `TxMetadata.tag` for a WASM-driven transaction:
+/// `[b'f', b'n', b'w', b'\n', crc[0], crc[1], crc[2], crc[3]]` — see ADR-014
+/// "Tag format". The literal prefix lets `roda-ctl unpack` render it as
+/// `"fnw\n4a2f1c3d"`, and the embedded CRC32C identifies the exact binary.
+#[inline]
+pub fn build_wasm_tag(crc32c: u32) -> [u8; 8] {
+    let bytes = crc32c.to_le_bytes();
+    [b'f', b'n', b'w', b'\n', bytes[0], bytes[1], bytes[2], bytes[3]]
+}
+
+#[cfg(test)]
+mod wasm_named_tests {
+    //! ADR-014 unit tests for `Operation::Named` execution inside
+    //! `TransactorRunner`. Exercises the full host-function wiring through
+    //! `WasmRuntimeEngine` end-to-end by submitting transactions through
+    //! `process_direct` and inspecting the resulting balances and rejection
+    //! reasons.
+    use super::*;
+    use crate::transaction::{Operation, Transaction};
+    use crate::wasm_runtime::WasmRuntime;
+    use std::sync::Arc;
+
+    fn make_runner_with(wat_src: &str, name: &str) -> (TransactorRunner, u32) {
+        let runtime = Arc::new(WasmRuntime::new());
+        let bin = wat::parse_str(wat_src).expect("wat parse");
+        let crc = crc32c::crc32c(&bin);
+        runtime.load_function(name, &bin, crc).unwrap();
+        (TransactorRunner::new(64, runtime), crc)
+    }
+
+    fn empty_runner() -> TransactorRunner {
+        TransactorRunner::new(64, Arc::new(WasmRuntime::new()))
+    }
+
+    fn submit(runner: &mut TransactorRunner, tx_id: u64, op: Operation) {
+        let mut tx = Transaction::new(op);
+        tx.id = tx_id;
+        runner.process_direct(tx);
+    }
+
+    const TRANSFER_WAT: &str = r#"
+        (module
+          (import "ledger" "credit" (func $credit (param i64 i64)))
+          (import "ledger" "debit"  (func $debit  (param i64 i64)))
+          (func (export "execute")
+            (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
+            local.get 0 local.get 1 call $credit
+            local.get 2 local.get 1 call $debit
+            i32.const 0))
+    "#;
+
+    const REJECT_WAT: &str = r#"
+        (module
+          (import "ledger" "credit" (func $credit (param i64 i64)))
+          (import "ledger" "debit"  (func $debit  (param i64 i64)))
+          (func (export "execute")
+            (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
+            local.get 0 local.get 1 call $credit
+            local.get 2 local.get 1 call $debit
+            i32.const 47))
+    "#;
+
+    const READ_BALANCE_WAT: &str = r#"
+        (module
+          (import "ledger" "get_balance" (func $get_balance (param i64) (result i64)))
+          (func (export "execute")
+            (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
+            local.get 0
+            call $get_balance
+            i32.wrap_i64))
+    "#;
+
+    #[test]
+    fn named_without_runtime_handler_fails_invalid_operation() {
+        let mut runner = empty_runner();
+        submit(
+            &mut runner,
+            1,
+            Operation::Named {
+                name: "missing".into(),
+                params: vec![0; 8],
+                user_ref: 0,
+            },
+        );
+        assert_eq!(
+            runner
+                .rejected_transactions
+                .get(&1)
+                .map(|e| *e.value()),
+            Some(FailReason::INVALID_OPERATION)
+        );
+    }
+
+    #[test]
+    fn named_transfer_applies_credit_and_debit() {
+        let (mut runner, crc) = make_runner_with(TRANSFER_WAT, "wasm_transfer");
+        assert_eq!(runner.state().borrow().balances[2], 0);
+        assert_eq!(runner.state().borrow().balances[3], 0);
+
+        submit(
+            &mut runner,
+            10,
+            Operation::Named {
+                name: "wasm_transfer".into(),
+                params: vec![2, 100, 3, 0, 0, 0, 0, 0],
+                user_ref: 42,
+            },
+        );
+
+        assert!(runner.rejected_transactions.get(&10).is_none());
+        assert_eq!(runner.state().borrow().balances[2], -100);
+        assert_eq!(runner.state().borrow().balances[3], 100);
+        assert_eq!(build_wasm_tag(crc)[..4], *b"fnw\n");
+    }
+
+    #[test]
+    fn named_non_zero_status_rolls_back_balances() {
+        let (mut runner, _) = make_runner_with(REJECT_WAT, "wasm_reject");
+        submit(
+            &mut runner,
+            1,
+            Operation::Named {
+                name: "wasm_reject".into(),
+                params: vec![4, 50, 5, 0, 0, 0, 0, 0],
+                user_ref: 7,
+            },
+        );
+
+        assert_eq!(
+            runner
+                .rejected_transactions
+                .get(&1)
+                .map(|e| *e.value())
+                .map(|f| f.as_u8()),
+            Some(47)
+        );
+        assert_eq!(runner.state().borrow().balances[4], 0);
+        assert_eq!(runner.state().borrow().balances[5], 0);
+    }
+
+    #[test]
+    fn named_get_balance_reads_live_state() {
+        let (mut runner, _) = make_runner_with(READ_BALANCE_WAT, "wasm_read_bal");
+        runner.state().borrow_mut().balances[7] = 33;
+
+        submit(
+            &mut runner,
+            1,
+            Operation::Named {
+                name: "wasm_read_bal".into(),
+                params: vec![7, 0, 0, 0, 0, 0, 0, 0],
+                user_ref: 0,
+            },
+        );
+
+        assert_eq!(
+            runner
+                .rejected_transactions
+                .get(&1)
+                .map(|e| *e.value())
+                .map(|f| f.as_u8()),
+            Some(33)
+        );
+        assert_eq!(runner.state().borrow().balances[7], 33);
+    }
+
+    #[test]
+    fn build_wasm_tag_layout_matches_adr() {
+        assert_eq!(
+            build_wasm_tag(0x1234_5678),
+            [b'f', b'n', b'w', b'\n', 0x78, 0x56, 0x34, 0x12]
+        );
     }
 }

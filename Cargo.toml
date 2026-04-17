@@ -33,9 +33,11 @@ tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 rustc-hash = "2"
+wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+wat = "1"
 
 [features]
 default = []
@@ -52,6 +54,10 @@ harness = false
 
 [[bench]]
 name = "transaction_runner_bench"
+harness = false
+
+[[bench]]
+name = "transaction_runner_bench_wasm"
 harness = false
 
 [[bench]]

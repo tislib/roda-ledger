@@ -1,4 +1,6 @@
 mod engine;
+pub mod function_snapshot;
+pub mod functions;
 mod index;
 mod layout;
 mod segment;

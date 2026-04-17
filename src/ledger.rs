@@ -10,6 +10,7 @@ use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
+use crate::wasm_runtime::WasmRuntime;
 use spdlog::{LevelFilter, info};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -23,6 +24,8 @@ pub struct Ledger {
     seal: Seal,
     storage: Arc<Storage>,
     pipeline: Arc<Pipeline>,
+    #[allow(dead_code)]
+    wasm_runtime: Arc<WasmRuntime>,
     handles: Vec<JoinHandle<()>>,
     #[allow(dead_code)]
     config: LedgerConfig,
@@ -40,7 +43,8 @@ impl Ledger {
         let pipeline = Pipeline::new(&config);
         let snapshot = Snapshot::new(&config);
         let seal = Seal::new(&config, storage.clone());
-        let transactor = Transactor::new(&config);
+        let wasm_runtime = Arc::new(WasmRuntime::new());
+        let transactor = Transactor::new(&config, wasm_runtime.clone());
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
@@ -50,6 +54,7 @@ impl Ledger {
             seal,
             storage,
             pipeline,
+            wasm_runtime,
             handles: Vec::new(),
             config,
         }

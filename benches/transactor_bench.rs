@@ -3,7 +3,9 @@ use roda_ledger::ledger::{LedgerConfig, WaitStrategy};
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::transaction::{Operation, Transaction, TransactionInput};
 use roda_ledger::transactor::Transactor;
+use roda_ledger::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -18,7 +20,8 @@ fn transactor_bench(c: &mut Criterion) {
         max_accounts: 10_000_000,
         ..LedgerConfig::default()
     };
-    let mut transactor = Transactor::new(&config);
+    let runtime = Arc::new(WasmRuntime::new());
+    let mut transactor = Transactor::new(&config, runtime);
 
     let handle = transactor.start(pipeline.transactor_context()).unwrap();
 
