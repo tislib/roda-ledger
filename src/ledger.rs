@@ -36,7 +36,7 @@ pub struct Ledger {
     storage: Arc<Storage>,
     pipeline: Arc<Pipeline>,
     wasm_runtime: Arc<WasmRuntime>,
-    /// Handle to push non-transactional WAL entries (ADR-014
+    /// Handle to push non-transactional WAL entries (e.g.
     /// `FunctionRegistered`) directly onto the WAL input queue.
     ledger_ctx: LedgerContext,
     handles: Vec<JoinHandle<()>>,
@@ -83,12 +83,12 @@ impl Ledger {
         self.sequencer.submit_batch(operations)
     }
 
-    // ─── ADR-014: Function Registry API ────────────────────────────────────
+    // ─── WASM Function Registry API (ADR-014) ──────────────────────────────
 
     /// Register a WASM function under `name` at the next version.
     ///
     /// Steps:
-    /// 1. Validate the binary against the ADR-014 ABI (`execute(i64×8)->i32`).
+    /// 1. Validate the binary against the ABI (`execute(i64×8)->i32`).
     /// 2. If `override_existing == false` and the name is already loaded,
     ///    return [`io::ErrorKind::AlreadyExists`].
     /// 3. Compute next version and write the binary atomically to
@@ -156,7 +156,7 @@ impl Ledger {
         }
 
         let next_version = self.next_function_version(name)?;
-        // Empty file under the next version — audit-trail preserved per ADR-014.
+        // Empty file under the next version — audit-trail preserved.
         function_storage::write_function(&self.storage, name, next_version, &[])?;
         let record = FunctionRegistered::new(name, next_version, 0);
         self.push_wal_entry_blocking(WalEntry::FunctionRegistered(record));

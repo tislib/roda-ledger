@@ -501,7 +501,7 @@ impl LedgerClient {
         })
     }
 
-    // -- ADR-014: Function registry -----------------------------------------
+    // -- WASM function registry ---------------------------------------------
 
     /// Register a WASM function. Blocks on the server side until the
     /// Snapshot stage has committed the record. Returns
@@ -555,9 +555,9 @@ impl LedgerClient {
             .collect())
     }
 
-    /// Submit an `Operation::Named` with 8 positional `i64` params and
-    /// wait until the given pipeline level.
-    pub async fn named_and_wait(
+    /// Submit an `Operation::Function` with 8 positional `i64` params
+    /// and wait until the given pipeline level.
+    pub async fn function_and_wait(
         &self,
         name: &str,
         params: [i64; 8],
@@ -567,8 +567,8 @@ impl LedgerClient {
         let mut client = self.inner.clone();
         let resp = client
             .submit_and_wait(proto::SubmitAndWaitRequest {
-                operation: Some(proto::submit_and_wait_request::Operation::Named(
-                    proto::Named {
+                operation: Some(proto::submit_and_wait_request::Operation::Function(
+                    proto::Function {
                         name: name.to_string(),
                         params: params.to_vec(),
                         user_ref,

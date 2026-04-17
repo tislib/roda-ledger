@@ -135,14 +135,14 @@ impl TxLink {
     }
 }
 
-/// ADR-014 function-registry WAL record. Written directly to the active
+/// WASM function-registry WAL record. Written directly to the active
 /// segment by the Ledger (not by the Transactor) whenever a function is
-/// registered or unregistered. Exactly 40 bytes so it packs into the same
-/// fixed-width record stream as every other `WalEntry`.
+/// registered or unregistered. Exactly 40 bytes so it packs into the
+/// same fixed-width record stream as every other `WalEntry`.
 ///
 /// - `crc32c == 0` means the function is unregistered (dual-signal with
 ///   the 0-byte file on disk; WAL is source of truth on conflict).
-/// - `name` is ASCII snake_case, null-padded. Max 32 bytes per ADR-014.
+/// - `name` is ASCII snake_case, null-padded. Max 32 bytes.
 /// - `version` is a per-name monotonic counter starting at 1.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
@@ -193,7 +193,6 @@ pub enum WalEntry {
     SegmentHeader(SegmentHeader),
     SegmentSealed(SegmentSealed),
     Link(TxLink),
-    /// ADR-014: function-registry event (register / unregister).
     FunctionRegistered(FunctionRegistered),
 }
 

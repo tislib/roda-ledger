@@ -1,4 +1,4 @@
-//! ADR-014 disk storage for registered WASM functions.
+//! Disk storage for registered WASM functions (ADR-014).
 //!
 //! Layout:
 //! ```text
@@ -54,8 +54,8 @@ pub fn read_function(storage: &Storage, name: &str, version: u16) -> io::Result<
     fs::read(function_path(storage, name, version))
 }
 
-/// Truncate the on-disk binary to 0 bytes (ADR-014: do not delete — preserve
-/// the audit trail). Returns `Ok(())` if the file did not exist.
+/// Truncate the on-disk binary to 0 bytes — do not delete, the audit
+/// trail is preserved. Returns `Ok(())` if the file did not exist.
 pub fn truncate_function(storage: &Storage, name: &str, version: u16) -> io::Result<()> {
     let path = function_path(storage, name, version);
     if !path.exists() {

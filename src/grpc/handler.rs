@@ -307,7 +307,7 @@ impl Ledger for LedgerHandler {
         }
     }
 
-    // ------- ADR-014: function registry -----------------------------------
+    // ------- WASM function registry ---------------------------------------
 
     async fn register_function(
         &self,

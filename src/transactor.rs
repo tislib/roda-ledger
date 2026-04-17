@@ -22,13 +22,19 @@ use std::thread::JoinHandle;
 
 /// Per-step computation state shared between the Transactor's built-in
 /// operation handlers and `WasmRuntimeEngine`'s host imports for
-/// `Operation::Named`.
+/// `Operation::Function`.
 ///
 /// Wrapped in `Rc<RefCell<>>` and held by **both** [`TransactorRunner`]
 /// (for direct mutation by `Transfer`/`Deposit`/etc.) and
 /// [`WasmRuntimeEngine`] (whose `ledger.{credit,debit,get_balance}` host
 /// functions call back into the same state). Single-threaded transactor
 /// loop → single borrow at any time → `RefCell` is sound.
+///
+/// **Stateful across one transaction.** [`init`] is called once per tx
+/// with the current `tx_id`; subsequent `credit` / `debit` / `meta` /
+/// `emit_duplicate` calls stamp that id onto the WAL records they emit.
+/// The WASM host functions read the same state without ever carrying a
+/// `tx_id` across the wasmtime boundary.
 ///
 /// Fields:
 /// - `balances` — mutable account balances vector indexed by `account_id`.
@@ -37,11 +43,13 @@ use std::thread::JoinHandle;
 /// - `position` — index into `entries` of the current `TxMetadata`; used
 ///   by `verify()` and `rollback()` to scope their iteration to the
 ///   entries belonging to the in-flight transaction.
+/// - `tx_id` — current transaction id, set by [`init`].
 pub struct TransactorState {
     pub balances: Vec<Balance>,
     pub entries: Vec<WalEntry>,
     pub fail_reason: FailReason,
     pub position: usize,
+    pub tx_id: u64,
 }
 
 impl TransactorState {
@@ -53,6 +61,7 @@ impl TransactorState {
             entries: Vec::with_capacity(16),
             fail_reason: FailReason::NONE,
             position: 0,
+            tx_id: 0,
         }
     }
 
@@ -62,6 +71,7 @@ impl TransactorState {
             entries: Vec::with_capacity(entries_capacity),
             fail_reason: FailReason::NONE,
             position: 0,
+            tx_id: 0,
         }
     }
 
@@ -73,15 +83,25 @@ impl TransactorState {
         }
     }
 
+    /// Begin a new transaction: pin the current `tx_id` and clear the
+    /// per-transaction `fail_reason`. Every subsequent [`Self::credit`] /
+    /// [`Self::debit`] / [`Self::meta`] / [`Self::emit_duplicate`] call
+    /// uses this id until the next `init()`.
     #[inline]
-    pub fn meta(&mut self, tx_id: u64, tag: [u8; 8], user_ref: u64, timestamp: u64) {
+    pub fn init(&mut self, tx_id: u64) {
+        self.tx_id = tx_id;
+        self.fail_reason = FailReason::NONE;
+    }
+
+    #[inline]
+    pub fn meta(&mut self, tag: [u8; 8], user_ref: u64, timestamp: u64) {
         self.entries.push(WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
             entry_count: 0,
             link_count: 0,
             fail_reason: FailReason::NONE,
             crc32c: 0,
-            tx_id,
+            tx_id: self.tx_id,
             timestamp,
             user_ref,
             tag,
@@ -93,9 +113,19 @@ impl TransactorState {
         self.fail_reason = reason;
     }
 
+    /// Whether the current transaction has tripped a failure flag.
     #[inline]
-    pub fn clear_fail(&mut self) {
-        self.fail_reason = FailReason::NONE;
+    pub fn is_failed(&self) -> bool {
+        self.fail_reason.is_failure()
+    }
+
+    /// Current status code: `0` = success, otherwise the `FailReason`
+    /// numeric value. Exposed as a plain `u8` so callers that want just
+    /// the opaque status (e.g. the WASM execution path) don't need to
+    /// reach for `FailReason` internals.
+    #[inline]
+    pub fn status(&self) -> u8 {
+        self.fail_reason.as_u8()
     }
 
     pub fn verify(&mut self) -> FailReason {
@@ -137,18 +167,12 @@ impl TransactorState {
         self.entries.truncate(self.position + 1);
     }
 
-    pub fn emit_duplicate(
-        &mut self,
-        tx_id: u64,
-        user_ref: u64,
-        timestamp: u64,
-        original_tx_id: u64,
-    ) {
+    pub fn emit_duplicate(&mut self, user_ref: u64, timestamp: u64, original_tx_id: u64) {
         let link = TxLink {
             entry_type: WalEntryKind::Link as u8,
             link_kind: TxLinkKind::Duplicate as u8,
             _pad: [0; 6],
-            tx_id,
+            tx_id: self.tx_id,
             to_tx_id: original_tx_id,
             _pad2: [0; 16],
         };
@@ -159,7 +183,7 @@ impl TransactorState {
             link_count: 1,
             fail_reason: FailReason::DUPLICATE,
             crc32c: 0,
-            tx_id,
+            tx_id: self.tx_id,
             timestamp,
             user_ref,
             tag: *b"DUPLICAT",
@@ -187,7 +211,7 @@ impl TransactorState {
 
 impl TransactorState {
     #[inline]
-    pub fn credit(&mut self, tx_id: u64, account_id: u64, amount: u64) {
+    pub fn credit(&mut self, account_id: u64, amount: u64) {
         if self.fail_reason.is_failure() {
             return;
         }
@@ -195,7 +219,7 @@ impl TransactorState {
             *balance = balance.saturating_sub(amount as i64);
             self.entries.push(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
-                tx_id,
+                tx_id: self.tx_id,
                 account_id,
                 amount,
                 kind: EntryKind::Credit,
@@ -208,7 +232,7 @@ impl TransactorState {
     }
 
     #[inline]
-    pub fn debit(&mut self, tx_id: u64, account_id: u64, amount: u64) {
+    pub fn debit(&mut self, account_id: u64, amount: u64) {
         if self.fail_reason.is_failure() {
             return;
         }
@@ -216,7 +240,7 @@ impl TransactorState {
             *balance = balance.saturating_add(amount as i64);
             self.entries.push(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
-                tx_id,
+                tx_id: self.tx_id,
                 account_id,
                 amount,
                 kind: EntryKind::Debit,
@@ -351,8 +375,6 @@ impl TransactorRunner {
         for tx in txs {
             self.transaction_buffer.push(tx);
         }
-        // One refresh per direct-batch cycle, same discipline as `run_step`.
-        self.wasm_engine.refresh();
         self.process(timestamp);
         self.reset();
     }
@@ -364,8 +386,6 @@ impl TransactorRunner {
             .unwrap_or_default()
             .as_nanos() as u64;
         self.transaction_buffer.push(tx);
-        // One refresh per direct-submit cycle, same discipline as `run_step`.
-        self.wasm_engine.refresh();
         self.process(timestamp);
         self.reset();
     }
@@ -433,7 +453,6 @@ impl TransactorRunner {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        self.wasm_engine.refresh();
         let max_tx_id = self.process(timestamp);
 
         // push all accumulated entries to outbound at the end of the step
@@ -469,17 +488,22 @@ impl TransactorRunner {
     fn process(&mut self, timestamp: u64) -> u64 {
         let mut max_tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
-            self.state.borrow_mut().clear_fail();
             let tx_id = self.transaction_buffer[idx].id;
             max_tx_id = max_tx_id.max(tx_id);
             let user_ref = self.transaction_buffer[idx].operation.user_ref();
+
+            // Every transaction starts with init() — pins the tx_id
+            // onto TransactorState so subsequent credit/debit/meta calls
+            // (including those made by WASM host imports) stamp it onto
+            // the records they emit.
+            self.state.borrow_mut().init(tx_id);
 
             // --- Deduplication check ---
             match self.dedup.check(user_ref, tx_id) {
                 DedupResult::Duplicate(original_tx_id) => {
                     self.state
                         .borrow_mut()
-                        .emit_duplicate(tx_id, user_ref, timestamp, original_tx_id);
+                        .emit_duplicate(user_ref, timestamp, original_tx_id);
                     self.rejected_transactions
                         .insert(tx_id, FailReason::DUPLICATE);
                     continue;
@@ -499,9 +523,9 @@ impl TransactorRunner {
                     ..
                 } => {
                     let mut s = self.state.borrow_mut();
-                    s.meta(tx_id, *b"DEPOSIT\0", user_ref, timestamp);
-                    s.debit(tx_id, account, amount);
-                    s.credit(tx_id, SYSTEM_ACCOUNT_ID, amount);
+                    s.meta(*b"DEPOSIT\0", user_ref, timestamp);
+                    s.debit(account, amount);
+                    s.credit(SYSTEM_ACCOUNT_ID, amount);
                 }
                 Operation::Withdrawal {
                     user_ref,
@@ -510,12 +534,12 @@ impl TransactorRunner {
                     ..
                 } => {
                     let mut s = self.state.borrow_mut();
-                    s.meta(tx_id, *b"WITHDRAW", user_ref, timestamp);
+                    s.meta(*b"WITHDRAW", user_ref, timestamp);
                     if s.get_balance(account) < amount as i64 {
                         s.fail(FailReason::INSUFFICIENT_FUNDS);
                     } else {
-                        s.credit(tx_id, account, amount);
-                        s.debit(tx_id, SYSTEM_ACCOUNT_ID, amount);
+                        s.credit(account, amount);
+                        s.debit(SYSTEM_ACCOUNT_ID, amount);
                     }
                 }
                 Operation::Transfer {
@@ -526,26 +550,26 @@ impl TransactorRunner {
                     ..
                 } => {
                     let mut s = self.state.borrow_mut();
-                    s.meta(tx_id, *b"TRANSFER", user_ref, timestamp);
+                    s.meta(*b"TRANSFER", user_ref, timestamp);
                     if from == to {
                         // no-op
                     } else if s.get_balance(from) < amount as i64 {
                         s.fail(FailReason::INSUFFICIENT_FUNDS);
                     } else {
-                        s.credit(tx_id, from, amount);
-                        s.debit(tx_id, to, amount);
+                        s.credit(from, amount);
+                        s.debit(to, amount);
                     }
                 }
                 Operation::Composite(op) => {
                     let mut s = self.state.borrow_mut();
-                    s.meta(tx_id, *b"COMPOSIT", op.user_ref, timestamp);
+                    s.meta(*b"COMPOSIT", op.user_ref, timestamp);
                     for step in &op.steps {
                         match step {
                             Step::Credit { account_id, amount } => {
-                                s.credit(tx_id, *account_id, *amount);
+                                s.credit(*account_id, *amount);
                             }
                             Step::Debit { account_id, amount } => {
-                                s.debit(tx_id, *account_id, *amount);
+                                s.debit(*account_id, *amount);
                             }
                         }
                     }
@@ -566,31 +590,42 @@ impl TransactorRunner {
                         }
                     }
                 }
-                Operation::Named {
+                Operation::Function {
                     name,
                     params,
                     user_ref,
                 } => {
-                    // 1. Resolve crc up-front so we can emit meta with the
-                    //    correct ADR-014 tag (zero crc when missing).
-                    let crc = self.wasm_engine.crc32c_of(&name).unwrap_or(0);
-                    self.state
-                        .borrow_mut()
-                        .meta(tx_id, build_wasm_tag(crc), user_ref, timestamp);
-
-                    // 2. Hand off to the engine. The engine's host imports
-                    //    will mutate the same `self.state` via Rc<RefCell<>>.
-                    match self.wasm_engine.execute(&name, params, tx_id) {
+                    // Locate the handler once. `caller()` lazily
+                    // reconciles with the shared registry for this name
+                    // only — no unrelated cache entries are touched.
+                    match self.wasm_engine.caller(&name).cloned() {
                         None => {
-                            self.state
-                                .borrow_mut()
-                                .fail(FailReason::INVALID_OPERATION);
+                            // Not registered: emit a meta with zero-CRC
+                            // tag and flip the fail flag. The shared
+                            // verify/rollback bookkeeping below records
+                            // the rejection and stamps the meta CRC.
+                            let mut s = self.state.borrow_mut();
+                            s.meta(build_wasm_tag(0), user_ref, timestamp);
+                            s.fail(FailReason::INVALID_OPERATION);
                         }
-                        Some(0) => {} // success
-                        Some(status) => {
+                        Some(caller) => {
+                            // Emit the tagged meta (drop the borrow
+                            // before WASM runs so host imports can
+                            // borrow_mut the same state).
                             self.state
                                 .borrow_mut()
-                                .fail(FailReason::from_u8(status));
+                                .meta(build_wasm_tag(caller.crc32c()), user_ref, timestamp);
+                            // The caller carries its own `Rc`-shared
+                            // handle to the engine's long-lived Store;
+                            // `execute` borrows it internally. Host
+                            // imports read TransactorState (including
+                            // its tx_id) on every credit/debit.
+                            let status = caller.execute(params);
+                            if status != 0 {
+                                self.state
+                                    .borrow_mut()
+                                    .fail(FailReason::from_u8(status));
+                            }
                         }
                     }
                 }
@@ -659,9 +694,9 @@ impl TransactorRunner {
 }
 
 /// Build the 8-byte `TxMetadata.tag` for a WASM-driven transaction:
-/// `[b'f', b'n', b'w', b'\n', crc[0], crc[1], crc[2], crc[3]]` — see ADR-014
-/// "Tag format". The literal prefix lets `roda-ctl unpack` render it as
-/// `"fnw\n4a2f1c3d"`, and the embedded CRC32C identifies the exact binary.
+/// `[b'f', b'n', b'w', b'\n', crc[0], crc[1], crc[2], crc[3]]`. The
+/// literal prefix lets `roda-ctl unpack` render it as `"fnw\n4a2f1c3d"`,
+/// and the embedded CRC32C identifies the exact binary.
 #[inline]
 pub fn build_wasm_tag(crc32c: u32) -> [u8; 8] {
     let bytes = crc32c.to_le_bytes();

@@ -21,10 +21,10 @@ pub enum Operation {
         user_ref: u64,
     },
     Composite(Box<CompositeOperation>),
-    Named {
+    Function {
         name: String,
-        /// ADR-014 fixed arity — exactly 8 `i64` positional parameters.
-        /// Unused slots are conventionally passed as `0`.
+        /// Fixed arity: exactly 8 `i64` positional parameters. Unused
+        /// slots are conventionally passed as `0`.
         params: [i64; 8],
         user_ref: u64,
     },
@@ -37,7 +37,7 @@ impl Operation {
             Operation::Deposit { user_ref, .. } => *user_ref,
             Operation::Withdrawal { user_ref, .. } => *user_ref,
             Operation::Composite(op) => op.user_ref,
-            Operation::Named { user_ref, .. } => *user_ref,
+            Operation::Function { user_ref, .. } => *user_ref,
         }
     }
 }

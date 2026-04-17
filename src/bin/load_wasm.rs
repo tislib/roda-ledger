@@ -1,10 +1,10 @@
-//! ADR-014 WASM-overhead load generator.
+//! WASM-overhead load generator.
 //!
 //! Identical to `src/bin/load.rs` in every respect — same account-count,
 //! same 10_000-unit amount, same sampling cadence, same output format —
 //! except that instead of submitting `Operation::Deposit`, it registers
 //! a tiny WASM function `deposit_wasm(account, amount)` and submits
-//! `Operation::Named { name: "deposit_wasm", ... }` per iteration.
+//! `Operation::Function { name: "deposit_wasm", ... }` per iteration.
 //!
 //! The WAT below performs exactly the same state transitions the
 //! built-in `Operation::Deposit` arm performs in the Transactor
@@ -108,7 +108,7 @@ fn main() {
 
     loop {
         let account = 1 + rand::random::<u64>() % account_count;
-        let op = Operation::Named {
+        let op = Operation::Function {
             name: "deposit_wasm".into(),
             // [account, amount, 0, 0, 0, 0, 0, 0]
             params: [account as i64, 10000, 0, 0, 0, 0, 0, 0],

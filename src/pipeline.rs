@@ -115,7 +115,7 @@ impl Pipeline {
         }
     }
 
-    /// ADR-014: context handed to the `Ledger` facade so it can push
+    /// Context handed to the `Ledger` facade so it can push
     /// non-transactional WAL entries (currently only
     /// [`WalEntry::FunctionRegistered`]) directly onto the same
     /// `wal_input` queue the Transactor uses. Both producers are
@@ -380,7 +380,7 @@ impl SealContext {
 
 /// Slice of the pipeline visible to the `Ledger` facade.
 ///
-/// ADR-014 function registration bypasses the Transactor: the WAL record
+/// Function registration (WASM) bypasses the Transactor: the WAL record
 /// for a register / unregister event is pushed directly onto the same
 /// `wal_input` queue every Transactor-emitted entry uses, so the WAL
 /// stage's single drain loop linearizes the two producers.

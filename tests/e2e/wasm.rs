@@ -1,4 +1,4 @@
-//! ADR-014 WASM Function Registry E2E tests.
+//! WASM Function Registry E2E tests (ADR-014).
 //!
 //! Exercises the full register → submit Named → unregister path through
 //! the gRPC surface. Restart / crash scenarios are skipped on the Inline
@@ -74,7 +74,7 @@ async fn deposit_via_wasm(
     user_ref: u64,
 ) {
     let result = ctx
-        .submit_named(
+        .submit_function(
             0,
             "deposit",
             [account as i64, amount as i64, 0, 0, 0, 0, 0, 0],
@@ -354,7 +354,7 @@ async fn wasm_unregister_persists_across_crash() {
 
     // Named now fails because handler is gone.
     let result = ctx
-        .submit_named(
+        .submit_function(
             0,
             "deposit",
             [1, 100, 0, 0, 0, 0, 0, 0],

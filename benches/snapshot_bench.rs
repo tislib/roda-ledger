@@ -48,10 +48,10 @@ fn snapshot_bench(c: &mut Criterion) {
     };
     let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
 
-    // ADR-014: Snapshot stage needs an Arc<WasmRuntime> + Arc<Storage>
-    // to load/unload WASM handlers on FunctionRegistered commits. This
-    // bench never emits such records; a fresh storage in a tempdir and an
-    // empty WasmRuntime suffice.
+    // The Snapshot stage needs an Arc<WasmRuntime> + Arc<Storage> to
+    // load/unload WASM handlers on FunctionRegistered commits. This
+    // bench never emits such records; a fresh storage in a tempdir and
+    // an empty WasmRuntime suffice.
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let storage_cfg = StorageConfig {
         data_dir: tmp_dir.path().to_string_lossy().into_owned(),

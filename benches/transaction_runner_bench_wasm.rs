@@ -1,4 +1,4 @@
-//! ADR-014 micro-benchmark: drives `Operation::Named` through `TransactorRunner`
+//! WASM micro-benchmark: drives `Operation::Function` through `TransactorRunner`
 //! using a tiny WAT function compiled by `WasmRuntime`. Mirrors the shape of
 //! [`transaction_runner_bench`] so the two can be compared side-by-side.
 //!
@@ -46,7 +46,7 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
             current_id += 1;
             let src = rand::random::<u64>() % 10_000_000;
             let dst = rand::random::<u64>() % 10_000_000;
-            let mut tx = Transaction::new(Operation::Named {
+            let mut tx = Transaction::new(Operation::Function {
                 name: "wasm_transfer".into(),
                 params: [src as i64, 100, dst as i64, 0, 0, 0, 0, 0],
                 user_ref: 0,
@@ -64,7 +64,7 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
                     current_id += 1;
                     let src = rand::random::<u64>() % 10_000_000;
                     let dst = rand::random::<u64>() % 10_000_000;
-                    let mut tx = Transaction::new(Operation::Named {
+                    let mut tx = Transaction::new(Operation::Function {
                         name: "wasm_transfer".into(),
                         params: [src as i64, 100, dst as i64, 0, 0, 0, 0, 0],
                         user_ref: 0,

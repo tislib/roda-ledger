@@ -2,7 +2,9 @@ use crate::config::LedgerConfig;
 use crate::entities::WalEntry;
 use crate::pipeline::SealContext;
 use crate::storage::SegmentStaus::SEALED;
+use crate::storage::function_snapshot::{FunctionSnapshotRecord, save_function_snapshot};
 use crate::storage::{Segment, Storage};
+use rustc_hash::FxHashMap;
 use spdlog::{debug, error, warn};
 use std::sync::Arc;
 use std::thread::{JoinHandle, sleep};
@@ -15,6 +17,15 @@ pub struct Seal {
 struct SealRunner {
     storage: Arc<Storage>,
     balances: Vec<i64>,
+    /// Mirror of the WASM function registry observed through sealed
+    /// segments. Same lifecycle as `balances`: updated inline as
+    /// `FunctionRegistered` WAL records pass by, snapshotted alongside
+    /// the balance snapshot at `snapshot_frequency`.
+    ///
+    /// Keyed by name → (version, crc32c). `crc32c == 0` means the
+    /// function was unregistered; kept in the map so the snapshot
+    /// preserves the audit trail.
+    functions: FxHashMap<String, (u16, u32)>,
     seal_check_internal: Duration,
 }
 
@@ -24,6 +35,7 @@ impl Seal {
             runner: Some(SealRunner {
                 storage,
                 balances: vec![0; config.max_accounts],
+                functions: FxHashMap::default(),
                 seal_check_internal: config.seal_check_internal,
             }),
         }
@@ -61,6 +73,25 @@ impl Seal {
     ) -> std::io::Result<()> {
         if let Some(mut runner) = self.runner.take() {
             runner.balances[account_id] = computed_balance;
+            self.runner = Some(runner);
+            Ok(())
+        } else {
+            Err(std::io::Error::other("Seal already started"))
+        }
+    }
+
+    /// Seed the Seal stage's function tracker during recovery so the
+    /// next emitted function snapshot reflects state from before the
+    /// last restart. Called once per record loaded from the function
+    /// snapshot (via `Recover`), before WAL replay adds any tail records.
+    pub(crate) fn recover_function(
+        &mut self,
+        name: String,
+        version: u16,
+        crc32c: u32,
+    ) -> std::io::Result<()> {
+        if let Some(mut runner) = self.runner.take() {
+            runner.functions.insert(name, (version, crc32c));
             self.runner = Some(runner);
             Ok(())
         } else {
@@ -115,9 +146,11 @@ impl SealRunner {
         }
 
         // only the last seal can be taken snapshot
-        // Load wal records and update balances
-        segment.visit_wal_records(|entry| {
-            if let WalEntry::Entry(e) = entry {
+        // Load wal records and update both balances and the function
+        // registry mirror from this segment's WAL.
+        let mut seg_last_tx_id: u64 = 0;
+        segment.visit_wal_records(|entry| match entry {
+            WalEntry::Entry(e) => {
                 let id = e.account_id as usize;
                 if id < self.balances.len() {
                     self.balances[id] = e.computed_balance;
@@ -125,9 +158,22 @@ impl SealRunner {
                     warn!("Seal: account ID {} exceeds balance vector length", id);
                 }
             }
+            WalEntry::Metadata(m) => {
+                if m.tx_id > seg_last_tx_id {
+                    seg_last_tx_id = m.tx_id;
+                }
+            }
+            // Mirror the WASM function registry through the sealed WAL.
+            // Unregister records (crc32c == 0) are kept in the map so
+            // the snapshot preserves the audit trail.
+            WalEntry::FunctionRegistered(f) => {
+                self.functions
+                    .insert(f.name_str().to_string(), (f.version, f.crc32c));
+            }
+            _ => {}
         })?;
 
-        // Conditionally write a snapshot
+        // Conditionally write snapshots (balance + function)
         let snapshot_frequency = self.storage.config().snapshot_frequency;
         if snapshot_frequency > 0 && segment.id().is_multiple_of(snapshot_frequency) {
             let mut snapshot_records: Vec<(u64, i64)> = self
@@ -148,6 +194,35 @@ impl SealRunner {
             if let Err(e) = segment.save_snapshot(&snapshot_records[..]) {
                 error!(
                     "Seal: failed to save snapshot for segment {}: {}",
+                    segment.id(),
+                    e
+                );
+            }
+
+            // Function snapshot piggybacks on the same trigger. Written
+            // unconditionally — even when the registry is empty — so
+            // recovery can always jump straight to the latest snapshot
+            // boundary instead of replaying WAL from segment 1.
+            let mut fn_records: Vec<FunctionSnapshotRecord> = self
+                .functions
+                .iter()
+                .map(|(name, (version, crc32c))| {
+                    FunctionSnapshotRecord::new(name, *version, *crc32c)
+                })
+                .collect();
+            // Deterministic ordering for reproducibility + diffing.
+            fn_records.sort_unstable_by(|a, b| a.name_str().cmp(b.name_str()));
+
+            debug!(
+                "Seal: saving function snapshot for WAL segment {} ({} records)",
+                segment.id(),
+                fn_records.len()
+            );
+            if let Err(e) =
+                save_function_snapshot(&self.storage, segment.id(), seg_last_tx_id, &fn_records)
+            {
+                error!(
+                    "Seal: failed to save function snapshot for segment {}: {}",
                     segment.id(),
                     e
                 );

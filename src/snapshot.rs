@@ -203,10 +203,10 @@ impl SnapshotRunner {
                             WalEntry::SegmentSealed(_) => {}
                             WalEntry::SegmentHeader(_) => {}
                             WalEntry::FunctionRegistered(f) => {
-                                // ADR-014: register / unregister handler. We
-                                // never touch pending_records or the
-                                // tx_id cursor — this record is not a
-                                // financial transaction.
+                                // Register / unregister handler. We never
+                                // touch pending_records or the tx_id cursor
+                                // — this record is not a financial
+                                // transaction.
                                 let name = f.name_str().to_string();
                                 if f.is_unregister() {
                                     if let Err(e) =

@@ -11,7 +11,7 @@ fn transaction_runner_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("transaction_runner");
     group.measurement_time(Duration::from_secs(10));
 
-    // ADR-014: every TransactorRunner takes a WasmRuntime. The built-in bench
+    // Every TransactorRunner takes a WasmRuntime. The built-in bench
     // never registers anything, so an empty runtime is enough.
     let runtime = Arc::new(WasmRuntime::new());
     let mut runner = TransactorRunner::new(10_000_000, runtime);

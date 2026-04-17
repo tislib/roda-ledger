@@ -100,6 +100,3 @@ required-features = ["grpc"]
 
 [profile.bench]
 debug = true
-
-[profile.release]
-debug = true

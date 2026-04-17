@@ -1,4 +1,4 @@
-//! ADR-014 function-registry snapshot file.
+//! Function-registry snapshot file (ADR-014).
 //!
 //! Mirrors the balance snapshot ([`crate::storage::snapshot`]) but persists the
 //! current function registry — `(name, version, crc32c)` triples — instead of

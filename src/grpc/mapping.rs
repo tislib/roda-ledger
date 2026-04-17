@@ -61,17 +61,17 @@ impl From<proto::Composite> for Operation {
     }
 }
 
-impl From<proto::Named> for Operation {
-    fn from(n: proto::Named) -> Self {
-        // ADR-014: `Operation::Named::params` is a fixed-arity `[i64; 8]`.
+impl From<proto::Function> for Operation {
+    fn from(n: proto::Function) -> Self {
+        // `Operation::Function::params` is a fixed-arity `[i64; 8]`.
         // Proto3 has no fixed-length array type, so the wire form stays
-        // `repeated int64` and we coerce here: slots beyond 8 are dropped,
-        // missing slots are zero-padded.
+        // `repeated int64` and we coerce here: slots beyond 8 are
+        // dropped, missing slots are zero-padded.
         let mut params = [0i64; 8];
         for (i, p) in n.params.into_iter().take(8).enumerate() {
             params[i] = p;
         }
-        Operation::Named {
+        Operation::Function {
             name: n.name,
             params,
             user_ref: n.user_ref,
@@ -88,7 +88,7 @@ impl TryFrom<proto::SubmitOperationRequest> for Operation {
             Some(proto::submit_operation_request::Operation::Withdrawal(w)) => Ok(w.into()),
             Some(proto::submit_operation_request::Operation::Transfer(t)) => Ok(t.into()),
             Some(proto::submit_operation_request::Operation::Composite(c)) => Ok(c.into()),
-            Some(proto::submit_operation_request::Operation::Named(n)) => Ok(n.into()),
+            Some(proto::submit_operation_request::Operation::Function(n)) => Ok(n.into()),
             None => Err(tonic::Status::invalid_argument("missing operation")),
         }
     }
@@ -103,7 +103,7 @@ impl TryFrom<proto::SubmitAndWaitRequest> for Operation {
             Some(proto::submit_and_wait_request::Operation::Withdrawal(w)) => Ok(w.into()),
             Some(proto::submit_and_wait_request::Operation::Transfer(t)) => Ok(t.into()),
             Some(proto::submit_and_wait_request::Operation::Composite(c)) => Ok(c.into()),
-            Some(proto::submit_and_wait_request::Operation::Named(n)) => Ok(n.into()),
+            Some(proto::submit_and_wait_request::Operation::Function(n)) => Ok(n.into()),
             None => Err(tonic::Status::invalid_argument("missing operation")),
         }
     }

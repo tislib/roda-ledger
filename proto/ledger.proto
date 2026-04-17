@@ -87,11 +87,11 @@ service Ledger {
   // WASM module under a snake_case name. The binary must export an
   // `execute(i64 x 8) -> i32` entry point. Blocks until the Snapshot stage
   // has committed the record and the runtime reflects the new handler —
-  // subsequent Named operations referencing `name` are guaranteed to see it.
+  // subsequent Function operations referencing `name` are guaranteed to see it.
   rpc RegisterFunction(RegisterFunctionRequest) returns (RegisterFunctionResponse);
 
   // UnregisterFunction removes the handler for `name`. Blocks until the
-  // handler is gone from the runtime. Subsequent Named operations
+  // handler is gone from the runtime. Subsequent Function operations
   // referencing `name` return INVALID_OPERATION.
   rpc UnregisterFunction(UnregisterFunctionRequest) returns (UnregisterFunctionResponse);
 
@@ -110,7 +110,7 @@ message SubmitOperationRequest {
     Withdrawal withdrawal = 2;
     Transfer   transfer   = 3;
     Composite  composite  = 4;
-    Named      named      = 5;
+    Function   function   = 5;
   }
 }
 
@@ -122,7 +122,7 @@ message SubmitAndWaitRequest {
     Withdrawal withdrawal = 2;
     Transfer   transfer   = 3;
     Composite  composite  = 4;
-    Named      named      = 5;
+    Function   function   = 5;
   }
   WaitLevel wait_level = 6;
 }
@@ -175,12 +175,12 @@ message Composite {
   uint64 user_ref     = 3; // Opaque external reference. See Deposit.user_ref.
 }
 
-// Named invokes a registered WASM function (ADR-014).
+// Function invokes a registered WASM function (ADR-014).
 // The function ABI is fixed-arity: exactly 8 `i64` positional parameters.
 // Proto3 has no fixed-length array type, so `params` stays `repeated int64`
 // on the wire; the server coerces to `[i64; 8]` by zero-padding short
 // lists and dropping anything beyond the first 8 values.
-message Named {
+message Function {
   string         name     = 1; // Operation name (snake_case, max 32 bytes).
   repeated int64 params   = 2; // 0..=8 positional parameters; short lists are zero-padded.
   uint64         user_ref = 3; // Opaque external reference. See Deposit.user_ref.

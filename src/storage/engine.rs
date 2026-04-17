@@ -25,9 +25,8 @@ impl Storage {
             )
         })?;
 
-        // ADR-014: ensure {data_dir}/functions exists at startup so that the
-        // `storage::functions` and `storage::function_snapshot` modules can
-        // assume the directory is present.
+        // Ensure {data_dir}/functions exists at startup so the
+        // `storage::functions` module can assume the directory is present.
         let functions_dir = Path::new(&config.data_dir).join("functions");
         std::fs::create_dir_all(&functions_dir).map_err(|e| {
             std::io::Error::new(
@@ -74,7 +73,7 @@ impl Storage {
         Path::new(&self.config.data_dir)
     }
 
-    /// ADR-014: directory holding `{name}_v{N}.wasm` binaries. Always
+    /// Directory holding `{name}_v{N}.wasm` binaries. Always
     /// `{data_dir}/functions`. Callers in `storage::functions` and
     /// `storage::function_snapshot` go through this accessor instead of
     /// constructing the path themselves.
@@ -120,6 +119,33 @@ impl Storage {
 
     pub fn next_segment(&self) {
         self.last_segment_id.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// List segment ids that have a `function_snapshot_{N}.bin` file on
+    /// disk, ascending. Recovery uses the last entry to locate the most
+    /// recent function snapshot; everything after it is reconstructed by
+    /// WAL replay of `FunctionRegistered` records.
+    pub fn list_function_snapshot_ids(&self) -> Result<Vec<u32>, std::io::Error> {
+        let dir = &self.config.data_dir;
+        if !std::path::Path::new(dir).exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids: Vec<u32> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name();
+                let name = name.to_str()?;
+                let stripped = name.strip_prefix("function_snapshot_")?;
+                let stripped = stripped.strip_suffix(".bin")?;
+                if stripped.len() == 6 && stripped.chars().all(|c| c.is_ascii_digit()) {
+                    stripped.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
     }
 }
 

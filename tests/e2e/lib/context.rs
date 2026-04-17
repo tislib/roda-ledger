@@ -365,7 +365,7 @@ impl E2EContext {
         (idx.compute, idx.commit, idx.snapshot)
     }
 
-    // -- ADR-014 Function registry -----------------------------------------
+    // -- WASM function registry --------------------------------------------
 
     /// Register a WASM function on `node`. Blocks server-side until the
     /// handler is installed. Returns `(version, crc32c)`.
@@ -399,10 +399,10 @@ impl E2EContext {
             .expect("list_functions RPC failed")
     }
 
-    /// Submit `Operation::Named { name, params, user_ref }` and wait until
-    /// the given pipeline level. Returns the full `SubmitResult` so tests
-    /// can inspect the `fail_reason`.
-    pub async fn submit_named(
+    /// Submit `Operation::Function { name, params, user_ref }` and wait
+    /// until the given pipeline level. Returns the full `SubmitResult`
+    /// so tests can inspect the `fail_reason`.
+    pub async fn submit_function(
         &self,
         node: usize,
         name: &str,
@@ -412,9 +412,9 @@ impl E2EContext {
     ) -> SubmitResult {
         let wl = wait_level_from_i32(wait_level);
         self.client(node)
-            .named_and_wait(name, params, user_ref, wl)
+            .function_and_wait(name, params, user_ref, wl)
             .await
-            .expect("named_and_wait RPC failed")
+            .expect("function_and_wait RPC failed")
     }
 
     // -- Runtime intervention -----------------------------------------------

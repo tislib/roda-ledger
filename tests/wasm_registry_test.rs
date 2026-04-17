@@ -1,14 +1,15 @@
-//! ADR-014 WASM Function Registry end-to-end tests.
+//! WASM Function Registry end-to-end tests (ADR-014).
 //!
 //! Exercises the full pipeline: `Ledger::register_function` pushes a
 //! `FunctionRegistered` WAL record onto `wal_input`, the WAL stage
 //! writes it to the active segment, the Snapshot stage reads it back
-//! and loads the handler into `WasmRuntime`, then `Operation::Named`
+//! and loads the handler into `WasmRuntime`, then `Operation::Function`
 //! invocations succeed. Unregister is the mirror path.
 //!
 //! Each test spins up its own `Ledger` against a fresh temp data_dir
 //! (`LedgerConfig::temp`) so tests are independent and isolable.
 
+use roda_ledger::config::StorageConfig;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::transaction::{Operation, WaitLevel};
 
@@ -233,7 +234,7 @@ fn named_succeeds_after_registration() {
     // built-in credit/debit convention is: `credit(from)` subtracts,
     // `debit(to)` adds (matches `Operation::Transfer`).
     let result = ledger.submit_and_wait(
-        Operation::Named {
+        Operation::Function {
             name: "transfer".into(),
             params: [10, 500, 20, 0, 0, 0, 0, 0],
             user_ref: 1,
@@ -258,7 +259,7 @@ fn named_rolls_back_on_nonzero_status() {
         .unwrap();
 
     let result = ledger.submit_and_wait(
-        Operation::Named {
+        Operation::Function {
             name: "reject".into(),
             params: [1, 100, 2, 0, 0, 0, 0, 0],
             user_ref: 1,
@@ -276,7 +277,7 @@ fn named_rolls_back_on_nonzero_status() {
 fn named_fails_for_unknown_function() {
     let ledger = start_ledger();
     let result = ledger.submit_and_wait(
-        Operation::Named {
+        Operation::Function {
             name: "nonexistent".into(),
             params: [0; 8],
             user_ref: 1,
@@ -297,7 +298,7 @@ fn named_fails_after_unregister() {
 
     // Works first.
     let ok = ledger.submit_and_wait(
-        Operation::Named {
+        Operation::Function {
             name: "transfer".into(),
             params: [10, 50, 20, 0, 0, 0, 0, 0],
             user_ref: 1,
@@ -310,7 +311,7 @@ fn named_fails_after_unregister() {
     ledger.unregister_function("transfer").unwrap();
 
     let fail = ledger.submit_and_wait(
-        Operation::Named {
+        Operation::Function {
             name: "transfer".into(),
             params: [10, 50, 20, 0, 0, 0, 0, 0],
             user_ref: 2,
@@ -334,7 +335,7 @@ fn named_uses_latest_version_after_override() {
         .unwrap();
 
     let result = ledger.submit_and_wait(
-        Operation::Named {
+        Operation::Function {
             name: "f".into(),
             params: [1, 10, 2, 0, 0, 0, 0, 0],
             user_ref: 1,
@@ -359,7 +360,7 @@ fn register_is_observable_before_and_during_concurrent_txs() {
         let src = (i % 8) + 1;
         let dst = src + 100;
         let result = ledger.submit_and_wait(
-            Operation::Named {
+            Operation::Function {
                 name: "transfer".into(),
                 params: [src as i64, 1, dst as i64, 0, 0, 0, 0, 0],
                 user_ref: i + 1,
@@ -390,4 +391,242 @@ fn register_is_observable_before_and_during_concurrent_txs() {
         "zero-sum invariant across WASM-driven transfers"
     );
     assert_eq!(debit_sum, tx_count as i64);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Function snapshot persistence across restart
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Build a `LedgerConfig` whose data directory survives `Drop` and can be
+/// reopened — required to exercise the recover-from-function-snapshot
+/// path. The caller is responsible for cleaning the directory afterwards.
+fn persistent_config(dir: &std::path::Path) -> LedgerConfig {
+    // Small segment so a handful of transactions force a seal quickly.
+    // snapshot_frequency = 1 makes every sealed segment emit a snapshot —
+    // both balance and function.
+    LedgerConfig {
+        max_accounts: 16,
+        storage: StorageConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            temporary: false,
+            transaction_count_per_segment: 5,
+            snapshot_frequency: 1,
+        },
+        ..LedgerConfig::default()
+    }
+}
+
+/// Create a fresh data directory, return its `PathBuf` and a guard that
+/// removes it when dropped — avoids leaking temp dirs between tests.
+struct DirGuard(std::path::PathBuf);
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn make_dir() -> DirGuard {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "roda_wasm_snapshot_test_{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    DirGuard(dir)
+}
+
+#[test]
+fn function_snapshot_loads_handler_after_restart() {
+    let guard = make_dir();
+
+    // Phase 1: register, submit enough transactions to force a seal
+    // (crosses `transaction_count_per_segment`), then close cleanly.
+    {
+        let mut ledger = Ledger::new(persistent_config(&guard.0));
+        ledger.start().expect("first start");
+        ledger
+            .register_function("transfer", &compile(TRANSFER_WAT), false)
+            .expect("register");
+
+        // Fire enough ops to cross the 5-tx segment boundary so at least
+        // one segment seals and emits a function snapshot.
+        for i in 0..12 {
+            let r = ledger.submit_and_wait(
+                Operation::Function {
+                    name: "transfer".into(),
+                    params: [1, 10, 2, 0, 0, 0, 0, 0],
+                    user_ref: i + 1,
+                },
+                WaitLevel::OnSnapshot,
+            );
+            assert!(r.fail_reason.is_success(), "submit {} failed", i);
+        }
+        ledger.wait_for_seal();
+        // ledger drops here — wal.stop is written, no crash recovery on
+        // the next open.
+    }
+
+    // Confirm a function snapshot exists on disk.
+    let snap_count = std::fs::read_dir(&guard.0)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("function_snapshot_") && n.ends_with(".bin"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        snap_count >= 1,
+        "expected at least one function_snapshot_*.bin on disk, found {}",
+        snap_count
+    );
+
+    // Phase 2: reopen the same data_dir. Recovery should reload the
+    // handler from the function snapshot before replaying any tail WAL.
+    let mut ledger = Ledger::new(persistent_config(&guard.0));
+    ledger.start().expect("second start");
+
+    let list = ledger.list_functions();
+    assert_eq!(list.len(), 1, "handler missing after restart: {:?}", list);
+    assert_eq!(list[0].name, "transfer");
+    assert_eq!(list[0].version, 1);
+
+    // Named execution still works against the restored handler.
+    let r = ledger.submit_and_wait(
+        Operation::Function {
+            name: "transfer".into(),
+            params: [3, 20, 4, 0, 0, 0, 0, 0],
+            user_ref: 999,
+        },
+        WaitLevel::OnSnapshot,
+    );
+    assert!(
+        r.fail_reason.is_success(),
+        "Named after snapshot-restore failed: {:?}",
+        r.fail_reason
+    );
+    assert_eq!(ledger.get_balance(3), -20);
+    assert_eq!(ledger.get_balance(4), 20);
+}
+
+#[test]
+fn function_snapshot_preserves_latest_version() {
+    let guard = make_dir();
+
+    // Phase 1: register v1, run some ops, register v2 (override), run more
+    // ops so v2 lives in the active segment at seal time and both versions
+    // cross into sealed segments.
+    {
+        let mut ledger = Ledger::new(persistent_config(&guard.0));
+        ledger.start().unwrap();
+
+        ledger
+            .register_function("fee", &compile(NOOP_WAT), false)
+            .unwrap();
+        for i in 0..6 {
+            ledger.submit_and_wait(
+                Operation::Function {
+                    name: "fee".into(),
+                    params: [1, 1, 2, 0, 0, 0, 0, 0],
+                    user_ref: i + 1,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+
+        // Override with v2 (REJECT_WAT returns status 47 → easily observable).
+        ledger
+            .register_function("fee", &compile(REJECT_WAT), true)
+            .unwrap();
+        for i in 0..6 {
+            let _ = ledger.submit_and_wait(
+                Operation::Function {
+                    name: "fee".into(),
+                    params: [1, 1, 2, 0, 0, 0, 0, 0],
+                    user_ref: 100 + i,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger.wait_for_seal();
+    }
+
+    // Phase 2: reopen — only v2 should survive (latest version wins).
+    let mut ledger = Ledger::new(persistent_config(&guard.0));
+    ledger.start().unwrap();
+
+    let list = ledger.list_functions();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "fee");
+    assert_eq!(
+        list[0].version, 2,
+        "expected latest version (v2) after snapshot restore"
+    );
+
+    // v2 rejects → fail_reason = 47.
+    let r = ledger.submit_and_wait(
+        Operation::Function {
+            name: "fee".into(),
+            params: [1, 1, 2, 0, 0, 0, 0, 0],
+            user_ref: 9_999,
+        },
+        WaitLevel::Committed,
+    );
+    assert_eq!(r.fail_reason.as_u8(), 47);
+}
+
+#[test]
+fn function_snapshot_records_unregistered_entries() {
+    let guard = make_dir();
+
+    // Phase 1: register two functions, unregister one, force a seal.
+    {
+        let mut ledger = Ledger::new(persistent_config(&guard.0));
+        ledger.start().unwrap();
+        ledger
+            .register_function("a", &compile(TRANSFER_WAT), false)
+            .unwrap();
+        ledger
+            .register_function("b", &compile(NOOP_WAT), false)
+            .unwrap();
+
+        // Drive a few transactions to cross the 5-tx threshold so seal
+        // actually fires.
+        for i in 0..8 {
+            ledger.submit_and_wait(
+                Operation::Function {
+                    name: "a".into(),
+                    params: [1, 1, 2, 0, 0, 0, 0, 0],
+                    user_ref: i + 1,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger.unregister_function("a").unwrap();
+        // More traffic so the unregister record ends up in a sealed segment
+        // + triggers another snapshot.
+        for i in 0..8 {
+            ledger.submit_and_wait(
+                Operation::Deposit {
+                    account: 5,
+                    amount: 1,
+                    user_ref: 200 + i,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger.wait_for_seal();
+    }
+
+    // Phase 2: reopen — only `b` should be loaded; `a` was unregistered.
+    let mut ledger = Ledger::new(persistent_config(&guard.0));
+    ledger.start().unwrap();
+
+    let names: Vec<String> = ledger
+        .list_functions()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    assert_eq!(names, vec!["b".to_string()]);
 }

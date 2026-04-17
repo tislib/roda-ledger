@@ -1,11 +1,11 @@
-# ADR-014: WASM Function Registry and Named Operation Execution
+# ADR-014: WASM Function Registry and Function Operation Execution
 
 **Status:** Proposed  
 **Date:** 2026-04-16  
 **Author:** Taleh Ibrahimli
 
 **Amends:**
-- ADR-003 — deprecates `Operation::Composite`, implements `Operation::Named` execution path
+- ADR-003 — deprecates `Operation::Composite`, implements `Operation::Function` execution path
 - ADR-001 — adds `WalEntryKind::FunctionRegistered` (kind=5)
 - ADR-006 — adds `function_snapshot_{N}.bin` to storage layout
 - ADR-001, ADR-003, ADR-009, ADR-010 — renames `fail_reason` to `status` across all structs, APIs, and documentation (see Decision: Rename fail_reason to status)
@@ -14,7 +14,7 @@
 
 ## Context
 
-`Operation::Named` was reserved in ADR-003 and ADR-004 as a forward-compatible extension point
+`Operation::Function` was reserved in ADR-003 and ADR-004 as a forward-compatible extension point
 for user-defined logic. The placeholder existed but had no implementation.
 
 `Operation::Composite` was the interim escape hatch — a caller-defined sequence of `Credit` and
@@ -406,7 +406,7 @@ Transactor picks up on next cycle — `update_seq` changed → clone handlers �
 ### Execution Flow
 
 ```
-Operation::Named { name, params: [i64; 8], user_ref }
+Operation::Function { name, params: [i64; 8], user_ref }
   → Transactor receives
   → dedup check on user_ref (same as all operations)
   → lookup FunctionCaller from local_handlers by name
@@ -429,7 +429,7 @@ Tag format in WAL output (`roda-ctl unpack`):
 {"type":"TxMetadata","tx_id":441001,"tag":"fnw\\n4a2f1c3d",...}
 ```
 
-`"fnw\n"` — human-readable marker identifying a Named/WASM call.
+`"fnw\n"` — human-readable marker identifying a Function/WASM call.
 `4a2f1c3d` — CRC32C of the WASM binary, identifies exact version executed.
 Auditors cross-reference with `FunctionRegistered` records to resolve name and version.
 
@@ -451,7 +451,7 @@ Snapshot stage receives WalEntry::FunctionRegistered { crc32c: 0 }
       → increment update_seq
 ```
 
-Transactor picks up on next cycle — handler gone → subsequent `Named { name }` →
+Transactor picks up on next cycle — handler gone → subsequent `Function { name }` →
 `Status::INVALID_OPERATION`.
 
 **Terminology:**
@@ -532,7 +532,7 @@ marked deprecated in code and documentation.
 ```rust
 #[deprecated(
    since = "0.2.0",
-   note = "use Operation::Named with a registered WASM function"
+   note = "use Operation::Function with a registered WASM function"
 )]
 Composite(Box<CompositeOperation>)
 ```
@@ -583,7 +583,7 @@ message FunctionInfo {
 }
 ```
 
-`Operation::Named` already exists in the proto (ADR-004) — no change needed for invocation.
+`Operation::Function` already exists in the proto (ADR-004) — no change needed for invocation.
 
 ---
 
@@ -644,7 +644,7 @@ Cargo.toml additions:
 ### Negative
 
 - wasmtime JIT compilation at registration — ~10-100ms per function (one-time cost)
-- `Store` creation per Named operation — small allocation on hot path
+- `Store` creation per Function operation — small allocation on hot path
 - 8-param limit — covers all practical cases but not unlimited flexibility
 - `Composite` deprecated but not removed — temporary API surface debt
 - `functions/` directory adds operational surface to manage
@@ -663,7 +663,7 @@ Cargo.toml additions:
 
 - ADR-001 — entries-based execution model, single execution in Transactor
 - ADR-003 — Operation enum, Composite deprecation, Named reserved
-- ADR-004 — gRPC interface, Named operation proto
+- ADR-004 — gRPC interface, Function operation proto
 - ADR-006 — WAL segment lifecycle, storage layout, snapshot format
 - ADR-009 — Status (formerly FailReason), user-defined range 128-255
 - ADR-011 — WAL write/commit separation, active segment direct write
