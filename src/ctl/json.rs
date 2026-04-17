@@ -44,6 +44,13 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "tx_id": l.tx_id,
             "to_tx_id": l.to_tx_id,
         }),
+        WalEntry::FunctionRegistered(f) => serde_json::json!({
+            "type": "FunctionRegistered",
+            "name": f.name_str(),
+            "version": f.version,
+            "crc32c": format!("{:#010x}", f.crc32c),
+            "unregister": f.is_unregister(),
+        }),
     }
 }
 
@@ -152,6 +159,18 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 to_tx_id,
                 _pad2: [0; 16],
             }))
+        }
+        "FunctionRegistered" => {
+            let name = value["name"].as_str().ok_or("missing name")?;
+            let version = value["version"].as_u64().ok_or("missing version")? as u16;
+            let crc32c = value
+                .get("crc32c")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hex_u32)
+                .unwrap_or(0);
+            Ok(WalEntry::FunctionRegistered(FunctionRegistered::new(
+                name, version, crc32c,
+            )))
         }
         other => Err(format!("unknown record type: {}", other)),
     }

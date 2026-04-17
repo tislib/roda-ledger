@@ -1,15 +1,50 @@
-use crate::entities::{FailReason, TxMetadata, WalEntry, WalEntryKind};
+use crate::entities::{FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind};
 use crate::pipeline::Pipeline;
 use crate::seal::Seal;
 use crate::snapshot::Snapshot;
 use crate::storage::SegmentStaus::SEALED;
-use crate::storage::{Segment, Storage};
+use crate::storage::{Segment, Storage, functions as function_storage};
 use crate::transactor::Transactor;
+use crate::wasm_runtime::WasmRuntime;
 use spdlog::{info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const ENTRY_SIZE: usize = 40;
+
+/// ADR-014: apply a single `FunctionRegistered` WAL record during
+/// recovery — either load or unload the handler. Free function so the
+/// per-segment `visit_wal_records` closures can call it without
+/// double-borrowing `&mut self`.
+fn apply_function_registered(
+    storage: &Storage,
+    wasm_runtime: &WasmRuntime,
+    f: &FunctionRegistered,
+) {
+    let name = f.name_str();
+    if f.is_unregister() {
+        if let Err(e) = wasm_runtime.unload_function(name) {
+            warn!("recover: unload_function({}) failed: {}", name, e);
+        }
+        return;
+    }
+    match function_storage::read_function(storage, name, f.version) {
+        Ok(binary) => {
+            if let Err(e) = wasm_runtime.load_function(name, &binary, f.version, f.crc32c) {
+                warn!(
+                    "recover: load_function({} v{}) failed: {}",
+                    name, f.version, e
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "recover: read_function({} v{}) failed: {}",
+                name, f.version, e
+            );
+        }
+    }
+}
 
 pub struct Recover<'r> {
     transactor: &'r mut Transactor,
@@ -17,6 +52,7 @@ pub struct Recover<'r> {
     seal: &'r mut Seal,
     pipeline: &'r Arc<Pipeline>,
     storage: &'r Storage,
+    wasm_runtime: &'r Arc<WasmRuntime>,
     segments: Vec<Segment>,
 }
 
@@ -27,6 +63,7 @@ impl<'r> Recover<'r> {
         seal: &'r mut Seal,
         pipeline: &'r Arc<Pipeline>,
         storage: &'r Storage,
+        wasm_runtime: &'r Arc<WasmRuntime>,
     ) -> Self {
         Self {
             transactor,
@@ -34,9 +71,14 @@ impl<'r> Recover<'r> {
             seal,
             pipeline,
             storage,
+            wasm_runtime,
             segments: vec![],
         }
     }
+
+    // apply_function_registered lives as a free fn below so the visitor
+    // closures can borrow only `storage` + `wasm_runtime` (shared) and
+    // leave `self.snapshot` free for mutable capture.
 
     /// Runs crash recovery on the active WAL segment if needed.
     ///
@@ -118,6 +160,15 @@ impl<'r> Recover<'r> {
                 k if k == WalEntryKind::SegmentHeader as u8
                     || k == WalEntryKind::SegmentSealed as u8 =>
                 {
+                    offset += ENTRY_SIZE;
+                    last_good = offset;
+                }
+
+                // ── ADR-014: FunctionRegistered is a standalone, non-
+                //    transactional WAL record. No follower records, no
+                //    cross-record CRC. Validate its length, accept it, and
+                //    move on.
+                k if k == WalEntryKind::FunctionRegistered as u8 => {
                     offset += ENTRY_SIZE;
                     last_good = offset;
                 }
@@ -386,20 +437,28 @@ impl<'r> Recover<'r> {
             })?;
 
             let mut segment_recover_tx_id = 0u64;
+            // Borrow the fields we need through local refs so the closure
+            // captures them by shared ref (WASM side) and mutable ref
+            // (snapshot side) without double-borrowing `self`.
+            let storage = self.storage;
+            let wasm_runtime = self.wasm_runtime.as_ref();
+            let snapshot = &mut self.snapshot;
             segment
                 .visit_wal_records(|record| match record {
                     WalEntry::Metadata(metadata) => {
                         last_tx_id = metadata.tx_id;
                         segment_recover_tx_id = metadata.tx_id;
-                        self.snapshot.recover_index_tx_metadata(metadata);
+                        snapshot.recover_index_tx_metadata(metadata);
                     }
                     WalEntry::Entry(entry) => {
                         recover_balances.insert(entry.account_id, entry.computed_balance);
-                        self.snapshot.recover_index_tx_entry(entry);
+                        snapshot.recover_index_tx_entry(entry);
                     }
                     WalEntry::Link(link) => {
-                        self.snapshot
-                            .recover_index_tx_link(segment_recover_tx_id, link);
+                        snapshot.recover_index_tx_link(segment_recover_tx_id, link);
+                    }
+                    WalEntry::FunctionRegistered(f) => {
+                        apply_function_registered(storage, wasm_runtime, f);
                     }
                     _ => {}
                 })
@@ -420,16 +479,20 @@ impl<'r> Recover<'r> {
             std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
         })?;
         let mut current_recover_tx_id = 0u64;
+        let storage = self.storage;
+        let wasm_runtime = self.wasm_runtime.as_ref();
+        let snapshot = &mut self.snapshot;
+        let transactor = &mut self.transactor;
         active_segment
             .visit_wal_records(|record| match record {
                 WalEntry::Metadata(metadata) => {
                     last_tx_id = metadata.tx_id;
                     current_recover_tx_id = metadata.tx_id;
-                    self.snapshot.recover_index_tx_metadata(metadata);
+                    snapshot.recover_index_tx_metadata(metadata);
 
                     // Only non-duplicate committed transactions should be in the dedup cache
                     if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
-                        self.transactor.dedup_cache_mut().recover_entry(
+                        transactor.dedup_cache_mut().recover_entry(
                             metadata.user_ref,
                             metadata.tx_id,
                             last_tx_id,
@@ -438,11 +501,13 @@ impl<'r> Recover<'r> {
                 }
                 WalEntry::Entry(entry) => {
                     recover_balances.insert(entry.account_id, entry.computed_balance);
-                    self.snapshot.recover_index_tx_entry(entry);
+                    snapshot.recover_index_tx_entry(entry);
                 }
                 WalEntry::Link(link) => {
-                    self.snapshot
-                        .recover_index_tx_link(current_recover_tx_id, link);
+                    snapshot.recover_index_tx_link(current_recover_tx_id, link);
+                }
+                WalEntry::FunctionRegistered(f) => {
+                    apply_function_registered(storage, wasm_runtime, f);
                 }
                 _ => {}
             })

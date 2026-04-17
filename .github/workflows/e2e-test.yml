@@ -91,7 +91,7 @@ jobs:
             --test e2e_tests \
             --features "e2e_tests,grpc" \
             --release \
-            -- --nocapture 2>&1 | tee /root/e2e-test-output.txt
+            -- --test-threads=1 --nocapture 2>&1 | tee /root/e2e-test-output.txt
           echo "::endgroup::"
           SETUP_EOF
         env:

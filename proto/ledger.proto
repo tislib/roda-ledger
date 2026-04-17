@@ -80,6 +80,23 @@ service Ledger {
   // back to sealed segments on a cache miss. Required for account statements,
   // balance verification, and dispute resolution.
   rpc GetAccountHistory(GetAccountHistoryRequest) returns (GetAccountHistoryResponse);
+
+  // ---- ADR-014: WASM Function Registry ----
+
+  // RegisterFunction installs (or replaces, with override=true) a compiled
+  // WASM module under a snake_case name. The binary must export an
+  // `execute(i64 x 8) -> i32` entry point. Blocks until the Snapshot stage
+  // has committed the record and the runtime reflects the new handler —
+  // subsequent Named operations referencing `name` are guaranteed to see it.
+  rpc RegisterFunction(RegisterFunctionRequest) returns (RegisterFunctionResponse);
+
+  // UnregisterFunction removes the handler for `name`. Blocks until the
+  // handler is gone from the runtime. Subsequent Named operations
+  // referencing `name` return INVALID_OPERATION.
+  rpc UnregisterFunction(UnregisterFunctionRequest) returns (UnregisterFunctionResponse);
+
+  // ListFunctions returns metadata for every currently-loaded function.
+  rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
 }
 
 // ---- Operation messages ----
@@ -419,4 +436,37 @@ message GetAccountHistoryRequest {
 message GetAccountHistoryResponse {
   repeated TxEntryRecord entries    = 1;
   uint64                 next_tx_id = 2;  // 0 = no more entries
+}
+
+// ---- ADR-014: Function Registry ----
+
+message RegisterFunctionRequest {
+  string name              = 1;   // snake_case, max 32 bytes
+  bytes  binary            = 2;   // WASM binary; must export execute(i64 x 8) -> i32
+  bool   override_existing = 3;   // if false and name already registered, server returns ALREADY_EXISTS
+}
+
+message RegisterFunctionResponse {
+  uint32 version = 1;  // monotonic per-name, starts at 1
+  uint32 crc32c  = 2;  // CRC32C of the binary
+}
+
+message UnregisterFunctionRequest {
+  string name = 1;
+}
+
+message UnregisterFunctionResponse {
+  uint32 version = 1;  // version stamped on the unregister record
+}
+
+message ListFunctionsRequest {}
+
+message ListFunctionsResponse {
+  repeated FunctionInfo functions = 1;
+}
+
+message FunctionInfo {
+  string name    = 1;
+  uint32 version = 2;
+  uint32 crc32c  = 3;
 }

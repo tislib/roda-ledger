@@ -6,5 +6,6 @@ pub mod lib;
 
 pub mod correctness;
 pub mod crash;
+pub mod wasm;
 
 pub use lib::{E2EBackend, E2EContext, Profile, profile};

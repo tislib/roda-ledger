@@ -34,7 +34,7 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
     let binary = wat::parse_str(TRANSFER_WAT).expect("transfer wat");
     let crc = crc32c::crc32c(&binary);
     runtime
-        .load_function("wasm_transfer", &binary, crc)
+        .load_function("wasm_transfer", &binary, 1, crc)
         .expect("load wasm_transfer");
 
     let mut runner = TransactorRunner::new(10_000_000, runtime.clone());

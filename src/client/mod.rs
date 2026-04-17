@@ -72,6 +72,14 @@ pub struct AccountHistory {
     pub next_tx_id: u64,
 }
 
+/// Metadata for a single registered WASM function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionInfo {
+    pub name: String,
+    pub version: u16,
+    pub crc32c: u32,
+}
+
 // ---------------------------------------------------------------------------
 // LedgerClient
 // ---------------------------------------------------------------------------
@@ -490,6 +498,89 @@ impl LedgerClient {
                 })
                 .collect(),
             next_tx_id: resp.next_tx_id,
+        })
+    }
+
+    // -- ADR-014: Function registry -----------------------------------------
+
+    /// Register a WASM function. Blocks on the server side until the
+    /// Snapshot stage has committed the record. Returns
+    /// `(version, crc32c)`.
+    pub async fn register_function(
+        &self,
+        name: &str,
+        binary: &[u8],
+        override_existing: bool,
+    ) -> Result<(u16, u32)> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .register_function(proto::RegisterFunctionRequest {
+                name: name.to_string(),
+                binary: binary.to_vec(),
+                override_existing,
+            })
+            .await?
+            .into_inner();
+        Ok((resp.version as u16, resp.crc32c))
+    }
+
+    /// Unregister a WASM function by name. Returns the version stamped on
+    /// the unregister record.
+    pub async fn unregister_function(&self, name: &str) -> Result<u16> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .unregister_function(proto::UnregisterFunctionRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(resp.version as u16)
+    }
+
+    /// List every currently-loaded function.
+    pub async fn list_functions(&self) -> Result<Vec<FunctionInfo>> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .list_functions(proto::ListFunctionsRequest {})
+            .await?
+            .into_inner();
+        Ok(resp
+            .functions
+            .into_iter()
+            .map(|f| FunctionInfo {
+                name: f.name,
+                version: f.version as u16,
+                crc32c: f.crc32c,
+            })
+            .collect())
+    }
+
+    /// Submit an `Operation::Named` with 8 positional `i64` params and
+    /// wait until the given pipeline level.
+    pub async fn named_and_wait(
+        &self,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        wait_level: proto::WaitLevel,
+    ) -> Result<SubmitResult> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .submit_and_wait(proto::SubmitAndWaitRequest {
+                operation: Some(proto::submit_and_wait_request::Operation::Named(
+                    proto::Named {
+                        name: name.to_string(),
+                        params: params.to_vec(),
+                        user_ref,
+                    },
+                )),
+                wait_level: wait_level as i32,
+            })
+            .await?
+            .into_inner();
+        Ok(SubmitResult {
+            tx_id: resp.transaction_id,
+            fail_reason: resp.fail_reason,
         })
     }
 }

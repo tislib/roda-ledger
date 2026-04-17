@@ -51,9 +51,11 @@ type ExecTypedFunc = TypedFunc<(i64, i64, i64, i64, i64, i64, i64, i64), i32>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One registered function in the shared registry. Holds the compiled
-/// `Module` (cheap — `Arc` inside) and its CRC32C.
+/// `Module` (cheap — `Arc` inside), its CRC32C, and the version number
+/// from the `FunctionRegistered` WAL record that installed it.
 #[derive(Clone)]
 struct Registered {
+    version: u16,
     crc32c: u32,
     module: Module,
 }
@@ -102,9 +104,15 @@ impl WasmRuntime {
     }
 
     /// Compile a binary, verify its CRC32C matches, and insert it into
-    /// the registry. Increments `update_seq` so every engine's next
-    /// refresh picks it up.
-    pub fn load_function(&self, name: &str, binary: &[u8], crc32c: u32) -> io::Result<()> {
+    /// the registry under the given `version`. Increments `update_seq`
+    /// so every engine's next refresh picks it up.
+    pub fn load_function(
+        &self,
+        name: &str,
+        binary: &[u8],
+        version: u16,
+        crc32c: u32,
+    ) -> io::Result<()> {
         validate_name(name)?;
 
         let observed = crc32c::crc32c(binary);
@@ -125,7 +133,14 @@ impl WasmRuntime {
             .handlers
             .write()
             .map_err(|_| io::Error::other("handlers lock poisoned"))?;
-        guard.insert(name.to_string(), Registered { crc32c, module });
+        guard.insert(
+            name.to_string(),
+            Registered {
+                version,
+                crc32c,
+                module,
+            },
+        );
         drop(guard);
 
         self.update_seq.fetch_add(1, Ordering::AcqRel);
@@ -160,6 +175,40 @@ impl WasmRuntime {
             .contains_key(name)
     }
 
+    /// CRC32C of the currently registered binary for `name`, or `None` if
+    /// no handler is loaded. Cheap read-lock acquisition — used by the
+    /// Ledger facade's register/unregister synchronization only.
+    pub fn crc32c_of(&self, name: &str) -> Option<u32> {
+        self.handlers
+            .read()
+            .expect("handlers lock poisoned")
+            .get(name)
+            .map(|r| r.crc32c)
+    }
+
+    /// Current version for `name`, or `None` if no handler is loaded.
+    /// Used by the `Ledger` facade to compute the next monotonic
+    /// version without scanning disk.
+    pub fn version_of(&self, name: &str) -> Option<u16> {
+        self.handlers
+            .read()
+            .expect("handlers lock poisoned")
+            .get(name)
+            .map(|r| r.version)
+    }
+
+    /// Snapshot of `(name, version, crc32c)` for every currently-loaded
+    /// handler. Intended for the `Ledger::list_functions` surface — not
+    /// on the hot path. Keyed on name; callers must not rely on ordering.
+    pub fn handlers_snapshot(&self) -> Vec<(String, u16, u32)> {
+        self.handlers
+            .read()
+            .expect("handlers lock poisoned")
+            .iter()
+            .map(|(n, r)| (n.clone(), r.version, r.crc32c))
+            .collect()
+    }
+
     /// Number of currently-registered functions.
     pub fn len(&self) -> usize {
         self.handlers.read().expect("handlers lock poisoned").len()
@@ -177,7 +226,7 @@ impl WasmRuntime {
     /// Internal: fetch a named module + its crc by cloning from the
     /// registry (cheap — `Module` is `Arc`-backed). Used by
     /// [`WasmRuntimeEngine`] on cache miss.
-    fn get(&self, name: &str) -> Option<(u32, Module)> {
+    fn get_module(&self, name: &str) -> Option<(u32, Module)> {
         self.handlers
             .read()
             .expect("handlers lock poisoned")
@@ -374,7 +423,7 @@ impl WasmRuntimeEngine {
         if let Some(entry) = self.cache.get(name) {
             return Some(entry.crc32c);
         }
-        let (crc32c, module) = self.runtime.get(name)?;
+        let (crc32c, module) = self.runtime.get_module(name)?;
         let caller = FunctionCaller::new(&self.runtime.linker, &module, &mut self.store).ok()?;
         self.cache
             .insert(name.to_string(), CacheEntry { crc32c, caller });
@@ -595,7 +644,7 @@ mod tests {
         assert_eq!(rt.last_update_seq(), 0);
 
         let bin = noop_wat();
-        rt.load_function("noop", &bin, crc32c::crc32c(&bin))
+        rt.load_function("noop", &bin, 1, crc32c::crc32c(&bin))
             .unwrap();
         assert_eq!(rt.last_update_seq(), 1);
 
@@ -608,7 +657,7 @@ mod tests {
         let rt = WasmRuntime::new();
         let bin = noop_wat();
         let err = rt
-            .load_function("noop", &bin, crc32c::crc32c(&bin) ^ 1)
+            .load_function("noop", &bin, 1, crc32c::crc32c(&bin) ^ 1)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -643,7 +692,7 @@ mod tests {
         let rt = WasmRuntime::new();
         assert!(rt.is_empty());
         let bin = noop_wat();
-        rt.load_function("noop", &bin, crc32c::crc32c(&bin))
+        rt.load_function("noop", &bin, 1, crc32c::crc32c(&bin))
             .unwrap();
         assert!(rt.contains("noop"));
         assert_eq!(rt.len(), 1);

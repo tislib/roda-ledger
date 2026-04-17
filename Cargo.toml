@@ -34,10 +34,14 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 rustc-hash = "2"
 wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
+# `wat` is available to library consumers (tests, benches, binaries like
+# `load_wasm`) so they can embed WAT source for registration without
+# shelling out to an external assembler. It is pulled in transitively by
+# wasmtime anyway.
+wat = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
-wat = "1"
 
 [features]
 default = []
@@ -86,9 +90,16 @@ name = "load"
 path = "src/bin/load.rs"
 
 [[bin]]
+name = "load_wasm"
+path = "src/bin/load_wasm.rs"
+
+[[bin]]
 name = "load_grpc"
 path = "src/bin/load_grpc.rs"
 required-features = ["grpc"]
 
 [profile.bench]
+debug = true
+
+[profile.release]
 debug = true

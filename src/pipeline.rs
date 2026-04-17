@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 pub struct Pipeline {
     // ---- inter-stage queues ----
     sequencer_to_transactor: ArrayQueue<TransactionInput>,
-    transactor_to_wal: ArrayQueue<WalEntry>,
+    wal_input: ArrayQueue<WalEntry>,
     wal_to_snapshot: ArrayQueue<SnapshotMessage>,
 
     // ---- global progress indexes (cache-padded to avoid false sharing) ----
@@ -64,7 +64,7 @@ impl Pipeline {
     ) -> Arc<Self> {
         Arc::new(Self {
             sequencer_to_transactor: ArrayQueue::new(small_queue_size),
-            transactor_to_wal: ArrayQueue::new(wal_queue_size),
+            wal_input: ArrayQueue::new(wal_queue_size),
             wal_to_snapshot: ArrayQueue::new(small_queue_size),
 
             sequencer_index: CachePadded::new(AtomicU64::new(1)),
@@ -111,6 +111,17 @@ impl Pipeline {
 
     pub fn seal_context(self: &Arc<Self>) -> SealContext {
         SealContext {
+            pipeline: Arc::clone(self),
+        }
+    }
+
+    /// ADR-014: context handed to the `Ledger` facade so it can push
+    /// non-transactional WAL entries (currently only
+    /// [`WalEntry::FunctionRegistered`]) directly onto the same
+    /// `wal_input` queue the Transactor uses. Both producers are
+    /// linearized by the WAL stage's single-consumer drain loop.
+    pub fn ledger_context(self: &Arc<Self>) -> LedgerContext {
+        LedgerContext {
             pipeline: Arc::clone(self),
         }
     }
@@ -236,7 +247,7 @@ impl TransactorContext {
 
     #[inline(always)]
     pub fn output(&self) -> &ArrayQueue<WalEntry> {
-        &self.pipeline.transactor_to_wal
+        &self.pipeline.wal_input
     }
 
     #[inline(always)]
@@ -274,7 +285,7 @@ pub struct WalContext {
 impl WalContext {
     #[inline(always)]
     pub fn input(&self) -> &ArrayQueue<WalEntry> {
-        &self.pipeline.transactor_to_wal
+        &self.pipeline.wal_input
     }
 
     #[inline(always)]
@@ -284,7 +295,7 @@ impl WalContext {
 
     #[inline(always)]
     pub fn input_capacity(&self) -> usize {
-        self.pipeline.transactor_to_wal.capacity()
+        self.pipeline.wal_input.capacity()
     }
 
     #[inline(always)]
@@ -354,6 +365,42 @@ impl SealContext {
     #[inline(always)]
     pub fn set_processed_index(&self, id: u32) {
         self.pipeline.seal_index.store(id, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn is_running(&self) -> bool {
+        self.pipeline.running.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.pipeline.wait_strategy
+    }
+}
+
+/// Slice of the pipeline visible to the `Ledger` facade.
+///
+/// ADR-014 function registration bypasses the Transactor: the WAL record
+/// for a register / unregister event is pushed directly onto the same
+/// `wal_input` queue every Transactor-emitted entry uses, so the WAL
+/// stage's single drain loop linearizes the two producers.
+///
+/// Exposes only what the Ledger needs:
+/// - [`Self::push_wal_entry`] — non-blocking push.
+/// - [`Self::is_running`] / [`Self::wait_strategy`] — for its own retry
+///   loop when the queue is full.
+#[derive(Clone)]
+pub struct LedgerContext {
+    pipeline: Arc<Pipeline>,
+}
+
+impl LedgerContext {
+    /// Try to push a WAL entry onto the `wal_input` queue without
+    /// blocking. Returns the entry back on a full queue so the caller can
+    /// retry with its own backpressure strategy.
+    #[inline]
+    pub fn push_wal_entry(&self, entry: WalEntry) -> Result<(), WalEntry> {
+        self.pipeline.wal_input.push(entry)
     }
 
     #[inline(always)]
