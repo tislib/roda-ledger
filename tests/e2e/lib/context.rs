@@ -412,9 +412,9 @@ impl E2EContext {
     ) -> SubmitResult {
         let wl = wait_level_from_i32(wait_level);
         self.client(node)
-            .function_and_wait(name, params, user_ref, wl)
+            .submit_function_and_wait(name, params, user_ref, wl)
             .await
-            .expect("function_and_wait RPC failed")
+            .expect("submit_function_and_wait RPC failed")
     }
 
     // -- Runtime intervention -----------------------------------------------

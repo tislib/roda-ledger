@@ -8,6 +8,11 @@
 //! `WasmRuntime`, then replays any `FunctionRegistered` WAL records appearing
 //! after the snapshot.
 //!
+//! All public I/O on this format goes through [`crate::storage::Storage`]
+//! (`save_function_snapshot` / `load_function_snapshot`) — this module's
+//! `save` / `load` helpers are `pub(super)` so no caller outside the
+//! storage layer sees raw paths.
+//!
 //! Layout:
 //! ```text
 //! Header (36 bytes):
@@ -31,11 +36,10 @@
 //!   file_crc32c(4) | file_size(8) | magic(4)
 //! ```
 
-use crate::storage::Storage;
 use bytemuck::{Pod, Zeroable};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Magic identifying a function snapshot file ("FUNC" little-endian).
 pub const FUNCTION_SNAPSHOT_MAGIC: u32 = 0x46554E43;
@@ -91,48 +95,39 @@ pub struct FunctionSnapshotData {
     pub records: Vec<FunctionSnapshotRecord>,
 }
 
-fn bin_path(storage: &Storage, segment_id: u32) -> PathBuf {
-    storage
-        .data_dir()
-        .join(format!("function_snapshot_{:06}.bin", segment_id))
+fn bin_path(data_dir: &Path, segment_id: u32) -> PathBuf {
+    data_dir.join(format!("function_snapshot_{:06}.bin", segment_id))
 }
 
-fn crc_path(storage: &Storage, segment_id: u32) -> PathBuf {
-    storage
-        .data_dir()
-        .join(format!("function_snapshot_{:06}.crc", segment_id))
+fn crc_path(data_dir: &Path, segment_id: u32) -> PathBuf {
+    data_dir.join(format!("function_snapshot_{:06}.crc", segment_id))
 }
 
-fn bin_tmp_path(storage: &Storage, segment_id: u32) -> PathBuf {
-    storage
-        .data_dir()
-        .join(format!("function_snapshot_{:06}.bin.tmp", segment_id))
+fn bin_tmp_path(data_dir: &Path, segment_id: u32) -> PathBuf {
+    data_dir.join(format!("function_snapshot_{:06}.bin.tmp", segment_id))
 }
 
-fn crc_tmp_path(storage: &Storage, segment_id: u32) -> PathBuf {
-    storage
-        .data_dir()
-        .join(format!("function_snapshot_{:06}.crc.tmp", segment_id))
+fn crc_tmp_path(data_dir: &Path, segment_id: u32) -> PathBuf {
+    data_dir.join(format!("function_snapshot_{:06}.crc.tmp", segment_id))
 }
 
-/// Atomically write a function snapshot under `storage.data_dir()`.
+/// Atomically write a function snapshot under `data_dir`.
 ///
 /// The sequence is:
 /// 1. Write the `.bin.tmp` (header + LZ4 compressed body) and the `.crc.tmp`
 ///    sidecar (file_crc32c + file_size + magic).
 /// 2. Rename `.bin.tmp` → `.bin` and `.crc.tmp` → `.crc`.
 ///
-/// On any error the temp files may remain on disk and should be cleaned up by
-/// the caller — same contract as [`crate::storage::snapshot::Segment::save_snapshot`].
-pub fn save_function_snapshot(
-    storage: &Storage,
+/// Exposed only inside the storage layer; external callers go through
+/// [`crate::storage::Storage::save_function_snapshot`].
+pub(super) fn save(
+    data_dir: &Path,
     segment_id: u32,
     last_tx_id: u64,
     records: &[FunctionSnapshotRecord],
 ) -> io::Result<()> {
-    // The data dir was created by `Storage::new`; this is a defensive guard
-    // for tests that bypass the constructor.
-    fs::create_dir_all(storage.data_dir())?;
+    // Defensive — `Storage::new` already created `data_dir`.
+    fs::create_dir_all(data_dir)?;
 
     let raw_body = bytemuck::cast_slice::<FunctionSnapshotRecord, u8>(records).to_vec();
     let data_crc32c = crc32c::crc32c(&raw_body);
@@ -151,10 +146,10 @@ pub fn save_function_snapshot(
     header.extend_from_slice(&data_crc32c.to_le_bytes()); // 4
     debug_assert_eq!(header.len(), FUNCTION_SNAPSHOT_HEADER_SIZE);
 
-    let bin_tmp = bin_tmp_path(storage, segment_id);
-    let crc_tmp = crc_tmp_path(storage, segment_id);
-    let bin = bin_path(storage, segment_id);
-    let crc = crc_path(storage, segment_id);
+    let bin_tmp = bin_tmp_path(data_dir, segment_id);
+    let crc_tmp = crc_tmp_path(data_dir, segment_id);
+    let bin = bin_path(data_dir, segment_id);
+    let crc = crc_path(data_dir, segment_id);
 
     {
         let mut f = fs::File::create(&bin_tmp)?;
@@ -180,18 +175,18 @@ pub fn save_function_snapshot(
     Ok(())
 }
 
-/// Load and validate a function snapshot from `storage.data_dir()`.
+/// Load and validate a function snapshot from `data_dir`.
 ///
 /// Verifies:
 /// - sidecar size, magic, and `file_crc32c` matches the actual `.bin` content
 /// - header magic + version
 /// - body `data_crc32c` after decompression
-pub fn load_function_snapshot(
-    storage: &Storage,
-    segment_id: u32,
-) -> io::Result<FunctionSnapshotData> {
-    let bin = bin_path(storage, segment_id);
-    let crc = crc_path(storage, segment_id);
+///
+/// Exposed only inside the storage layer; external callers go through
+/// [`crate::storage::Storage::load_function_snapshot`].
+pub(super) fn load(data_dir: &Path, segment_id: u32) -> io::Result<FunctionSnapshotData> {
+    let bin = bin_path(data_dir, segment_id);
+    let crc = crc_path(data_dir, segment_id);
 
     let sidecar_bytes = fs::read(&crc)?;
     if sidecar_bytes.len() != FUNCTION_SNAPSHOT_SIDECAR_SIZE {
@@ -246,7 +241,7 @@ pub fn load_function_snapshot(
             "function snapshot file too small for header",
         ));
     }
-    // Manually parse the 36-byte header (mirror of `save_function_snapshot`).
+    // Manually parse the 36-byte header (mirror of `save`).
     let h = &bin_bytes[..FUNCTION_SNAPSHOT_HEADER_SIZE];
     let header_magic = u32::from_le_bytes(h[0..4].try_into().unwrap());
     let header_version = h[4];
@@ -323,6 +318,7 @@ pub fn load_function_snapshot(
 mod tests {
     use super::*;
     use crate::config::StorageConfig;
+    use crate::storage::Storage;
     use tempfile::tempdir;
 
     fn temp_storage() -> (Storage, tempfile::TempDir) {
@@ -335,11 +331,15 @@ mod tests {
         (storage, dir)
     }
 
+    fn data_dir_of(s: &Storage) -> PathBuf {
+        PathBuf::from(&s.config().data_dir)
+    }
+
     #[test]
     fn save_and_load_empty() {
         let (storage, _td) = temp_storage();
-        save_function_snapshot(&storage, 4, 1234, &[]).unwrap();
-        let data = load_function_snapshot(&storage, 4).unwrap();
+        storage.save_function_snapshot(4, 1234, &[]).unwrap();
+        let data = storage.load_function_snapshot(4).unwrap();
         assert_eq!(data.segment_id, 4);
         assert_eq!(data.last_tx_id, 1234);
         assert!(data.records.is_empty());
@@ -356,9 +356,11 @@ mod tests {
                 0xDEADBEEF ^ i,
             ));
         }
-        save_function_snapshot(&storage, 12, 9_999_999, &records).unwrap();
+        storage
+            .save_function_snapshot(12, 9_999_999, &records)
+            .unwrap();
 
-        let data = load_function_snapshot(&storage, 12).unwrap();
+        let data = storage.load_function_snapshot(12).unwrap();
         assert_eq!(data.segment_id, 12);
         assert_eq!(data.last_tx_id, 9_999_999);
         assert_eq!(data.records.len(), 50);
@@ -373,8 +375,8 @@ mod tests {
             FunctionSnapshotRecord::new("registered", 2, 0x1234_5678),
             FunctionSnapshotRecord::new("removed", 5, 0),
         ];
-        save_function_snapshot(&storage, 1, 0, &records).unwrap();
-        let data = load_function_snapshot(&storage, 1).unwrap();
+        storage.save_function_snapshot(1, 0, &records).unwrap();
+        let data = storage.load_function_snapshot(1).unwrap();
         assert_eq!(data.records[0].crc32c, 0x1234_5678);
         assert_eq!(data.records[1].crc32c, 0);
         assert_eq!(data.records[1].name_str(), "removed");
@@ -384,25 +386,27 @@ mod tests {
     fn load_rejects_corrupt_sidecar() {
         let (storage, _td) = temp_storage();
         let records = vec![FunctionSnapshotRecord::new("foo", 1, 0xAA55_AA55)];
-        save_function_snapshot(&storage, 7, 0, &records).unwrap();
-        let crc = crc_path(&storage, 7);
+        storage.save_function_snapshot(7, 0, &records).unwrap();
+        let dir = data_dir_of(&storage);
+        let crc = crc_path(&dir, 7);
         let mut buf = fs::read(&crc).unwrap();
         buf[12] ^= 0xFF; // corrupt sidecar magic
         fs::write(&crc, &buf).unwrap();
-        assert!(load_function_snapshot(&storage, 7).is_err());
+        assert!(storage.load_function_snapshot(7).is_err());
     }
 
     #[test]
     fn load_detects_body_corruption() {
         let (storage, _td) = temp_storage();
         let records = vec![FunctionSnapshotRecord::new("foo", 1, 0xAA55_AA55)];
-        save_function_snapshot(&storage, 8, 0, &records).unwrap();
-        let path = bin_path(&storage, 8);
+        storage.save_function_snapshot(8, 0, &records).unwrap();
+        let dir = data_dir_of(&storage);
+        let path = bin_path(&dir, 8);
         let mut buf = fs::read(&path).unwrap();
         let last = buf.len() - 1;
         buf[last] ^= 0x01; // flip a byte well past the header
         fs::write(&path, &buf).unwrap();
-        assert!(load_function_snapshot(&storage, 8).is_err());
+        assert!(storage.load_function_snapshot(8).is_err());
     }
 
     #[test]

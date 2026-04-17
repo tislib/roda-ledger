@@ -3,7 +3,7 @@ use crate::config::LedgerConfig;
 use crate::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
-use crate::storage::{Storage, functions as function_storage};
+use crate::storage::Storage;
 use crate::wasm_runtime::WasmRuntime;
 use spdlog::error;
 use std::collections::HashMap;
@@ -218,11 +218,7 @@ impl SnapshotRunner {
                                         );
                                     }
                                 } else {
-                                    match function_storage::read_function(
-                                        &self.storage,
-                                        &name,
-                                        f.version,
-                                    ) {
+                                    match self.storage.read_function(&name, f.version) {
                                         Ok(binary) => {
                                             if let Err(e) = self.wasm_runtime.load_function(
                                                 &name,

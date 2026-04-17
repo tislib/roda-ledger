@@ -7,6 +7,7 @@
 - [Concepts](01-concepts.md)
 - [API](02-api.md)
 - [Architecture](03-architecture.md)
+- [WASM Runtime](wasm-runtime.md)
 
 [//]: # (- [Internals]&#40;04-internals.md&#41;)
 - [Load Testing](load.md)
@@ -24,3 +25,4 @@
     - [ADR-0008 Transaction account index](adr/0008-transaction-account-index.md)
     - [ADR-0009 Tx link dedup reversal](adr/0009-tx-link-dedup-reversal.md)
     - [ADR-0010 Sync submit](adr/0010-sync-submit.md)
+    - [ADR-0014 WASM function registry](adr/0014-wasm-function-registry.md)

@@ -3,8 +3,7 @@ use crate::pipeline::Pipeline;
 use crate::seal::Seal;
 use crate::snapshot::Snapshot;
 use crate::storage::SegmentStaus::SEALED;
-use crate::storage::function_snapshot::load_function_snapshot;
-use crate::storage::{Segment, Storage, functions as function_storage};
+use crate::storage::{Segment, Storage};
 use crate::transactor::Transactor;
 use crate::wasm_runtime::WasmRuntime;
 use spdlog::{info, warn};
@@ -36,7 +35,7 @@ fn apply_function_registered(
             )
         });
     }
-    let binary = function_storage::read_function(storage, name, f.version).map_err(|e| {
+    let binary = storage.read_function(name, f.version).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!(
@@ -591,7 +590,7 @@ impl<'r> Recover<'r> {
             return Ok(());
         };
 
-        let data = load_function_snapshot(self.storage, segment_id).map_err(|e| {
+        let data = self.storage.load_function_snapshot(segment_id).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -633,7 +632,7 @@ impl<'r> Recover<'r> {
             // the authoritative replay source for its segment range. If we
             // cannot reconstruct a handler it committed, the registry
             // would silently diverge.
-            let binary = function_storage::read_function(self.storage, name, record.version)
+            let binary = self.storage.read_function(name, record.version)
                 .map_err(|e| {
                     std::io::Error::new(
                         e.kind(),

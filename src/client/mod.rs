@@ -557,7 +557,7 @@ impl LedgerClient {
 
     /// Submit an `Operation::Function` with 8 positional `i64` params
     /// and wait until the given pipeline level.
-    pub async fn function_and_wait(
+    pub async fn submit_function_and_wait(
         &self,
         name: &str,
         params: [i64; 8],

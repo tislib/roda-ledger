@@ -24,7 +24,11 @@
 //!
 //! No `unsafe`, no raw pointers, no generics.
 
+use crate::entities::{FunctionRegistered, WalEntry};
+use crate::pipeline::LedgerContext;
+use crate::storage::Storage;
 use crate::transactor::TransactorState;
+use crate::wait_strategy::WaitStrategy;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -552,6 +556,184 @@ pub fn validate_name(name: &str) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WasmRegistry — Ledger-facing façade (ADR-014 register/unregister/list)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Metadata returned by [`WasmRegistry::list`] for every currently
+/// registered WASM function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionInfo {
+    pub name: String,
+    pub version: u16,
+    pub crc32c: u32,
+}
+
+/// Facade over the full function-registry lifecycle: validate → write
+/// to disk → push `FunctionRegistered` onto the WAL → block until the
+/// Snapshot stage commits it and the live runtime reflects the change.
+///
+/// Owned by [`crate::ledger::Ledger`] as a thin composition layer so
+/// the Ledger's public API (`register_function` / `unregister_function`
+/// / `list_functions`) reduces to one-line delegations.
+///
+/// Holds:
+/// - `Arc<WasmRuntime>` — the shared registry whose `update_seq` gates
+///   every engine's caller cache;
+/// - `Arc<Storage>` — the `{data_dir}/functions` binary store;
+/// - [`LedgerContext`] — the pipeline handle used to push
+///   non-transactional WAL entries;
+/// - `WaitStrategy` — backpressure + polling cadence for the blocking
+///   waits after WAL push.
+#[derive(Clone)]
+pub struct WasmRegistry {
+    runtime: Arc<WasmRuntime>,
+    storage: Arc<Storage>,
+    ledger_ctx: LedgerContext,
+    wait_strategy: WaitStrategy,
+}
+
+impl WasmRegistry {
+    pub fn new(
+        runtime: Arc<WasmRuntime>,
+        storage: Arc<Storage>,
+        ledger_ctx: LedgerContext,
+        wait_strategy: WaitStrategy,
+    ) -> Self {
+        Self {
+            runtime,
+            storage,
+            ledger_ctx,
+            wait_strategy,
+        }
+    }
+
+    /// Register a WASM function under `name` at the next monotonic
+    /// version. Returns `(version, crc32c)` once the Snapshot stage has
+    /// committed the record and the live runtime reflects the handler.
+    pub fn register(
+        &self,
+        name: &str,
+        binary: &[u8],
+        override_existing: bool,
+    ) -> io::Result<(u16, u32)> {
+        // 1. Validate (ABI + name).
+        validate_name(name)?;
+        self.runtime.validate(binary)?;
+
+        // 2. Uniqueness check against the live registry.
+        if !override_existing && self.runtime.contains(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("function `{}` is already registered", name),
+            ));
+        }
+
+        // 3. Pick next version. The WAL + WasmRuntime carry the
+        //    authoritative version counter; the on-disk `functions/`
+        //    directory is reference data only.
+        let next_version = self.next_version(name)?;
+        self.storage.write_function(name, next_version, binary)?;
+        let crc = crc32c::crc32c(binary);
+
+        // 4. Push WAL record (non-transactional; bypasses Transactor).
+        let record = FunctionRegistered::new(name, next_version, crc);
+        self.push_wal_entry_blocking(WalEntry::FunctionRegistered(record));
+
+        // 5. Wait for the Snapshot stage to commit it.
+        self.wait_until_loaded(name, crc);
+
+        Ok((next_version, crc))
+    }
+
+    /// Unregister the currently-loaded function under `name`. Writes a
+    /// 0-byte `{name}_v{N+1}.wasm` on disk and a WAL record with
+    /// `crc32c = 0`. Blocks until the Snapshot stage commits it and the
+    /// handler is gone from the live runtime. Returns the version
+    /// number stamped on the unregister record. Errors with
+    /// [`io::ErrorKind::NotFound`] if `name` is not currently loaded.
+    pub fn unregister(&self, name: &str) -> io::Result<u16> {
+        validate_name(name)?;
+
+        if !self.runtime.contains(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("function `{}` is not registered", name),
+            ));
+        }
+
+        let next_version = self.next_version(name)?;
+        // Empty file under the next version — audit-trail preserved.
+        self.storage.write_function(name, next_version, &[])?;
+        let record = FunctionRegistered::new(name, next_version, 0);
+        self.push_wal_entry_blocking(WalEntry::FunctionRegistered(record));
+
+        self.wait_until_unloaded(name);
+        Ok(next_version)
+    }
+
+    /// Snapshot of every currently-loaded function with its version + CRC32C.
+    pub fn list(&self) -> Vec<FunctionInfo> {
+        self.runtime
+            .handlers_snapshot()
+            .into_iter()
+            .map(|(name, version, crc32c)| FunctionInfo {
+                name,
+                version,
+                crc32c,
+            })
+            .collect()
+    }
+
+    // ── internals ──────────────────────────────────────────────────────
+
+    /// Next monotonic version number for `name`. The authoritative
+    /// counter is the in-memory registry (installed by the Snapshot
+    /// stage from committed `FunctionRegistered` WAL records).
+    fn next_version(&self, name: &str) -> io::Result<u16> {
+        let prev = self.runtime.version_of(name).unwrap_or(0);
+        prev.checked_add(1)
+            .ok_or_else(|| io::Error::other("function version overflow (u16 exhausted)"))
+    }
+
+    /// Push a WAL entry with backpressure.
+    fn push_wal_entry_blocking(&self, mut entry: WalEntry) {
+        let mut retry_count = 0u64;
+        while self.ledger_ctx.is_running() {
+            match self.ledger_ctx.push_wal_entry(entry) {
+                Ok(()) => return,
+                Err(returned) => {
+                    entry = returned;
+                    self.wait_strategy.retry(retry_count);
+                    retry_count += 1;
+                }
+            }
+        }
+    }
+
+    fn wait_until_loaded(&self, name: &str, expected_crc: u32) {
+        let mut retry_count = 0u64;
+        while self.ledger_ctx.is_running() {
+            if self.runtime.crc32c_of(name) == Some(expected_crc) {
+                return;
+            }
+            self.wait_strategy.retry(retry_count);
+            retry_count += 1;
+        }
+    }
+
+    fn wait_until_unloaded(&self, name: &str) {
+        let mut retry_count = 0u64;
+        while self.ledger_ctx.is_running() {
+            if !self.runtime.contains(name) {
+                return;
+            }
+            self.wait_strategy.retry(retry_count);
+            retry_count += 1;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
