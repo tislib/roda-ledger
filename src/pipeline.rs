@@ -115,11 +115,6 @@ impl Pipeline {
         }
     }
 
-    /// Context handed to the `Ledger` facade so it can push
-    /// non-transactional WAL entries (currently only
-    /// [`WalEntry::FunctionRegistered`]) directly onto the same
-    /// `wal_input` queue the Transactor uses. Both producers are
-    /// linearized by the WAL stage's single-consumer drain loop.
     pub fn ledger_context(self: &Arc<Self>) -> LedgerContext {
         LedgerContext {
             pipeline: Arc::clone(self),
@@ -378,17 +373,6 @@ impl SealContext {
     }
 }
 
-/// Slice of the pipeline visible to the `Ledger` facade.
-///
-/// Function registration (WASM) bypasses the Transactor: the WAL record
-/// for a register / unregister event is pushed directly onto the same
-/// `wal_input` queue every Transactor-emitted entry uses, so the WAL
-/// stage's single drain loop linearizes the two producers.
-///
-/// Exposes only what the Ledger needs:
-/// - [`Self::push_wal_entry`] — non-blocking push.
-/// - [`Self::is_running`] / [`Self::wait_strategy`] — for its own retry
-///   loop when the queue is full.
 #[derive(Clone)]
 pub struct LedgerContext {
     pipeline: Arc<Pipeline>,

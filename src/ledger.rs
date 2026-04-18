@@ -78,10 +78,6 @@ impl Ledger {
         self.sequencer.submit_batch(operations)
     }
 
-    // ─── WASM Function Registry API (ADR-014) ──────────────────────────────
-    //
-    // Thin facade: everything is delegated to `WasmRegistry`.
-
     pub fn register_function(
         &self,
         name: &str,
