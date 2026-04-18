@@ -1,8 +1,8 @@
 # roda-ledger
 
-**A financial ledger engine that treats correctness guarantees as a choice, not a constraint — and performance as a consequence of good design, not a tradeoff.**
+**A programmable financial ledger engine that treats correctness guarantees as a choice, not a constraint — and performance as a consequence of good design, not a tradeoff.**
 
-roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic via composite operations, with WASM custom logic on the roadmap. Get 2.49 million transactions per second out of the box.
+roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic by uploading sandboxed WebAssembly functions that execute atomically inside the ledger as first-class operations. Get 2.49 million transactions per second out of the box.
 
 ---
 
@@ -14,7 +14,7 @@ Most ledger systems make you pick two out of three:
 - **Programmable** — but slow, closed-source, expensive (Thought Machine Vault)
 - **Correct** — but not a ledger, no financial primitives (general-purpose databases)
 
-roda-ledger pursues all three. It does this through a staged pipeline where each stage runs on a dedicated thread, adds a specific guarantee, and exposes its progress as an observable index.
+roda-ledger pursues all three. It does this through a staged pipeline where each stage runs on a dedicated thread, adds a specific guarantee, and exposes its progress as an observable index — and a sandboxed WebAssembly runtime that lets you extend the ledger with custom operations at runtime, without recompiling the engine.
 
 ---
 
@@ -82,16 +82,35 @@ The three pipeline indexes — `compute_index`, `commit_index`, `snapshot_index`
 
 ## Operations
 
-Four built-in operation types cover common financial workflows:
+Four operation types cover both common financial workflows and arbitrary user-defined logic:
 
 | Operation | Description |
 |---|---|
 | `Deposit` | Credit an account from the system source |
 | `Withdrawal` | Debit an account to the system sink |
 | `Transfer` | Move funds between accounts atomically |
-| `Composite` | Arbitrary sequence of credits and debits — your logic, ledger guarantees |
+| `Function` | Invoke a registered WebAssembly function as a first-class atomic transaction |
 
-`Composite` is the escape hatch. Multi-leg settlements, fee deductions, split payments — anything that doesn't fit the named types. The zero-sum invariant is always enforced. WASM-sandboxed custom operations are on the roadmap.
+`Function` is the **programmable ledger** surface and the only extension point: upload a compiled WebAssembly module via `RegisterFunction`, then invoke it by name. The function runs inside the Transactor — single-threaded, deterministic, sandboxed — and produces normal WAL entries alongside every other transaction. The zero-sum invariant is always enforced; non-zero return codes trigger full rollback. Multi-leg settlements, fee splits, conditional transfers — anything that doesn't fit the named types is expressed as a `Function`. See [WASM Runtime](docs/wasm-runtime.md) for the ABI, host API, and durability guarantees.
+
+---
+
+## Programmable ledger
+
+A registered WASM function becomes a first-class `Operation::Function` — sequenced, executed atomically by the Transactor, durably logged, and recoverable across restarts. The runtime exposes a deliberately narrow host API (`credit`, `debit`, `get_balance`) so every execution is deterministic: no clocks, no I/O, no randomness, no threads. This is the property that makes the runtime fit for future Raft replication — followers apply the leader's WAL entries directly, with no re-execution.
+
+```bash
+# Register a compiled WASM module
+grpcurl -d "$(jq -n --arg bin "$(base64 -w0 fee_transfer.wasm)" \
+  '{name:"fee_transfer", binary:$bin, override_existing:false}')" \
+  -plaintext localhost:50051 roda.ledger.v1.Ledger/RegisterFunction
+
+# Invoke it like any other operation
+grpcurl -plaintext -d '{"function": {"name": "fee_transfer", "params": [101, 202, 999, 10000, 50], "user_ref": 1}}' \
+  localhost:50051 roda.ledger.v1.Ledger/SubmitOperation
+```
+
+Functions can be written in Rust, AssemblyScript, or hand-written WAT. Registration is durable before the call returns; the binary, a `FunctionRegistered` WAL record, and a paired function snapshot together let recovery rebuild the live registry deterministically.
 
 ---
 
@@ -125,15 +144,16 @@ Full documentation: [tislib.net/roda-ledger](https://tislib.net/roda-ledger/)
 | 2 | [API](docs/02-api.md) | Operations, wait levels, gRPC reference |
 | 3 | [Architecture](docs/03-architecture.md) | Pipeline design, stage internals, recovery |
 | 4 | [Internals](docs/04-internals.md) | Data structures, WAL format, lock mechanics |
+| + | [WASM Runtime](docs/wasm-runtime.md) | Programmable ledger — ABI, registration, recovery |
 
 ---
 
 ## Roadmap
 
 - Raft-based multi-node replication
-- WASM-sandboxed custom transaction logic
 - mTLS authentication
 - Account hierarchies and sub-account structures
+- Per-function CPU / memory metering and quotas
 
 ---
 

@@ -76,6 +76,75 @@ For each transaction the Transactor: checks deduplication by `user_ref`, execute
 
 The balance cache always reflects the latest state. This is why the write path is always linearizable — the Transactor never makes a decision based on stale data.
 
+For built-in operations (`Deposit`, `Withdrawal`, `Transfer`) the Transactor runs native Rust code. For an `Operation::Function`, the Transactor delegates to the embedded **WASM Runtime** described below. Either path produces the same `TxEntry` records, is bounded by the same zero-sum check, and uses the same rollback machinery — there is no second code path for durability or recovery.
+
+---
+
+## The WASM Runtime — programmable execution inside the Transactor
+
+The WASM Runtime is not a separate pipeline stage. It is a component **inside the Transactor** that handles `Operation::Function` the same way native code handles `Operation::Transfer`. This placement is deliberate: a function execution must inherit every guarantee the Transactor already provides — single-writer ordering, zero-sum enforcement, atomic rollback, deduplication — without any new coordination.
+
+<img src="./resources/transactor-flow.png" style="width: 100%;"/>
+
+### Where it sits in the pipeline
+
+```
+Sequencer → Transactor ─┬─ native execution path  ─┐
+                        │                          ├─→ TxEntry stream → WAL → Snapshotter
+                        └─ WasmRuntime.invoke()   ─┘
+```
+
+A `Function` operation flows through Sequencer → WAL → Snapshotter exactly like any other operation. The only difference is *how* the Transactor produces its entries: by calling into a sandboxed WebAssembly handler that issues `credit` / `debit` host calls, instead of running a hard-coded Rust branch.
+
+### Components
+
+- **`WasmRuntime`** — one per ledger, wrapping a single shared `wasmtime::Engine` and `Linker`. Lives behind an `Arc<WasmRuntime>` and is cheap to clone.
+- **Per-Transactor caller cache** — a `HashMap<name, CachedHandler>` owned by the Transactor thread. No locks on the hot path; the cache stores the `update_seq` of the registry it was verified against and revalidates lazily when a registration changes.
+- **Shared registry** — a small lock-protected map of `name → (version, crc32c, compiled module)`. Only touched on registration, unregistration, and cache miss / revalidation — never on every transaction.
+- **Host-side execution context** — a per-Transactor `TransactorState` that captures the host calls a function emits during a single `execute()` invocation. Credits and debits accumulate here, not in WASM-visible globals, so no state leaks across calls.
+
+### Atomic execution flow
+
+For an `Operation::Function { name, params, user_ref }` the Transactor:
+
+1. Performs the standard `user_ref` deduplication check.
+2. Resolves `name` against the caller cache, falling back to the shared registry on miss; verifies `update_seq` to detect a concurrent registration.
+3. Opens an isolated host-side execution context — credits and debits emitted from now on are recorded against this transaction only.
+4. Calls `TypedFunc::call(execute, params)` on the cached handler. The function may issue any number of `credit` / `debit` / `get_balance` host calls; each is captured into the execution context.
+5. On any trap, host error, or non-zero return code: discards every captured credit/debit, marks the transaction failed with the appropriate status (the user-defined `u8` for `128..=255`, a standard reason otherwise), and writes a `TxMetadata` record so auditors can see exactly which function and which return code rejected the transaction.
+6. On a `0` return: verifies `sum(credits) == sum(debits)`. Failure here yields `ZERO_SUM_VIOLATION` and the same rollback. Success commits the captured entries to the live balance cache and emits them as ordinary `TxEntry` records.
+7. Tags the resulting `TxMetadata` with `b"fnw\n" ++ crc32c[0..4]` so every committed transaction permanently identifies the exact binary that produced it.
+
+Stages 5–7 are the atomicity boundary. Nothing reaches the WAL queue until the function has either fully succeeded *and* balanced, or been fully rolled back. The WAL stage and the Snapshotter that follow it are unchanged — they cannot tell a function-produced entry stream from a native one.
+
+### Why this fits the pipeline
+
+- **Single-writer correctness.** A function executes on the Transactor thread, in strict sequence, with the same in-memory balance cache native operations use. Two functions cannot race; a function cannot race with a native operation.
+- **No new persistence path.** Function-produced entries are normal `TxEntry` records. WAL segmentation, sealing, snapshotting, and replay treat them identically to entries from a `Transfer`.
+- **No new failure mode.** A WASM trap, an unbalanced credit/debit set, or a domain-specific reject all use the existing transaction-rollback machinery.
+- **Determinism for replication.** The host API is intentionally narrow: no clocks, no randomness, no I/O, no atomics, no threads. The leader executes a function; any future Raft follower can apply the resulting WAL entries directly without re-running the WASM code.
+
+### Registration as a first-class WAL event
+
+Registering or unregistering a function is itself a durable transaction in the pipeline:
+
+1. The submitted binary is validated (signature, size, exports) before any disk write.
+2. The binary is written atomically (`tmp + rename`) to `data/functions/{name}_v{N}.wasm`. Unregister writes a 0-byte file under the next version — the audit trail is preserved.
+3. A `FunctionRegistered` WAL record (`name`, `version`, `crc32c`) is committed to the active segment.
+4. The handler is compiled and installed in the live `WasmRuntime`.
+5. Only after all four steps does `RegisterFunction` return.
+
+Periodic snapshots emit a paired `function_snapshot_{N}.bin` next to the balance `snapshot_{N}.bin`, on the same `snapshot_frequency` trigger. Recovery loads the function snapshot first, replays `FunctionRegistered` records from the WAL after it (`crc32c != 0` → load, `crc32c == 0` → unload), and only then resumes processing transactions. A missing or corrupted binary aborts startup — the runtime never serves traffic against a registry that diverges from the WAL.
+
+### Performance shape
+
+- The hot path adds one `HashMap::get`, one `TypedFunc::call`, and one host-import crossing per `credit` / `debit`.
+- Compiled modules are cached per `(name, crc)`; instantiation cost is paid once per registration, not per call.
+- Cache invalidation is per-name — registering `foo` does not evict the cached entry for `bar`.
+- At the Transactor level, WASM execution adds ~200 ns per operation over the native path. At the pipeline level, this is invisible: the WAL `fdatasync` cost dominates and end-to-end TPS for `Function` and `Deposit` are within a percent of each other.
+
+Detailed ABI, host API, validation rules, and recovery semantics live in [WASM Runtime](./wasm-runtime.md) and [ADR-014](./adr/0014-wasm-function-registry.md).
+
 ---
 
 ## The WAL
