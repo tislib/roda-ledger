@@ -6,7 +6,7 @@ use crate::entities::{
     WalEntryKind,
 };
 use crate::pipeline::TransactorContext;
-use crate::transaction::{CompositeOperationFlags, Operation, Step, Transaction, TransactionInput};
+use crate::transaction::{Operation, Transaction, TransactionInput};
 use crate::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
 use crossbeam_skiplist::SkipMap;
 use std::cell::RefCell;
@@ -558,36 +558,6 @@ impl TransactorRunner {
                     } else {
                         s.credit(from, amount);
                         s.debit(to, amount);
-                    }
-                }
-                Operation::Composite(op) => {
-                    let mut s = self.state.borrow_mut();
-                    s.meta(*b"COMPOSIT", op.user_ref, timestamp);
-                    for step in &op.steps {
-                        match step {
-                            Step::Credit { account_id, amount } => {
-                                s.credit(*account_id, *amount);
-                            }
-                            Step::Debit { account_id, amount } => {
-                                s.debit(*account_id, *amount);
-                            }
-                        }
-                    }
-
-                    if op
-                        .flags
-                        .contains(CompositeOperationFlags::CHECK_NEGATIVE_BALANCE)
-                    {
-                        let position = s.position;
-                        let entries_len = s.entries.len();
-                        for i in (position + 1)..entries_len {
-                            if let WalEntry::Entry(e) = s.entries[i]
-                                && s.get_balance(e.account_id) < 0
-                            {
-                                s.fail(FailReason::INSUFFICIENT_FUNDS);
-                                break;
-                            }
-                        }
                     }
                 }
                 Operation::Function {

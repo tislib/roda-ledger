@@ -1,6 +1,5 @@
 use crate::entities::FailReason;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Operation {
@@ -20,7 +19,6 @@ pub enum Operation {
         amount: u64,
         user_ref: u64,
     },
-    Composite(Box<CompositeOperation>),
     Function {
         name: String,
         /// Fixed arity: exactly 8 `i64` positional parameters. Unused
@@ -36,29 +34,8 @@ impl Operation {
             Operation::Transfer { user_ref, .. } => *user_ref,
             Operation::Deposit { user_ref, .. } => *user_ref,
             Operation::Withdrawal { user_ref, .. } => *user_ref,
-            Operation::Composite(op) => op.user_ref,
             Operation::Function { user_ref, .. } => *user_ref,
         }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct CompositeOperation {
-    pub steps: SmallVec<[Step; 8]>,
-    pub flags: CompositeOperationFlags,
-    pub user_ref: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Step {
-    Credit { account_id: u64, amount: u64 },
-    Debit { account_id: u64, amount: u64 },
-}
-
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-    pub struct CompositeOperationFlags: u64 {
-        const CHECK_NEGATIVE_BALANCE = 0b00000001;
     }
 }
 

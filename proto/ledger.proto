@@ -109,9 +109,11 @@ message SubmitOperationRequest {
     Deposit    deposit    = 1;
     Withdrawal withdrawal = 2;
     Transfer   transfer   = 3;
-    Composite  composite  = 4;
+    // 4 reserved (previously Composite; removed in favour of WASM
+    // Function operations — see ADR-014).
     Function   function   = 5;
   }
+  reserved 4;
 }
 
 // SubmitAndWaitRequest wraps an operation with a WaitLevel.
@@ -121,9 +123,10 @@ message SubmitAndWaitRequest {
     Deposit    deposit    = 1;
     Withdrawal withdrawal = 2;
     Transfer   transfer   = 3;
-    Composite  composite  = 4;
+    // 4 reserved (previously Composite).
     Function   function   = 5;
   }
+  reserved 4;
   WaitLevel wait_level = 6;
 }
 
@@ -164,17 +167,6 @@ message Transfer {
   uint64 user_ref = 4; // Opaque external reference. See Deposit.user_ref.
 }
 
-// Composite is a user-defined multi-step atomic operation.
-// All steps execute atomically — either all commit or none do.
-// The zero-sum invariant is always enforced: sum(credits) must equal sum(debits).
-// Additional checks are controlled via the flags field.
-// Maximum 255 steps per operation.
-message Composite {
-  repeated Step steps = 1; // Ordered list of credit/debit steps.
-  uint64 flags        = 2; // Bitset of CompositeOperationFlags. See flag definitions below.
-  uint64 user_ref     = 3; // Opaque external reference. See Deposit.user_ref.
-}
-
 // Function invokes a registered WASM function (ADR-014).
 // The function ABI is fixed-arity: exactly 8 `i64` positional parameters.
 // Proto3 has no fixed-length array type, so `params` stays `repeated int64`
@@ -184,51 +176,6 @@ message Function {
   string         name     = 1; // Operation name (snake_case, max 32 bytes).
   repeated int64 params   = 2; // 0..=8 positional parameters; short lists are zero-padded.
   uint64         user_ref = 3; // Opaque external reference. See Deposit.user_ref.
-}
-
-// CompositeOperationFlags is a bitset encoded as uint64.
-// Each bit enables an additional validation check applied atomically with execution.
-// Combine multiple flags with bitwise OR (e.g. flags = 0x1 | 0x2 = 3).
-//
-// Defined bits:
-//
-//   0x0000000000000001 (bit 0) — CHECK_NEGATIVE_BALANCE
-//       Reject the entire operation if any account touched by the steps would go
-//       negative after execution. Enforces that no account is overdrafted as a
-//       result of this specific operation. Without this flag, negative balances
-//       are permitted (useful for liability accounts or system accounts).
-//       Rejection code: INSUFFICIENT_FUNDS.
-//
-//   0x0000000000000002–0x4000000000000000 (bits 1–62) — Reserved.
-//       Reserved for future standard checks. Do not set these bits.
-//
-// Example — fee deduction with overdraft protection:
-//   flags    = 1  (CHECK_NEGATIVE_BALANCE)
-//   steps    = [Credit(sender, amount+fee), Debit(receiver, amount), Debit(fee_acct, fee)]
-//   Outcome  = rejected if sender balance would go negative after the credit step.
-
-// Step is a single credit or debit within a Composite operation.
-message Step {
-  oneof kind {
-    CreditStep credit = 1; // Reduce account balance (funds leave this account).
-    DebitStep  debit  = 2; // Increase account balance (funds arrive at this account).
-  }
-}
-
-// CreditStep reduces the balance of an account.
-// In double-entry terms: the account is on the credit side of the entry.
-// Economically: funds flow out of this account.
-message CreditStep {
-  uint64 account_id = 1; // Account to credit. Must be < max_accounts.
-  uint64 amount     = 2; // Amount in minor units. Must be > 0.
-}
-
-// DebitStep increases the balance of an account.
-// In double-entry terms: the account is on the debit side of the entry.
-// Economically: funds flow into this account.
-message DebitStep {
-  uint64 account_id = 1; // Account to debit. Must be < max_accounts.
-  uint64 amount     = 2; // Amount in minor units. Must be > 0.
 }
 
 // ---- Submit responses ----

@@ -307,11 +307,8 @@ impl Reporter {
         for i in 0..num_buckets {
             let sum = self.metrics.time_series_sum[i].load(Ordering::Relaxed);
             let count = self.metrics.time_series_count[i].load(Ordering::Relaxed);
-            if count > 0 {
-                latency_history.push(Duration::from_nanos(sum / count));
-            } else {
-                latency_history.push(Duration::from_nanos(0));
-            }
+            let avg = sum.checked_div(count).unwrap_or(0);
+            latency_history.push(Duration::from_nanos(avg));
         }
 
         RunResult {

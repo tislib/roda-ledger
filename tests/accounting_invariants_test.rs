@@ -1,7 +1,6 @@
 use roda_ledger::entities::FailReason;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::transaction::{CompositeOperation, CompositeOperationFlags, Operation, Step};
-use smallvec::smallvec;
+use roda_ledger::transaction::Operation;
 use std::time::Duration;
 
 /// After 10K mixed operations, sum of all account balances (including system account 0) must be 0.
@@ -91,115 +90,6 @@ fn test_insufficient_funds_rejected() {
         100,
         "balance must not change on rejection"
     );
-}
-
-/// Unbalanced composite operation -> ZERO_SUM_VIOLATION rejection.
-#[test]
-fn test_composite_unbalanced_rejected() {
-    let config = LedgerConfig {
-        seal_check_internal: Duration::from_millis(10),
-        ..LedgerConfig::temp()
-    };
-    let mut ledger = Ledger::new(config);
-    ledger.start().unwrap();
-
-    // Unbalanced: credit without matching debit
-    let unbalanced_id = ledger.submit(Operation::Composite(Box::new(CompositeOperation {
-        steps: smallvec![Step::Credit {
-            account_id: 1,
-            amount: 100,
-        }],
-        flags: CompositeOperationFlags::empty(),
-        user_ref: 0,
-    })));
-    ledger.wait_for_transaction(unbalanced_id);
-
-    let status = ledger.get_transaction_status(unbalanced_id);
-    assert!(status.is_err(), "unbalanced composite should be rejected");
-    assert_eq!(status.error_reason(), FailReason::ZERO_SUM_VIOLATION);
-    assert_eq!(
-        ledger.get_balance(1),
-        0,
-        "balance must not change on rejection"
-    );
-}
-
-/// Balanced composite (credit + debit of equal amounts) succeeds.
-/// Note: credit() subtracts from balance, debit() adds to balance (accounting convention).
-#[test]
-fn test_composite_balanced_succeeds() {
-    let config = LedgerConfig {
-        seal_check_internal: Duration::from_millis(10),
-        ..LedgerConfig::temp()
-    };
-    let mut ledger = Ledger::new(config);
-    ledger.start().unwrap();
-
-    let id = ledger.submit(Operation::Composite(Box::new(CompositeOperation {
-        steps: smallvec![
-            Step::Credit {
-                account_id: 1,
-                amount: 100,
-            },
-            Step::Debit {
-                account_id: 2,
-                amount: 100,
-            },
-        ],
-        flags: CompositeOperationFlags::empty(),
-        user_ref: 0,
-    })));
-    ledger.wait_for_transaction(id);
-
-    let status = ledger.get_transaction_status(id);
-    assert!(
-        status.balance_ready(),
-        "balanced composite should succeed and be on snapshot"
-    );
-    // credit() subtracts, debit() adds
-    assert_eq!(
-        ledger.get_balance(1),
-        -100,
-        "credit should subtract from account 1"
-    );
-    assert_eq!(ledger.get_balance(2), 100, "debit should add to account 2");
-}
-
-/// CHECK_NEGATIVE_BALANCE flag rejects composite when a step would make an account negative.
-#[test]
-fn test_composite_negative_balance_flag() {
-    let config = LedgerConfig {
-        seal_check_internal: Duration::from_millis(10),
-        ..LedgerConfig::temp()
-    };
-    let mut ledger = Ledger::new(config);
-    ledger.start().unwrap();
-
-    // Account 3 has balance 0, debiting it with CHECK_NEGATIVE_BALANCE should fail
-    let id = ledger.submit(Operation::Composite(Box::new(CompositeOperation {
-        steps: smallvec![
-            Step::Debit {
-                account_id: 3,
-                amount: 50,
-            },
-            Step::Credit {
-                account_id: 4,
-                amount: 50,
-            },
-        ],
-        flags: CompositeOperationFlags::CHECK_NEGATIVE_BALANCE,
-        user_ref: 0,
-    })));
-    ledger.wait_for_transaction(id);
-
-    let status = ledger.get_transaction_status(id);
-    assert!(
-        status.is_err(),
-        "composite with CHECK_NEGATIVE_BALANCE should reject overdraft"
-    );
-    assert_eq!(status.error_reason(), FailReason::INSUFFICIENT_FUNDS);
-    assert_eq!(ledger.get_balance(3), 0);
-    assert_eq!(ledger.get_balance(4), 0);
 }
 
 /// Multiple transfers between funded accounts, verify net-zero per transaction at the balance level.

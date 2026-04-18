@@ -158,10 +158,8 @@ impl SealRunner {
                     warn!("Seal: account ID {} exceeds balance vector length", id);
                 }
             }
-            WalEntry::Metadata(m) => {
-                if m.tx_id > seg_last_tx_id {
-                    seg_last_tx_id = m.tx_id;
-                }
+            WalEntry::Metadata(m) if m.tx_id > seg_last_tx_id => {
+                seg_last_tx_id = m.tx_id;
             }
             // Mirror the WASM function registry through the sealed WAL.
             // Unregister records (crc32c == 0) are kept in the map so
