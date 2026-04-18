@@ -61,7 +61,8 @@ pub struct FunctionSnapshotRecord {
     pub version: u16,   // 2  @ 36
     pub _pad: [u8; 2],  // 2  @ 38
 }
-const _: () = assert!(std::mem::size_of::<FunctionSnapshotRecord>() == FUNCTION_SNAPSHOT_RECORD_SIZE);
+const _: () =
+    assert!(std::mem::size_of::<FunctionSnapshotRecord>() == FUNCTION_SNAPSHOT_RECORD_SIZE);
 
 impl FunctionSnapshotRecord {
     /// Build a record from logical fields. `name` is null-padded into the
@@ -261,10 +262,7 @@ pub(super) fn load(data_dir: &Path, segment_id: u32) -> io::Result<FunctionSnaps
     if header_version != FUNCTION_SNAPSHOT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "unsupported function snapshot version {}",
-                header_version
-            ),
+            format!("unsupported function snapshot version {}", header_version),
         ));
     }
 

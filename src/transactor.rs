@@ -612,9 +612,11 @@ impl TransactorRunner {
                             // Emit the tagged meta (drop the borrow
                             // before WASM runs so host imports can
                             // borrow_mut the same state).
-                            self.state
-                                .borrow_mut()
-                                .meta(build_wasm_tag(caller.crc32c()), user_ref, timestamp);
+                            self.state.borrow_mut().meta(
+                                build_wasm_tag(caller.crc32c()),
+                                user_ref,
+                                timestamp,
+                            );
                             // The caller carries its own `Rc`-shared
                             // handle to the engine's long-lived Store;
                             // `execute` borrows it internally. Host
@@ -622,9 +624,7 @@ impl TransactorRunner {
                             // its tx_id) on every credit/debit.
                             let status = caller.execute(params);
                             if status != 0 {
-                                self.state
-                                    .borrow_mut()
-                                    .fail(FailReason::from_u8(status));
+                                self.state.borrow_mut().fail(FailReason::from_u8(status));
                             }
                         }
                     }
@@ -700,6 +700,7 @@ impl TransactorRunner {
 #[inline]
 pub fn build_wasm_tag(crc32c: u32) -> [u8; 8] {
     let bytes = crc32c.to_le_bytes();
-    [b'f', b'n', b'w', b'\n', bytes[0], bytes[1], bytes[2], bytes[3]]
+    [
+        b'f', b'n', b'w', b'\n', bytes[0], bytes[1], bytes[2], bytes[3],
+    ]
 }
-

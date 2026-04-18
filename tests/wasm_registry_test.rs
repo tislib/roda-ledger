@@ -212,7 +212,10 @@ fn multiple_functions_listed_independently() {
     assert_eq!(list.len(), 3);
     let mut names: Vec<String> = list.iter().map(|i| i.name.clone()).collect();
     names.sort();
-    assert_eq!(names, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(
+        names,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
     for info in &list {
         assert_eq!(info.version, 1);
     }
@@ -426,10 +429,7 @@ impl Drop for DirGuard {
 }
 fn make_dir() -> DirGuard {
     let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "roda_wasm_snapshot_test_{}",
-        rand::random::<u64>()
-    ));
+    dir.push(format!("roda_wasm_snapshot_test_{}", rand::random::<u64>()));
     std::fs::create_dir_all(&dir).unwrap();
     DirGuard(dir)
 }

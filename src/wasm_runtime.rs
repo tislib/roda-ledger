@@ -373,7 +373,10 @@ impl WasmRuntimeEngine {
     /// holding an `Rc::clone(&state)` so every host call sees the same
     /// mutable transactor state.
     pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<TransactorState>>) -> Self {
-        let store = Rc::new(RefCell::new(Store::new(runtime.engine(), Rc::clone(&state))));
+        let store = Rc::new(RefCell::new(Store::new(
+            runtime.engine(),
+            Rc::clone(&state),
+        )));
         Self {
             runtime,
             state,
@@ -429,8 +432,7 @@ impl WasmRuntimeEngine {
                     // resulting `FunctionCaller` can share it.
                     let exec_fn: ExecTypedFunc = {
                         let mut store = self.store.borrow_mut();
-                        let Ok(instance) =
-                            self.runtime.linker.instantiate(&mut *store, &module)
+                        let Ok(instance) = self.runtime.linker.instantiate(&mut *store, &module)
                         else {
                             return None;
                         };

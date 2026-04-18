@@ -1,8 +1,8 @@
 use crate::config::LedgerConfig;
 use crate::entities::WalEntry;
 use crate::pipeline::SealContext;
-use crate::storage::SegmentStaus::SEALED;
 use crate::storage::FunctionSnapshotRecord;
+use crate::storage::SegmentStaus::SEALED;
 use crate::storage::{Segment, Storage};
 use rustc_hash::FxHashMap;
 use spdlog::{debug, error, warn};
@@ -218,11 +218,10 @@ impl SealRunner {
                 segment.id(),
                 fn_records.len()
             );
-            if let Err(e) = self.storage.save_function_snapshot(
-                segment.id(),
-                seg_last_tx_id,
-                &fn_records,
-            ) {
+            if let Err(e) =
+                self.storage
+                    .save_function_snapshot(segment.id(), seg_last_tx_id, &fn_records)
+            {
                 error!(
                     "Seal: failed to save function snapshot for segment {}: {}",
                     segment.id(),

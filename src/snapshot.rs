@@ -209,23 +209,16 @@ impl SnapshotRunner {
                                 // transaction.
                                 let name = f.name_str().to_string();
                                 if f.is_unregister() {
-                                    if let Err(e) =
-                                        self.wasm_runtime.unload_function(&name)
-                                    {
-                                        error!(
-                                            "Snapshot: unload_function({}) failed: {}",
-                                            name, e
-                                        );
+                                    if let Err(e) = self.wasm_runtime.unload_function(&name) {
+                                        error!("Snapshot: unload_function({}) failed: {}", name, e);
                                     }
                                 } else {
                                     match self.storage.read_function(&name, f.version) {
                                         Ok(binary) => {
-                                            if let Err(e) = self.wasm_runtime.load_function(
-                                                &name,
-                                                &binary,
-                                                f.version,
-                                                f.crc32c,
-                                            ) {
+                                            if let Err(e) = self
+                                                .wasm_runtime
+                                                .load_function(&name, &binary, f.version, f.crc32c)
+                                            {
                                                 error!(
                                                     "Snapshot: load_function({} v{}) failed: {}",
                                                     name, f.version, e

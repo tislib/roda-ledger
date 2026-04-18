@@ -1,8 +1,6 @@
 use crate::config::StorageConfig;
 use crate::storage::Segment;
-use crate::storage::function_snapshot::{
-    self, FunctionSnapshotData, FunctionSnapshotRecord,
-};
+use crate::storage::function_snapshot::{self, FunctionSnapshotData, FunctionSnapshotRecord};
 use crate::storage::layout::parse_segment_id;
 use spdlog::info;
 use std::path::{Path, PathBuf};
@@ -125,12 +123,7 @@ impl Storage {
     /// Atomically write a WASM binary under the versioned path (write to
     /// a temp file in the same directory, then rename). Returns the
     /// CRC32C of the bytes written.
-    pub fn write_function(
-        &self,
-        name: &str,
-        version: u16,
-        binary: &[u8],
-    ) -> std::io::Result<u32> {
+    pub fn write_function(&self, name: &str, version: u16, binary: &[u8]) -> std::io::Result<u32> {
         // Defensive create — the constructor already made this, but tests
         // that bypass Storage::new rely on it.
         let dir = Path::new(&self.config.data_dir).join("functions");
@@ -180,10 +173,7 @@ impl Storage {
     }
 
     /// Load and validate the function snapshot written at `segment_id`.
-    pub fn load_function_snapshot(
-        &self,
-        segment_id: u32,
-    ) -> std::io::Result<FunctionSnapshotData> {
+    pub fn load_function_snapshot(&self, segment_id: u32) -> std::io::Result<FunctionSnapshotData> {
         function_snapshot::load(Path::new(&self.config.data_dir), segment_id)
     }
 

@@ -147,11 +147,11 @@ impl TxLink {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct FunctionRegistered {
-    pub entry_type: u8,       // 1 @ 0  — WalEntryKind::FunctionRegistered (5)
-    pub _pad0: u8,            // 1 @ 1
-    pub version: u16,         // 2 @ 2  — per-name monotonic, 1..=65535
-    pub crc32c: u32,          // 4 @ 4  — CRC32C of the WASM binary; 0 = unregistered
-    pub name: [u8; 32],       // 32 @ 8 — null-padded UTF-8
+    pub entry_type: u8, // 1 @ 0  — WalEntryKind::FunctionRegistered (5)
+    pub _pad0: u8,      // 1 @ 1
+    pub version: u16,   // 2 @ 2  — per-name monotonic, 1..=65535
+    pub crc32c: u32,    // 4 @ 4  — CRC32C of the WASM binary; 0 = unregistered
+    pub name: [u8; 32], // 32 @ 8 — null-padded UTF-8
 } // total: 40 bytes
 
 impl FunctionRegistered {

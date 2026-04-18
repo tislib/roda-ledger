@@ -7,15 +7,14 @@
 //! restart semantics).
 //!
 //! Test scenarios (per user request):
-//!   1. `wasm_runs_properly`                    — basic register + submit Named.
-//!   2. `wasm_new_version_runs_properly`        — register v1, v2-with-override,
-//!                                                wait 100ms, new version
-//!                                                executes.
-//!   3. `wasm_loaded_after_restart`             — clean restart (Process).
-//!   4. `wasm_loaded_after_crash`               — kill -9 + restart (Process).
-//!   5. `wasm_new_version_loaded_after_restart` — register v1 → checkpoint
-//!                                                → register v2 → restart →
-//!                                                v2 is the one loaded.
+//!
+//! 1. `wasm_runs_properly` — basic register + submit Function.
+//! 2. `wasm_new_version_runs_properly` — register v1, v2-with-override,
+//!    wait 100ms, new version executes.
+//! 3. `wasm_loaded_after_restart` — clean restart (Process).
+//! 4. `wasm_loaded_after_crash` — kill -9 + restart (Process).
+//! 5. `wasm_new_version_loaded_after_restart` — register v1 →
+//!    checkpoint → register v2 → restart → v2 is the one loaded.
 //!
 //! Scenarios are combined where possible: the restart / crash variants
 //! cover both "handler loaded from WAL" (just appended, no seal) and
@@ -67,12 +66,7 @@ fn compile(src: &str) -> Vec<u8> {
 
 /// Submit a Named "deposit" for `(account, amount)` and assert success.
 /// Centralizes the boilerplate every test here needs.
-async fn deposit_via_wasm(
-    ctx: &crate::e2e::E2EContext,
-    account: u64,
-    amount: u64,
-    user_ref: u64,
-) {
+async fn deposit_via_wasm(ctx: &crate::e2e::E2EContext, account: u64, amount: u64, user_ref: u64) {
     let result = ctx
         .submit_function(
             0,

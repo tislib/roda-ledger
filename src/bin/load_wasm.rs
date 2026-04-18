@@ -44,7 +44,10 @@ const DEPOSIT_WAT: &str = r#"
 "#;
 
 #[derive(Parser, Debug)]
-#[command(name = "load_wasm", about = "WASM-overhead load generator for roda-ledger")]
+#[command(
+    name = "load_wasm",
+    about = "WASM-overhead load generator for roda-ledger"
+)]
 struct Args {
     #[arg(short, long, default_value_t = 1_000_000)]
     account_count: u64,

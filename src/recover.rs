@@ -590,15 +590,18 @@ impl<'r> Recover<'r> {
             return Ok(());
         };
 
-        let data = self.storage.load_function_snapshot(segment_id).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to load function snapshot for segment {}: {}",
-                    segment_id, e
-                ),
-            )
-        })?;
+        let data = self
+            .storage
+            .load_function_snapshot(segment_id)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to load function snapshot for segment {}: {}",
+                        segment_id, e
+                    ),
+                )
+            })?;
 
         info!(
             "recover: loaded function snapshot for segment {} with {} records",
@@ -632,7 +635,9 @@ impl<'r> Recover<'r> {
             // the authoritative replay source for its segment range. If we
             // cannot reconstruct a handler it committed, the registry
             // would silently diverge.
-            let binary = self.storage.read_function(name, record.version)
+            let binary = self
+                .storage
+                .read_function(name, record.version)
                 .map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
