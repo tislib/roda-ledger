@@ -16,7 +16,7 @@ This has a concrete implication: if you lose your balances but keep your transac
 
 An **account** is an identifier — a `u64` that represents a participant in the ledger. Accounts are not created explicitly; they come into existence the first time a transaction references them.
 
-A **balance** is the current state of an account, represented as an `i64`. Balances can be positive or negative. By default, roda-ledger protects accounts from going below zero — a transaction that would produce a negative balance is rejected. This protection can be intentionally bypassed in composite operations and, in the future, via WASM-defined logic (for example, to model overdraft accounts or internal system accounts).
+A **balance** is the current state of an account, represented as an `i64`. Balances can be positive or negative. By default, roda-ledger protects accounts from going below zero — a transaction that would produce a negative balance is rejected. This protection can be intentionally bypassed in composite operations or via WASM-defined functions that explicitly check `get_balance` themselves (for example, to model overdraft accounts or internal system accounts).
 
 **Account 0** is the system account. It serves as the source and sink for all money entering or leaving the ledger. Deposits credit a user account and debit account 0. Withdrawals debit a user account and credit account 0. This is not a convention — it is required by the zero-sum invariant described below.
 
@@ -26,12 +26,13 @@ A **balance** is the current state of an account, represented as an `i64`. Balan
 
 These two terms are distinct and the distinction matters.
 
-An **operation** is the client's intent. roda-ledger provides four operation types:
+An **operation** is the client's intent. roda-ledger provides five operation types:
 
 - **Deposit** — credits a user account, debiting account 0 as the source
 - **Withdrawal** — debits a user account, crediting account 0 as the sink
 - **Transfer** — moves an amount from one account to another
-- **Composite** — a caller-defined sequence of `Credit` and `Debit` steps, executed atomically. This is the escape hatch for logic that does not fit the named operation types.
+- **Composite** — a caller-defined sequence of `Credit` and `Debit` steps, executed atomically. The escape hatch for one-off logic that does not fit the named operation types.
+- **Function** — invokes a previously registered WebAssembly module by name, with up to eight `i64` parameters. The module produces credits and debits via host calls and runs atomically as a single transaction. This is the **programmable ledger** entry point: reusable, server-side logic that the caller can extend without recompiling the engine.
 
 Every operation carries a `user_ref` — a caller-supplied value that serves two purposes: an idempotency key to prevent duplicate processing, and a reference stored alongside the transaction for correlation or auditing. Idempotency is described in detail below.
 
@@ -47,7 +48,7 @@ The client thinks in operations. The ledger thinks in transactions. The Transact
 
 ## Atomicity
 
-A transaction is the atomicity boundary for failure. All steps within a single transaction either all succeed or all fail — if any condition fails at any point during execution (a balance check, a custom rule, or the zero-sum invariant), the entire transaction is rolled back, no balance is updated, and the caller is notified. The **Transactor** — the single deterministic writer at the heart of roda-ledger — enforces this.
+A transaction is the atomicity boundary for failure. All steps within a single transaction either all succeed or all fail — if any condition fails at any point during execution (a balance check, a custom rule, or the zero-sum invariant), the entire transaction is rolled back, no balance is updated, and the caller is notified. The **Transactor** — the single deterministic writer at the heart of roda-ledger — enforces this for every operation type, including registered WebAssembly functions: a function that traps, returns a non-zero status, or emits an unbalanced credit/debit set is rolled back exactly the same way a failed `Transfer` is.
 
 **No torn writes.** Each individual internal credit or debit is a single atomic store. A concurrent reader will never observe a partially-written balance for any single account. Every balance a reader sees is always a complete, valid value.
 
@@ -137,7 +138,7 @@ roda-ledger is designed around two dimensions of flexibility that set it apart f
 
 **Composite operations.** Beyond the built-in `Deposit`, `Withdrawal`, and `Transfer` operation types, the caller can express arbitrary multi-account logic through `Composite` operations — a caller-defined sequence of `Credit` and `Debit` steps executed atomically as a single transaction. This covers any financial logic that does not fit the named types: split payments, fee deductions, multi-leg settlements, or domain-specific balance rules. The ledger engine handles ordering, durability, and atomicity — the caller defines the steps.
 
-**WASM-sandboxed operations (near future).** The `Named` operation type is the extension point for pre-registered WASM modules. The caller uploads compiled logic, registers it under a name, and invokes it by name with parameters. The WASM module executes within a sandboxed API surface — it can credit and debit accounts but cannot escape the ledger's invariants. This brings programmable logic to the ledger without recompiling or redeploying it.
+**Programmable ledger via WebAssembly.** The `Function` operation type is the extension point for pre-registered WebAssembly modules. The caller uploads a compiled module, registers it under a name (a durable operation in its own right — see below), and from then on invokes it by name with up to eight `i64` parameters. The runtime exposes only three host calls — `credit`, `debit`, `get_balance` — so the module can move value and inspect balances but cannot break out of the ledger's invariants. This is what makes the ledger *programmable*: new transaction types can be added at runtime, without recompiling or redeploying the engine, while keeping the same correctness, durability, and audit guarantees as the built-in operations.
 
 **Choose your guarantee level.** The staged pipeline exposes a dial between performance and consistency. The caller chooses how much to wait per submission:
 
@@ -147,6 +148,26 @@ roda-ledger is designed around two dimensions of flexibility that set it apart f
 - `submit_wait(snapshot)` — waits for the balance to be visible. Guarantees linearizable reads via `get_balance`.
 
 The caller makes this choice per submission based on what their use case requires.
+
+---
+
+## Atomic Function Execution
+
+A `Function` operation is, from the ledger's perspective, indistinguishable from any other transaction once committed. From the perspective of the *programmer who wrote the function*, the contract is precise and worth stating explicitly:
+
+**One execution = one transaction.** A single call to the function's exported `execute` symbol corresponds to exactly one transaction. The function may issue any number of `credit` / `debit` calls during that execution; together they form one atomic unit.
+
+**All-or-nothing.** The Transactor accumulates every credit and debit the function emits in an isolated host-side context. Nothing is applied to the live balance cache until the function has fully returned *and* its credits balance its debits. If the function returns a non-zero status, traps, or violates the zero-sum invariant, the entire batch of host calls is discarded and no balance changes — exactly as if a `Composite` operation had failed mid-step.
+
+**No partial visibility.** Because the function runs on the single Transactor thread, intermediate state from a partially-executed function is never visible to readers, other functions, or other transactions. Other transactions see the function's effects all at once, at the same moment they see the `last_tx_id` advance past it.
+
+**Reusable, named, versioned.** Unlike a `Composite` (which the caller assembles fresh on every submission), a `Function` is registered once and invoked many times by name. Every register or override bumps the version by one; the CRC32C of the executing binary is recorded in every transaction it produces, so any past entry can be traced back to the exact code that wrote it.
+
+**Durable registration.** `RegisterFunction` is itself transactional. The call only returns after the binary is on disk, a `FunctionRegistered` record is committed to the WAL, and the handler is loaded into the live runtime. A subsequent `Operation::Function` is therefore guaranteed to see the new version. After a crash, recovery rebuilds the registry from a paired function snapshot plus the `FunctionRegistered` records that follow it — the live runtime always matches what the WAL says it should be.
+
+**Determinism by construction.** The host API does not expose clocks, randomness, file or network I/O, threads, or atomics. Every legal function is a pure mapping from `(params, observed balances) → (status, credits, debits)`. This is what makes the runtime safe for future Raft replication: the leader executes the function, and followers apply the WAL entries it produced without ever re-running the WASM code.
+
+In short, the `Function` operation gives the caller a way to express *new* transaction shapes — fee splits, multi-leg settlements, conditional transfers, accounting templates — that behave as if they had been built into the engine from day one.
 
 ---
 
@@ -162,4 +183,4 @@ Understanding the boundaries is as important as understanding the capabilities.
 
 **What it does have today.** A gRPC interface and a Docker image. roda-ledger is not only an embedded library — it can run as a standalone service.
 
-**Planned additions.** Raft-based multi-node replication, mTLS authentication, and WASM-sandboxed custom logic.x
+**Planned additions.** Raft-based multi-node replication, mTLS authentication, and per-function CPU / memory metering for the WASM runtime.
