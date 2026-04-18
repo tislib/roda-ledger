@@ -308,7 +308,7 @@ let status = ledger.get_transaction_status(tx_id);
 | `1` | `INSUFFICIENT_FUNDS` | Account balance too low for the requested operation |
 | `2` | `ACCOUNT_NOT_FOUND` | Referenced account does not exist |
 | `3` | `ZERO_SUM_VIOLATION` | Credits and debits in the transaction do not net to zero |
-| `4` | `ENTRY_LIMIT_EXCEEDED` | Reserved (retained for wire compatibility) |
+| `4` | `ENTRY_LIMIT_EXCEEDED` | Transaction emitted more than 255 entries (per-transaction limit) |
 | `5` | `INVALID_OPERATION` | Operation is malformed or contains invalid parameters |
 | `6` | `ACCOUNT_LIMIT_EXCEEDED` | Account ID exceeds `max_accounts` configuration |
 | `7` | `DUPLICATE` | `user_ref` was seen within the dedup window — linked to the original transaction |

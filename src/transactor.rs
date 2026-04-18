@@ -593,8 +593,19 @@ impl TransactorRunner {
                             // imports read TransactorState (including
                             // its tx_id) on every credit/debit.
                             let status = caller.execute(params);
+                            let mut s = self.state.borrow_mut();
                             if status != 0 {
-                                self.state.borrow_mut().fail(FailReason::from_u8(status));
+                                s.fail(FailReason::from_u8(status));
+                            } else {
+                                // TxMetadata.entry_count is u8 — a WASM
+                                // function can call credit/debit more
+                                // than 255 times. Reject those here so
+                                // the meta's entry_count can losslessly
+                                // encode the real count downstream.
+                                let entry_count = s.entries.len() - s.position - 1;
+                                if entry_count > u8::MAX as usize {
+                                    s.fail(FailReason::ENTRY_LIMIT_EXCEEDED);
+                                }
                             }
                         }
                     }

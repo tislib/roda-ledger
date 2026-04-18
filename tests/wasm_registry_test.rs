@@ -43,6 +43,27 @@ const REJECT_WAT: &str = r#"
         i32.const 47))
 "#;
 
+/// Parametrized loop: calls `credit(param0, param1)` + `debit(param2, param1)`
+/// `param3` times, producing `2 * param3` entries. Used to exercise the
+/// post-WASM `ENTRY_LIMIT_EXCEEDED` check (entry_count is u8, so >255 rejects).
+const LOOP_TRANSFER_WAT: &str = r#"
+    (module
+      (import "ledger" "credit" (func $credit (param i64 i64)))
+      (import "ledger" "debit"  (func $debit  (param i64 i64)))
+      (func (export "execute")
+        (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
+        (local $i i64)
+        (local.set $i (i64.const 0))
+        (block $done
+          (loop $loop
+            (br_if $done (i64.ge_u (local.get $i) (local.get 3)))
+            local.get 0 local.get 1 call $credit
+            local.get 2 local.get 1 call $debit
+            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+            br $loop))
+        i32.const 0))
+"#;
+
 /// No imports, trivial `execute` → returns 0. Used for registry-only tests
 /// where we don't care about execution.
 const NOOP_WAT: &str = r#"
@@ -274,6 +295,61 @@ fn named_rolls_back_on_nonzero_status() {
     assert_eq!(result.fail_reason.as_u8(), 47);
     assert_eq!(ledger.get_balance(1), 0);
     assert_eq!(ledger.get_balance(2), 0);
+}
+
+#[test]
+fn named_exceeding_entry_limit_rejects_and_rolls_back() {
+    // TxMetadata.entry_count is a u8, so a successful WASM execution that
+    // emits more than 255 credit/debit records cannot be encoded losslessly.
+    // The transactor must detect this after `execute` returns and fail the
+    // tx with `ENTRY_LIMIT_EXCEEDED` (= 4), triggering the standard rollback
+    // path so neither account retains any of the interim balance changes.
+    let ledger = start_ledger();
+    ledger
+        .register_function("loop_transfer", &compile(LOOP_TRANSFER_WAT), false)
+        .expect("register");
+
+    // 200 iterations → 400 entries, well past the 255 cap.
+    let over = ledger.submit_and_wait(
+        Operation::Function {
+            name: "loop_transfer".into(),
+            params: [1, 10, 2, 200, 0, 0, 0, 0],
+            user_ref: 1,
+        },
+        WaitLevel::Committed,
+    );
+    assert!(
+        over.fail_reason.is_failure(),
+        "tx should be rejected: {:?}",
+        over.fail_reason
+    );
+    assert_eq!(
+        over.fail_reason.as_u8(),
+        4,
+        "expected ENTRY_LIMIT_EXCEEDED (4), got {}",
+        over.fail_reason.as_u8()
+    );
+    // Rollback restored both accounts to zero.
+    assert_eq!(ledger.get_balance(1), 0, "credit side must roll back");
+    assert_eq!(ledger.get_balance(2), 0, "debit side must roll back");
+
+    // Sanity: a run that stays under the limit on the same handler still
+    // commits — proves the check fires on size only, not on the loop shape.
+    let ok = ledger.submit_and_wait(
+        Operation::Function {
+            name: "loop_transfer".into(),
+            params: [1, 10, 2, 100, 0, 0, 0, 0],
+            user_ref: 2,
+        },
+        WaitLevel::OnSnapshot,
+    );
+    assert!(
+        ok.fail_reason.is_success(),
+        "200 entries must commit: {:?}",
+        ok.fail_reason
+    );
+    assert_eq!(ledger.get_balance(1), -1_000);
+    assert_eq!(ledger.get_balance(2), 1_000);
 }
 
 #[test]
