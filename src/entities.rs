@@ -8,6 +8,7 @@ pub enum WalEntryKind {
     SegmentHeader = 2,
     SegmentSealed = 3,
     Link = 4,
+    FunctionRegistered = 5,
 }
 
 #[repr(u8)]
@@ -134,6 +135,57 @@ impl TxLink {
     }
 }
 
+/// WASM function-registry WAL record. Written directly to the active
+/// segment by the Ledger (not by the Transactor) whenever a function is
+/// registered or unregistered. Exactly 40 bytes so it packs into the
+/// same fixed-width record stream as every other `WalEntry`.
+///
+/// - `crc32c == 0` means the function is unregistered (dual-signal with
+///   the 0-byte file on disk; WAL is source of truth on conflict).
+/// - `name` is ASCII snake_case, null-padded. Max 32 bytes.
+/// - `version` is a per-name monotonic counter starting at 1.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct FunctionRegistered {
+    pub entry_type: u8, // 1 @ 0  — WalEntryKind::FunctionRegistered (5)
+    pub _pad0: u8,      // 1 @ 1
+    pub version: u16,   // 2 @ 2  — per-name monotonic, 1..=65535
+    pub crc32c: u32,    // 4 @ 4  — CRC32C of the WASM binary; 0 = unregistered
+    pub name: [u8; 32], // 32 @ 8 — null-padded UTF-8
+} // total: 40 bytes
+
+impl FunctionRegistered {
+    /// Build a record from logical fields. Panics in debug if `name` is
+    /// longer than 32 bytes — the Ledger runs `validate_name` (≤ 32 bytes)
+    /// before ever reaching this constructor.
+    pub fn new(name: &str, version: u16, crc32c: u32) -> Self {
+        let mut name_buf = [0u8; 32];
+        let bytes = name.as_bytes();
+        debug_assert!(bytes.len() <= 32, "function name exceeds 32 bytes");
+        let copy_len = bytes.len().min(32);
+        name_buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        Self {
+            entry_type: WalEntryKind::FunctionRegistered as u8,
+            _pad0: 0,
+            version,
+            crc32c,
+            name: name_buf,
+        }
+    }
+
+    /// Borrow the snake-case name with trailing nulls trimmed.
+    pub fn name_str(&self) -> &str {
+        let end = self.name.iter().position(|b| *b == 0).unwrap_or(32);
+        std::str::from_utf8(&self.name[..end]).unwrap_or("")
+    }
+
+    /// True iff this record represents an *unregister* action.
+    #[inline]
+    pub fn is_unregister(&self) -> bool {
+        self.crc32c == 0
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalEntry {
     Metadata(TxMetadata),
@@ -141,6 +193,7 @@ pub enum WalEntry {
     SegmentHeader(SegmentHeader),
     SegmentSealed(SegmentSealed),
     Link(TxLink),
+    FunctionRegistered(FunctionRegistered),
 }
 
 impl WalEntry {
@@ -151,6 +204,7 @@ impl WalEntry {
             WalEntry::SegmentHeader(_) => WalEntryKind::SegmentHeader,
             WalEntry::SegmentSealed(_) => WalEntryKind::SegmentSealed,
             WalEntry::Link(_) => WalEntryKind::Link,
+            WalEntry::FunctionRegistered(_) => WalEntryKind::FunctionRegistered,
         }
     }
 
@@ -161,6 +215,10 @@ impl WalEntry {
             WalEntry::Link(e) => e.tx_id,
             WalEntry::SegmentHeader(_) => 0,
             WalEntry::SegmentSealed(_) => 0,
+            // FunctionRegistered carries no tx_id; it is not a financial
+            // transaction and the Pipeline's commit/snapshot indexes never
+            // advance from it.
+            WalEntry::FunctionRegistered(_) => 0,
         }
     }
 }
@@ -179,3 +237,4 @@ const _: () = assert!(std::mem::size_of::<TxEntry>() == 40);
 const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SegmentSealed>() == 40);
 const _: () = assert!(std::mem::size_of::<TxLink>() == 40);
+const _: () = assert!(std::mem::size_of::<FunctionRegistered>() == 40);

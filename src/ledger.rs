@@ -10,7 +10,10 @@ use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
+pub use crate::wasm_runtime::FunctionInfo;
+use crate::wasm_runtime::{WasmRegistry, WasmRuntime};
 use spdlog::{LevelFilter, info};
+use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -23,6 +26,9 @@ pub struct Ledger {
     seal: Seal,
     storage: Arc<Storage>,
     pipeline: Arc<Pipeline>,
+    wasm_runtime: Arc<WasmRuntime>,
+    /// Thin facade over the full register / unregister / list lifecycle.
+    wasm_registry: WasmRegistry,
     handles: Vec<JoinHandle<()>>,
     #[allow(dead_code)]
     config: LedgerConfig,
@@ -38,9 +44,16 @@ impl Ledger {
         let storage = Arc::new(storage);
 
         let pipeline = Pipeline::new(&config);
-        let snapshot = Snapshot::new(&config);
+        let wasm_runtime = Arc::new(WasmRuntime::new());
+        let snapshot = Snapshot::new(&config, wasm_runtime.clone(), storage.clone());
         let seal = Seal::new(&config, storage.clone());
-        let transactor = Transactor::new(&config);
+        let transactor = Transactor::new(&config, wasm_runtime.clone());
+        let wasm_registry = WasmRegistry::new(
+            wasm_runtime.clone(),
+            storage.clone(),
+            pipeline.ledger_context(),
+            config.wait_strategy,
+        );
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
@@ -50,6 +63,8 @@ impl Ledger {
             seal,
             storage,
             pipeline,
+            wasm_runtime,
+            wasm_registry,
             handles: Vec::new(),
             config,
         }
@@ -61,6 +76,23 @@ impl Ledger {
 
     pub fn submit_batch(&self, operations: Vec<Operation>) -> u64 {
         self.sequencer.submit_batch(operations)
+    }
+
+    pub fn register_function(
+        &self,
+        name: &str,
+        binary: &[u8],
+        override_existing: bool,
+    ) -> io::Result<(u16, u32)> {
+        self.wasm_registry.register(name, binary, override_existing)
+    }
+
+    pub fn unregister_function(&self, name: &str) -> io::Result<u16> {
+        self.wasm_registry.unregister(name)
+    }
+
+    pub fn list_functions(&self) -> Vec<FunctionInfo> {
+        self.wasm_registry.list()
     }
 
     pub fn get_balance(&self, account_id: u64) -> Balance {
@@ -315,6 +347,7 @@ impl Ledger {
             &mut self.seal,
             &self.pipeline,
             &self.storage,
+            &self.wasm_runtime,
         );
 
         recover.recover().map_err(|e| {

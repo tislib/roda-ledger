@@ -1,10 +1,13 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::config::LedgerConfig;
+use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use roda_ledger::ledger::WaitStrategy;
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::snapshot::{Snapshot, SnapshotMessage};
+use roda_ledger::storage::Storage;
+use roda_ledger::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn make_snapshot_messages(tx_id: u64, account_id: u64, amount: u64) -> [SnapshotMessage; 2] {
@@ -45,7 +48,20 @@ fn snapshot_bench(c: &mut Criterion) {
     };
     let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
 
-    let mut snapshot = Snapshot::new(&config);
+    // The Snapshot stage needs an Arc<WasmRuntime> + Arc<Storage> to
+    // load/unload WASM handlers on FunctionRegistered commits. This
+    // bench never emits such records; a fresh storage in a tempdir and
+    // an empty WasmRuntime suffice.
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let storage_cfg = StorageConfig {
+        data_dir: tmp_dir.path().to_string_lossy().into_owned(),
+        temporary: true,
+        ..StorageConfig::default()
+    };
+    let storage = Arc::new(Storage::new(storage_cfg).unwrap());
+    let wasm_runtime = Arc::new(WasmRuntime::new());
+
+    let mut snapshot = Snapshot::new(&config, wasm_runtime, storage);
     let handle = snapshot.start(pipeline.snapshot_context()).unwrap();
 
     let snapshot_ctx = pipeline.snapshot_context();

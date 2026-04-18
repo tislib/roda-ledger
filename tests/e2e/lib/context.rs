@@ -8,7 +8,7 @@ use crate::e2e::lib::backend::E2EBackend;
 use crate::e2e::lib::backend_inline::InlineNode;
 use crate::e2e::lib::backend_process::ProcessNode;
 use crate::e2e::lib::profile::Profile;
-use roda_ledger::client::LedgerClient;
+use roda_ledger::client::{FunctionInfo, LedgerClient, SubmitResult};
 use roda_ledger::grpc::proto::WaitLevel;
 use std::net::SocketAddr;
 use tokio::time::{Duration, sleep};
@@ -363,6 +363,58 @@ impl E2EContext {
             .await
             .expect("get_pipeline_index RPC failed");
         (idx.compute, idx.commit, idx.snapshot)
+    }
+
+    // -- WASM function registry --------------------------------------------
+
+    /// Register a WASM function on `node`. Blocks server-side until the
+    /// handler is installed. Returns `(version, crc32c)`.
+    pub async fn register_function(
+        &self,
+        node: usize,
+        name: &str,
+        binary: &[u8],
+        override_existing: bool,
+    ) -> (u16, u32) {
+        self.client(node)
+            .register_function(name, binary, override_existing)
+            .await
+            .expect("register_function RPC failed")
+    }
+
+    /// Unregister a WASM function on `node`. Blocks server-side until the
+    /// handler is gone. Returns the unregister version.
+    pub async fn unregister_function(&self, node: usize, name: &str) -> u16 {
+        self.client(node)
+            .unregister_function(name)
+            .await
+            .expect("unregister_function RPC failed")
+    }
+
+    /// List every currently-loaded function on `node`.
+    pub async fn list_functions(&self, node: usize) -> Vec<FunctionInfo> {
+        self.client(node)
+            .list_functions()
+            .await
+            .expect("list_functions RPC failed")
+    }
+
+    /// Submit `Operation::Function { name, params, user_ref }` and wait
+    /// until the given pipeline level. Returns the full `SubmitResult`
+    /// so tests can inspect the `fail_reason`.
+    pub async fn submit_function(
+        &self,
+        node: usize,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        wait_level: i32,
+    ) -> SubmitResult {
+        let wl = wait_level_from_i32(wait_level);
+        self.client(node)
+            .submit_function_and_wait(name, params, user_ref, wl)
+            .await
+            .expect("submit_function_and_wait RPC failed")
     }
 
     // -- Runtime intervention -----------------------------------------------

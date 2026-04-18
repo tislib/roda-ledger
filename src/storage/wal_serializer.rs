@@ -1,5 +1,6 @@
 use crate::entities::{
-    SegmentHeader, SegmentSealed, TxEntry, TxLink, TxMetadata, WalEntry, WalEntryKind,
+    FunctionRegistered, SegmentHeader, SegmentSealed, TxEntry, TxLink, TxMetadata, WalEntry,
+    WalEntryKind,
 };
 
 pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
@@ -9,6 +10,7 @@ pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
         WalEntry::SegmentHeader(h) => bytemuck::bytes_of(h),
         WalEntry::SegmentSealed(s) => bytemuck::bytes_of(s),
         WalEntry::Link(l) => bytemuck::bytes_of(l),
+        WalEntry::FunctionRegistered(f) => bytemuck::bytes_of(f),
     }
 }
 
@@ -43,6 +45,10 @@ pub fn parse_wal_record(data: &[u8]) -> Result<WalEntry, std::io::Error> {
         k if k == WalEntryKind::Link as u8 => {
             let link: TxLink = bytemuck::pod_read_unaligned(record_data);
             Ok(WalEntry::Link(link))
+        }
+        k if k == WalEntryKind::FunctionRegistered as u8 => {
+            let func_reg: FunctionRegistered = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::FunctionRegistered(func_reg))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -202,6 +208,39 @@ mod tests {
         buf.extend_from_slice(&[0xFF; 20]); // trailing garbage
         let parsed = parse_wal_record(&buf).expect("should parse with extra bytes");
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_function_registered_round_trip() {
+        let reg = FunctionRegistered::new("fee_calc", 3, 0xDEAD_BEEF);
+        let original = WalEntry::FunctionRegistered(reg);
+        let buf = serialize_wal_records(&original);
+        assert_eq!(buf.len(), 40);
+        assert_eq!(buf[0], WalEntryKind::FunctionRegistered as u8);
+        let parsed = parse_wal_record(buf).expect("parse");
+        assert_eq!(parsed, original);
+        if let WalEntry::FunctionRegistered(f) = parsed {
+            assert_eq!(f.name_str(), "fee_calc");
+            assert_eq!(f.version, 3);
+            assert_eq!(f.crc32c, 0xDEAD_BEEF);
+            assert!(!f.is_unregister());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn function_registered_unregister_carries_zero_crc() {
+        let reg = FunctionRegistered::new("fee_calc", 4, 0);
+        assert!(reg.is_unregister());
+        let entry = WalEntry::FunctionRegistered(reg);
+        let buf = serialize_wal_records(&entry);
+        let parsed = parse_wal_record(buf).expect("parse");
+        if let WalEntry::FunctionRegistered(f) = parsed {
+            assert!(f.is_unregister());
+        } else {
+            panic!("wrong variant");
+        }
     }
 
     #[test]

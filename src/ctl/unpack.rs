@@ -91,7 +91,9 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
                     let _ = writeln!(writer, "{}", wal_entry_to_json(entry));
                 }
             }
-            WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {
+            WalEntry::SegmentHeader(_)
+            | WalEntry::SegmentSealed(_)
+            | WalEntry::FunctionRegistered(_) => {
                 if let Some((prev, idx)) = pending_meta.take() {
                     if let Err(e) = flush_tx(
                         &prev,

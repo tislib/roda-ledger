@@ -306,6 +306,68 @@ impl Ledger for LedgerHandler {
             _ => Err(Status::internal("query failed")),
         }
     }
+
+    // ------- WASM function registry ---------------------------------------
+
+    async fn register_function(
+        &self,
+        request: Request<proto::RegisterFunctionRequest>,
+    ) -> Result<Response<proto::RegisterFunctionResponse>, Status> {
+        let req = request.into_inner();
+        match self
+            .ledger
+            .register_function(&req.name, &req.binary, req.override_existing)
+        {
+            Ok((version, crc32c)) => Ok(Response::new(proto::RegisterFunctionResponse {
+                version: version as u32,
+                crc32c,
+            })),
+            Err(e) => Err(map_registry_err(e)),
+        }
+    }
+
+    async fn unregister_function(
+        &self,
+        request: Request<proto::UnregisterFunctionRequest>,
+    ) -> Result<Response<proto::UnregisterFunctionResponse>, Status> {
+        let req = request.into_inner();
+        match self.ledger.unregister_function(&req.name) {
+            Ok(version) => Ok(Response::new(proto::UnregisterFunctionResponse {
+                version: version as u32,
+            })),
+            Err(e) => Err(map_registry_err(e)),
+        }
+    }
+
+    async fn list_functions(
+        &self,
+        _request: Request<proto::ListFunctionsRequest>,
+    ) -> Result<Response<proto::ListFunctionsResponse>, Status> {
+        let functions = self
+            .ledger
+            .list_functions()
+            .into_iter()
+            .map(|info| proto::FunctionInfo {
+                name: info.name,
+                version: info.version as u32,
+                crc32c: info.crc32c,
+            })
+            .collect();
+        Ok(Response::new(proto::ListFunctionsResponse { functions }))
+    }
+}
+
+/// Map `register_function` / `unregister_function` [`std::io::Error`] kinds
+/// to a canonical `tonic::Status`. Keeps the handler branches uniform.
+fn map_registry_err(e: std::io::Error) -> Status {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::AlreadyExists => Status::already_exists(e.to_string()),
+        ErrorKind::NotFound => Status::not_found(e.to_string()),
+        ErrorKind::InvalidInput => Status::invalid_argument(e.to_string()),
+        ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
 }
 
 impl LedgerHandler {

@@ -209,6 +209,10 @@ impl WalRunner {
                 self.pending_records = self.pending_records.saturating_sub(1);
             }
             WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
+            // FunctionRegistered is a standalone (non-transactional) WAL
+            // record. It carries no tx_id and does not participate in the
+            // entry-count book-keeping.
+            WalEntry::FunctionRegistered(_) => {}
         }
         self.pending_records == 0
     }

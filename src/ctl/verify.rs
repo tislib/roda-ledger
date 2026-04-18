@@ -226,6 +226,9 @@ fn verify_segment(storage: &crate::storage::Storage, segment_id: u32) -> Segment
                 }
                 last_tx_id = s.last_tx_id;
             }
+            // Function-registry events are validated independently: the
+            // CRC32C is embedded in the record, no cross-record invariants.
+            WalEntry::FunctionRegistered(_) => {}
         }
     });
 

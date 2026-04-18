@@ -8,7 +8,7 @@ echo "Running rustfmt..."
 cargo fmt --all --check
 
 echo "Running clippy..."
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "Running tests..."
 cargo test --workspace --lib --bins --tests --examples --all-features --release

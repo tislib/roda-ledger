@@ -151,7 +151,7 @@ let tx_id = ledger.submit(Operation::Transfer {
 
 **Transfer** — moves funds between two accounts atomically. Fails with `INSUFFICIENT_FUNDS` if the source account balance is insufficient. If `from == to`, the operation succeeds immediately as a no-op.
 
-**Composite** — a caller-defined sequence of `Credit` and `Debit` steps executed as a single atomic transaction. The zero-sum invariant is always enforced. See [Composite Operations](#composite-operations) below.
+**Function** — invokes a registered WASM function by name with up to 8 `i64` parameters. See [WASM Runtime](./wasm-runtime.md) for the full guide on writing, registering, versioning, and invoking functions.
 
 ### The `user_ref` Field
 
@@ -162,50 +162,11 @@ Every operation carries a `user_ref` — a `uint64` supplied by the caller. It s
 
 ---
 
-## Composite Operations
+## Custom Operations (WASM Function)
 
-Composite operations let you express arbitrary multi-account logic as an atomic sequence of `Credit` and `Debit` steps.
+Arbitrary multi-account, multi-step atomic logic is expressed as a registered WASM function and invoked via `Operation::Function`. The function can call the `ledger.credit` / `ledger.debit` / `ledger.get_balance` host imports; the zero-sum invariant is enforced after it returns, identically to built-in operations.
 
-**gRPC:**
-
-```bash
-# Fee deduction: debit sender, credit receiver and fee account
-grpcurl -plaintext -d '{
-  "composite": {
-    "steps": [
-      {"credit": {"account_id": "1", "amount": "1050"}},
-      {"debit":  {"account_id": "2", "amount": "1000"}},
-      {"debit":  {"account_id": "99", "amount": "50"}}
-    ],
-    "flags": 1,
-    "user_ref": "45"
-  }
-}' localhost:50051 roda.ledger.v1.Ledger/SubmitOperation
-```
-
-**Rust library:**
-
-```rust
-use roda_ledger::transaction::{Operation, CompositeOperation, Step};
-
-let tx_id = ledger.submit(Operation::Composite(Box::new(CompositeOperation {
-    steps: smallvec![
-        Step::Credit { account_id: 1, amount: 1050 },
-        Step::Debit  { account_id: 2, amount: 1000 },
-        Step::Debit  { account_id: 99, amount: 50  },
-    ],
-    flags: CompositeOperationFlags::CHECK_NEGATIVE_BALANCE,
-    user_ref: 45,
-})));
-```
-
-**Flags:**
-
-| Flag | Value | Effect |
-|---|---|---|
-| `CHECK_NEGATIVE_BALANCE` | `0x01` | Reject if any touched account would go negative. Without this flag, negative balances are permitted — useful for liability accounts or account 0. |
-
-Maximum 255 steps per Composite operation. The zero-sum invariant is always enforced regardless of flags — sum of credits must equal sum of debits.
+See the **[WASM Runtime guide](./wasm-runtime.md)** for the full story: writing functions in Rust / AssemblyScript / WAT, registering them over gRPC or the Rust library, versioning, recovery, and performance numbers.
 
 ---
 
@@ -347,7 +308,7 @@ let status = ledger.get_transaction_status(tx_id);
 | `1` | `INSUFFICIENT_FUNDS` | Account balance too low for the requested operation |
 | `2` | `ACCOUNT_NOT_FOUND` | Referenced account does not exist |
 | `3` | `ZERO_SUM_VIOLATION` | Credits and debits in the transaction do not net to zero |
-| `4` | `ENTRY_LIMIT_EXCEEDED` | Composite operation exceeds the 255 step limit |
+| `4` | `ENTRY_LIMIT_EXCEEDED` | Transaction emitted more than 255 entries (per-transaction limit) |
 | `5` | `INVALID_OPERATION` | Operation is malformed or contains invalid parameters |
 | `6` | `ACCOUNT_LIMIT_EXCEEDED` | Account ID exceeds `max_accounts` configuration |
 | `7` | `DUPLICATE` | `user_ref` was seen within the dedup window — linked to the original transaction |

@@ -33,6 +33,12 @@ tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 rustc-hash = "2"
+wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
+# `wat` is available to library consumers (tests, benches, binaries like
+# `load_wasm`) so they can embed WAT source for registration without
+# shelling out to an external assembler. It is pulled in transitively by
+# wasmtime anyway.
+wat = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -52,6 +58,10 @@ harness = false
 
 [[bench]]
 name = "transaction_runner_bench"
+harness = false
+
+[[bench]]
+name = "transaction_runner_bench_wasm"
 harness = false
 
 [[bench]]
@@ -78,6 +88,10 @@ path = "src/bin/roda_ctl.rs"
 [[bin]]
 name = "load"
 path = "src/bin/load.rs"
+
+[[bin]]
+name = "load_wasm"
+path = "src/bin/load_wasm.rs"
 
 [[bin]]
 name = "load_grpc"

@@ -1,8 +1,6 @@
 use crate::entities::FailReason;
 use crate::grpc::proto;
-use crate::transaction::{
-    CompositeOperation, CompositeOperationFlags, Operation, Step, TransactionStatus, WaitLevel,
-};
+use crate::transaction::{Operation, TransactionStatus, WaitLevel};
 
 impl From<proto::Deposit> for Operation {
     fn from(d: proto::Deposit) -> Self {
@@ -35,37 +33,19 @@ impl From<proto::Transfer> for Operation {
     }
 }
 
-impl From<proto::Composite> for Operation {
-    fn from(c: proto::Composite) -> Self {
-        let steps = c
-            .steps
-            .into_iter()
-            .filter_map(|s| s.kind)
-            .map(|k| match k {
-                proto::step::Kind::Credit(c) => Step::Credit {
-                    account_id: c.account_id,
-                    amount: c.amount,
-                },
-                proto::step::Kind::Debit(d) => Step::Debit {
-                    account_id: d.account_id,
-                    amount: d.amount,
-                },
-            })
-            .collect();
-
-        Operation::Composite(Box::new(CompositeOperation {
-            steps,
-            flags: CompositeOperationFlags::from_bits_retain(c.flags),
-            user_ref: c.user_ref,
-        }))
-    }
-}
-
-impl From<proto::Named> for Operation {
-    fn from(n: proto::Named) -> Self {
-        Operation::Named {
+impl From<proto::Function> for Operation {
+    fn from(n: proto::Function) -> Self {
+        // `Operation::Function::params` is a fixed-arity `[i64; 8]`.
+        // Proto3 has no fixed-length array type, so the wire form stays
+        // `repeated int64` and we coerce here: slots beyond 8 are
+        // dropped, missing slots are zero-padded.
+        let mut params = [0i64; 8];
+        for (i, p) in n.params.into_iter().take(8).enumerate() {
+            params[i] = p;
+        }
+        Operation::Function {
             name: n.name,
-            params: n.params,
+            params,
             user_ref: n.user_ref,
         }
     }
@@ -79,8 +59,7 @@ impl TryFrom<proto::SubmitOperationRequest> for Operation {
             Some(proto::submit_operation_request::Operation::Deposit(d)) => Ok(d.into()),
             Some(proto::submit_operation_request::Operation::Withdrawal(w)) => Ok(w.into()),
             Some(proto::submit_operation_request::Operation::Transfer(t)) => Ok(t.into()),
-            Some(proto::submit_operation_request::Operation::Composite(c)) => Ok(c.into()),
-            Some(proto::submit_operation_request::Operation::Named(n)) => Ok(n.into()),
+            Some(proto::submit_operation_request::Operation::Function(n)) => Ok(n.into()),
             None => Err(tonic::Status::invalid_argument("missing operation")),
         }
     }
@@ -94,8 +73,7 @@ impl TryFrom<proto::SubmitAndWaitRequest> for Operation {
             Some(proto::submit_and_wait_request::Operation::Deposit(d)) => Ok(d.into()),
             Some(proto::submit_and_wait_request::Operation::Withdrawal(w)) => Ok(w.into()),
             Some(proto::submit_and_wait_request::Operation::Transfer(t)) => Ok(t.into()),
-            Some(proto::submit_and_wait_request::Operation::Composite(c)) => Ok(c.into()),
-            Some(proto::submit_and_wait_request::Operation::Named(n)) => Ok(n.into()),
+            Some(proto::submit_and_wait_request::Operation::Function(n)) => Ok(n.into()),
             None => Err(tonic::Status::invalid_argument("missing operation")),
         }
     }

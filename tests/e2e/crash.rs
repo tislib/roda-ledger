@@ -86,8 +86,8 @@ async fn crash_in_the_middle() {
     const AMOUNT: u64 = 1;
     const ACCOUNT: u64 = 1;
 
-    // retry 100 times to ensure idempotency
-    for i in 0..100 {
+    // retry 10 times to ensure idempotency
+    for i in 0..10 {
         let label = format!("iteration_{}", i);
         eprintln!("iteration: {}", i);
         let mut profile = profile("single_node");

@@ -3,9 +3,8 @@ mod tests {
     use roda_ledger::grpc::GrpcServer;
     use roda_ledger::grpc::proto::ledger_client::LedgerClient;
     use roda_ledger::grpc::proto::{
-        Composite, CreditStep, DebitStep, Deposit, GetBalanceRequest, GetBalancesRequest,
-        GetPipelineIndexRequest, GetStatusRequest, GetStatusesRequest, Step, SubmitBatchRequest,
-        SubmitOperationRequest, Transfer, Withdrawal, step,
+        Deposit, GetBalanceRequest, GetBalancesRequest, GetPipelineIndexRequest, GetStatusRequest,
+        GetStatusesRequest, SubmitBatchRequest, SubmitOperationRequest, Transfer, Withdrawal,
     };
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use std::net::SocketAddr;
@@ -151,64 +150,6 @@ mod tests {
 
         assert_eq!(ledger.get_balance(1), 600);
         assert_eq!(ledger.get_balance(2), 400);
-    }
-
-    #[tokio::test]
-    async fn test_grpc_submit_operation_composite() {
-        let (ledger, addr) = setup_grpc_server().await;
-        let mut client = LedgerClient::connect(format!("http://{}", addr))
-            .await
-            .unwrap();
-
-        // Deposit to account 1
-        client
-            .submit_operation(SubmitOperationRequest {
-                operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
-                        Deposit {
-                            account: 1,
-                            amount: 1000,
-                            user_ref: 1,
-                        },
-                    ),
-                ),
-            })
-            .await
-            .unwrap();
-
-        let request = SubmitOperationRequest {
-            operation: Some(
-                roda_ledger::grpc::proto::submit_operation_request::Operation::Composite(
-                    Composite {
-                        steps: vec![
-                            Step {
-                                kind: Some(step::Kind::Credit(CreditStep {
-                                    account_id: 1,
-                                    amount: 100,
-                                })),
-                            },
-                            Step {
-                                kind: Some(step::Kind::Debit(DebitStep {
-                                    account_id: 2,
-                                    amount: 100,
-                                })),
-                            },
-                        ],
-                        flags: 0,
-                        user_ref: 2,
-                    },
-                ),
-            ),
-        };
-
-        let response = client.submit_operation(request).await.unwrap().into_inner();
-        let tx_id = response.transaction_id;
-
-        // Wait for processing
-        ledger.wait_for_transaction(tx_id);
-
-        assert_eq!(ledger.get_balance(1), 900);
-        assert_eq!(ledger.get_balance(2), 100);
     }
 
     #[tokio::test]
