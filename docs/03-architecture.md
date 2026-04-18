@@ -76,7 +76,7 @@ For each transaction the Transactor: checks deduplication by `user_ref`, execute
 
 The balance cache always reflects the latest state. This is why the write path is always linearizable — the Transactor never makes a decision based on stale data.
 
-For built-in operations (`Deposit`, `Withdrawal`, `Transfer`, `Composite`) the Transactor runs native Rust code. For an `Operation::Function`, the Transactor delegates to the embedded **WASM Runtime** described below. Either path produces the same `TxEntry` records, is bounded by the same zero-sum check, and uses the same rollback machinery — there is no second code path for durability or recovery.
+For built-in operations (`Deposit`, `Withdrawal`, `Transfer`) the Transactor runs native Rust code. For an `Operation::Function`, the Transactor delegates to the embedded **WASM Runtime** described below. Either path produces the same `TxEntry` records, is bounded by the same zero-sum check, and uses the same rollback machinery — there is no second code path for durability or recovery.
 
 ---
 

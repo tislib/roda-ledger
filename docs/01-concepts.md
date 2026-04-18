@@ -16,7 +16,7 @@ This has a concrete implication: if you lose your balances but keep your transac
 
 An **account** is an identifier — a `u64` that represents a participant in the ledger. Accounts are not created explicitly; they come into existence the first time a transaction references them.
 
-A **balance** is the current state of an account, represented as an `i64`. Balances can be positive or negative. By default, roda-ledger protects accounts from going below zero — a transaction that would produce a negative balance is rejected. This protection can be intentionally bypassed in composite operations or via WASM-defined functions that explicitly check `get_balance` themselves (for example, to model overdraft accounts or internal system accounts).
+A **balance** is the current state of an account, represented as an `i64`. Balances can be positive or negative. By default, roda-ledger protects accounts from going below zero — a transaction that would produce a negative balance is rejected. This protection can be intentionally bypassed via WASM-defined functions that explicitly check `get_balance` themselves (for example, to model overdraft accounts or internal system accounts).
 
 **Account 0** is the system account. It serves as the source and sink for all money entering or leaving the ledger. Deposits credit a user account and debit account 0. Withdrawals debit a user account and credit account 0. This is not a convention — it is required by the zero-sum invariant described below.
 
@@ -26,13 +26,12 @@ A **balance** is the current state of an account, represented as an `i64`. Balan
 
 These two terms are distinct and the distinction matters.
 
-An **operation** is the client's intent. roda-ledger provides five operation types:
+An **operation** is the client's intent. roda-ledger provides four operation types:
 
 - **Deposit** — credits a user account, debiting account 0 as the source
 - **Withdrawal** — debits a user account, crediting account 0 as the sink
 - **Transfer** — moves an amount from one account to another
-- **Composite** — a caller-defined sequence of `Credit` and `Debit` steps, executed atomically. The escape hatch for one-off logic that does not fit the named operation types.
-- **Function** — invokes a previously registered WebAssembly module by name, with up to eight `i64` parameters. The module produces credits and debits via host calls and runs atomically as a single transaction. This is the **programmable ledger** entry point: reusable, server-side logic that the caller can extend without recompiling the engine.
+- **Function** — invokes a previously registered WebAssembly module by name, with up to eight `i64` parameters. The module produces credits and debits via host calls and runs atomically as a single transaction. This is the **programmable ledger** entry point and the only extension surface: any multi-account, multi-step logic that does not fit the named types is expressed as a registered function.
 
 Every operation carries a `user_ref` — a caller-supplied value that serves two purposes: an idempotency key to prevent duplicate processing, and a reference stored alongside the transaction for correlation or auditing. Idempotency is described in detail below.
 
@@ -40,7 +39,7 @@ The client submits operations. It never writes transactions directly.
 
 A **transaction** is the ledger's immutable record of what happened. When an operation is accepted and executed, roda-ledger creates a transaction — a permanent, ordered fact in the log. Transactions are never modified, never deleted, and never reordered. The caller can query a transaction directly to check its status or inspect its details.
 
-When querying a transaction, the caller sees **entries** — the individual credits and debits the Transactor produced from the original operation — not the operation itself. A `Transfer` becomes two entries: a debit on the sender and a credit on the receiver. A `Composite` becomes one entry per step. The operation is the intent; the entries are the facts.
+When querying a transaction, the caller sees **entries** — the individual credits and debits the Transactor produced from the original operation — not the operation itself. A `Transfer` becomes two entries: a debit on the sender and a credit on the receiver. A `Function` becomes one entry per `credit` / `debit` host call it issued. The operation is the intent; the entries are the facts.
 
 The client thinks in operations. The ledger thinks in transactions. The Transactor translates between the two.
 
@@ -52,7 +51,7 @@ A transaction is the atomicity boundary for failure. All steps within a single t
 
 **No torn writes.** Each individual internal credit or debit is a single atomic store. A concurrent reader will never observe a partially-written balance for any single account. Every balance a reader sees is always a complete, valid value.
 
-**Intermediate state is visible across accounts.** In a Composite operation, the Transactor applies each step in sequence. A concurrent reader can observe some of these stores before others have landed — for example, seeing a Credit applied to one account before the corresponding Debit on another has landed. This is by design. The `last_tx_id` returned by `get_balance` is the signal that a transaction is fully settled: it is only updated after all steps in the transaction are complete. If a caller needs to know that a specific transaction is fully reflected across all accounts, they should wait for `last_tx_id` to advance past their transaction ID, or use `submit_wait(snapshot)` for a linearizable read.
+**Intermediate state is visible across accounts.** Within a multi-step operation — a `Transfer`, or a `Function` issuing several `credit` / `debit` host calls — the Transactor applies each step in sequence. A concurrent reader can observe some of these stores before others have landed — for example, seeing a Credit applied to one account before the corresponding Debit on another has landed. This is by design. The `last_tx_id` returned by `get_balance` is the signal that a transaction is fully settled: it is only updated after all steps in the transaction are complete. If a caller needs to know that a specific transaction is fully reflected across all accounts, they should wait for `last_tx_id` to advance past their transaction ID, or use `submit_wait(snapshot)` for a linearizable read.
 
 ---
 
@@ -136,9 +135,7 @@ The window is defined by transaction count, not wall-clock time. This makes idem
 
 roda-ledger is designed around two dimensions of flexibility that set it apart from opinionated ledger systems.
 
-**Composite operations.** Beyond the built-in `Deposit`, `Withdrawal`, and `Transfer` operation types, the caller can express arbitrary multi-account logic through `Composite` operations — a caller-defined sequence of `Credit` and `Debit` steps executed atomically as a single transaction. This covers any financial logic that does not fit the named types: split payments, fee deductions, multi-leg settlements, or domain-specific balance rules. The ledger engine handles ordering, durability, and atomicity — the caller defines the steps.
-
-**Programmable ledger via WebAssembly.** The `Function` operation type is the extension point for pre-registered WebAssembly modules. The caller uploads a compiled module, registers it under a name (a durable operation in its own right — see below), and from then on invokes it by name with up to eight `i64` parameters. The runtime exposes only three host calls — `credit`, `debit`, `get_balance` — so the module can move value and inspect balances but cannot break out of the ledger's invariants. This is what makes the ledger *programmable*: new transaction types can be added at runtime, without recompiling or redeploying the engine, while keeping the same correctness, durability, and audit guarantees as the built-in operations.
+**Programmable ledger via WebAssembly.** Beyond the built-in `Deposit`, `Withdrawal`, and `Transfer` operation types, the `Function` operation type is the single extension point for arbitrary multi-account logic. The caller uploads a compiled WebAssembly module, registers it under a name (a durable operation in its own right — see below), and from then on invokes it by name with up to eight `i64` parameters. The runtime exposes only three host calls — `credit`, `debit`, `get_balance` — so the module can move value and inspect balances but cannot break out of the ledger's invariants. This covers any financial logic that does not fit the named types: split payments, fee deductions, multi-leg settlements, or domain-specific balance rules. New transaction types can be added at runtime without recompiling or redeploying the engine, while keeping the same correctness, durability, and audit guarantees as the built-in operations.
 
 **Choose your guarantee level.** The staged pipeline exposes a dial between performance and consistency. The caller chooses how much to wait per submission:
 
@@ -157,11 +154,11 @@ A `Function` operation is, from the ledger's perspective, indistinguishable from
 
 **One execution = one transaction.** A single call to the function's exported `execute` symbol corresponds to exactly one transaction. The function may issue any number of `credit` / `debit` calls during that execution; together they form one atomic unit.
 
-**All-or-nothing.** The Transactor accumulates every credit and debit the function emits in an isolated host-side context. Nothing is applied to the live balance cache until the function has fully returned *and* its credits balance its debits. If the function returns a non-zero status, traps, or violates the zero-sum invariant, the entire batch of host calls is discarded and no balance changes — exactly as if a `Composite` operation had failed mid-step.
+**All-or-nothing.** The Transactor accumulates every credit and debit the function emits in an isolated host-side context. Nothing is applied to the live balance cache until the function has fully returned *and* its credits balance its debits. If the function returns a non-zero status, traps, or violates the zero-sum invariant, the entire batch of host calls is discarded and no balance changes — exactly as if a built-in operation had failed mid-step.
 
 **No partial visibility.** Because the function runs on the single Transactor thread, intermediate state from a partially-executed function is never visible to readers, other functions, or other transactions. Other transactions see the function's effects all at once, at the same moment they see the `last_tx_id` advance past it.
 
-**Reusable, named, versioned.** Unlike a `Composite` (which the caller assembles fresh on every submission), a `Function` is registered once and invoked many times by name. Every register or override bumps the version by one; the CRC32C of the executing binary is recorded in every transaction it produces, so any past entry can be traced back to the exact code that wrote it.
+**Reusable, named, versioned.** A `Function` is registered once and invoked many times by name. Every register or override bumps the version by one; the CRC32C of the executing binary is recorded in every transaction it produces, so any past entry can be traced back to the exact code that wrote it.
 
 **Durable registration.** `RegisterFunction` is itself transactional. The call only returns after the binary is on disk, a `FunctionRegistered` record is committed to the WAL, and the handler is loaded into the live runtime. A subsequent `Operation::Function` is therefore guaranteed to see the new version. After a crash, recovery rebuilds the registry from a paired function snapshot plus the `FunctionRegistered` records that follow it — the live runtime always matches what the WAL says it should be.
 

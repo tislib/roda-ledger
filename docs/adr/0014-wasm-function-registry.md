@@ -5,7 +5,7 @@
 **Author:** Taleh Ibrahimli
 
 **Amends:**
-- ADR-003 — deprecates `Operation::Composite`, implements `Operation::Function` execution path
+- ADR-003 — removes `Operation::Composite`, implements `Operation::Function` execution path
 - ADR-001 — adds `WalEntryKind::FunctionRegistered` (kind=5)
 - ADR-006 — adds `function_snapshot_{N}.bin` to storage layout
 - ADR-001, ADR-003, ADR-009, ADR-010 — renames `fail_reason` to `status` across all structs, APIs, and documentation (see Decision: Rename fail_reason to status)
@@ -26,8 +26,8 @@ for user-defined logic. The placeholder existed but had no implementation.
 - No registry — cannot be inspected, listed, or managed
 - Bypasses the registry entirely — invisible to operators
 
-With a proper Function registry, `Composite` has no remaining purpose. It is deprecated by this
-ADR and will be removed in a future ADR once WASM is stable.
+With a proper Function registry, `Composite` has no remaining purpose. It is removed by this
+ADR; the proto field number is reserved and no in-process variant remains.
 
 The missing piece was a safe, high-performance runtime for user-defined logic that:
 
@@ -524,21 +524,14 @@ Sidecar .crc (16 bytes):
 
 ---
 
-### Operation::Composite Deprecation
+### Operation::Composite Removal
 
-`Composite` is deprecated by this ADR. It remains in the API for backward compatibility but is
-marked deprecated in code and documentation.
-
-```rust
-#[deprecated(
-   since = "0.2.0",
-   note = "use Operation::Function with a registered WASM function"
-)]
-Composite(Box<CompositeOperation>)
-```
+`Composite` is removed by this ADR. The `Operation` enum no longer has a `Composite` variant,
+and proto field number `4` is permanently reserved on `SubmitOperationRequest` and
+`SubmitAndWaitRequest`.
 
 Migration: any `Composite` operation is expressible as a WASM function. The Rust SDK provides
-a template. Removal is planned in a future ADR once WASM is stable.
+a template (`examples/custom_transaction.rs`).
 
 ---
 
@@ -634,7 +627,7 @@ Cargo.toml additions:
 - Atomicity guaranteed — failure causes full rollback, identical to built-in operations
 - Transactor hot path lock-free — local cache, sequence check only
 - Future Raft compatible — leader executes, entries replicated, followers apply directly
-- `Composite` deprecated — one extensibility model, not two
+- `Composite` removed — one extensibility model, not two
 - Single WAL source of truth — function registration ordered relative to transactions
 - Dual-signal unregistration — WAL `crc32c=0` + 0-byte file, WAL wins on conflict
 - No `name_len` or status flag fields — simpler struct, less surface area
@@ -646,7 +639,7 @@ Cargo.toml additions:
 - wasmtime JIT compilation at registration — ~10-100ms per function (one-time cost)
 - `Store` creation per Function operation — small allocation on hot path
 - 8-param limit — covers all practical cases but not unlimited flexibility
-- `Composite` deprecated but not removed — temporary API surface debt
+- Removing `Composite` is a breaking API change for any caller still using it
 - `functions/` directory adds operational surface to manage
 - `fail_reason` → `status` is a breaking rename across all structs, APIs, and proto fields
 
@@ -662,7 +655,7 @@ Cargo.toml additions:
 ## References
 
 - ADR-001 — entries-based execution model, single execution in Transactor
-- ADR-003 — Operation enum, Composite deprecation, Named reserved
+- ADR-003 — Operation enum, Composite removal, Named reserved
 - ADR-004 — gRPC interface, Function operation proto
 - ADR-006 — WAL segment lifecycle, storage layout, snapshot format
 - ADR-009 — Status (formerly FailReason), user-defined range 128-255

@@ -2,7 +2,7 @@
 
 **A programmable financial ledger engine that treats correctness guarantees as a choice, not a constraint — and performance as a consequence of good design, not a tradeoff.**
 
-roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic via composite operations, or upload sandboxed WebAssembly functions that execute atomically inside the ledger as first-class operations. Get 2.49 million transactions per second out of the box.
+roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic by uploading sandboxed WebAssembly functions that execute atomically inside the ledger as first-class operations. Get 2.49 million transactions per second out of the box.
 
 ---
 
@@ -82,17 +82,16 @@ The three pipeline indexes — `compute_index`, `commit_index`, `snapshot_index`
 
 ## Operations
 
-Five operation types cover both common financial workflows and arbitrary user-defined logic:
+Four operation types cover both common financial workflows and arbitrary user-defined logic:
 
 | Operation | Description |
 |---|---|
 | `Deposit` | Credit an account from the system source |
 | `Withdrawal` | Debit an account to the system sink |
 | `Transfer` | Move funds between accounts atomically |
-| `Composite` | Arbitrary sequence of credits and debits — your logic, ledger guarantees |
 | `Function` | Invoke a registered WebAssembly function as a first-class atomic transaction |
 
-`Composite` is the escape hatch for one-off multi-leg flows. `Function` is the **programmable ledger** surface: upload a compiled WebAssembly module via `RegisterFunction`, then invoke it by name. The function runs inside the Transactor — single-threaded, deterministic, sandboxed — and produces normal WAL entries alongside every other transaction. The zero-sum invariant is always enforced; non-zero return codes trigger full rollback. See [WASM Runtime](docs/wasm-runtime.md) for the ABI, host API, and durability guarantees.
+`Function` is the **programmable ledger** surface and the only extension point: upload a compiled WebAssembly module via `RegisterFunction`, then invoke it by name. The function runs inside the Transactor — single-threaded, deterministic, sandboxed — and produces normal WAL entries alongside every other transaction. The zero-sum invariant is always enforced; non-zero return codes trigger full rollback. Multi-leg settlements, fee splits, conditional transfers — anything that doesn't fit the named types is expressed as a `Function`. See [WASM Runtime](docs/wasm-runtime.md) for the ABI, host API, and durability guarantees.
 
 ---
 
