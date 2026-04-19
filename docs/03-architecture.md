@@ -84,7 +84,6 @@ For built-in operations (`Deposit`, `Withdrawal`, `Transfer`) the Transactor run
 
 The WASM Runtime is not a separate pipeline stage. It is a component **inside the Transactor** that handles `Operation::Function` the same way native code handles `Operation::Transfer`. This placement is deliberate: a function execution must inherit every guarantee the Transactor already provides — single-writer ordering, zero-sum enforcement, atomic rollback, deduplication — without any new coordination.
 
-<img src="./resources/transactor-flow.png" style="width: 100%;"/>
 
 ### Where it sits in the pipeline
 
