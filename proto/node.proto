@@ -4,7 +4,8 @@ syntax = "proto3";
 package roda.node.v1;
 
 service Node {
-  // Ship WAL blocks from leader to follower; returns on durable commit.
+  // Ship a contiguous range of WAL bytes from leader to follower.
+  // Returns after the follower has durably appended and fsynced.
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
 
   // Peer health check.
@@ -20,59 +21,92 @@ service Node {
 // ---- AppendEntries ----
 
 message AppendEntriesRequest {
-  uint64 leader_id         = 1;
-  uint64 term              = 2;
-  uint64 prev_block_index  = 3;
-  uint64 prev_block_term   = 4;
-  // Raw WAL bytes per block: `BlockHeader (40B) + len × 40B records`.
-  repeated bytes blocks    = 5;
-  uint64 leader_commit_index = 6;
+  uint64 leader_id           = 1;
+  uint64 term                = 2;
+
+  // Raft consistency check. `prev_tx_id` is the tx_id of the WAL
+  // record immediately preceding `from_tx_id`. `prev_term` is the
+  // term that record was written under (looked up from the
+  // follower's `.term` sidecars). For the first RPC ever (catching
+  // up from empty), both are 0.
+  uint64 prev_tx_id          = 3;
+  uint64 prev_term           = 4;
+
+  // Inclusive tx_id range covered by `wal_bytes`. Followers validate
+  // that the first parsed record's tx_id == from_tx_id and the last
+  // parsed record's tx_id == to_tx_id.
+  uint64 from_tx_id          = 5;
+  uint64 to_tx_id            = 6;
+
+  // Raw WAL bytes, byte-identical to what the leader wrote to its
+  // own WAL. Follower appends verbatim after validation. Size is
+  // bounded per-RPC (default 4 MiB); larger catch-up ranges spill
+  // into subsequent RPCs.
+  bytes  wal_bytes           = 7;
+
+  // Highest tx_id the leader has observed as quorum-committed.
+  // Follower may advance its own commit watermark up to
+  // min(leader_commit_tx_id, last locally-appended tx_id).
+  uint64 leader_commit_tx_id = 8;
 }
 
 message AppendEntriesResponse {
-  uint64 term             = 1;
-  bool   success          = 2;
-  uint64 last_block_index = 3; // follower's tail; backtrack hint on reject
-  uint32 reject_reason    = 4; // See RejectReason.
+  // Follower's current term. If > request.term, leader steps down
+  // (ADR-016). Under ADR-015's static-leader model this always
+  // equals request.term.
+  uint64 term            = 1;
+
+  // True iff the follower accepted and durably appended all bytes.
+  bool   success         = 2;
+
+  // Highest tx_id durably on the follower's disk after this RPC.
+  // Leader uses this to advance matchIndex for the follower.
+  uint64 last_tx_id      = 3;
+
+  // Diagnostic detail on reject. See RejectReason.
+  uint32 reject_reason   = 4;
 }
 
 enum RejectReason {
-  REJECT_NONE                = 0;
-  REJECT_TERM_STALE          = 1;
-  REJECT_PREV_MISMATCH       = 2;
-  REJECT_BLOCK_HEADER_INVALID = 3;
-  REJECT_CRC_FAILED          = 4;
-  REJECT_SEQUENCE_INVALID    = 5;
-  REJECT_WAL_APPEND_FAILED   = 6;
-  REJECT_NOT_FOLLOWER        = 7;
+  REJECT_NONE              = 0;
+  REJECT_TERM_STALE        = 1;  // request.term < follower.current_term
+  REJECT_PREV_MISMATCH     = 2;  // prev_tx_id/prev_term not in follower's log
+  REJECT_CRC_FAILED        = 3;  // per-record CRC32C check failed
+  REJECT_SEQUENCE_INVALID  = 4;  // tx_id sequence non-monotonic or range mismatch
+  REJECT_WAL_APPEND_FAILED = 5;  // local I/O error during append or fsync
+  REJECT_NOT_FOLLOWER      = 6;  // recipient is leader or recovering
 }
 
 // ---- Ping ----
 
 message PingRequest {
   uint64 from_node_id = 1;
+  // Echoed back for RTT measurement without requiring clock sync.
+  uint64 nonce        = 2;
 }
 
 message PingResponse {
-  uint64 node_id          = 1;
-  uint64 term             = 2;
-  uint64 last_block_index = 3;
-  NodeRole role           = 4;
+  uint64   node_id    = 1;
+  uint64   term       = 2;
+  uint64   last_tx_id = 3;
+  NodeRole role       = 4;
+  uint64   nonce      = 5;
 }
 
 enum NodeRole {
   NODE_ROLE_UNSPECIFIED = 0;
   NODE_ROLE_LEADER      = 1;
   NODE_ROLE_FOLLOWER    = 2;
+  NODE_ROLE_RECOVERING  = 3;  // local recovery in progress, not serving
 }
 
 // ---- RequestVote (placeholder, UNIMPLEMENTED until ADR-016) ----
 
 message RequestVoteRequest {
-  uint64 term             = 1;
-  uint64 candidate_id     = 2;
-  uint64 last_block_index = 3;
-  uint64 last_block_term  = 4;
+  uint64 term         = 1;
+  uint64 candidate_id = 2;
+  uint64 last_tx_id   = 3;
+  uint64 last_term    = 4;
 }
 
 message RequestVoteResponse {
@@ -83,13 +117,13 @@ message RequestVoteResponse {
 // ---- InstallSnapshot (placeholder, UNIMPLEMENTED until ADR-016) ----
 
 message InstallSnapshotRequest {
-  uint64 term                 = 1;
-  uint64 leader_id            = 2;
-  uint64 last_included_index  = 3;
-  uint64 last_included_term   = 4;
-  uint64 offset               = 5;
-  bytes  data                 = 6;
-  bool   done                 = 7;
+  uint64 term                = 1;
+  uint64 leader_id           = 2;
+  uint64 last_included_tx_id = 3;
+  uint64 last_included_term  = 4;
+  uint64 offset              = 5;
+  bytes  data                = 6;
+  bool   done                = 7;
 }
 
 message InstallSnapshotResponse {
