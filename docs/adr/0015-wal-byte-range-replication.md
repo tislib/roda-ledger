@@ -5,7 +5,6 @@
 **Author:** Taleh Ibrahimli
 
 **Amends:**
-
 - ADR-010 — `WaitLevel::Committed` semantics change in multi-node mode
 - ADR-011 — WAL committer extended with peer shipping
 
@@ -13,46 +12,25 @@
 
 ## Context
 
-Roda-ledger today is single-node. Multi-node replication is required
-for production deployment — both for availability (surviving node
-failure) and for data durability (surviving disk failure on a single
-machine).
+Roda-ledger is single-node today. This ADR adds multi-node
+replication via a minimal Raft-style transport: the leader ships WAL
+byte ranges to followers; followers append verbatim. Leader election,
+term changes, and demote-and-recover are deferred to ADR-016.
 
-Raft is the consensus protocol of choice. This ADR addresses the first
-step: **replication of the WAL record stream from leader to followers**
-under a static cluster configuration with a manually designated
-leader. Leader election, term changes, and demote-and-recover are
-deferred to ADR-016.
+Constraints:
 
-The core constraints:
+1. No second fsync on the commit path.
+2. The WAL is the source of truth. AppendEntries ships bytes from the
+   existing WAL — not a separate Raft log.
+3. Existing pipeline invariants stay intact.
+4. No structure imposed on the WAL for Raft's benefit alone.
 
-1. **No second fsync on the commit path.** Roda's existing WAL
-   already performs one fdatasync per commit cycle. Adding a second
-   for a separate Raft log would roughly halve throughput.
-2. **The WAL is the source of truth.** Raft must not maintain its own
-   separate log. AppendEntries ships bytes from the existing WAL.
-3. **The pipeline's design invariants (single-writer Transactor,
-   derived balances, WAL record as the atomic unit) must be
-   preserved.** Raft-driven truncation, when introduced in ADR-016,
-   will rely on the existing `Recover` mechanism rather than in-place
-   rewinds.
-4. **Replication must not impose structure on the WAL that exists only
-   for Raft's benefit.** The WAL is a record stream the pipeline
-   already produces for its own reasons; replication rides on top of
-   it without changing its shape.
-
-An earlier draft of this ADR introduced a block abstraction — a
-`BlockHeader` WAL record type and a `block_index` that would serve as
-the Raft log index. That approach was rejected during design review:
-blocks were a transient abstraction with no end-user meaning that
-would have become a driver of the writer's internal structure
-(cycle == block, per-block transaction-completeness assertions,
-role-specific follower block-tracking state). The decision here is to
-treat **each WAL record as one Raft log entry** and ship WAL byte
-ranges over the wire. Batching is implicit: whatever records the
-committer finds durable on a given pass are shipped together in one
-`AppendEntries`. No new record kind, no new on-disk structure, no new
-concept in the pipeline.
+An earlier draft introduced a `BlockHeader` record and a `block_index`
+to serve as the Raft log index. It was rejected: the block was a
+transient abstraction with no end-user value that started driving the
+writer's internal structure. The decision here is **one WAL record =
+one Raft entry**; AppendEntries ships a contiguous byte range; batching
+is whatever accumulated since the committer's last pass.
 
 ---
 
@@ -60,188 +38,35 @@ concept in the pipeline.
 
 ### Raft log = WAL record stream
 
-`RaftEntry = WalEntry`. The Raft log is the WAL record stream, exactly
-as the writer produces it today. Raft indexes WAL records by their
-`tx_id`; non-transactional records (`FunctionRegistered`, segment
-markers) travel inside `AppendEntries` byte ranges but do not have
-their own Raft index — they are piggybacked between transactional
-records in the stream.
+`RaftEntry = WalEntry`. Transactional records are indexed by `tx_id`.
+Non-transactional records (`FunctionRegistered`, segment markers)
+travel inside ranges without their own Raft index — they piggyback
+between transactional records.
 
-The Raft consistency check runs on transactional boundaries:
-`prev_tx_id` + `prev_term`. A follower accepting an `AppendEntries`
-verifies that its own record at `prev_tx_id` was written under
-`prev_term` before appending the incoming bytes.
+The consistency check runs on transactional boundaries:
+`prev_tx_id` + `prev_term`.
 
-### Term lives outside the WAL
+### Term storage
 
-Term is not embedded in WAL records. Each node maintains:
+- `raft_state` sidecar file — `{current_term, voted_for}`. Written
+  once at init under ADR-015 (static leader, never updated). Exercised
+  by ADR-016.
+- `segment-N.term` per-segment sidecar — tx_id ranges and their term.
+  Under ADR-015 each file holds one line (`term=1 tx_range=X-Y`).
+- In-memory term index — reconstructed from `.term` sidecars on
+  startup.
 
-- A `raft_state` sidecar file holding `{current_term, voted_for}` for
-  the node's own Raft state. Durable, fsync'd on change. Under
-  ADR-015's static-leader model it is written once at initialization
-  and never updated. Exercised by ADR-016's elections.
-- A per-segment `segment-N.term` sidecar describing which tx_id
-  ranges within that segment belong to which term. Append-only,
-  written on every term transition (rare). Under ADR-015 this file
-  contains a single line per segment (`term=1 tx_range=X-Y`) because
-  the term never changes.
-- An in-memory term index, reconstructed on startup by reading all
-  `.term` sidecars. O(log n) lookup for "what term is tx_id X?" where
-  n = number of elections over the cluster lifetime (typically tens,
-  not thousands).
+Term is not embedded in WAL records. Followers take term from the
+`AppendEntries.term` envelope and write to their own `.term` files.
 
-The `.term` sidecar parallels the existing `.crc` and `.seal`
-sidecars: metadata *about* the WAL, not *in* it. Sealed segments
-freeze their `.term` file alongside their `.crc`.
+### Cluster configuration
 
-On a follower, the incoming `AppendEntries.term` (from the RPC
-envelope) is the authoritative term for the bytes in that RPC. The
-follower appends an entry to its active segment's `.term` whenever it
-observes a term that differs from its last recorded term.
-
-### AppendEntries carries WAL bytes
-
-Each `AppendEntries` RPC carries a contiguous byte range from the
-leader's WAL:
-
-```
-AppendEntries {
-  leader_id,
-  term,
-  prev_tx_id, prev_term,     // Raft consistency check
-  from_tx_id, to_tx_id,      // inclusive tx_id range
-  wal_bytes,                 // raw WAL bytes, byte-identical to leader's WAL
-  leader_commit_tx_id,
-}
-```
-
-`wal_bytes` is what the leader wrote to its own WAL for the tx_id
-range. The follower appends it verbatim after validation. No parse +
-reserialize, no per-record wire representation.
-
-The range size on each RPC is bounded by the gRPC default message
-ceiling (4 MiB). Catching up a far-behind follower spills into many
-RPCs processed back-to-back.
-
-### Follower receives and validates
-
-Follower's Replication stage (see "Pipeline stages by role") receives
-`AppendEntries`, runs these checks in order:
-
-1. `request.term >= follower.current_term` (reject `TERM_STALE` on
-   mismatch).
-2. Follower's record at `prev_tx_id` has term `prev_term` — looked up
-   from the follower's `.term` sidecars (reject `PREV_MISMATCH` on
-   mismatch).
-3. Parse `wal_bytes` as WAL records; verify per-record CRC32C (reject
-   `CRC_FAILED` on mismatch).
-4. First parsed transactional record's tx_id == `from_tx_id`; last
-   transactional record's tx_id == `to_tx_id`; tx_ids monotonic
-   (reject `SEQUENCE_INVALID` on mismatch).
-5. Append `wal_bytes` to local active segment, fdatasync. If the
-   RPC's term differs from the last term recorded in the current
-   `.term` sidecar, append a new entry to `.term`.
-6. Respond `success` with updated `last_tx_id`.
-
-No business logic runs on the follower. No Transactor. Balances are
-carried inside replicated bytes via `TxMetadata` records (computed by
-the leader's Transactor) and consumed by the follower's Snapshot
-stage unchanged.
-
-### Pipeline stages by role
-
-The pipeline composition is role-dependent:
-
-- **Leader:** Sequencer → Transactor → WAL → Snapshot → Seal
-  (unchanged from single-node). The WAL committer additionally ships
-  byte ranges to followers.
-- **Follower:** Replication → WAL → Snapshot → Seal. The Transactor
-  and Sequencer stages are absent. The WAL writer runs, but the
-  committer does not ship anywhere — it only fsyncs locally.
-
-The Replication stage replaces Transactor on followers. It does not
-compute balances, does not invoke WASM functions, does not run any
-business logic. It receives `AppendEntries`, validates, and feeds the
-incoming bytes into the WAL stage via the same inbound queue the
-Transactor would have used.
-
-### WAL writer (leader and follower): unchanged
-
-The WAL writer's cycle is the same on both roles, and the same as
-today:
-
-1. Drain available entries from inbound queue.
-2. Append to segment's pending buffer.
-3. Write pending buffer to file.
-4. Advance `last_written_tx_id`.
-5. Rotate segment if tx-count threshold exceeded.
-6. Push drained entries to outbound queue for the Snapshot stage.
-
-There is no block boundary logic, no BlockHeader emission, no
-role-specific state in the writer. The leader's writer is fed by the
-Transactor; the follower's writer is fed by the Replication stage.
-Everything downstream of "inbound queue" is identical.
-
-### Committer flow (leader)
-
-The committer's existing fsync responsibility is extended with peer
-shipping. On each pass:
-
-1. Read `last_written_tx_id`. If unchanged since the last pass, back
-   off and retry.
-2. Spawn a tokio task per follower to send
-   `AppendEntries{from_tx_id = last_shipped_tx_id + 1, to_tx_id =
-   last_written_tx_id, wal_bytes = <WAL bytes for that range>}`.
-3. In parallel, call `fdatasync` on the active WAL segment.
-4. Await both: local fsync AND quorum (including self) acking up to
-   `to_tx_id`.
-5. Advance `last_committed_tx_id` to `to_tx_id`. Advance
-   `last_shipped_tx_id` per follower based on their ack.
-
-The committer is a pure reader of WAL state. It never writes. It
-opens read-only `File` handles on WAL segments and reads byte ranges
-via `read_at(offset, len)` bounded by `last_written_tx_id`. Each
-follower-sender task has its own handle and its own
-`last_shipped_tx_id`.
-
-Batching falls out naturally: whatever accumulated between committer
-passes is one `AppendEntries`. Busy periods ship large ranges; idle
-periods ship small ranges or skip entirely. No tuning knobs.
-
-### Committer flow (follower)
-
-The committer on a follower only fsyncs. It does not ship. The
-shipping code path is dead on followers — no committer-side walk of
-ranges, no per-follower tracking. `last_committed_tx_id` advances
-when the follower's AppendEntries handler acks durability, which is
-itself the commit signal for the local copy.
-
-### WaitLevel::Committed semantics
-
-`WaitLevel::Committed` now means "durable on leader's disk AND acked
-by quorum of followers (including leader itself)." This is the same
-guarantee clients want in single-node mode (durable), extended to
-multi-node (durable on a quorum).
-
-No new WaitLevel is introduced. Single-node deployments (quorum =
-self) behave identically to today.
-
-`WaitLevel::Computed` and `WaitLevel::Snapshotted` retain their
-existing leader-local semantics. A caller wanting "executed on leader
-but not yet quorum-confirmed" uses `Computed`.
-
-### Cluster configuration (static)
-
-For ADR-015 scope: cluster membership is defined in a config file at
-startup. No dynamic membership changes. No elections — one node is
-designated leader via config, all others are followers. If the leader
-crashes, the cluster halts new writes until manual restart. Failover
-is addressed in ADR-016.
+A new `ClusterConfig` alongside `ServerConfig`:
 
 ```toml
 [cluster]
+mode    = "leader"           # or "follower"
 node_id = 1
-role = "leader"   # or "follower"
 
 [[cluster.peers]]
 node_id = 2
@@ -252,61 +77,119 @@ node_id = 3
 address = "10.0.0.3:50052"
 ```
 
-The `raft_state` file holds `{current_term: 1, voted_for: None}`
-forever. Each segment's `.term` sidecar contains a single
-`term=1 tx_range=...` line.
+Validation: exactly one node in the cluster has `mode = "leader"`.
+Static — no elections in this ADR.
 
-### Transport: separate gRPC service, separate port
+### Ledger API gating
 
-Internal node-to-node communication runs on a separate gRPC service
-on a separate port from the client-facing Ledger API. This isolates
-client load from replication traffic, simplifies firewall rules, and
-allows different TLS configurations per channel.
+In follower mode, the Ledger rejects `submit` and `register_function`
+with an error. Read APIs work on both roles.
 
-```toml
-[server]
-host = "0.0.0.0"
-port = 50051              # client API
+### Pipeline composition
 
-[cluster]
-listen_port = 50052       # peer API (this node)
-```
+**Leader:** Sequencer → Transactor → WAL → Snapshot → Seal
+(unchanged). The WAL committer gains peer shipping.
 
-The `node.proto` service for ADR-015 defines `AppendEntries`, `Ping`,
-and stubs for `RequestVote` and `InstallSnapshot`. The stubbed RPCs
-return `UNIMPLEMENTED` until ADR-016.
+**Follower:** Replication → WAL → Snapshot → Seal. Transactor and
+Sequencer are not started. The committer only fsyncs — no shipping.
 
-### Reading from the WAL
+### NodeHandler (gRPC server)
 
-The committer and its per-follower senders read WAL bytes via their
-own read-only `File` handles (opened separately from the writer's
-append handle). Concurrency is handled by the OS: the writer appends
-to its handle; readers use `read_at(offset, len)` up to the
-`last_written_tx_id` watermark (translated to a byte offset via the
-existing `wal_position` tracking).
+Implements `node.proto` on port 50052 (separate from the client API
+on 50051).
 
-No shared in-memory buffer. No `unsafe`. No mmap (durability
-semantics are cleaner without it). Per-reader syscall overhead is
-negligible — reads hit the OS page cache for recently-written WAL
-data.
+RPCs:
+- `AppendEntries`:
+    - Leader mode: return `REJECT_NOT_FOLLOWER`.
+    - Follower mode: hand off directly (synchronous call) to the
+      Replication stage.
+- `Ping`: works on both roles.
+- `RequestVote`, `InstallSnapshot`: return `UNIMPLEMENTED` until
+  ADR-016.
 
-Each follower gets its own tokio task, its own `File` handle, and
-its own `last_shipped_tx_id`. They operate independently.
+### Replication stage (follower only)
 
-### Non-transactional records and replication
+Lives in `pipeline/replication.rs`. Called directly from the gRPC
+handler (no queue between them).
 
-`FunctionRegistered` and segment-lifecycle records (`SegmentHeader`,
-`SegmentSealed`) carry no tx_id. They travel inside `AppendEntries`
-byte ranges between transactional records but do not participate in
-the Raft consistency check.
+On each `AppendEntries`:
 
-On the follower, `FunctionRegistered` records are replayed into the
-function registry by the downstream Snapshot stage, exactly as they
-are on the leader. Segment-lifecycle records are currently part of
-the WAL stream — whether they should remain so is a separate cleanup
-tracked outside this ADR; for now, followers observe them in the
-stream and let them flow through to Snapshot/Seal without special
-handling.
+1. Validate: `request.term >= follower.current_term`,
+   `prev_tx_id`/`prev_term` match the follower's log, per-record CRC,
+   tx_id sequence within `wal_bytes`.
+2. Push the incoming records into the WAL stage's inbound queue (the
+   same queue the Transactor uses on a leader — Replication is the
+   follower-side producer).
+3. Wait for the WAL committer to advance `last_committed_tx_id` past
+   `to_tx_id`. On a follower, committed = fsynced locally.
+4. Return success with `last_tx_id`.
+
+Segment markers (`SegmentHeader`, `SegmentSealed`) flow through in
+replicated ranges but have no Raft-level meaning on the follower —
+they're handed to the WAL stage like any other record.
+
+### WAL writer (both roles): untouched
+
+The writer cycle is unchanged. On a leader it's fed by the Transactor;
+on a follower by the Replication stage. Same code, same queue.
+
+One new shared variable: `last_write_position: Arc<AtomicU64>`.
+Advanced by the writer after each flush, alongside `last_written_tx_id`.
+Used by the committer to find the byte range to ship.
+
+### Committer flow (leader)
+
+Every pass:
+
+1. Observe `last_write_position` (atomic). If unchanged since last
+   pass, back off.
+2. Compute the byte range:
+   `[last_committed_position, last_write_position)` in the active
+   segment. Read from the segment file into a buffer.
+3. Spawn tokio tasks:
+    - One per peer, calling `AppendEntries` with the byte range.
+    - One for local `fdatasync`.
+4. Wait for **all** tasks to complete. For this ADR, failure of any
+   peer blocks commit progress (single-peer minimal implementation —
+   quorum policy is a later refinement).
+5. Advance `last_committed_tx_id` to `to_tx_id` and
+   `last_committed_position` to the end of the shipped range.
+
+Rotation is unaffected: rotation forces a commit first, so the
+committer never sees a range that spans two segments. When the
+committer observes a new active segment via `sync_id` change (existing
+mechanism), it resets `last_committed_position` to just past the
+`SegmentHeader`.
+
+Peer connections are opened lazily on first `AppendEntries`.
+
+### Committer flow (follower)
+
+Same as today: fsync the active segment, advance
+`last_committed_tx_id`. No peer shipping.
+
+The follower's Replication stage waits on this watermark before
+responding to the leader, so local fsync gates the ack.
+
+### tx_id → byte position
+
+Shared atomics (`last_write_position`, plus committer-private
+`last_committed_position`) make this trivial: the committer doesn't
+need a reverse lookup from tx_id to offset. It ships whatever bytes
+lie between the two positions. The writer is the only source of truth
+for position, and it publishes it atomically.
+
+### WaitLevel::Committed semantics
+
+Multi-node: "durable on leader's disk AND acked by all peers" (for
+ADR-015's all-peers policy). Single-node: unchanged (durable locally).
+
+No new WaitLevel introduced.
+
+### Transport
+
+Separate gRPC service on port 50052. Isolates client load from
+replication traffic. Follows etcd / CockroachDB / TigerBeetle pattern.
 
 ---
 
@@ -314,120 +197,68 @@ handling.
 
 ### Positive
 
-- **Single fsync on the commit path.** No separate Raft log, no
-  double-sync. Replication runs in parallel with fsync, not in
-  series.
-- **WAL remains source of truth.** Raft is a transport over the WAL,
-  not a parallel structure.
-- **No new abstractions.** No block concept, no `BlockHeader` record
-  kind, no `block_index`. The only new on-disk artifact is the
-  `.term` sidecar, which parallels existing sidecars.
-- **Writer cycle is role-agnostic.** Leader and follower run the
-  same writer code. The only role-specific code is in the Replication
-  stage (follower-only) and in the committer's shipping logic
-  (leader-only).
-- **Natural batching.** The committer ships whatever records
-  accumulated since its last pass. Busy periods ship large ranges;
-  idle periods ship small ones. No tuning.
-- **Followers are simple.** Receive bytes, validate per-record CRC
-    + sequence, append, fdatasync. No replay, no business logic, no
-      boundary tracking.
-- **Follower balance cache stays in sync automatically.** Balances
-  are carried inside replicated bytes via `TxMetadata` records
-  (computed by the leader's Transactor). Followers run Snapshot and
-  Seal stages as usual against their local WAL. On promotion
-  (ADR-016), the new leader's cache is already current.
-- **Historical queries work on any node** because each node's WAL
-  contains the same record stream (post-replication).
-- **Two-port gRPC cleanly separates client load from replication
-  traffic.**
-- **Term history is introspectable.** Segment `.term` sidecars are
-  trivial to read and reason about. No inline metadata records mixed
-  into the transactional stream.
+- No new abstractions on the WAL (no BlockHeader, no block_index).
+  The `.term` sidecar is the only new on-disk artifact.
+- Writer cycle is role-agnostic; leader and follower share writer
+  code.
+- Natural batching from the committer's pass cadence.
+- Followers are simple: validate + append + fsync. No replay, no
+  business logic.
+- Follower balance cache stays in sync automatically via `TxMetadata`
+  records in the replicated stream.
+- Single fsync on the commit path; replication runs in parallel with
+  fsync.
 
 ### Negative
 
-- **`AppendEntries.term` is the only source of term for incoming
-  bytes.** A bug in the RPC envelope or in the follower's `.term`
-  writing could cause `.term` sidecars on different followers to
-  disagree, even with byte-identical WAL record streams. Mitigation:
-  the RPC envelope and sidecar write are both small, simple pieces
-  of code; unit-testable in isolation. If stronger cross-checking is
-  needed later, a WAL-embedded term marker record can be added
-  without changing the rest of this design.
-- **`WaitLevel::Committed` latency in multi-node mode** includes
-  network round-trip + follower fsync. Client-observed commit
-  latency increases from ~700µs (single node) to ~1–3ms (3-node LAN).
-- **Static cluster config** — no failover if leader dies. Operator
-  intervention required. Addressed in ADR-016.
-- **Non-transactional records piggyback.** `FunctionRegistered` and
-  segment markers have no Raft index. They ride inside
-  `AppendEntries` ranges without their own consistency check. This
-  is correct (they are always adjacent to transactional records in
-  the stream), but it means there is no way to reference them
-  individually in a Raft-level truncation or rewind. Demote-and-
-  recover (ADR-016) handles this by discarding and replaying
-  everything past the divergence point, not by rewinding record-by-
-  record.
+- All-peers ack policy: any peer down blocks writes. Acceptable for
+  ADR-015's minimal single-peer scope; quorum policy is a later
+  refinement.
+- `WaitLevel::Committed` latency increases in multi-node mode
+  (network RTT + peer fsync).
+- `AppendEntries.term` is the sole source of term for followers. A
+  bug in the RPC envelope or `.term` writing could cause divergence
+  between nodes' `.term` files. Mitigated by keeping both pieces
+  small and unit-testable.
+- Static cluster config — no failover in this ADR.
 
 ### Neutral
 
-- Single-node deployment continues to work unchanged — quorum =
-  self, no network, behavior identical to today.
-- The WAL record format is unchanged. No new record kind is
-  introduced.
-- `raft_state` file (current_term, voted_for) is created at init but
-  under ADR-015's static-leader model is never updated.
+- Single-node deployment unchanged (empty peer list → committer skips
+  shipping).
+- WAL record format is unchanged.
+- `raft_state` file created at init but never updated under ADR-015.
 
 ---
 
 ## Alternatives considered
 
-**Block-based replication with a `BlockHeader` WAL record.** Earlier
-draft of this ADR. Rejected during design review: introduced a
-transient abstraction with no end-user value that became a driver of
-the writer's internal structure. The writer cycle became a block
-cycle, role-specific follower block-tracking state appeared, and the
-"transaction must not straddle a block boundary" invariant started
-imposing constraints on pipeline scheduling. The byte-range model
-here achieves the same goals (per-RPC batching, quorum commit) with
-no new abstraction.
+**Block-based replication with `BlockHeader` records.** Rejected —
+transient abstraction that started driving pipeline internals.
 
-**Separate Raft log file.** Rejected — would require a second fsync
-per commit, roughly halving throughput.
+**Separate Raft log file.** Rejected — second fsync halves throughput.
 
-**Range references without bytes (leader sends `{from, to}` only;
-follower fetches bytes separately).** Rejected — followers' WALs
-don't exist yet; they must receive the bytes to produce identical
-local WALs.
+**Per-record `term` field.** Rejected — term is sparse (changes only
+on elections); sidecar matches the sparsity.
 
-**Put `term` in every WAL record.** Rejected — term changes on
-elections only (rare). Per-record term is expensive storage for
-information that's sparse by nature. Sidecar-per-segment matches
-the sparsity.
+**Term only in `raft_state` (no per-range info).** Rejected — can't
+reconstruct historical term assignments needed for Raft's Figure 8
+commit safety rule.
 
-**Put `term` only in the `raft_state` file (no per-range record).**
-Rejected — `raft_state` holds the node's current term but does not
-describe which historical log ranges belong to which term. Raft's
-commit safety (the "commit only current-term entries" rule from the
-Figure 8 scenario) requires knowing historical terms.
+**Queued handoff between NodeHandler and Replication.** Rejected —
+direct call is simpler and the gRPC handler is already on a tokio
+task.
 
-**Per-record `wal_seq` field for a stream-wide Raft index.**
-Rejected — adds 8 bytes per record for no benefit under this design.
-`tx_id` serves as the Raft index for transactional records;
-non-transactional records piggyback without their own index.
+**Quorum-ack policy (majority, not all peers).** Deferred — standard
+Raft behavior and clearly correct, but ADR-015's scope is minimal
+single-peer validation. Will revisit when adding the second follower.
 
 ---
 
 ## References
 
-- ADR-006 — WAL, snapshot, and seal durability
-- ADR-010 — Synchronous submit with wait levels (Committed semantics)
+- ADR-006 — WAL, snapshot, seal durability
+- ADR-010 — Wait levels
 - ADR-011 — WAL write/commit separation
-- ADR-014 — Function registry persistence (`FunctionRegistered`
-  record)
-- Ongaro & Ousterhout 2014 — "In Search of an Understandable
-  Consensus Algorithm" (Raft paper)
-- PostgreSQL walsender — separate reader handles on WAL files, ship
-  byte ranges
-- TigerBeetle VR — pre-quorum execution, log-range ship
+- ADR-014 — Function registry persistence
+- Ongaro & Ousterhout 2014 — Raft paper
