@@ -14,3 +14,4 @@ pub use function_snapshot::{FunctionSnapshotData, FunctionSnapshotRecord};
 pub use segment::*;
 pub use snapshot::*;
 pub use syncer::*;
+pub(crate) use wal_serializer::parse_wal_record;

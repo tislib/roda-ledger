@@ -1,8 +1,22 @@
 //! Raw WAL byte streaming for ADR-015 Cluster Mode leader shipping.
 
-use crate::entities::WalEntryKind;
-use crate::storage::Storage;
+use crate::entities::{WalEntry, WalEntryKind};
+use crate::storage::{Storage, parse_wal_record};
 use std::sync::Arc;
+
+/// Decode a buffer returned by [`WalTailer::tail`] into `WalEntry` values.
+/// Malformed 40-byte records are skipped; extra trailing bytes are ignored.
+pub fn decode_records(bytes: &[u8]) -> Vec<WalEntry> {
+    let mut out = Vec::with_capacity(bytes.len() / WAL_RECORD_SIZE);
+    let mut off = 0;
+    while off + WAL_RECORD_SIZE <= bytes.len() {
+        if let Ok(e) = parse_wal_record(&bytes[off..off + WAL_RECORD_SIZE]) {
+            out.push(e);
+        }
+        off += WAL_RECORD_SIZE;
+    }
+    out
+}
 
 /// Every WAL record is `#[repr(C)]` and exactly 40 bytes (entities.rs asserts).
 pub const WAL_RECORD_SIZE: usize = 40;
