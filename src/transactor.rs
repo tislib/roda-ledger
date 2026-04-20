@@ -3,7 +3,7 @@ use crate::config::LedgerConfig;
 use crate::dedup::{DedupCache, DedupResult};
 use crate::entities::{
     EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
-    WalEntryKind,
+    WalEntryKind, WalInput,
 };
 use crate::pipeline::TransactorContext;
 use crate::transaction::{Operation, Transaction, TransactionInput};
@@ -461,11 +461,13 @@ impl TransactorRunner {
         let mut i = 0;
         while i < entries_len {
             let entry = self.state.borrow().entries[i];
+            let mut pending = WalInput::Single(entry);
             let mut retry_count = 0;
             loop {
                 retry_count += 1;
-                if output.push(entry).is_ok() {
-                    break;
+                match output.push(pending) {
+                    Ok(()) => break,
+                    Err(returned) => pending = returned,
                 }
                 if retry_count % 10000 == 0 && !ctx.is_running() {
                     return;

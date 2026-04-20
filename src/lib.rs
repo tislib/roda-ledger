@@ -15,6 +15,7 @@ pub mod transaction;
 pub mod transactor;
 pub mod wait_strategy;
 pub mod wal;
+pub mod wal_tail;
 pub mod wasm_runtime;
 
 #[cfg(feature = "grpc")]

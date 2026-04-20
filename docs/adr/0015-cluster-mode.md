@@ -48,10 +48,10 @@ checkpoint, without coupling Cluster to Ledger's internal WAL types.
 
 ```
 ┌──────────────────────────────────────────┐
-│  Cluster                                  │
+│  Cluster                                 │
 │                                          │
 │  ┌──────────┐   Write RPC   ┌──────────┐ │
-│  │  Leader  │ ──────────────▶ Follower  │ │
+│  │  Leader  │ ──────────────▶ Follower │ │
 │  │          │   Commit RPC  │          │ │
 │  │  Ledger  │ ──────────────▶  Ledger  │ │
 │  └──────────┘               └──────────┘ │

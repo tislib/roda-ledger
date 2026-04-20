@@ -69,6 +69,10 @@ name = "wal_bench"
 harness = false
 
 [[bench]]
+name = "wal_tail_bench"
+harness = false
+
+[[bench]]
 name = "snapshot_bench"
 harness = false
 

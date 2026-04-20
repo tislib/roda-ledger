@@ -223,6 +223,38 @@ impl WalEntry {
     }
 }
 
+/// Unit of work flowing into the WAL stage's inbound queue.
+/// `Multi` is produced by the Cluster follower path (ADR-015).
+#[derive(Debug)]
+pub enum WalInput {
+    Single(WalEntry),
+    Multi(Vec<WalEntry>),
+}
+
+impl WalInput {
+    pub fn is_single(&self) -> bool {
+        matches!(self, WalInput::Single(_))
+    }
+
+    pub fn is_multi(&self) -> bool {
+        matches!(self, WalInput::Multi(_))
+    }
+
+    pub fn single(self) -> WalEntry {
+        match self {
+            WalInput::Single(e) => e,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn multi(self) -> Vec<WalEntry> {
+        match self {
+            WalInput::Multi(v) => v,
+            _ => unreachable!(),
+        }
+    }
+}
+
 // Safety checks for bytemuck
 unsafe impl Pod for WalEntryKind {}
 unsafe impl Zeroable for WalEntryKind {}

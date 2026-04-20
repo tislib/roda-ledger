@@ -1,5 +1,6 @@
 use crate::balance::Balance;
 pub use crate::config::{LedgerConfig, StorageConfig};
+use crate::entities::WalEntry;
 use crate::pipeline::Pipeline;
 use crate::recover::Recover;
 use crate::seal::Seal;
@@ -10,6 +11,7 @@ use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
+use crate::wal_tail::WalTailer;
 pub use crate::wasm_runtime::FunctionInfo;
 use crate::wasm_runtime::{WasmRegistry, WasmRuntime};
 use spdlog::{LevelFilter, info};
@@ -241,6 +243,44 @@ impl Ledger {
 
     pub fn get_rejected_count(&self) -> u64 {
         self.transactor.get_rejected_count()
+    }
+
+    // ── Cluster Mode Surface (ADR-015) ────────────────────────────────────
+
+    /// Follower write path: hand a pre-validated batch to the WAL stage as
+    /// one `WalInput::Multi` slot, bypassing the Transactor.
+    pub fn append_wal_entries(&mut self, entries: Vec<WalEntry>) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let ctx = self.pipeline.ledger_context();
+        let wait_strategy = ctx.wait_strategy();
+
+        let mut pending = entries;
+        let mut retry_count = 0u64;
+        loop {
+            if !ctx.is_running() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "ledger pipeline shut down before append_wal_entries completed",
+                ));
+            }
+            match ctx.push_wal_entries(pending) {
+                Ok(()) => return Ok(()),
+                Err(returned) => {
+                    pending = returned;
+                    wait_strategy.retry(retry_count);
+                    retry_count = retry_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Build a stateful `WalTailer` bound to this ledger's storage.
+    /// See [`WalTailer`] for cursor semantics (ADR-015).
+    pub fn wal_tailer(&self) -> WalTailer {
+        WalTailer::new(self.storage.clone())
     }
 
     pub fn wait_for_transaction(&self, transaction_id: u64) {

@@ -1,4 +1,4 @@
-use crate::entities::WalEntry;
+use crate::entities::{WalEntry, WalInput};
 use crate::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline::WalContext;
 use crate::snapshot::SnapshotMessage;
@@ -107,21 +107,26 @@ impl WalRunner {
 
     pub fn run(&mut self, ctx: WalContext) {
         while ctx.is_running() {
-            // Receive entries from the inbound queue.
+            // Each slot is a WalInput::{Single,Multi}; Multi carries a follower batch.
             let inbound = ctx.input();
             let available = inbound
                 .len()
                 .min(self.buffer.capacity() - self.buffer.len());
 
+            let mut entries_ingested: u32 = 0;
             let mut k = available;
             while k > 0 || self.pending_records > 0 {
-                if let Some(entry) = inbound.pop() {
-                    self.active_segment.append_pending_entry(&entry);
-                    self.buffer.push_back(entry);
-                    if self.move_pending_entry(&entry) {
-                        self.last_received_tx_id = entry.tx_id();
-                        if self.segment_start_tx_id == 0 {
-                            self.segment_start_tx_id = entry.tx_id();
+                if let Some(input) = inbound.pop() {
+                    match input {
+                        WalInput::Single(entry) => {
+                            self.ingest_entry(entry);
+                            entries_ingested += 1;
+                        }
+                        WalInput::Multi(entries) => {
+                            for entry in entries {
+                                self.ingest_entry(entry);
+                                entries_ingested += 1;
+                            }
                         }
                     }
                 } else {
@@ -131,14 +136,14 @@ impl WalRunner {
             }
 
             // if new entries are available, write them to the segment.
-            if available > 0 {
+            if entries_ingested > 0 {
                 self.active_segment.write_pending_entries();
                 self.last_written_tx_id
                     .store(self.last_received_tx_id, Release);
             }
 
             // if there are no movements, skip the rest of the loop.
-            if available == 0 && self.buffer.is_empty() {
+            if entries_ingested == 0 && self.buffer.is_empty() {
                 self.retry_count += 1;
                 self.wait_strategy.retry(self.retry_count);
                 continue;
@@ -167,6 +172,18 @@ impl WalRunner {
                     break;
                 }
                 ctx.set_processed_index(tx_id);
+            }
+        }
+    }
+
+    /// Append one entry to the active segment buffer and update tx_id bookkeeping.
+    fn ingest_entry(&mut self, entry: WalEntry) {
+        self.active_segment.append_pending_entry(&entry);
+        self.buffer.push_back(entry);
+        if self.move_pending_entry(&entry) {
+            self.last_received_tx_id = entry.tx_id();
+            if self.segment_start_tx_id == 0 {
+                self.segment_start_tx_id = entry.tx_id();
             }
         }
     }
