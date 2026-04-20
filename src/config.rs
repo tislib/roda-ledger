@@ -49,6 +49,14 @@ pub struct LedgerConfig {
     pub seal_check_internal: Duration,
     #[serde(skip)]
     pub disable_seal: bool,
+
+    /// Follower mode (ADR-015). When true:
+    ///   - Transactor is not started.
+    ///   - `submit` / `submit_batch` / `register_function` return an error.
+    ///   - The WAL input queue is fed by the Replication stage instead.
+    /// Set programmatically by the cluster bootstrap, never via config.toml.
+    #[serde(skip)]
+    pub replication_mode: bool,
 }
 
 fn default_log_level() -> Level {
@@ -68,6 +76,7 @@ impl Default for LedgerConfig {
             log_level: default_log_level(),
             seal_check_internal: default_seal_check_internal(),
             disable_seal: false,
+            replication_mode: false,
         }
     }
 }

@@ -6,6 +6,7 @@ pub mod entities;
 pub mod ledger;
 pub mod pipeline;
 mod recover;
+pub mod replication;
 pub mod seal;
 mod sequencer;
 pub mod snapshot;
@@ -19,6 +20,8 @@ pub mod wasm_runtime;
 
 #[cfg(feature = "grpc")]
 pub mod client;
+#[cfg(feature = "grpc")]
+pub mod cluster;
 mod entries;
 #[cfg(feature = "grpc")]
 pub mod grpc;

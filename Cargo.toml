@@ -69,12 +69,21 @@ name = "wal_bench"
 harness = false
 
 [[bench]]
+name = "replication_bench"
+harness = false
+
+[[bench]]
 name = "snapshot_bench"
 harness = false
 
 [[bin]]
 name = "roda-ledger"
 path = "src/bin/server.rs"
+required-features = ["grpc"]
+
+[[bin]]
+name = "cluster"
+path = "src/bin/cluster.rs"
 required-features = ["grpc"]
 
 [[bin]]

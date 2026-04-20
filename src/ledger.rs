@@ -70,11 +70,36 @@ impl Ledger {
         }
     }
 
+    /// Whether this Ledger instance is a follower (ADR-015). When true,
+    /// write APIs (`submit`, `submit_batch`, `register_function`,
+    /// `unregister_function`) are rejected — the WAL is fed by the
+    /// Replication stage instead.
+    #[inline(always)]
+    pub fn is_replication_mode(&self) -> bool {
+        self.config.replication_mode
+    }
+
+    /// Shared `LedgerContext` — used by the follower-side Replication
+    /// stage to push parsed WAL records onto the same input queue the
+    /// Transactor writes to on a leader, and to observe the commit
+    /// watermark.
+    pub fn ledger_context(&self) -> crate::pipeline::LedgerContext {
+        self.pipeline.ledger_context()
+    }
+
     pub fn submit(&self, operation: Operation) -> u64 {
+        assert!(
+            !self.config.replication_mode,
+            "Ledger::submit called in replication_mode (follower) — submit is disabled"
+        );
         self.sequencer.submit(operation)
     }
 
     pub fn submit_batch(&self, operations: Vec<Operation>) -> u64 {
+        assert!(
+            !self.config.replication_mode,
+            "Ledger::submit_batch called in replication_mode (follower) — submit is disabled"
+        );
         self.sequencer.submit_batch(operations)
     }
 
@@ -84,10 +109,22 @@ impl Ledger {
         binary: &[u8],
         override_existing: bool,
     ) -> io::Result<(u16, u32)> {
+        if self.config.replication_mode {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "register_function is disabled in replication_mode (follower)",
+            ));
+        }
         self.wasm_registry.register(name, binary, override_existing)
     }
 
     pub fn unregister_function(&self, name: &str) -> io::Result<u16> {
+        if self.config.replication_mode {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unregister_function is disabled in replication_mode (follower)",
+            ));
+        }
         self.wasm_registry.unregister(name)
     }
 
@@ -309,13 +346,18 @@ impl Ledger {
                 format!("failed to recover ledger during start: {}", e),
             )
         })?;
-        self.handles.push(
-            self.transactor
-                .start(self.pipeline.transactor_context())
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
-                })?,
-        );
+        // Follower (ADR-015): the Transactor is not started. The WAL
+        // input queue is fed directly by the Replication stage through
+        // the Node gRPC handler.
+        if !self.config.replication_mode {
+            self.handles.push(
+                self.transactor
+                    .start(self.pipeline.transactor_context())
+                    .map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
+                    })?,
+            );
+        }
         self.handles.extend(
             self.wal.start(self.pipeline.wal_context()).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
