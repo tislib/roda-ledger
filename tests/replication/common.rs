@@ -1,10 +1,3 @@
-//! Shared test fixtures for the replication integration suite.
-//!
-//! The helpers in this file deliberately avoid reaching into internal
-//! crate modules — they rely only on what the crate exposes publicly,
-//! the same surface area a downstream consumer of the replication stage
-//! would see.
-
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::entities::{
     EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind,
@@ -15,18 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-test term used by every request in the suite. ADR-015 runs with
-/// a single static term.
 pub const TEST_TERM: u64 = 1;
 
-// ─────────────────────────────────────────────────────────────────────────
-// Temp-dir ledger setup
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Scoped temp directory: removes itself on drop so a failed assertion
-/// does not leave files behind. The nanosecond suffix matches the
-/// pattern used elsewhere in `tests/` so collisions between parallel
-/// test runs are impossible.
 pub struct TempDir {
     pub path: PathBuf,
 }
@@ -54,47 +37,30 @@ impl Drop for TempDir {
     }
 }
 
-/// Build a `LedgerConfig` pointing at `data_dir`. `replication_mode`
-/// flips the follower semantics (Transactor disabled, write APIs
-/// refused).
 pub fn config_for(data_dir: &str, replication_mode: bool) -> LedgerConfig {
     let mut cfg = LedgerConfig {
         queue_size: 1 << 14,
         max_accounts: 1_000_000,
         storage: StorageConfig {
             data_dir: data_dir.to_string(),
-            temporary: false, // TempDir owns cleanup
+            temporary: false,
             snapshot_frequency: 2,
             transaction_count_per_segment: 10_000_000,
         },
         seal_check_internal: Duration::from_millis(10),
-        disable_seal: true, // seal not needed for these tests
+        disable_seal: true,
         ..Default::default()
     };
     cfg.replication_mode = replication_mode;
     cfg
 }
 
-/// Build, start, and Arc-wrap a Ledger. Panics on start failure, like
-/// the other integration tests.
 pub fn start_ledger(cfg: LedgerConfig) -> Arc<Ledger> {
     let mut ledger = Ledger::new(cfg);
     ledger.start().expect("ledger start");
     Arc::new(ledger)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// WAL byte-range builders (mirror `replication::test_helpers`)
-// ─────────────────────────────────────────────────────────────────────────
-//
-// `test_helpers` in `src/replication.rs` is `#[cfg(test)]`-gated, so
-// it is invisible from an integration-test crate. Recreating the
-// helpers here keeps the integration suite decoupled from the
-// library's private test surface.
-
-/// Build a single-entry Credit transaction: one 40-byte TxMetadata
-/// followed by one 40-byte TxEntry, CRC filled in. Returns the raw
-/// 80-byte buffer ready to go into `AppendEntries.wal_bytes`.
 pub fn build_tx(tx_id: u64, account_id: u64, amount: u64) -> Vec<u8> {
     let entry = TxEntry {
         entry_type: WalEntryKind::TxEntry as u8,
@@ -126,14 +92,8 @@ pub fn build_tx(tx_id: u64, account_id: u64, amount: u64) -> Vec<u8> {
     out
 }
 
-/// Concatenate `count` single-entry Credit transactions with
-/// contiguous tx_ids starting at `first_tx_id`. Every transaction
-/// credits `account_id` by `amount_each`.
 pub fn build_range(first_tx_id: u64, count: u64, account_id: u64, amount_each: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity((count as usize) * 80);
-    // Track running balance so each TxEntry has a correct
-    // `computed_balance`. Followers use the leader's computed value
-    // verbatim during recovery.
     let mut running: i64 = 0;
     for i in 0..count {
         running += amount_each as i64;
@@ -147,10 +107,6 @@ pub fn build_range(first_tx_id: u64, count: u64, account_id: u64, amount_each: u
     bytes
 }
 
-/// Low-level variant: explicit `computed_balance`. The validator does
-/// not check balance arithmetic (that's the snapshot stage's job), but
-/// leaf tests that later reopen the ledger in leader mode will see the
-/// value we put here, so we keep it consistent.
 pub fn build_tx_with_balance(
     tx_id: u64,
     account_id: u64,
@@ -187,15 +143,11 @@ pub fn build_tx_with_balance(
     out
 }
 
-/// Decode a leader-produced WAL byte range into `WalEntry` values for
-/// inspection. Uses the same parser the validator uses internally.
+#[allow(dead_code)]
 pub fn decode_range(data: &[u8]) -> Vec<WalEntry> {
     let mut out = Vec::with_capacity(data.len() / 40);
     let mut off = 0;
     while off + 40 <= data.len() {
-        // Re-use the library's serializer by parsing byte-by-byte via
-        // bytemuck. We only need `Metadata` and `Entry` shapes for the
-        // round-trip tests.
         let kind = data[off];
         match kind {
             k if k == WalEntryKind::TxMetadata as u8 => {
@@ -213,14 +165,6 @@ pub fn decode_range(data: &[u8]) -> Vec<WalEntry> {
     out
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Replication harness
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Build an `AppendEntries` describing the contiguous range
-/// `[from_tx_id, to_tx_id]` carried by `wal_bytes`. Picks `prev_tx_id`
-/// /`prev_term` automatically (0/0 if `from_tx_id == 1`, otherwise the
-/// predecessor under the static term).
 pub fn make_append<'a>(
     from_tx_id: u64,
     to_tx_id: u64,
@@ -242,17 +186,12 @@ pub fn make_append<'a>(
     }
 }
 
-/// Drive `Replication::process` and assert success. Returns the
-/// `AppendOk` for further assertions.
 pub fn apply_ok(replication: &Replication, req: AppendEntries<'_>, last_local_tx_id: u64) -> AppendOk {
     replication
         .process(req, last_local_tx_id)
         .expect("process should succeed on a well-formed request")
 }
 
-/// Block the caller until `ledger.last_commit_id() >= target`, with a
-/// generous timeout. Replication returns as soon as records are queued
-/// to the WAL runner; commit happens asynchronously behind that.
 pub fn wait_for_commit(ledger: &Ledger, target: u64, timeout: Duration) {
     let start = Instant::now();
     while ledger.last_commit_id() < target {

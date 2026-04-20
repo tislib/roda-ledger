@@ -13,18 +13,38 @@ use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{JoinHandle, yield_now};
 
+/// Leader-side hook for shipping a WAL byte range to every peer.
+pub trait PeerShipper: Send + Sync {
+    fn ship(&self, buffer: &[u8]);
+}
+
 pub struct Wal {
     storage: Arc<Storage>,
+    last_committed_tx_id: Arc<AtomicU64>,
+    peer_shipper: Option<Arc<dyn PeerShipper>>,
 }
 
 impl Wal {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            last_committed_tx_id: Arc::new(AtomicU64::new(0)),
+            peer_shipper: None,
+        }
+    }
+
+    pub fn last_committed_tx_id_atomic(&self) -> Arc<AtomicU64> {
+        self.last_committed_tx_id.clone()
+    }
+
+    /// Install before `start()` — the writer thread captures a clone.
+    pub fn set_peer_shipper(&mut self, shipper: Arc<dyn PeerShipper>) {
+        self.peer_shipper = Some(shipper);
     }
 
     pub fn start(&self, ctx: WalContext) -> std::io::Result<[JoinHandle<()>; 2]> {
         let last_written_tx_id = Arc::new(AtomicU64::new(0));
-        let last_committed_tx_id = Arc::new(AtomicU64::new(0));
+        let last_committed_tx_id = self.last_committed_tx_id.clone();
         let active_segment_sync: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
 
         let mut wal_runner = WalRunner::new(
@@ -32,6 +52,7 @@ impl Wal {
             last_written_tx_id.clone(),
             last_committed_tx_id.clone(),
             active_segment_sync.clone(),
+            self.peer_shipper.clone(),
             &ctx,
         );
         let wal_ctx_clone = ctx.clone();
@@ -68,6 +89,7 @@ pub struct WalRunner {
     last_received_tx_id: u64,
     segment_start_tx_id: u64,
     wait_strategy: WaitStrategy,
+    peer_shipper: Option<Arc<dyn PeerShipper>>,
 }
 
 impl WalRunner {
@@ -76,6 +98,7 @@ impl WalRunner {
         last_written_tx_id: Arc<AtomicU64>,
         last_committed_tx_id: Arc<AtomicU64>,
         active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
+        peer_shipper: Option<Arc<dyn PeerShipper>>,
         ctx: &WalContext,
     ) -> Self {
         let mut active_segment = storage.active_segment().unwrap();
@@ -102,6 +125,7 @@ impl WalRunner {
             last_received_tx_id: 0,
             segment_start_tx_id: 0,
             wait_strategy,
+            peer_shipper,
         }
     }
 
@@ -132,6 +156,8 @@ impl WalRunner {
 
             // if new entries are available, write them to the segment.
             if available > 0 {
+                let buffer = self.active_segment.get_pending_buffer();
+                self.write_to_peers(buffer);
                 self.active_segment.write_pending_entries();
                 self.last_written_tx_id
                     .store(self.last_received_tx_id, Release);
@@ -241,6 +267,16 @@ impl WalRunner {
         syncer.sync().expect("Failed to sync segment");
         self.last_committed_tx_id
             .store(self.last_written_tx_id.load(Acquire), Release);
+    }
+
+    /// Hand the pending WAL bytes to the peer shipper (runs on the write path).
+    pub fn write_to_peers(&self, buffer: &[u8]) {
+        if buffer.is_empty() {
+            return;
+        }
+        if let Some(shipper) = &self.peer_shipper {
+            shipper.ship(buffer);
+        }
     }
 }
 

@@ -1,7 +1,3 @@
-//! Replication-mode gating: a follower Ledger must refuse every write
-//! API. Read APIs are left alone (covered indirectly by the
-//! end-to-end tests).
-
 use super::common::{config_for, start_ledger, TempDir};
 use roda_ledger::transaction::Operation;
 
@@ -10,9 +6,6 @@ fn follower_rejects_register_function() {
     let dir = TempDir::new("gating_register");
     let ledger = start_ledger(config_for(&dir.as_str(), true));
 
-    // A valid empty WASM module body would still be rejected — the
-    // mode-check runs before any registry work. Pass a trivially
-    // invalid payload, we only care about the error path.
     let res = ledger.register_function("fee_calc", b"not a wasm", false);
     let err = res.expect_err("must be rejected in replication_mode");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -49,9 +42,6 @@ fn is_replication_mode_flag_surfaces_to_callers() {
 fn follower_submit_panics() {
     let dir = TempDir::new("gating_submit_panic");
     let ledger = start_ledger(config_for(&dir.as_str(), true));
-    // The ADR calls this "rejected" — the implementation enforces it
-    // via `assert!` so a misconfiguration fails loudly at the call
-    // site rather than silently corrupting state.
     let _ = ledger.submit(Operation::Deposit {
         account: 1,
         amount: 100,

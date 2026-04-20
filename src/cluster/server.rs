@@ -1,7 +1,3 @@
-//! Combined multi-node bootstrap: brings up the client gRPC service
-//! (`roda.ledger.v1`) AND the peer-to-peer Node service
-//! (`roda.node.v1`) in the same process, on separate ports.
-
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::handler::NodeHandler;
 use crate::cluster::proto::node_server::NodeServer;
@@ -34,9 +30,6 @@ impl ClusterServer {
         }
     }
 
-    /// Run both gRPC services until the first one fails or a shutdown
-    /// signal is received. `tokio::try_join!` propagates the first
-    /// error; a clean shutdown resolves both arms with `Ok(())`.
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let client_server = GrpcServer::new(self.ledger.clone(), self.client_addr);
         let client_fut = client_server.run();
@@ -68,7 +61,6 @@ impl ClusterServer {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         };
 
-        // Run both concurrently; bail out on the first error.
         tokio::try_join!(
             async { client_fut.await.map_err(|e| e.to_string()) },
             async { node_fut.await.map_err(|e| e.to_string()) },
@@ -78,8 +70,6 @@ impl ClusterServer {
     }
 }
 
-/// Matches the shutdown pattern used by the single-node server (SIGINT
-/// + SIGTERM).
 async fn node_shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

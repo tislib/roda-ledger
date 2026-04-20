@@ -1,36 +1,9 @@
-//! Follower-side replication stage (ADR-015).
-//!
-//! The `Replication` struct is **not** a runner — it has no thread of its
-//! own. Like the `Sequencer`, it is a synchronous stage invoked directly
-//! from its caller (the Node gRPC `AppendEntries` handler).
-//!
-//! Flow of `process`:
-//!   1. Parse the incoming contiguous WAL byte range into 40-byte records.
-//!   2. Validate envelope (`prev_tx_id` / `prev_term` match the follower's
-//!      local state, `request.term >= current_term`, the parsed stream's
-//!      first/last tx_id match `from_tx_id`/`to_tx_id`).
-//!   3. Validate each record: sequence monotonicity, per-transaction CRC32C
-//!      (mirrors `Recover::validate_wal_transactions`).
-//!   4. Push the parsed records into the shared WAL input queue (same
-//!      queue the Transactor uses on a leader).
-//!   5. Block until the WAL committer advances `last_commit_id` past
-//!      `to_tx_id` — on a follower, committed == fsynced locally.
-//!   6. Return `last_tx_id` so the leader can advance matchIndex.
-//!
-//! The function is intentionally blocking: the ADR requires the RPC
-//! handler to call it from a blocking tokio task
-//! (`tokio::task::spawn_blocking`) so the async reactor stays free.
-
 use crate::entities::{TxMetadata, WalEntry, WalEntryKind};
 use crate::pipeline::LedgerContext;
 use crate::storage::wal_serializer::parse_wal_record;
 
-/// Fixed WAL record size (see `entities.rs` — every variant is 40 bytes).
 pub const ENTRY_SIZE: usize = 40;
 
-/// Mirrors `node.proto::RejectReason` for handler-side mapping. Kept as a
-/// plain enum so the core replication stage does not depend on the
-/// generated proto crate (tests/benches can exercise it without `grpc`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RejectReason {
     None = 0,
@@ -42,7 +15,6 @@ pub enum RejectReason {
     NotFollower = 6,
 }
 
-/// Validated parameters extracted from an `AppendEntriesRequest`.
 #[derive(Clone, Debug)]
 pub struct AppendEntries<'a> {
     pub term: u64,
@@ -69,19 +41,10 @@ pub struct AppendError {
 
 pub type AppendResult = Result<AppendOk, AppendError>;
 
-/// Follower state the replication stage needs to consult on each call.
-/// Backed by the `Pipeline` for `last_commit_id()` and by the Ledger for
-/// `current_term` + `prev_term` lookup. For ADR-015 the static leader
-/// writes term=1 and the follower's `current_term` is also 1 — the lookup
-/// closure is still supplied so the structure is already shaped for
-/// ADR-016.
 pub struct Replication {
-    /// Queue access + shutdown flag + wait strategy.
     ctx: LedgerContext,
-    /// Cluster id (used for observability / future leader-change checks).
     #[allow(dead_code)]
     node_id: u64,
-    /// Follower's persisted term (from `raft_state` sidecar).
     current_term: u64,
 }
 
@@ -94,12 +57,7 @@ impl Replication {
         }
     }
 
-    /// Entry point called from the gRPC handler (inside a blocking task).
-    ///
-    /// Runs the full validate → enqueue → wait-for-commit cycle. The
-    /// handler maps the result to `AppendEntriesResponse`.
     pub fn process(&self, req: AppendEntries<'_>, last_local_tx_id: u64) -> AppendResult {
-        // ── 1. Envelope: term check ────────────────────────────────────
         if req.term < self.current_term {
             return Err(AppendError {
                 term: self.current_term,
@@ -111,14 +69,6 @@ impl Replication {
             });
         }
 
-        // ── 2. Envelope: prev_tx_id / prev_term consistency ────────────
-        //
-        // ADR-015 uses a static single-term model (term=1). The
-        // follower's only piece of historical term info is
-        // `current_term`, so the consistency check is:
-        //   - If prev_tx_id==0 (very first RPC), accept.
-        //   - Else prev_tx_id must match what we already have on disk,
-        //     and prev_term must equal our current_term.
         if req.prev_tx_id != 0 {
             if req.prev_tx_id != last_local_tx_id {
                 return Err(AppendError {
@@ -142,7 +92,6 @@ impl Replication {
             }
         }
 
-        // ── 3. Range bounds sanity ─────────────────────────────────────
         if req.from_tx_id == 0 || req.to_tx_id < req.from_tx_id {
             return Err(AppendError {
                 term: self.current_term,
@@ -154,7 +103,6 @@ impl Replication {
             });
         }
 
-        // ── 4. Parse + validate the WAL byte range ─────────────────────
         let entries = validate_wal_bytes(
             req.wal_bytes,
             req.from_tx_id,
@@ -162,10 +110,6 @@ impl Replication {
             self.current_term,
         )?;
 
-        // ── 5. Push all parsed entries into the WAL input queue.
-        //     Backpressure via the pipeline's wait strategy, same pattern
-        //     as the sequencer / transactor. Aborts if the pipeline was
-        //     shut down mid-enqueue.
         let mut retry_count = 0u64;
         for entry in entries.into_iter() {
             let mut msg = entry;
@@ -195,10 +139,6 @@ impl Replication {
     }
 }
 
-/// Walk the 40-byte-aligned byte range, enforce the tx_id sequence rule,
-/// recompute per-transaction CRC32C, and return the parsed `WalEntry` list
-/// in order. Mirrors `Recover::validate_wal_transactions` but keyed on the
-/// advertised tx_id range instead of the file-tail-truncation semantic.
 pub fn validate_wal_bytes(
     data: &[u8],
     from_tx_id: u64,
@@ -239,7 +179,6 @@ pub fn validate_wal_bytes(
                 || k == WalEntryKind::SegmentSealed as u8
                 || k == WalEntryKind::FunctionRegistered as u8 =>
             {
-                // Non-transactional record: parse and append, no CRC step.
                 let entry = parse_wal_record(&data[offset..offset + ENTRY_SIZE]).map_err(|e| {
                     AppendError {
                         term: _term,
@@ -256,8 +195,6 @@ pub fn validate_wal_bytes(
                     bytemuck::pod_read_unaligned(&data[offset..offset + ENTRY_SIZE]);
                 let expected = meta.entry_count as usize + meta.link_count as usize;
 
-                // Sequence check: tx_id must be strictly monotonic and
-                // land inside `[from_tx_id, to_tx_id]`.
                 if meta.tx_id < from_tx_id || meta.tx_id > to_tx_id {
                     return Err(AppendError {
                         term: _term,
@@ -291,7 +228,6 @@ pub fn validate_wal_bytes(
                     });
                 }
 
-                // Follower-record count check.
                 let records_left = (data.len() - offset) / ENTRY_SIZE - 1;
                 if records_left < expected {
                     return Err(AppendError {
@@ -304,7 +240,6 @@ pub fn validate_wal_bytes(
                     });
                 }
 
-                // Collect follower slices, kind-check on the fly.
                 let mut follower_slices: Vec<&[u8]> = Vec::with_capacity(expected);
                 let mut foff = offset + ENTRY_SIZE;
                 for _ in 0..expected {
@@ -323,7 +258,6 @@ pub fn validate_wal_bytes(
                     foff += ENTRY_SIZE;
                 }
 
-                // CRC: zero the stored crc field when folding.
                 let mut meta_for_crc = meta;
                 meta_for_crc.crc32c = 0;
                 let mut digest = crc32c::crc32c(bytemuck::bytes_of(&meta_for_crc));
@@ -365,7 +299,6 @@ pub fn validate_wal_bytes(
         }
     }
 
-    // Post-walk check: advertised range must be fully covered.
     match first_tx_id {
         None => Err(AppendError {
             term: _term,
@@ -384,21 +317,11 @@ pub fn validate_wal_bytes(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Unit tests (Step 9): exercise the pure validator against hand-crafted
-// byte ranges — positive & negative cases. Integration with the WAL runner
-// is covered indirectly by `tests/replay_test.rs` patterns; this file
-// keeps the byte-level semantics tight.
-// ─────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 pub mod test_helpers {
     use super::*;
     use crate::entities::{EntryKind, FailReason, TxEntry, TxMetadata};
 
-    /// Build a single-entry transaction (Metadata + one TxEntry) with a
-    /// correct CRC. Returns (bytes, tx_id). Caller can splice into a
-    /// multi-tx buffer.
     pub fn make_single_tx_bytes(tx_id: u64, account_id: u64, amount: u64) -> Vec<u8> {
         let entry = TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
@@ -431,7 +354,6 @@ pub mod test_helpers {
         bytes
     }
 
-    /// Concatenate N single-entry transactions with contiguous tx_ids.
     pub fn make_range_bytes(first_tx_id: u64, count: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity((count as usize) * 80);
         for i in 0..count {
@@ -477,7 +399,6 @@ mod tests {
     fn valid_multi_tx_range() {
         let bytes = make_range_bytes(10, 4);
         let entries = validate_wal_bytes(&bytes, 10, 13, TERM).expect("valid");
-        // 4 transactions * 2 records each.
         assert_eq!(entries.len(), 8);
     }
 
@@ -500,7 +421,6 @@ mod tests {
     #[test]
     fn crc_mismatch_is_rejected() {
         let mut bytes = make_single_tx_bytes(1, 42, 500);
-        // Corrupt the TxEntry amount (byte 24 of the follower record).
         bytes[ENTRY_SIZE + 24] ^= 0xFF;
         let err = validate_wal_bytes(&bytes, 1, 1, TERM).unwrap_err();
         assert_eq!(err.reason, RejectReason::CrcFailed);
@@ -508,10 +428,9 @@ mod tests {
 
     #[test]
     fn orphan_tx_entry_rejected() {
-        // Only a TxEntry with no preceding TxMetadata.
         let bytes = {
             let mut b = make_single_tx_bytes(1, 1, 100);
-            b.drain(..ENTRY_SIZE); // remove metadata
+            b.drain(..ENTRY_SIZE);
             b
         };
         let err = validate_wal_bytes(&bytes, 1, 1, TERM).unwrap_err();
@@ -549,14 +468,13 @@ mod tests {
         let mut bytes = bytemuck::bytes_of(&header).to_vec();
         bytes.extend(make_single_tx_bytes(7, 1, 100));
         let entries = validate_wal_bytes(&bytes, 7, 7, TERM).expect("valid");
-        // 1 header + Metadata + TxEntry
         assert_eq!(entries.len(), 3);
     }
 
     #[test]
     fn truncated_follower_rejected() {
         let mut bytes = make_single_tx_bytes(1, 1, 100);
-        bytes.truncate(ENTRY_SIZE); // drop the TxEntry follower
+        bytes.truncate(ENTRY_SIZE);
         let err = validate_wal_bytes(&bytes, 1, 1, TERM).unwrap_err();
         assert_eq!(err.reason, RejectReason::SequenceInvalid);
     }
@@ -564,7 +482,7 @@ mod tests {
     #[test]
     fn non_monotonic_tx_id_rejected() {
         let mut bytes = make_single_tx_bytes(5, 1, 100);
-        bytes.extend(make_single_tx_bytes(7, 1, 100)); // gap: 5 → 7
+        bytes.extend(make_single_tx_bytes(7, 1, 100));
         let err = validate_wal_bytes(&bytes, 5, 7, TERM).unwrap_err();
         assert_eq!(err.reason, RejectReason::SequenceInvalid);
     }

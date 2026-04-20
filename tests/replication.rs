@@ -1,9 +1,3 @@
-//! Integration tests for ADR-015 follower-side replication.
-//!
-//! Each submodule below is a separate file under `tests/replication/`.
-//! All submodules compile into one integration-test binary
-//! (`cargo test --test replication`).
-
 #[path = "replication/common.rs"]
 mod common;
 

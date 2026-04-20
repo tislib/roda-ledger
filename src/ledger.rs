@@ -9,7 +9,7 @@ use crate::storage::{Segment, Storage};
 use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
-use crate::wal::Wal;
+use crate::wal::{PeerShipper, Wal};
 pub use crate::wasm_runtime::FunctionInfo;
 use crate::wasm_runtime::{WasmRegistry, WasmRuntime};
 use spdlog::{LevelFilter, info};
@@ -70,21 +70,22 @@ impl Ledger {
         }
     }
 
-    /// Whether this Ledger instance is a follower (ADR-015). When true,
-    /// write APIs (`submit`, `submit_batch`, `register_function`,
-    /// `unregister_function`) are rejected — the WAL is fed by the
-    /// Replication stage instead.
     #[inline(always)]
     pub fn is_replication_mode(&self) -> bool {
         self.config.replication_mode
     }
 
-    /// Shared `LedgerContext` — used by the follower-side Replication
-    /// stage to push parsed WAL records onto the same input queue the
-    /// Transactor writes to on a leader, and to observe the commit
-    /// watermark.
     pub fn ledger_context(&self) -> crate::pipeline::LedgerContext {
         self.pipeline.ledger_context()
+    }
+
+    pub fn last_committed_tx_id_atomic(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.wal.last_committed_tx_id_atomic()
+    }
+
+    /// Install before `start()`.
+    pub fn set_peer_shipper(&mut self, shipper: Arc<dyn PeerShipper>) {
+        self.wal.set_peer_shipper(shipper);
     }
 
     pub fn submit(&self, operation: Operation) -> u64 {
@@ -346,9 +347,7 @@ impl Ledger {
                 format!("failed to recover ledger during start: {}", e),
             )
         })?;
-        // Follower (ADR-015): the Transactor is not started. The WAL
-        // input queue is fed directly by the Replication stage through
-        // the Node gRPC handler.
+        // Follower: Transactor is not started; WAL input comes from the Replication stage.
         if !self.config.replication_mode {
             self.handles.push(
                 self.transactor

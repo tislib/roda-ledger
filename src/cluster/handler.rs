@@ -1,10 +1,3 @@
-//! gRPC server-side implementation of `roda.node.v1.Node` (ADR-015).
-//!
-//! The leader returns `REJECT_NOT_FOLLOWER` on `AppendEntries`; only
-//! followers hand off to the `Replication` stage. `Ping` works in both
-//! roles. `RequestVote` and `InstallSnapshot` are `UNIMPLEMENTED` until
-//! ADR-016.
-
 use crate::cluster::config::{ClusterConfig, NodeMode};
 use crate::cluster::proto;
 use crate::cluster::proto::node_server::Node;
@@ -14,13 +7,9 @@ use spdlog::{debug, warn};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-/// Follower-side handler. On the leader, the `Replication` field is
-/// unused and every `AppendEntries` returns `REJECT_NOT_FOLLOWER`.
 pub struct NodeHandler {
     ledger: Arc<InternalLedger>,
     cluster: Arc<ClusterConfig>,
-    /// Present only when `cluster.mode == Follower`. `Arc`ed so it can
-    /// be cloned into the blocking task the handler spawns per RPC.
     replication: Option<Arc<Replication>>,
 }
 
@@ -42,9 +31,6 @@ impl NodeHandler {
         }
     }
 
-    /// Observe the follower's local `last_tx_id` — currently the WAL
-    /// commit watermark. On a follower that has fsynced through tx N,
-    /// `last_commit_id()` == N.
     fn last_local_tx_id(&self) -> u64 {
         self.ledger.last_commit_id()
     }
@@ -56,9 +42,6 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::AppendEntriesRequest>,
     ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
-        // Leader-side: refuse. Leaders never accept AppendEntries in
-        // ADR-015's static-leader model (only ADR-016's demoted leader
-        // would — and that's a follower for protocol purposes).
         let Some(replication) = self.replication.clone() else {
             debug!("AppendEntries received on leader node — rejecting");
             return Ok(Response::new(proto::AppendEntriesResponse {
@@ -72,8 +55,6 @@ impl Node for NodeHandler {
         let req = request.into_inner();
         let last_local_tx_id = self.last_local_tx_id();
 
-        // Ownership dance: `wal_bytes` is a `Vec<u8>` owned by `req`.
-        // The blocking task needs to own it too, so we move `req` in.
         let result = tokio::task::spawn_blocking(move || {
             let append = AppendEntries {
                 term: req.term,

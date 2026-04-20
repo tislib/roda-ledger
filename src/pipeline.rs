@@ -397,8 +397,6 @@ impl LedgerContext {
         self.pipeline.wait_strategy
     }
 
-    /// Last tx_id durably committed (fsynced) to the local WAL. Used by
-    /// the follower-side replication stage to block on per-RPC durability.
     #[inline(always)]
     pub fn last_commit_id(&self) -> u64 {
         self.pipeline.last_commit_id()

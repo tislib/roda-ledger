@@ -1,26 +1,14 @@
-//! Root config for the `cluster` binary (ADR-015).
-//!
-//! Layers over the existing single-node `ServerConfig`:
-//!   - `server` + `ledger`: inherited from `crate::grpc::ServerConfig`.
-//!   - `cluster`: new section describing node identity, role, peers,
-//!     and the Node-proto listen address.
-
 use crate::config::LedgerConfig;
 use crate::grpc::GrpcServerSection;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 
-/// Top-level config for a clustered deployment.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ClusterServerConfig {
-    /// Client-facing gRPC transport (same `[server]` section used by the
-    /// single-node `roda-ledger` binary — port 50051 by default).
     pub server: GrpcServerSection,
-    /// Embedded ledger.
     pub ledger: LedgerConfig,
-    /// Peer-to-peer replication transport + membership.
     pub cluster: ClusterConfig,
 }
 
@@ -35,19 +23,11 @@ pub enum NodeMode {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
-    /// Role of this node.
     pub mode: NodeMode,
-    /// Unique id inside the cluster.
     pub node_id: u64,
-    /// Bind host for the Node-proto service.
     pub node_host: String,
-    /// Bind port for the Node-proto service (separate from client API).
     pub node_port: u16,
-    /// Static peer list (ADR-015 — no elections). Addresses of the other
-    /// nodes in this cluster. Empty on a single-node deployment.
     pub peers: Vec<PeerConfig>,
-    /// Persisted term from the `raft_state` sidecar. Under ADR-015 this
-    /// is always 1; ADR-016 will overwrite on leader change.
     pub current_term: u64,
 }
 
@@ -71,12 +51,10 @@ pub struct PeerConfig {
 }
 
 impl ClusterConfig {
-    /// Resolve the Node-proto bind socket from host + port.
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.node_host, self.node_port).parse()
     }
 
-    /// True iff this node is a follower under the static-leader model.
     pub fn is_follower(&self) -> bool {
         self.mode == NodeMode::Follower
     }
@@ -92,8 +70,7 @@ impl ClusterServerConfig {
         Ok(toml::from_str(s)?)
     }
 
-    /// Apply cluster-derived overrides onto the embedded `LedgerConfig`.
-    /// In particular: flip `replication_mode = true` for followers.
+    /// Apply cluster-derived overrides onto the embedded ledger config.
     pub fn finalize(mut self) -> Self {
         if self.cluster.is_follower() {
             self.ledger.replication_mode = true;

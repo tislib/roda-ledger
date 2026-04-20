@@ -217,6 +217,10 @@ impl Segment {
         self.wal_buffer.clear();
     }
 
+    pub(crate) fn get_pending_buffer(&self) -> &[u8] {
+        &self.wal_buffer
+    }
+
     pub(crate) fn write_entries(&mut self, entries: &[WalEntry]) {
         assert_eq!(
             self.status,

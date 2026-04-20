@@ -50,11 +50,7 @@ pub struct LedgerConfig {
     #[serde(skip)]
     pub disable_seal: bool,
 
-    /// Follower mode (ADR-015). When true:
-    ///   - Transactor is not started.
-    ///   - `submit` / `submit_batch` / `register_function` return an error.
-    ///   - The WAL input queue is fed by the Replication stage instead.
-    /// Set programmatically by the cluster bootstrap, never via config.toml.
+    /// Follower mode — disables Transactor and write APIs; set by cluster bootstrap.
     #[serde(skip)]
     pub replication_mode: bool,
 }

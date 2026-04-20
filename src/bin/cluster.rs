@@ -1,14 +1,4 @@
-//! Multi-node `cluster` binary (ADR-015).
-//!
-//! Boots a single Ledger instance and mounts two gRPC services on
-//! separate ports:
-//!   * `roda.ledger.v1` — client API (50051 by default).
-//!   * `roda.node.v1`   — peer-to-peer replication API (50052 by default).
-//!
-//! The client binary (`roda-ledger` / `src/bin/server.rs`) is left
-//! untouched — it continues to serve single-node deployments.
-
-use roda_ledger::cluster::{ClusterServer, ClusterServerConfig};
+use roda_ledger::cluster::{ClusterServer, ClusterServerConfig, LeaderPeerShipper};
 use roda_ledger::ledger::Ledger;
 use spdlog::info;
 use std::env;
@@ -17,7 +7,6 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Config path precedence: CLI arg > RODA_CLUSTER_CONFIG env > ./cluster.toml
     let config_path: PathBuf = env::args()
         .nth(1)
         .or_else(|| env::var("RODA_CLUSTER_CONFIG").ok())
@@ -44,6 +33,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut ledger = Ledger::new(cluster_config.ledger);
+
+    if !cluster_config.cluster.is_follower() && !cluster_config.cluster.peers.is_empty() {
+        let shipper = LeaderPeerShipper::new(
+            &cluster_config.cluster,
+            tokio::runtime::Handle::current(),
+            ledger.last_committed_tx_id_atomic(),
+        )
+        .map_err(|e| format!("peer shipper init failed: {}", e))?;
+        info!(
+            "leader peer shipper installed: {} peers, semaphore capacity {}",
+            shipper.peer_count(),
+            shipper.semaphore_capacity()
+        );
+        ledger.set_peer_shipper(Arc::new(shipper));
+    }
+
     ledger.start()?;
     let ledger_arc = Arc::new(ledger);
 
