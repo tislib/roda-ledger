@@ -11,7 +11,7 @@ use crate::grpc::GrpcServer;
 use crate::ledger::Ledger;
 use spdlog::info;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -83,6 +83,8 @@ impl Cluster {
         // spawns one child sub-task per peer.
         let mut peer_manager_handle: Option<JoinHandle<()>> = None;
         let mut peer_manager_running: Option<Arc<AtomicBool>> = None;
+        let mut majority_commit_id: Option<Arc<AtomicU64>> = None;
+        let mut peer_commit_ids: Option<Arc<Vec<Arc<AtomicU64>>>> = None;
         if self.config.mode == ClusterMode::Leader && !self.config.peers.is_empty() {
             let params = ReplicationParams::new(
                 self.config.node_id,
@@ -96,6 +98,8 @@ impl Cluster {
                 params,
             );
             peer_manager_running = Some(manager.running());
+            majority_commit_id = Some(manager.majority_commit_id());
+            peer_commit_ids = Some(manager.peer_commit_ids());
             peer_manager_handle = Some(manager.spawn());
             info!(
                 "cluster: leader node_id={} replicating to {} peer(s)",
@@ -109,6 +113,8 @@ impl Cluster {
             node_handle,
             peer_manager_handle,
             peer_manager_running,
+            majority_commit_id,
+            peer_commit_ids,
         })
     }
 }
@@ -121,6 +127,10 @@ pub struct ClusterHandles {
     /// Shutdown flag owned by the peer manager; flipping it drains every
     /// peer subtask without aborting.
     pub peer_manager_running: Option<Arc<AtomicBool>>,
+    /// Cluster-wide majority commit watermark (leader only).
+    pub majority_commit_id: Option<Arc<AtomicU64>>,
+    /// Per-peer commit atomics, positionally aligned with `config.peers`.
+    pub peer_commit_ids: Option<Arc<Vec<Arc<AtomicU64>>>>,
 }
 
 impl ClusterHandles {

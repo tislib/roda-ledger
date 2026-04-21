@@ -5,10 +5,11 @@
 //! Columns:
 //! - TPS            — submitted tx/s
 //! - leader         — leader commit_tx_id
-//! - min_follower   — minimum follower commit_tx_id across all followers
+//! - majority       — cluster-wide majority commit watermark (Raft-style)
 //! - in-flight      — gap between sent_tx_id and leader_commit_tx_id
-//! - min_repl_lag   — min(leader_commit − follower_commit) across followers
-//! - max_repl_lag   — max(leader_commit − follower_commit) across followers
+//! - maj_lag        — leader_commit − majority_commit  (main replication metric)
+//! - min_lag        — leader_commit − max follower commit  (best follower)
+//! - max_lag        — leader_commit − min follower commit  (worst follower)
 
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
@@ -21,6 +22,7 @@ use roda_ledger::transaction::Operation;
 use spdlog::Level::Critical;
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -195,6 +197,14 @@ async fn main() {
     let leader_handles = leader.run().await.expect("leader run");
     let leader_ledger = leader.ledger();
 
+    // Share-of-truth for replication progress. The leader's PeerManager
+    // updates `majority_commit_id` via `fetch_max` on every accepted
+    // `AppendEntries`; we read it directly here.
+    let majority_commit_id = leader_handles
+        .majority_commit_id
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+
     // Give replication tasks a beat to connect before writes start.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -207,10 +217,12 @@ async fn main() {
     // Drive writes on a blocking thread so the tokio runtime keeps
     // servicing replication (which is async).
     let writer_followers = follower_ledgers.clone();
+    let writer_majority = majority_commit_id.clone();
     let writer = tokio::task::spawn_blocking(move || {
         run_writer(
             leader_ledger,
             writer_followers,
+            writer_majority,
             account_count,
             duration,
             &mut per_second,
@@ -272,11 +284,12 @@ async fn main() {
     }
 }
 
-/// Blocking write loop. Tracks min/max follower commit across every
-/// follower ledger each tick.
+/// Blocking write loop. Reads `majority_commit_id` (published by the
+/// leader's `PeerManager`) and per-follower ledger commit ids each tick.
 fn run_writer(
     leader_ledger: Arc<Ledger>,
     followers: Vec<Arc<Ledger>>,
+    majority_commit_id: Arc<AtomicU64>,
     account_count: u64,
     duration: Duration,
     per_second: &mut [LatencyMeasurer],
@@ -288,12 +301,12 @@ fn run_writer(
     let mut last_leader = 0u64;
     let mut second = 0u32;
 
-    let sep = "  +-----+--------+------------+------------+------------+----------+----------+------------+------------+------------+";
+    let sep = "  +-----+--------+------------+------------+------------+----------+----------+------------+------------+----------+----------+";
     println!();
     println!("{}", sep);
     println!(
-        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} |",
-        "#", "time", "TPS", "leader", "min_fol", "P50", "P99", "in-flight", "min_lag", "max_lag"
+        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>8} | {:>8} |",
+        "#", "time", "TPS", "leader", "majority", "P50", "P99", "in-flight", "maj_lag", "min_lag", "max_lag"
     );
     println!("{}", sep);
 
@@ -328,11 +341,13 @@ fn run_writer(
                 second += 1;
                 let wall = start_time.elapsed();
                 let leader_commit = leader_ledger.last_commit_id();
+                let majority = majority_commit_id.load(Ordering::Acquire);
                 let (min_follower, max_follower) = follower_commit_stats(&followers);
                 let delta = leader_commit - last_leader;
                 let interval = now.duration_since(last_tick).as_secs_f64();
                 let tps = delta as f64 / interval;
                 let in_flight = i.saturating_sub(leader_commit);
+                let maj_lag = leader_commit.saturating_sub(majority);
                 let min_repl_lag = leader_commit.saturating_sub(max_follower);
                 let max_repl_lag = leader_commit.saturating_sub(min_follower);
 
@@ -344,15 +359,16 @@ fn run_writer(
                 };
 
                 println!(
-                    "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} |",
+                    "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>8} | {:>8} |",
                     second,
                     wall.as_secs(),
                     format!("{:.0}", tps),
                     leader_commit,
-                    min_follower,
+                    majority,
                     fmt_ns(stats.p50),
                     fmt_ns(stats.p99),
                     in_flight,
+                    maj_lag,
                     min_repl_lag,
                     max_repl_lag,
                 );
@@ -369,24 +385,27 @@ fn run_writer(
 
     println!("{}", sep);
 
-    // Drain: wait briefly for every follower to catch up (cap 30s).
+    // Drain: wait briefly for the cluster majority to catch up (cap 30s).
     let drain_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let leader_commit = leader_ledger.last_commit_id();
-        let (min_follower, _) = follower_commit_stats(&followers);
-        if min_follower >= leader_commit || Instant::now() >= drain_deadline {
+        let majority = majority_commit_id.load(Ordering::Acquire);
+        if majority >= leader_commit || Instant::now() >= drain_deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 
     let leader_commit = leader_ledger.last_commit_id();
+    let majority = majority_commit_id.load(Ordering::Acquire);
     let (min_follower, max_follower) = follower_commit_stats(&followers);
     println!(
-        "  drain: leader_commit={} min_follower={} max_follower={} min_lag={} max_lag={}",
+        "  drain: leader_commit={} majority={} min_follower={} max_follower={} maj_lag={} min_lag={} max_lag={}",
         leader_commit,
+        majority,
         min_follower,
         max_follower,
+        leader_commit.saturating_sub(majority),
         leader_commit.saturating_sub(max_follower),
         leader_commit.saturating_sub(min_follower),
     );
