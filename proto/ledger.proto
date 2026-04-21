@@ -191,6 +191,7 @@ message Function {
 // Used by the fire-and-forget SubmitOperation RPC.
 message SubmitOperationResponse {
   uint64 transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
+  uint64 term = 2; // Current leader term at the moment of the reply. 0 in single-node mode.
 }
 
 // SubmitAndWaitResponse is returned after the operation reaches the requested WaitLevel.
@@ -198,6 +199,7 @@ message SubmitOperationResponse {
 message SubmitAndWaitResponse {
   uint64   transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
   uint32   fail_reason = 2; // 0 if status == COMMITTED. See FailReason codes.
+  uint64   term = 3; // Current leader term at the moment of the reply. 0 in single-node mode.
 }
 
 // SubmitBatchRequest submits multiple operations in a single round trip.
@@ -211,6 +213,7 @@ message SubmitBatchRequest {
 // SubmitBatchResponse returns one result per input operation, same order.
 message SubmitBatchResponse {
   repeated SubmitOperationResponse results = 1; // One result per input operation, same order.
+  uint64 term = 2; // Current leader term at the moment of the reply. 0 in single-node mode.
 }
 
 // SubmitBatchAndWaitRequest submits multiple operations and blocks until all reach WaitLevel.
@@ -222,6 +225,7 @@ message SubmitBatchAndWaitRequest {
 // SubmitBatchAndWaitResponse returns the full result per operation after WaitLevel is reached.
 message SubmitBatchAndWaitResponse {
   repeated SubmitAndWaitResponse results = 1; // One result per input operation, same order.
+  uint64 term = 2; // Current leader term at the moment of the reply. 0 in single-node mode.
 }
 
 // ---- Balance messages ----

@@ -6,12 +6,12 @@
 //! The top-level `tokio::spawn` for peer supervision lives here —
 //! `Leader::run` spawns one child per peer.
 
+use crate::cluster::GrpcServer;
 use crate::cluster::Quorum;
 use crate::cluster::config::ClusterConfig;
+use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
-use crate::cluster::proto::NodeRole;
-use crate::cluster::server::{NodeHandler, NodeServerRuntime};
-use crate::grpc::GrpcServer;
+use crate::cluster::proto::node::NodeRole;
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -38,7 +38,9 @@ impl Leader {
         let node_addr = self.config.node.socket_addr()?;
 
         // Client-facing Ledger server — full read/write on the leader.
-        let client_server = GrpcServer::new(self.ledger.clone(), client_addr);
+        // `with_term` stamps the current cluster term on every submit reply.
+        let client_server =
+            GrpcServer::new(self.ledger.clone(), client_addr).with_term(self.config.term);
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("leader ledger gRPC server exited: {}", e);

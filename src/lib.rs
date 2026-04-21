@@ -28,6 +28,20 @@ pub mod client;
 #[cfg(feature = "grpc")]
 pub mod cluster;
 mod entries;
-#[cfg(feature = "grpc")]
-pub mod grpc;
 pub mod index;
+
+/// Back-compat re-export — the gRPC server files were merged into
+/// `cluster`. A "single node" is now just a `Cluster` with zero peers.
+/// External call sites that still reference `roda_ledger::grpc::*`
+/// resolve through this facade.
+#[cfg(feature = "grpc")]
+pub mod grpc {
+    pub use crate::cluster::{
+        GrpcServer, GrpcServerSection, LedgerHandler, ServerConfig, ServerConfigError,
+    };
+    /// Legacy alias for the client-API proto. New code should use
+    /// `crate::cluster::proto::ledger` directly.
+    pub mod proto {
+        pub use crate::cluster::proto::ledger::*;
+    }
+}

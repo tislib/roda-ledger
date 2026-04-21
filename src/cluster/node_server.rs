@@ -1,7 +1,7 @@
 //! Node service server. Handles peer-to-peer RPCs (`AppendEntries`, `Ping`).
 
-use crate::cluster::proto;
-use crate::cluster::proto::node_server::{Node, NodeServer};
+use crate::cluster::proto::node as proto;
+use crate::cluster::proto::node::node_server::{Node, NodeServer};
 use crate::ledger::Ledger;
 use crate::wal_tail::decode_records;
 use spdlog::{info, warn};

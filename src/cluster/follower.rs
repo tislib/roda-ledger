@@ -5,10 +5,10 @@
 //! fan-out runs on this side; incoming `AppendEntries` are applied to the
 //! local ledger via `NodeHandler`.
 
+use crate::cluster::GrpcServer;
 use crate::cluster::config::ClusterConfig;
-use crate::cluster::proto::NodeRole;
-use crate::cluster::server::{NodeHandler, NodeServerRuntime};
-use crate::grpc::GrpcServer;
+use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
+use crate::cluster::proto::node::NodeRole;
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -32,7 +32,11 @@ impl Follower {
 
         // Client-facing Ledger server — read-only on followers. Every
         // `submit_*` / `register_function` RPC returns FAILED_PRECONDITION.
-        let client_server = GrpcServer::new_read_only(self.ledger.clone(), client_addr);
+        // Follower handler is read-only; we still stamp the configured term
+        // onto any submit replies (which will immediately return
+        // FAILED_PRECONDITION), so callers can observe the current term.
+        let client_server =
+            GrpcServer::new_read_only(self.ledger.clone(), client_addr).with_term(self.config.term);
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("follower ledger gRPC server exited: {}", e);

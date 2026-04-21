@@ -326,6 +326,7 @@ mod tests {
             let response = client
                 .get_transaction_status(GetStatusRequest {
                     transaction_id: tx_id1,
+                    term: 0,
                 })
                 .await
                 .unwrap()
@@ -426,6 +427,7 @@ mod tests {
             let response = client
                 .get_transaction_status(GetStatusRequest {
                     transaction_id: tx_id,
+                    term: 0,
                 })
                 .await
                 .unwrap()

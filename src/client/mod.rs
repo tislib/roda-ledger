@@ -4,8 +4,8 @@
 //! It provides ergonomic Rust types, hides proto construction, and
 //! exposes every RPC as a simple async method.
 
-use crate::grpc::proto;
-use crate::grpc::proto::ledger_client::LedgerClient as TonicLedgerClient;
+use crate::cluster::proto::ledger as proto;
+use crate::cluster::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
 use std::net::SocketAddr;
 use tonic::transport::Channel;
 
@@ -397,7 +397,10 @@ impl LedgerClient {
     pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<(i32, u32)> {
         let mut client = self.inner.clone();
         let resp = client
-            .get_transaction_status(proto::GetStatusRequest { transaction_id })
+            .get_transaction_status(proto::GetStatusRequest {
+                transaction_id,
+                term: 0,
+            })
             .await?
             .into_inner();
         Ok((resp.status, resp.fail_reason))

@@ -1,5 +1,5 @@
-use crate::grpc::handler::LedgerHandler;
-use crate::grpc::proto::ledger_server::LedgerServer;
+use crate::cluster::client_handler::LedgerHandler;
+use crate::cluster::proto::ledger::ledger_server::LedgerServer;
 use crate::ledger::Ledger;
 use spdlog::info;
 use std::net::SocketAddr;
@@ -10,6 +10,7 @@ pub struct GrpcServer {
     ledger: Arc<Ledger>,
     addr: SocketAddr,
     read_only: bool,
+    term: u64,
 }
 
 impl GrpcServer {
@@ -18,6 +19,7 @@ impl GrpcServer {
             ledger,
             addr,
             read_only: false,
+            term: 0,
         }
     }
 
@@ -27,15 +29,24 @@ impl GrpcServer {
             ledger,
             addr,
             read_only: true,
+            term: 0,
         }
+    }
+
+    /// Stamp `term` onto every submit response. Call after `new` /
+    /// `new_read_only`. `0` keeps the single-node default.
+    pub fn with_term(mut self, term: u64) -> Self {
+        self.term = term;
+        self
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let read_only = self.read_only;
+        let term = self.term;
         let handler = if read_only {
-            LedgerHandler::new_read_only(self.ledger)
+            LedgerHandler::new_read_only(self.ledger).with_term(term)
         } else {
-            LedgerHandler::new(self.ledger)
+            LedgerHandler::new(self.ledger).with_term(term)
         };
 
         info!(

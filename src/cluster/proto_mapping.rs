@@ -1,5 +1,5 @@
+use crate::cluster::proto::ledger as proto;
 use crate::entities::FailReason;
-use crate::grpc::proto;
 use crate::transaction::{Operation, TransactionStatus, WaitLevel};
 
 impl From<proto::Deposit> for Operation {

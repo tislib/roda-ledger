@@ -6,7 +6,7 @@
 
 use crate::e2e::lib::profile::Profile;
 use roda_ledger::client::LedgerClient;
-use roda_ledger::grpc::server::GrpcServer;
+use roda_ledger::grpc::GrpcServer;
 use roda_ledger::ledger::Ledger;
 use std::net::SocketAddr;
 use std::sync::Arc;

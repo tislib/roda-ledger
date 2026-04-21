@@ -1,8 +1,8 @@
 #[cfg(feature = "grpc")]
 mod tests {
     use roda_ledger::client::LedgerClient;
+    use roda_ledger::grpc::GrpcServer;
     use roda_ledger::grpc::proto::WaitLevel;
-    use roda_ledger::grpc::server::GrpcServer;
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use std::net::SocketAddr;
     use std::sync::Arc;
