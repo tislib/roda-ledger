@@ -10,11 +10,38 @@ use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
     ledger: Arc<InternalLedger>,
+    read_only: bool,
 }
 
 impl LedgerHandler {
     pub fn new(ledger: Arc<InternalLedger>) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            read_only: false,
+        }
+    }
+
+    /// Read-only handler: all `submit_*` / `register_function` /
+    /// `unregister_function` RPCs return `FAILED_PRECONDITION`.
+    pub fn new_read_only(ledger: Arc<InternalLedger>) -> Self {
+        Self {
+            ledger,
+            read_only: true,
+        }
+    }
+
+    // `Status` is the canonical tonic error; every handler method in this
+    // file already returns `Result<_, Status>`. Boxing here would force a
+    // `.map_err` at every call site for no benefit.
+    #[allow(clippy::result_large_err)]
+    fn ensure_writable(&self) -> Result<(), Status> {
+        if self.read_only {
+            Err(Status::failed_precondition(
+                "node is a follower; writes are not accepted",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -24,6 +51,7 @@ impl Ledger for LedgerHandler {
         &self,
         request: Request<proto::SubmitOperationRequest>,
     ) -> Result<Response<proto::SubmitOperationResponse>, Status> {
+        self.ensure_writable()?;
         let op = request.into_inner().try_into()?;
         let transaction_id = self.ledger.submit(op);
         Ok(Response::new(proto::SubmitOperationResponse {
@@ -35,6 +63,7 @@ impl Ledger for LedgerHandler {
         &self,
         request: Request<proto::SubmitAndWaitRequest>,
     ) -> Result<Response<proto::SubmitAndWaitResponse>, Status> {
+        self.ensure_writable()?;
         let req = request.into_inner();
         let level = proto::WaitLevel::try_from(req.wait_level)
             .map(WaitLevel::from)
@@ -61,6 +90,7 @@ impl Ledger for LedgerHandler {
         &self,
         request: Request<proto::SubmitBatchRequest>,
     ) -> Result<Response<proto::SubmitBatchResponse>, Status> {
+        self.ensure_writable()?;
         let req = request.into_inner();
         let len = req.operations.len();
         let mut results = Vec::with_capacity(len);
@@ -87,6 +117,7 @@ impl Ledger for LedgerHandler {
         &self,
         request: Request<proto::SubmitBatchAndWaitRequest>,
     ) -> Result<Response<proto::SubmitBatchAndWaitResponse>, Status> {
+        self.ensure_writable()?;
         let req = request.into_inner();
         let level = proto::WaitLevel::try_from(req.wait_level)
             .map(WaitLevel::from)
@@ -313,6 +344,7 @@ impl Ledger for LedgerHandler {
         &self,
         request: Request<proto::RegisterFunctionRequest>,
     ) -> Result<Response<proto::RegisterFunctionResponse>, Status> {
+        self.ensure_writable()?;
         let req = request.into_inner();
         match self
             .ledger
@@ -330,6 +362,7 @@ impl Ledger for LedgerHandler {
         &self,
         request: Request<proto::UnregisterFunctionRequest>,
     ) -> Result<Response<proto::UnregisterFunctionResponse>, Status> {
+        self.ensure_writable()?;
         let req = request.into_inner();
         match self.ledger.unregister_function(&req.name) {
             Ok(version) => Ok(Response::new(proto::UnregisterFunctionResponse {

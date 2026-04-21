@@ -10,7 +10,7 @@
 //! one stage do not cause false sharing with adjacent indexes.
 
 use crate::config::LedgerConfig;
-use crate::entities::WalEntry;
+use crate::entities::{WalEntry, WalInput};
 use crate::snapshot::SnapshotMessage;
 use crate::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 pub struct Pipeline {
     // ---- inter-stage queues ----
     sequencer_to_transactor: ArrayQueue<TransactionInput>,
-    wal_input: ArrayQueue<WalEntry>,
+    wal_input: ArrayQueue<WalInput>,
     wal_to_snapshot: ArrayQueue<SnapshotMessage>,
 
     // ---- global progress indexes (cache-padded to avoid false sharing) ----
@@ -241,7 +241,7 @@ impl TransactorContext {
     }
 
     #[inline(always)]
-    pub fn output(&self) -> &ArrayQueue<WalEntry> {
+    pub fn output(&self) -> &ArrayQueue<WalInput> {
         &self.pipeline.wal_input
     }
 
@@ -279,7 +279,7 @@ pub struct WalContext {
 
 impl WalContext {
     #[inline(always)]
-    pub fn input(&self) -> &ArrayQueue<WalEntry> {
+    pub fn input(&self) -> &ArrayQueue<WalInput> {
         &self.pipeline.wal_input
     }
 
@@ -379,12 +379,22 @@ pub struct LedgerContext {
 }
 
 impl LedgerContext {
-    /// Try to push a WAL entry onto the `wal_input` queue without
-    /// blocking. Returns the entry back on a full queue so the caller can
-    /// retry with its own backpressure strategy.
+    /// Non-blocking single-entry push; returns the entry back on a full queue.
     #[inline]
     pub fn push_wal_entry(&self, entry: WalEntry) -> Result<(), WalEntry> {
-        self.pipeline.wal_input.push(entry)
+        self.pipeline
+            .wal_input
+            .push(WalInput::Single(entry))
+            .map_err(|wi| wi.single())
+    }
+
+    /// Non-blocking batch push as a single `WalInput::Multi` slot (ADR-015).
+    #[inline]
+    pub fn push_wal_entries(&self, entries: Vec<WalEntry>) -> Result<(), Vec<WalEntry>> {
+        self.pipeline
+            .wal_input
+            .push(WalInput::Multi(entries))
+            .map_err(|wi| wi.multi())
     }
 
     #[inline(always)]

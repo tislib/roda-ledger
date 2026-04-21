@@ -2,8 +2,10 @@ use crate::config::StorageConfig;
 use crate::storage::Segment;
 use crate::storage::function_snapshot::{self, FunctionSnapshotData, FunctionSnapshotRecord};
 use crate::storage::layout::parse_segment_id;
+use crate::storage::wal_tail::WalTailer;
 use spdlog::info;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Snapshot file magic: "SNAP" = 0x534E4150
@@ -105,6 +107,12 @@ impl Storage {
 
     pub fn next_segment(&self) {
         self.last_segment_id.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Build a fresh [`WalTailer`] bound to this storage. Each call yields
+    /// an independent cursor.
+    pub fn wal_tailer(self: &Arc<Self>) -> WalTailer {
+        WalTailer::new(self.clone())
     }
 
     // ─── WASM function binaries (ADR-014) ──────────────────────────────────

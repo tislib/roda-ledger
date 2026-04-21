@@ -9,17 +9,39 @@ use tonic::transport::Server;
 pub struct GrpcServer {
     ledger: Arc<Ledger>,
     addr: SocketAddr,
+    read_only: bool,
 }
 
 impl GrpcServer {
     pub fn new(ledger: Arc<Ledger>, addr: SocketAddr) -> Self {
-        Self { ledger, addr }
+        Self {
+            ledger,
+            addr,
+            read_only: false,
+        }
+    }
+
+    /// Build a server where every write RPC returns `FAILED_PRECONDITION`.
+    pub fn new_read_only(ledger: Arc<Ledger>, addr: SocketAddr) -> Self {
+        Self {
+            ledger,
+            addr,
+            read_only: true,
+        }
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let handler = LedgerHandler::new(self.ledger);
+        let read_only = self.read_only;
+        let handler = if read_only {
+            LedgerHandler::new_read_only(self.ledger)
+        } else {
+            LedgerHandler::new(self.ledger)
+        };
 
-        info!("gRPC server listening on {}", self.addr);
+        info!(
+            "gRPC server listening on {} (read_only={})",
+            self.addr, read_only
+        );
 
         let mut builder = Server::builder().add_service(LedgerServer::new(handler));
 

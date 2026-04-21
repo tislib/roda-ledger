@@ -7,6 +7,7 @@ mod snapshot;
 mod syncer;
 mod wal_reader;
 mod wal_serializer;
+pub mod wal_tail;
 
 pub use crate::config::StorageConfig;
 pub use engine::*;
@@ -14,3 +15,4 @@ pub use function_snapshot::{FunctionSnapshotData, FunctionSnapshotRecord};
 pub use segment::*;
 pub use snapshot::*;
 pub use syncer::*;
+pub use wal_tail::{WalTailer, decode_records};
