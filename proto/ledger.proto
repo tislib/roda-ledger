@@ -81,6 +81,11 @@ service Ledger {
   // balance verification, and dispute resolution.
   rpc GetAccountHistory(GetAccountHistoryRequest) returns (GetAccountHistoryResponse);
 
+  // WaitForTransaction blocks until the transaction reaches the requested WaitLevel,
+  // or the outcome is known (not found, or term mismatch).
+  // Pass term=0 to skip term checking (behaves like a dumb wait).
+  rpc WaitForTransaction(WaitForTransactionRequest) returns (WaitForTransactionResponse);
+
   // ---- ADR-014: WASM Function Registry ----
 
   // RegisterFunction installs (or replaces, with override=true) a compiled
@@ -106,12 +111,12 @@ service Ledger {
 // Used by the fire-and-forget SubmitOperation RPC.
 message SubmitOperationRequest {
   oneof operation {
-    Deposit    deposit    = 1;
+    Deposit    deposit = 1;
     Withdrawal withdrawal = 2;
-    Transfer   transfer   = 3;
+    Transfer   transfer = 3;
     // 4 reserved (previously Composite; removed in favour of WASM
     // Function operations — see ADR-014).
-    Function   function   = 5;
+    Function   function = 5;
   }
   reserved 4;
 }
@@ -120,19 +125,19 @@ message SubmitOperationRequest {
 // Used by the blocking SubmitAndWait RPC.
 message SubmitAndWaitRequest {
   oneof operation {
-    Deposit    deposit    = 1;
+    Deposit    deposit = 1;
     Withdrawal withdrawal = 2;
-    Transfer   transfer   = 3;
+    Transfer   transfer = 3;
     // 4 reserved (previously Composite).
-    Function   function   = 5;
+    Function   function = 5;
   }
   reserved 4;
   WaitLevel wait_level = 6;
 }
 
 enum WaitLevel {
-  WAIT_LEVEL_COMPUTED   = 0; // if omitted in request, used for async SubmitOperation
-  WAIT_LEVEL_COMMITTED   = 1;
+  WAIT_LEVEL_COMPUTED = 0; // if omitted in request, used for async SubmitOperation
+  WAIT_LEVEL_COMMITTED = 1;
   WAIT_LEVEL_SNAPSHOT = 2;
 }
 
@@ -140,19 +145,19 @@ enum WaitLevel {
 // The system source (SYSTEM_SOURCE) absorbs the corresponding debit to maintain
 // the zero-sum invariant. Deposits never fail due to insufficient funds.
 message Deposit {
-  uint64 account  = 1; // Target account ID. Must be < max_accounts.
-  uint64 amount   = 2; // Amount to deposit in minor units. Must be > 0.
+  uint64 account = 1; // Target account ID. Must be < max_accounts.
+  uint64 amount = 2; // Amount to deposit in minor units. Must be > 0.
   uint64 user_ref = 3; // Opaque external reference. Stored in WAL, not interpreted
-                       // by the ledger. Use this to link to your own database record
-                       // (e.g. an order ID, payment ID).
+  // by the ledger. Use this to link to your own database record
+  // (e.g. an order ID, payment ID).
 }
 
 // Withdrawal debits an account to the system sink.
 // The system sink (SYSTEM_SINK) absorbs the corresponding credit to maintain
 // the zero-sum invariant. Fails with INSUFFICIENT_FUNDS if balance < amount.
 message Withdrawal {
-  uint64 account  = 1; // Source account ID. Must be < max_accounts.
-  uint64 amount   = 2; // Amount to withdraw in minor units. Must be > 0.
+  uint64 account = 1; // Source account ID. Must be < max_accounts.
+  uint64 amount = 2; // Amount to withdraw in minor units. Must be > 0.
   uint64 user_ref = 3; // Opaque external reference. See Deposit.user_ref.
 }
 
@@ -161,9 +166,9 @@ message Withdrawal {
 // Fails with INSUFFICIENT_FUNDS if from account balance < amount.
 // If from == to, the operation is a no-op and succeeds immediately.
 message Transfer {
-  uint64 from     = 1; // Source account ID. Must be < max_accounts.
-  uint64 to       = 2; // Destination account ID. Must be < max_accounts.
-  uint64 amount   = 3; // Amount to transfer in minor units. Must be > 0.
+  uint64 from = 1; // Source account ID. Must be < max_accounts.
+  uint64 to = 2; // Destination account ID. Must be < max_accounts.
+  uint64 amount = 3; // Amount to transfer in minor units. Must be > 0.
   uint64 user_ref = 4; // Opaque external reference. See Deposit.user_ref.
 }
 
@@ -173,8 +178,8 @@ message Transfer {
 // on the wire; the server coerces to `[i64; 8]` by zero-padding short
 // lists and dropping anything beyond the first 8 values.
 message Function {
-  string         name     = 1; // Operation name (snake_case, max 32 bytes).
-  repeated int64 params   = 2; // 0..=8 positional parameters; short lists are zero-padded.
+  string         name = 1; // Operation name (snake_case, max 32 bytes).
+  repeated int64 params = 2; // 0..=8 positional parameters; short lists are zero-padded.
   uint64         user_ref = 3; // Opaque external reference. See Deposit.user_ref.
 }
 
@@ -192,15 +197,15 @@ message SubmitOperationResponse {
 // Contains the full result including status and fail_reason.
 message SubmitAndWaitResponse {
   uint64   transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
-  uint32   fail_reason    = 2; // 0 if status == COMMITTED. See FailReason codes.
+  uint32   fail_reason = 2; // 0 if status == COMMITTED. See FailReason codes.
 }
 
 // SubmitBatchRequest submits multiple operations in a single round trip.
 // Used by the fire-and-forget SubmitBatch RPC.
 message SubmitBatchRequest {
   repeated SubmitOperationRequest operations = 1; // Operations to submit, in order.
-                                                  // Each is independent — failure of one
-                                                  // does not affect others.
+  // Each is independent — failure of one
+  // does not affect others.
 }
 
 // SubmitBatchResponse returns one result per input operation, same order.
@@ -227,11 +232,11 @@ message GetBalanceRequest {
 
 message GetBalanceResponse {
   int64 balance = 1; // Current balance in minor units. May be negative for liability
-                     // or system accounts. Reflects only transactions that have reached
-                     // ON_SNAPSHOT — see TransactionStatus for stage definitions.
+  // or system accounts. Reflects only transactions that have reached
+  // ON_SNAPSHOT — see TransactionStatus for stage definitions.
   uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
-                                  // this ID are reflected in the balance. The actual
-                                  // last snapshot ID might be slightly higher.
+  // this ID are reflected in the balance. The actual
+  // last snapshot ID might be slightly higher.
 }
 
 message GetBalancesRequest {
@@ -240,30 +245,29 @@ message GetBalancesRequest {
 
 message GetBalancesResponse {
   repeated int64 balances = 1; // One balance per input account_id, in the same order.
-                               // Returns 0 for accounts that have never been touched.
+  // Returns 0 for accounts that have never been touched.
   uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
-                                  // this ID are reflected in the balances.
+  // this ID are reflected in the balances.
 }
 
 // ---- Status messages ----
 
+// GetStatusRequest now accepts an optional term for fencing.
+// If term != 0 and current term != request term, returns TERM_MISMATCH
+// and populates term + term_start_tx_id instead of status.
 message GetStatusRequest {
   uint64 transaction_id = 1;
+  uint64 term = 2; // Optional. 0 = do not check term.
 }
 
-// GetStatusResponse returns the pipeline stage and rejection reason for a transaction.
 message GetStatusResponse {
-  TransactionStatus status      = 1; // Current pipeline stage. See TransactionStatus.
-  uint32            fail_reason = 2; // Rejection code. 0 = success. Only meaningful when
-                                     // status == ERROR.
-                                     // Standard codes:
-                                     //   1 = INSUFFICIENT_FUNDS
-                                     //   2 = ACCOUNT_NOT_FOUND
-                                     //   3 = ZERO_SUM_VIOLATION
-                                     //   4 = ENTRY_LIMIT_EXCEEDED
-                                     //   5 = INVALID_OPERATION
-                                     //   6 = ACCOUNT_LIMIT_EXCEEDED
-                                     // Codes 128–255 are user-defined.
+  TransactionStatus status = 1;
+  uint32            fail_reason = 2;
+  // Populated only when term != 0 and a mismatch is detected.
+  // status will be unset in this case.
+  bool              term_mismatch = 3;
+  uint64            term = 4; // The superseding term.
+  uint64            term_start_tx_id = 5; // First tx_id of the superseding term.
 }
 
 message GetStatusesRequest {
@@ -334,6 +338,8 @@ message GetPipelineIndexResponse {
   // GetBalance reflects all transactions at or below this index.
   // Maps to Ledger::last_snapshot_id().
   uint64 snapshot_index = 3;
+
+  uint64 term = 4; // Current term
 }
 
 // ---- Transaction query (ADR-008) ----
@@ -343,33 +349,53 @@ message GetTransactionRequest {
 }
 
 message GetTransactionResponse {
-  uint64               tx_id       = 1;
-  repeated TxEntryRecord entries   = 2;
-  repeated TxLinkRecord  links     = 3;
+  uint64               tx_id = 1;
+  repeated TxEntryRecord entries = 2;
+  repeated TxLinkRecord  links = 3;
 }
 
 // TxEntryRecord represents a single debit or credit within a transaction.
 message TxEntryRecord {
-  uint64    account_id       = 1;
-  uint64    amount           = 2;
-  EntryKind kind             = 3;
+  uint64    account_id = 1;
+  uint64    amount = 2;
+  EntryKind kind = 3;
   int64     computed_balance = 4;
 }
 
 enum EntryKind {
   CREDIT = 0;
-  DEBIT  = 1;
+  DEBIT = 1;
 }
 
 // TxLinkRecord represents a link between transactions (ADR-009).
 message TxLinkRecord {
   uint64   to_tx_id = 1;  // Referenced transaction ID.
-  LinkKind kind     = 2;  // Type of link relationship.
+  LinkKind kind = 2;  // Type of link relationship.
 }
 
 enum LinkKind {
   DUPLICATE = 0;  // This transaction is a duplicate of to_tx_id.
-  REVERSAL  = 1;  // This transaction reverses to_tx_id.
+  REVERSAL = 1;  // This transaction reverses to_tx_id.
+}
+
+message WaitForTransactionRequest {
+  uint64    transaction_id = 1;
+  uint64    term = 2; // Expected term. 0 = do not check.
+  WaitLevel wait_level = 3;
+}
+
+message WaitForTransactionResponse {
+  WaitOutcome outcome = 1;
+  uint64      term = 2; // The term that superseded. Only set on TERM_MISMATCH.
+  uint64      term_start_tx_id = 3; // First tx_id of the superseding term. Only set on TERM_MISMATCH.
+  // Transactions between this and your tx_id are lost.
+}
+
+enum WaitOutcome {
+  REACHED = 0; // Transaction reached the requested WaitLevel.
+  NOT_FOUND = 1; // transaction_id is unknown — too old, never existed, or compacted.
+  TERM_MISMATCH = 2; // Term changed before this transaction committed. It is lost.
+  // Inspect term and term_start_tx_id to determine the loss boundary.
 }
 
 // ---- Account history query (ADR-008) ----
@@ -377,25 +403,25 @@ enum LinkKind {
 message GetAccountHistoryRequest {
   uint64 account_id = 1;
   uint64 from_tx_id = 2;  // 0 = latest
-  uint32 limit      = 3;  // default 20, max 1000
+  uint32 limit = 3;  // default 20, max 1000
 }
 
 message GetAccountHistoryResponse {
-  repeated TxEntryRecord entries    = 1;
+  repeated TxEntryRecord entries = 1;
   uint64                 next_tx_id = 2;  // 0 = no more entries
 }
 
 // ---- ADR-014: Function Registry ----
 
 message RegisterFunctionRequest {
-  string name              = 1;   // snake_case, max 32 bytes
-  bytes  binary            = 2;   // WASM binary; must export execute(i64 x 8) -> i32
+  string name = 1;   // snake_case, max 32 bytes
+  bytes  binary = 2;   // WASM binary; must export execute(i64 x 8) -> i32
   bool   override_existing = 3;   // if false and name already registered, server returns ALREADY_EXISTS
 }
 
 message RegisterFunctionResponse {
   uint32 version = 1;  // monotonic per-name, starts at 1
-  uint32 crc32c  = 2;  // CRC32C of the binary
+  uint32 crc32c = 2;  // CRC32C of the binary
 }
 
 message UnregisterFunctionRequest {
@@ -413,7 +439,7 @@ message ListFunctionsResponse {
 }
 
 message FunctionInfo {
-  string name    = 1;
+  string name = 1;
   uint32 version = 2;
-  uint32 crc32c  = 3;
+  uint32 crc32c = 3;
 }
