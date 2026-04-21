@@ -30,7 +30,10 @@ pub struct NodeServerSection {
 
 impl Default for NodeServerSection {
     fn default() -> Self {
-        Self { host: "0.0.0.0".to_string(), port: 50061 }
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 50061,
+        }
     }
 }
 

@@ -17,7 +17,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into();
 
     let cfg = ClusterConfig::from_file(&config_path).map_err(|e| {
-        format!("failed to load cluster config from {}: {}", config_path.display(), e)
+        format!(
+            "failed to load cluster config from {}: {}",
+            config_path.display(),
+            e
+        )
     })?;
 
     info!(

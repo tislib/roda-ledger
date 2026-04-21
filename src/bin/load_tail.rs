@@ -14,7 +14,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "load_tail", about = "Tailer-only load generator for roda-ledger")]
+#[command(
+    name = "load_tail",
+    about = "Tailer-only load generator for roda-ledger"
+)]
 struct Args {
     #[arg(short, long, default_value_t = 1_000_000)]
     account_count: u64,
@@ -154,7 +157,8 @@ fn main() {
                 let total_tail_bytes = tailed_bytes.load(Ordering::Relaxed);
                 let interval = now.duration_since(last_tick).as_secs_f64();
                 let tps = (committed - last_committed) as f64 / interval;
-                let tail_mb = (total_tail_bytes - last_tailed_bytes) as f64 / 1_048_576.0 / interval;
+                let tail_mb =
+                    (total_tail_bytes - last_tailed_bytes) as f64 / 1_048_576.0 / interval;
                 let in_flight = i.saturating_sub(tailed);
 
                 let bucket = (second as usize).saturating_sub(1);
@@ -217,8 +221,14 @@ fn main() {
         elapsed.as_secs_f64()
     );
     println!("  ║  Submitted     : {:>10}                  ║", i);
-    println!("  ║  Committed     : {:>10}                  ║", committed_final);
-    println!("  ║  Tailed        : {:>10}                  ║", tailed_final);
+    println!(
+        "  ║  Committed     : {:>10}                  ║",
+        committed_final
+    );
+    println!(
+        "  ║  Tailed        : {:>10}                  ║",
+        tailed_final
+    );
     println!("  ║  Avg TPS       : {:>10.0}                  ║", avg_tps);
     println!(
         "  ║  Tail bytes    : {:>10}                  ║",

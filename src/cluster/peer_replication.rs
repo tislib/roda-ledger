@@ -146,7 +146,10 @@ impl PeerReplication {
             }
         }
 
-        info!("replication: peer-task for node_id={} stopped", self.peer.id);
+        info!(
+            "replication: peer-task for node_id={} stopped",
+            self.peer.id
+        );
     }
 
     /// Retry `AppendEntries` for the given chunk until the peer accepts it
@@ -199,11 +202,8 @@ impl PeerReplication {
                         e.message()
                     );
                     sleep(Duration::from_millis(50)).await;
-                    if let Ok(c) = connect(
-                        &self.peer.node_addr,
-                        self.params.rpc_message_size_limit,
-                    )
-                    .await
+                    if let Ok(c) =
+                        connect(&self.peer.node_addr, self.params.rpc_message_size_limit).await
                     {
                         *client = c;
                     }

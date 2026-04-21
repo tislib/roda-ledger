@@ -15,15 +15,25 @@ pub struct LedgerHandler {
 
 impl LedgerHandler {
     pub fn new(ledger: Arc<InternalLedger>) -> Self {
-        Self { ledger, read_only: false }
+        Self {
+            ledger,
+            read_only: false,
+        }
     }
 
     /// Read-only handler: all `submit_*` / `register_function` /
     /// `unregister_function` RPCs return `FAILED_PRECONDITION`.
     pub fn new_read_only(ledger: Arc<InternalLedger>) -> Self {
-        Self { ledger, read_only: true }
+        Self {
+            ledger,
+            read_only: true,
+        }
     }
 
+    // `Status` is the canonical tonic error; every handler method in this
+    // file already returns `Result<_, Status>`. Boxing here would force a
+    // `.map_err` at every call site for no benefit.
+    #[allow(clippy::result_large_err)]
     fn ensure_writable(&self) -> Result<(), Status> {
         if self.read_only {
             Err(Status::failed_precondition(

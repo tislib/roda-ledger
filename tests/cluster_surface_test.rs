@@ -1,8 +1,6 @@
 //! Integration tests for ADR-015 `Ledger::append_wal_entries` + `WalTailer`.
 
-use roda_ledger::entities::{
-    EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind,
-};
+use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use roda_ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use roda_ledger::transaction::{Operation, WaitLevel};
 use std::time::{Duration, Instant};
@@ -70,7 +68,11 @@ fn record_tx_id(record: &[u8]) -> u64 {
 /// Drive a deposit through the normal client path and block until committed.
 fn deposit_client(ledger: &Ledger, account: u64, amount: u64) -> u64 {
     let r = ledger.submit_and_wait(
-        Operation::Deposit { account, amount, user_ref: 0 },
+        Operation::Deposit {
+            account,
+            amount,
+            user_ref: 0,
+        },
         WaitLevel::Committed,
     );
     assert!(r.fail_reason.is_success());
@@ -84,7 +86,9 @@ fn append_wal_entries_advances_commit_index() {
     let ledger = started_ledger();
     assert_eq!(ledger.last_commit_id(), 0);
 
-    ledger.append_wal_entries(deposit_entries(1, 42, 500)).unwrap();
+    ledger
+        .append_wal_entries(deposit_entries(1, 42, 500))
+        .unwrap();
     wait_until("commit_index >= 1", || ledger.last_commit_id() >= 1);
     assert_eq!(ledger.last_commit_id(), 1);
 }
@@ -92,7 +96,9 @@ fn append_wal_entries_advances_commit_index() {
 #[test]
 fn append_wal_entries_writes_records_visible_via_tailer() {
     let ledger = started_ledger();
-    ledger.append_wal_entries(deposit_entries(1, 7, 1_000)).unwrap();
+    ledger
+        .append_wal_entries(deposit_entries(1, 7, 1_000))
+        .unwrap();
     wait_until("commit_index >= 1", || ledger.last_commit_id() >= 1);
 
     let mut tailer = ledger.wal_tailer();
@@ -297,7 +303,7 @@ fn tailer_crosses_segment_rotation() {
     let mut last_tx = 0u64;
     for i in 0..(n / WAL_RECORD_SIZE) {
         let tx = record_tx_id(&buf[i * WAL_RECORD_SIZE..]);
-        assert!(tx >= 1 && tx <= 10);
+        assert!((1..=10).contains(&tx));
         assert!(tx >= last_tx);
         last_tx = tx;
     }

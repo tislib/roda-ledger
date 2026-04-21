@@ -1,9 +1,7 @@
 //! Benchmarks for `WalTailer` — the ADR-015 leader-side raw WAL reader.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::entities::{
-    EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind,
-};
+use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use roda_ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use std::time::Duration;
 
@@ -82,18 +80,14 @@ fn bench_tail_full_scan(c: &mut Criterion) {
         let buf_size = total_records * WAL_RECORD_SIZE;
 
         group.throughput(Throughput::Elements(total_records as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(tx_count),
-            &tx_count,
-            |b, _| {
-                let mut buf = vec![0u8; buf_size];
-                b.iter(|| {
-                    let mut tailer = ledger.wal_tailer();
-                    let n = tailer.tail(1, &mut buf);
-                    criterion::black_box(n);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(tx_count), &tx_count, |b, _| {
+            let mut buf = vec![0u8; buf_size];
+            b.iter(|| {
+                let mut tailer = ledger.wal_tailer();
+                let n = tailer.tail(1, &mut buf);
+                criterion::black_box(n);
+            });
+        });
     }
 
     group.finish();
@@ -183,7 +177,9 @@ fn bench_tail_active_append(c: &mut Criterion) {
     let mut buf = vec![0u8; 40 * 16];
     group.bench_function("append_then_tail", |b| {
         b.iter(|| {
-            ledger.append_wal_entries(deposit_entries(next_tx, 1, 10)).unwrap();
+            ledger
+                .append_wal_entries(deposit_entries(next_tx, 1, 10))
+                .unwrap();
             next_tx += 1;
             // Spin briefly until the fresh record is committed, then tail.
             while ledger.last_commit_id() < next_tx - 1 {

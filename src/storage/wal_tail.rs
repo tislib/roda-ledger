@@ -70,7 +70,10 @@ struct Cursor {
 
 impl WalTailer {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage, cursor: None }
+        Self {
+            storage,
+            cursor: None,
+        }
     }
 
     /// Reset the cursor; the next `tail()` re-seeks.
@@ -91,11 +94,12 @@ impl WalTailer {
         // cursor so the filter below uses the correct value — a freshly
         // seeded cursor starts at 0 and would otherwise leak structural
         // records when `from_tx_id > 0`.
-        let regressed = self.cursor.as_ref().is_some_and(|c| from_tx_id < c.from_tx_id);
-        if self.cursor.is_none() || regressed {
-            if self.seek(from_tx_id).is_err() {
-                return 0;
-            }
+        let regressed = self
+            .cursor
+            .as_ref()
+            .is_some_and(|c| from_tx_id < c.from_tx_id);
+        if (self.cursor.is_none() || regressed) && self.seek(from_tx_id).is_err() {
+            return 0;
         }
         if let Some(c) = self.cursor.as_mut() {
             c.from_tx_id = from_tx_id;
@@ -103,7 +107,9 @@ impl WalTailer {
 
         let mut written = 0usize;
         while written + WAL_RECORD_SIZE <= capacity {
-            let Some(cursor) = self.cursor.as_mut() else { break };
+            let Some(cursor) = self.cursor.as_mut() else {
+                break;
+            };
 
             let file_len = match cursor.file.metadata() {
                 Ok(m) => m.len(),
@@ -171,7 +177,9 @@ impl WalTailer {
         let data_dir = Path::new(&data_dir);
 
         loop {
-            let Some(cursor) = self.cursor.as_ref() else { return Ok(()); };
+            let Some(cursor) = self.cursor.as_ref() else {
+                return Ok(());
+            };
             match first_tx_id_in_file(&cursor.file) {
                 Some(first) if first > from_tx_id => {
                     if cursor.segment_id <= 1 {
@@ -203,7 +211,12 @@ impl WalTailer {
         self.open_file(&path, id, false)
     }
 
-    fn open_file(&mut self, path: &PathBuf, segment_id: u32, is_active: bool) -> std::io::Result<()> {
+    fn open_file(
+        &mut self,
+        path: &PathBuf,
+        segment_id: u32,
+        is_active: bool,
+    ) -> std::io::Result<()> {
         let file = File::open(path)?;
         let inode = file.metadata()?.ino();
         let carried_from_tx = self.cursor.as_ref().map_or(0, |c| c.from_tx_id);
@@ -221,7 +234,9 @@ impl WalTailer {
     /// Advance from the current segment to the next one. Returns `false` when
     /// there is no next segment yet (no new writes or no rotation).
     fn advance_segment(&mut self) -> bool {
-        let Some(cursor) = self.cursor.as_ref() else { return false };
+        let Some(cursor) = self.cursor.as_ref() else {
+            return false;
+        };
         let data_dir = self.storage.config().data_dir.clone();
         let data_dir = Path::new(&data_dir);
         let active_path = active_wal_path(data_dir);
@@ -276,7 +291,9 @@ fn first_tx_id_in_file(file: &File) -> Option<u64> {
             || kind == WalEntryKind::TxEntry as u8
             || kind == WalEntryKind::Link as u8;
         if has_tx {
-            return Some(u64::from_le_bytes(buf[TX_ID_OFFSET..TX_ID_OFFSET + 8].try_into().ok()?));
+            return Some(u64::from_le_bytes(
+                buf[TX_ID_OFFSET..TX_ID_OFFSET + 8].try_into().ok()?,
+            ));
         }
     }
 }

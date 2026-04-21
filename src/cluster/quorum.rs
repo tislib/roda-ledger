@@ -22,8 +22,7 @@ pub struct Quorum {
 impl Quorum {
     /// Build with `peer_count` positional peers. `majority = peer_count/2 + 1`.
     pub fn new(peer_count: usize) -> Self {
-        let match_index: Vec<AtomicU64> =
-            (0..peer_count).map(|_| AtomicU64::new(0)).collect();
+        let match_index: Vec<AtomicU64> = (0..peer_count).map(|_| AtomicU64::new(0)).collect();
         Self {
             match_index,
             majority_index: AtomicU64::new(0),

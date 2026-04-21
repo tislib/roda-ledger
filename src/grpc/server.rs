@@ -14,12 +14,20 @@ pub struct GrpcServer {
 
 impl GrpcServer {
     pub fn new(ledger: Arc<Ledger>, addr: SocketAddr) -> Self {
-        Self { ledger, addr, read_only: false }
+        Self {
+            ledger,
+            addr,
+            read_only: false,
+        }
     }
 
     /// Build a server where every write RPC returns `FAILED_PRECONDITION`.
     pub fn new_read_only(ledger: Arc<Ledger>, addr: SocketAddr) -> Self {
-        Self { ledger, addr, read_only: true }
+        Self {
+            ledger,
+            addr,
+            read_only: true,
+        }
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {

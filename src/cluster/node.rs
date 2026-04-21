@@ -22,7 +22,10 @@ impl Cluster {
     pub fn new(config: ClusterConfig) -> std::io::Result<Self> {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start()?;
-        Ok(Self { config, ledger: Arc::new(ledger) })
+        Ok(Self {
+            config,
+            ledger: Arc::new(ledger),
+        })
     }
 
     pub fn ledger(&self) -> Arc<Ledger> {

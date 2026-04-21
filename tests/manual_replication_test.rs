@@ -130,12 +130,16 @@ fn manual_replication_leader_to_follower() {
     assert_eq!(leader.last_commit_id(), total_tx);
 
     // 5. Wait for follower commit + snapshot indexes to catch up.
-    wait_for("follower commit catches up", Duration::from_secs(60), || {
-        follower.lock().unwrap().last_commit_id() >= last_leader_tx
-    });
-    wait_for("follower snapshot catches up", Duration::from_secs(60), || {
-        follower.lock().unwrap().last_snapshot_id() >= last_leader_tx
-    });
+    wait_for(
+        "follower commit catches up",
+        Duration::from_secs(60),
+        || follower.lock().unwrap().last_commit_id() >= last_leader_tx,
+    );
+    wait_for(
+        "follower snapshot catches up",
+        Duration::from_secs(60),
+        || follower.lock().unwrap().last_snapshot_id() >= last_leader_tx,
+    );
 
     running.store(false, Ordering::Relaxed);
     repl.join().expect("repl thread");
