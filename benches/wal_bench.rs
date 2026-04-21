@@ -1,6 +1,8 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use roda_ledger::config::LedgerConfig;
-use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
+use roda_ledger::entities::{
+    EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind, WalInput,
+};
 use roda_ledger::ledger::WaitStrategy;
 use roda_ledger::pipeline::Pipeline;
 use roda_ledger::storage::Storage;
@@ -69,8 +71,8 @@ fn wal_bench(c: &mut Criterion) {
             let entries = make_deposit_entries(current_id, account_id, 100);
             for entry in entries {
                 let mut e = entry;
-                while let Err(returned) = wal_ctx.input().push(e) {
-                    e = returned;
+                while let Err(returned) = wal_ctx.input().push(WalInput::Single(e)) {
+                    e = returned.single();
                     spin_loop();
                 }
             }
