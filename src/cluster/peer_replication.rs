@@ -122,6 +122,14 @@ impl PeerReplication {
         while self.running.load(Ordering::Relaxed) {
             let n = self.tailer.tail(self.from_tx_id, &mut buf) as usize;
             if n == 0 {
+                // Idle heartbeat: send an empty `AppendEntries` so the
+                // follower's fresh `last_commit_id` flows back into our
+                // `Quorum` even when the writer has stopped producing.
+                // Without this, the majority watermark would freeze at
+                // the value the follower returned on the previous
+                // non-empty RPC — which is always one batch stale, since
+                // `append_wal_entries` queues-then-returns on the follower.
+                self.send_heartbeat(&mut client).await;
                 sleep(self.params.poll_interval).await;
                 continue;
             }
@@ -200,6 +208,36 @@ impl PeerReplication {
                         *client = c;
                     }
                 }
+            }
+        }
+    }
+
+    /// Send a zero-byte `AppendEntries` to refresh the peer's
+    /// `last_commit_id` in our `Quorum`. Failures are swallowed — the
+    /// next heartbeat (or real shipment) will retry; the purpose here is
+    /// purely observational.
+    async fn send_heartbeat(&mut self, client: &mut NodeClient<Channel>) {
+        let req = proto::AppendEntriesRequest {
+            leader_id: self.params.leader_id,
+            term: self.params.term,
+            prev_tx_id: self.peer_last_tx,
+            prev_term: self.params.term,
+            from_tx_id: self.from_tx_id,
+            to_tx_id: self.peer_last_tx,
+            wal_bytes: Vec::new(),
+            leader_commit_tx_id: self.ledger.last_commit_id(),
+        };
+        match client.append_entries(req).await {
+            Ok(resp) => {
+                let r = resp.into_inner();
+                if r.success {
+                    self.majority.advance(self.peer_index, r.last_tx_id);
+                }
+            }
+            Err(_) => {
+                // Transport hiccup on an idle heartbeat is not worth
+                // acting on — the next cycle will reconnect via the
+                // normal `ship_until_accepted` path.
             }
         }
     }

@@ -7,7 +7,6 @@ use crate::wal_tail::decode_records;
 use spdlog::{info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 

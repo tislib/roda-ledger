@@ -14,7 +14,7 @@
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use roda_ledger::cluster::config::NodeServerSection;
-use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, Quorum, PeerConfig};
+use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, PeerConfig, Quorum};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::grpc::GrpcServerSection;
 use roda_ledger::ledger::Ledger;
@@ -25,7 +25,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "load_cluster", about = "Cluster load generator for roda-ledger")]
+#[command(
+    name = "load_cluster",
+    about = "Cluster load generator for roda-ledger"
+)]
 struct Args {
     #[arg(short, long, default_value_t = 1_000_000)]
     account_count: u64,
@@ -243,10 +246,7 @@ async fn main() {
         "  ║  Followers     : {:>10}                  ║",
         follower_count
     );
-    println!(
-        "  ║  Submitted     : {:>10}                  ║",
-        submitted
-    );
+    println!("  ║  Submitted     : {:>10}                  ║", submitted);
     println!("  ║  Avg TPS       : {:>10.0}                  ║", avg_tps);
     println!("  ╠══════════════════════════════════════════════╣");
     println!(
@@ -293,7 +293,11 @@ fn run_writer(
     duration: Duration,
     per_second: &mut [LatencyMeasurer],
     global: &mut LatencyMeasurer,
-) -> (u64, roda_latency_tracker::latency_measurer::LatencyStats, Duration) {
+) -> (
+    u64,
+    roda_latency_tracker::latency_measurer::LatencyStats,
+    Duration,
+) {
     let start_time = Instant::now();
     let mut i = 0u64;
     let mut last_tick = start_time;
@@ -305,7 +309,17 @@ fn run_writer(
     println!("{}", sep);
     println!(
         "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>8} | {:>8} |",
-        "#", "time", "TPS", "leader", "majority", "P50", "P99", "in-flight", "maj_lag", "min_lag", "max_lag"
+        "#",
+        "time",
+        "TPS",
+        "leader",
+        "majority",
+        "P50",
+        "P99",
+        "in-flight",
+        "maj_lag",
+        "min_lag",
+        "max_lag"
     );
     println!("{}", sep);
 
@@ -393,6 +407,10 @@ fn run_writer(
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
+        println!(
+            "  drain[X]: leader_commit={} majority={}",
+            leader_commit, majority_v
+        );
     }
 
     let leader_commit = leader_ledger.last_commit_id();
