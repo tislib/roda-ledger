@@ -15,11 +15,18 @@ pub mod transaction;
 pub mod transactor;
 pub mod wait_strategy;
 pub mod wal;
-pub mod wal_tail;
 pub mod wasm_runtime;
+
+/// Back-compat re-export — the actual implementation now lives in
+/// `storage::wal_tail` (the tailer is a storage-layer concern).
+pub mod wal_tail {
+    pub use crate::storage::wal_tail::*;
+}
 
 #[cfg(feature = "grpc")]
 pub mod client;
+#[cfg(feature = "grpc")]
+pub mod cluster;
 mod entries;
 #[cfg(feature = "grpc")]
 pub mod grpc;

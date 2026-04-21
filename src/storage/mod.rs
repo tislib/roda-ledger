@@ -5,6 +5,7 @@ mod layout;
 mod segment;
 mod snapshot;
 mod syncer;
+pub mod wal_tail;
 mod wal_reader;
 mod wal_serializer;
 
@@ -14,4 +15,4 @@ pub use function_snapshot::{FunctionSnapshotData, FunctionSnapshotRecord};
 pub use segment::*;
 pub use snapshot::*;
 pub use syncer::*;
-pub(crate) use wal_serializer::parse_wal_record;
+pub use wal_tail::{WalTailer, decode_records};

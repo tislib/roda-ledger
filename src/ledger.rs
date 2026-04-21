@@ -11,7 +11,7 @@ use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
-use crate::wal_tail::WalTailer;
+use crate::storage::WalTailer;
 pub use crate::wasm_runtime::FunctionInfo;
 use crate::wasm_runtime::{WasmRegistry, WasmRuntime};
 use spdlog::{LevelFilter, info};
@@ -249,7 +249,7 @@ impl Ledger {
 
     /// Follower write path: hand a pre-validated batch to the WAL stage as
     /// one `WalInput::Multi` slot, bypassing the Transactor.
-    pub fn append_wal_entries(&mut self, entries: Vec<WalEntry>) -> io::Result<()> {
+    pub fn append_wal_entries(&self, entries: Vec<WalEntry>) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -280,7 +280,7 @@ impl Ledger {
     /// Build a stateful `WalTailer` bound to this ledger's storage.
     /// See [`WalTailer`] for cursor semantics (ADR-015).
     pub fn wal_tailer(&self) -> WalTailer {
-        WalTailer::new(self.storage.clone())
+        self.storage.wal_tailer()
     }
 
     pub fn wait_for_transaction(&self, transaction_id: u64) {

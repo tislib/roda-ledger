@@ -102,5 +102,19 @@ name = "load_grpc"
 path = "src/bin/load_grpc.rs"
 required-features = ["grpc"]
 
+[[bin]]
+name = "roda-cluster"
+path = "src/bin/cluster.rs"
+required-features = ["grpc"]
+
+[[bin]]
+name = "load_cluster"
+path = "src/bin/load_cluster.rs"
+required-features = ["grpc"]
+
+[[bin]]
+name = "load_tail"
+path = "src/bin/load_tail.rs"
+
 [profile.bench]
 debug = true

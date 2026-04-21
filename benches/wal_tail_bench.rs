@@ -168,7 +168,7 @@ fn bench_tail_active_append(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(8));
     group.throughput(Throughput::Elements(1));
 
-    let mut ledger = prefilled_ledger(10_000, 10_000_000);
+    let ledger = prefilled_ledger(10_000, 10_000_000);
     let mut tailer = ledger.wal_tailer();
     // Drain the prefilled history once so the tailer is caught up.
     let mut drain_buf = vec![0u8; 40 * 40_000];

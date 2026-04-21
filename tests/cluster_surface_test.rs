@@ -81,7 +81,7 @@ fn deposit_client(ledger: &Ledger, account: u64, amount: u64) -> u64 {
 
 #[test]
 fn append_wal_entries_advances_commit_index() {
-    let mut ledger = started_ledger();
+    let ledger = started_ledger();
     assert_eq!(ledger.last_commit_id(), 0);
 
     ledger.append_wal_entries(deposit_entries(1, 42, 500)).unwrap();
@@ -91,7 +91,7 @@ fn append_wal_entries_advances_commit_index() {
 
 #[test]
 fn append_wal_entries_writes_records_visible_via_tailer() {
-    let mut ledger = started_ledger();
+    let ledger = started_ledger();
     ledger.append_wal_entries(deposit_entries(1, 7, 1_000)).unwrap();
     wait_until("commit_index >= 1", || ledger.last_commit_id() >= 1);
 
@@ -108,7 +108,7 @@ fn append_wal_entries_writes_records_visible_via_tailer() {
 
 #[test]
 fn append_wal_entries_multi_slot_batches_multiple_tx() {
-    let mut ledger = started_ledger();
+    let ledger = started_ledger();
     let mut batch = Vec::new();
     for tx_id in 1..=3 {
         batch.extend(deposit_entries(tx_id, tx_id, 100));
@@ -127,7 +127,7 @@ fn append_wal_entries_multi_slot_batches_multiple_tx() {
 
 #[test]
 fn append_wal_entries_empty_batch_is_noop() {
-    let mut ledger = started_ledger();
+    let ledger = started_ledger();
     ledger.append_wal_entries(Vec::new()).unwrap();
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(ledger.last_commit_id(), 0);
