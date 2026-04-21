@@ -3,13 +3,15 @@
 //! replication fan-out.
 
 use crate::cluster::config::{ClusterConfig, ClusterMode};
+use crate::cluster::peer_manager::PeerManager;
+use crate::cluster::peer_replication::ReplicationParams;
 use crate::cluster::proto::NodeRole;
-use crate::cluster::replication::Replication;
 use crate::cluster::server::{NodeHandler, NodeServerRuntime};
 use crate::grpc::GrpcServer;
 use crate::ledger::Ledger;
 use spdlog::info;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -76,18 +78,25 @@ impl Cluster {
             }
         });
 
-        // Replication: leader only.
-        let mut repl_handles: Vec<JoinHandle<()>> = Vec::new();
+        // Replication: leader only. `PeerManager::spawn` is the only
+        // top-level `tokio::spawn` — it owns one supervisor task that
+        // spawns one child sub-task per peer.
+        let mut peer_manager_handle: Option<JoinHandle<()>> = None;
+        let mut peer_manager_running: Option<Arc<AtomicBool>> = None;
         if self.config.mode == ClusterMode::Leader && !self.config.peers.is_empty() {
-            let repl = Replication::new(
-                self.ledger.clone(),
-                self.config.peers.clone(),
+            let params = ReplicationParams::new(
                 self.config.node_id,
                 self.config.term,
                 self.config.append_entries_max_bytes,
                 Duration::from_millis(self.config.replication_poll_ms.max(1)),
             );
-            repl_handles = repl.spawn();
+            let manager = PeerManager::new(
+                self.ledger.clone(),
+                self.config.peers.clone(),
+                params,
+            );
+            peer_manager_running = Some(manager.running());
+            peer_manager_handle = Some(manager.spawn());
             info!(
                 "cluster: leader node_id={} replicating to {} peer(s)",
                 self.config.node_id,
@@ -98,7 +107,8 @@ impl Cluster {
         Ok(ClusterHandles {
             client_handle,
             node_handle,
-            repl_handles,
+            peer_manager_handle,
+            peer_manager_running,
         })
     }
 }
@@ -106,7 +116,11 @@ impl Cluster {
 pub struct ClusterHandles {
     pub client_handle: JoinHandle<()>,
     pub node_handle: JoinHandle<()>,
-    pub repl_handles: Vec<JoinHandle<()>>,
+    /// Supervisor handle for the peer-replication subtree (leader only).
+    pub peer_manager_handle: Option<JoinHandle<()>>,
+    /// Shutdown flag owned by the peer manager; flipping it drains every
+    /// peer subtask without aborting.
+    pub peer_manager_running: Option<Arc<AtomicBool>>,
 }
 
 impl ClusterHandles {
@@ -116,7 +130,10 @@ impl ClusterHandles {
     pub fn abort(&self) {
         self.client_handle.abort();
         self.node_handle.abort();
-        for h in &self.repl_handles {
+        if let Some(run) = &self.peer_manager_running {
+            run.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(h) = &self.peer_manager_handle {
             h.abort();
         }
     }

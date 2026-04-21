@@ -9,11 +9,14 @@
 
 pub mod config;
 pub mod node;
-pub mod replication;
+pub mod peer_manager;
+pub mod peer_replication;
 pub mod server;
 
 pub use config::{ClusterConfig, ClusterMode, PeerConfig};
 pub use node::Cluster;
+pub use peer_manager::PeerManager;
+pub use peer_replication::{PeerReplication, ReplicationParams};
 
 pub mod proto {
     tonic::include_proto!("roda.node.v1");

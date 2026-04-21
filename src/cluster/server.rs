@@ -16,8 +16,6 @@ pub struct NodeHandler {
     node_id: u64,
     term: u64,
     role: proto::NodeRole,
-    /// Highest tx_id known to the follower's WAL stage, updated after each append.
-    last_applied: Arc<AtomicU64>,
 }
 
 impl NodeHandler {
@@ -27,12 +25,7 @@ impl NodeHandler {
             node_id,
             term,
             role,
-            last_applied: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    pub fn last_applied_handle(&self) -> Arc<AtomicU64> {
-        self.last_applied.clone()
     }
 }
 
@@ -49,38 +42,35 @@ impl Node for NodeHandler {
             return Ok(Response::new(proto::AppendEntriesResponse {
                 term: self.term,
                 success: false,
-                last_tx_id: self.last_applied.load(Ordering::Acquire),
+                last_tx_id: 0,
                 reject_reason: proto::RejectReason::RejectNotFollower as u32,
             }));
         }
+        let last = self.ledger.last_commit_id();
 
         let entries = decode_records(&req.wal_bytes);
         if entries.is_empty() {
             return Ok(Response::new(proto::AppendEntriesResponse {
                 term: self.term,
                 success: true,
-                last_tx_id: self.last_applied.load(Ordering::Acquire),
+                last_tx_id: last,
                 reject_reason: proto::RejectReason::RejectNone as u32,
             }));
         }
 
         match self.ledger.append_wal_entries(entries) {
-            Ok(()) => {
-                let last = self.ledger.last_commit_id();
-                self.last_applied.store(last, Ordering::Release);
-                Ok(Response::new(proto::AppendEntriesResponse {
-                    term: self.term,
-                    success: true,
-                    last_tx_id: last,
-                    reject_reason: proto::RejectReason::RejectNone as u32,
-                }))
-            }
+            Ok(()) => Ok(Response::new(proto::AppendEntriesResponse {
+                term: self.term,
+                success: true,
+                last_tx_id: last,
+                reject_reason: proto::RejectReason::RejectNone as u32,
+            })),
             Err(e) => {
                 warn!("append_entries failed on node {}: {}", self.node_id, e);
                 Ok(Response::new(proto::AppendEntriesResponse {
                     term: self.term,
                     success: false,
-                    last_tx_id: self.last_applied.load(Ordering::Acquire),
+                    last_tx_id: last,
                     reject_reason: proto::RejectReason::RejectWalAppendFailed as u32,
                 }))
             }
@@ -127,7 +117,11 @@ impl NodeServerRuntime {
     /// outbound response encoding. Must be at least as large as the leader's
     /// `append_entries_max_bytes` + protobuf framing overhead.
     pub fn new(addr: SocketAddr, handler: NodeHandler, max_message_bytes: usize) -> Self {
-        Self { addr, handler, max_message_bytes }
+        Self {
+            addr,
+            handler,
+            max_message_bytes,
+        }
     }
 
     fn service(handler: NodeHandler, max_bytes: usize) -> NodeServer<NodeHandler> {
@@ -145,9 +139,12 @@ impl NodeServerRuntime {
         Ok(())
     }
 
-    pub async fn run_with_shutdown<F>(self, shutdown: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    pub async fn run_with_shutdown<F>(
+        self,
+        shutdown: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
-        F: std::future::Future<Output = ()>,
+        F: Future<Output = ()>,
     {
         info!("Node gRPC server listening on {}", self.addr);
         Server::builder()
