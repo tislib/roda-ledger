@@ -86,14 +86,18 @@ impl WalTailer {
             return 0;
         }
 
-        // Seek on first call or regression; otherwise carry the from_tx_id
-        // forward into the existing cursor so the filter uses the latest one.
+        // Seek on first call or regression; otherwise keep the existing
+        // cursor. Either way, stamp the caller's `from_tx_id` onto the
+        // cursor so the filter below uses the correct value — a freshly
+        // seeded cursor starts at 0 and would otherwise leak structural
+        // records when `from_tx_id > 0`.
         let regressed = self.cursor.as_ref().is_some_and(|c| from_tx_id < c.from_tx_id);
         if self.cursor.is_none() || regressed {
             if self.seek(from_tx_id).is_err() {
                 return 0;
             }
-        } else if let Some(c) = self.cursor.as_mut() {
+        }
+        if let Some(c) = self.cursor.as_mut() {
             c.from_tx_id = from_tx_id;
         }
 

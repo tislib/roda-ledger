@@ -1,13 +1,14 @@
-//! Load generator for a live cluster: boots one leader + one follower
+//! Load generator for a live cluster: boots one leader + N followers
 //! in-process and drives writes against the leader's embedded ledger
-//! while the replication thread ships WAL bytes to the follower.
+//! while the replication thread ships WAL bytes to every follower.
 //!
 //! Columns:
-//! - TPS          — submitted tx/s
-//! - leader       — leader commit_tx_id
-//! - follower     — follower commit_tx_id (through replication)
-//! - in-flight    — gap between sent_tx_id and leader_commit_tx_id
-//! - repl-lag     — gap between leader_commit_tx_id and follower_commit_tx_id
+//! - TPS            — submitted tx/s
+//! - leader         — leader commit_tx_id
+//! - min_follower   — minimum follower commit_tx_id across all followers
+//! - in-flight      — gap between sent_tx_id and leader_commit_tx_id
+//! - min_repl_lag   — min(leader_commit − follower_commit) across followers
+//! - max_repl_lag   — max(leader_commit − follower_commit) across followers
 
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
@@ -15,9 +16,11 @@ use roda_ledger::cluster::config::NodeServerSection;
 use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, PeerConfig};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::grpc::GrpcServerSection;
+use roda_ledger::ledger::Ledger;
 use roda_ledger::transaction::Operation;
 use spdlog::Level::Critical;
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -29,6 +32,10 @@ struct Args {
     #[arg(short, long, default_value_t = 60)]
     duration: u64,
 
+    /// Number of followers to boot and replicate to.
+    #[arg(short = 'f', long, default_value_t = 3)]
+    follower_count: usize,
+
     /// Max bytes the leader ships per AppendEntries RPC.
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     append_entries_max_bytes: usize,
@@ -37,7 +44,7 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     replication_poll_ms: u64,
 
-    /// Transactions per WAL segment on the follower.
+    /// Transactions per WAL segment on each follower.
     #[arg(long, default_value_t = 10_000_000)]
     follower_segment_tx_count: u64,
 }
@@ -84,25 +91,92 @@ fn ledger_cfg(account_count: u64, data_dir: &str, tx_per_seg: u64) -> LedgerConf
     }
 }
 
+/// Aggregate commit-id stats across every follower ledger.
+fn follower_commit_stats(followers: &[Arc<Ledger>]) -> (u64, u64) {
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    for f in followers {
+        let c = f.last_commit_id();
+        if c < min {
+            min = c;
+        }
+        if c > max {
+            max = c;
+        }
+    }
+    if followers.is_empty() {
+        (0, 0)
+    } else {
+        (min, max)
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let args = Args::parse();
     let account_count = args.account_count;
+    let follower_count = args.follower_count.max(1);
 
-    // ── Leader/follower on unique ports, temp dirs ──────────────────────
+    // ── Allocate unique ports for every node ────────────────────────────
     let leader_client_port = free_port();
     let leader_node_port = free_port();
-    let follower_client_port = free_port();
-    let follower_node_port = free_port();
+    let mut follower_ports: Vec<(u16, u16)> = Vec::with_capacity(follower_count);
+    for _ in 0..follower_count {
+        follower_ports.push((free_port(), free_port()));
+    }
+
+    // ── Boot followers first so their node ports are bound when the leader
+    //    replication tasks try to connect. Keep their Cluster handles + ledgers.
+    let mut follower_clusters = Vec::with_capacity(follower_count);
+    let mut follower_handles = Vec::with_capacity(follower_count);
+    let mut follower_ledgers: Vec<Arc<Ledger>> = Vec::with_capacity(follower_count);
+    for (idx, (client_port, node_port)) in follower_ports.iter().enumerate() {
+        // node_ids: 2..=follower_count+1 (1 reserved for leader).
+        let node_id = (idx as u64) + 2;
+        let cfg = ClusterConfig {
+            mode: ClusterMode::Follower,
+            node_id,
+            term: 1,
+            peers: Vec::new(),
+            server: GrpcServerSection {
+                host: "127.0.0.1".into(),
+                port: *client_port,
+                ..Default::default()
+            },
+            node: NodeServerSection {
+                host: "127.0.0.1".into(),
+                port: *node_port,
+            },
+            ledger: ledger_cfg(
+                account_count,
+                &tmp_dir(&format!("follower_{}", idx + 1)),
+                args.follower_segment_tx_count,
+            ),
+            replication_poll_ms: args.replication_poll_ms,
+            append_entries_max_bytes: args.append_entries_max_bytes,
+        };
+        let cluster = Cluster::new(cfg).expect("follower ledger");
+        let handles = cluster.run().await.expect("follower run");
+        follower_ledgers.push(cluster.ledger());
+        follower_handles.push(handles);
+        follower_clusters.push(cluster);
+    }
+
+    // ── Leader config with one PeerConfig per follower ───────────────────
+    let peers: Vec<PeerConfig> = follower_ports
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, node_port))| PeerConfig {
+            id: (idx as u64) + 2,
+            node_addr: format!("http://127.0.0.1:{}", node_port),
+        })
+        .collect();
 
     let leader_cfg = ClusterConfig {
         mode: ClusterMode::Leader,
         node_id: 1,
         term: 1,
-        peers: vec![PeerConfig {
-            id: 2,
-            node_addr: format!("http://127.0.0.1:{}", follower_node_port),
-        }],
+        peers,
         server: GrpcServerSection {
             host: "127.0.0.1".into(),
             port: leader_client_port,
@@ -117,43 +191,11 @@ async fn main() {
         append_entries_max_bytes: args.append_entries_max_bytes,
     };
 
-    let follower_cfg = ClusterConfig {
-        mode: ClusterMode::Follower,
-        node_id: 2,
-        term: 1,
-        peers: Vec::new(),
-        server: GrpcServerSection {
-            host: "127.0.0.1".into(),
-            port: follower_client_port,
-            ..Default::default()
-        },
-        node: NodeServerSection {
-            host: "127.0.0.1".into(),
-            port: follower_node_port,
-        },
-        ledger: ledger_cfg(
-            account_count,
-            &tmp_dir("follower"),
-            args.follower_segment_tx_count,
-        ),
-        replication_poll_ms: args.replication_poll_ms,
-        append_entries_max_bytes: args.append_entries_max_bytes,
-    };
-
-    // Follower first so its node port is listening when the leader's
-    // replication task connects.
-    let follower = Cluster::new(follower_cfg).expect("follower ledger");
-    let follower_handles = follower.run().await.expect("follower run");
-
     let leader = Cluster::new(leader_cfg).expect("leader ledger");
     let leader_handles = leader.run().await.expect("leader run");
-
-    // Drop the Cluster wrappers' handles (gRPC servers) — we drive writes
-    // directly against the embedded leader ledger for load.rs-like throughput.
     let leader_ledger = leader.ledger();
-    let follower_ledger = follower.ledger();
 
-    // Give the replication thread a beat to connect before we start writing.
+    // Give replication tasks a beat to connect before writes start.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let duration = Duration::from_secs(args.duration);
@@ -164,10 +206,11 @@ async fn main() {
 
     // Drive writes on a blocking thread so the tokio runtime keeps
     // servicing replication (which is async).
+    let writer_followers = follower_ledgers.clone();
     let writer = tokio::task::spawn_blocking(move || {
         run_writer(
             leader_ledger,
-            follower_ledger,
+            writer_followers,
             account_count,
             duration,
             &mut per_second,
@@ -185,6 +228,10 @@ async fn main() {
     println!(
         "  ║  Duration      : {:>10.2}s                 ║",
         elapsed.as_secs_f64()
+    );
+    println!(
+        "  ║  Followers     : {:>10}                  ║",
+        follower_count
     );
     println!(
         "  ║  Submitted     : {:>10}                  ║",
@@ -220,15 +267,16 @@ async fn main() {
     println!();
 
     leader_handles.abort();
-    follower_handles.abort();
+    for h in follower_handles {
+        h.abort();
+    }
 }
 
-/// Blocking write loop. Mirrors the per-second table in `load.rs` but with
-/// a dedicated `follower` column and a `repl-lag` column (leader_commit –
-/// follower_commit).
+/// Blocking write loop. Tracks min/max follower commit across every
+/// follower ledger each tick.
 fn run_writer(
-    leader_ledger: std::sync::Arc<roda_ledger::ledger::Ledger>,
-    follower_ledger: std::sync::Arc<roda_ledger::ledger::Ledger>,
+    leader_ledger: Arc<Ledger>,
+    followers: Vec<Arc<Ledger>>,
     account_count: u64,
     duration: Duration,
     per_second: &mut [LatencyMeasurer],
@@ -240,17 +288,14 @@ fn run_writer(
     let mut last_leader = 0u64;
     let mut second = 0u32;
 
+    let sep = "  +-----+--------+------------+------------+------------+----------+----------+------------+------------+------------+";
     println!();
+    println!("{}", sep);
     println!(
-        "  +-----+--------+------------+------------+------------+----------+----------+------------+----------+"
+        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} |",
+        "#", "time", "TPS", "leader", "min_fol", "P50", "P99", "in-flight", "min_lag", "max_lag"
     );
-    println!(
-        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>8} |",
-        "#", "time", "TPS", "leader", "follower", "P50", "P99", "in-flight", "repl-lag"
-    );
-    println!(
-        "  +-----+--------+------------+------------+------------+----------+----------+------------+----------+"
-    );
+    println!("{}", sep);
 
     loop {
         let account = 1 + rand::random::<u64>() % account_count;
@@ -283,12 +328,13 @@ fn run_writer(
                 second += 1;
                 let wall = start_time.elapsed();
                 let leader_commit = leader_ledger.last_commit_id();
-                let follower_commit = follower_ledger.last_commit_id();
+                let (min_follower, max_follower) = follower_commit_stats(&followers);
                 let delta = leader_commit - last_leader;
                 let interval = now.duration_since(last_tick).as_secs_f64();
                 let tps = delta as f64 / interval;
                 let in_flight = i.saturating_sub(leader_commit);
-                let repl_lag = leader_commit.saturating_sub(follower_commit);
+                let min_repl_lag = leader_commit.saturating_sub(max_follower);
+                let max_repl_lag = leader_commit.saturating_sub(min_follower);
 
                 let bucket = (second as usize).saturating_sub(1);
                 let stats = if bucket < per_second.len() {
@@ -298,16 +344,17 @@ fn run_writer(
                 };
 
                 println!(
-                    "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>8} |",
+                    "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} |",
                     second,
                     wall.as_secs(),
                     format!("{:.0}", tps),
                     leader_commit,
-                    follower_commit,
+                    min_follower,
                     fmt_ns(stats.p50),
                     fmt_ns(stats.p99),
                     in_flight,
-                    repl_lag,
+                    min_repl_lag,
+                    max_repl_lag,
                 );
 
                 last_tick = now;
@@ -320,26 +367,28 @@ fn run_writer(
         }
     }
 
-    println!(
-        "  +-----+--------+------------+------------+------------+----------+----------+------------+----------+"
-    );
+    println!("{}", sep);
 
-    // Drain: wait briefly for follower to catch up so the summary reflects
-    // steady state, capped at 30 s.
+    // Drain: wait briefly for every follower to catch up (cap 30s).
     let drain_deadline = Instant::now() + Duration::from_secs(30);
-    while follower_ledger.last_commit_id() < leader_ledger.last_commit_id()
-        && Instant::now() < drain_deadline
-    {
+    loop {
+        let leader_commit = leader_ledger.last_commit_id();
+        let (min_follower, _) = follower_commit_stats(&followers);
+        if min_follower >= leader_commit || Instant::now() >= drain_deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 
     let leader_commit = leader_ledger.last_commit_id();
-    let follower_commit = follower_ledger.last_commit_id();
+    let (min_follower, max_follower) = follower_commit_stats(&followers);
     println!(
-        "  drain: leader_commit={} follower_commit={} repl-lag={}",
+        "  drain: leader_commit={} min_follower={} max_follower={} min_lag={} max_lag={}",
         leader_commit,
-        follower_commit,
-        leader_commit.saturating_sub(follower_commit)
+        min_follower,
+        max_follower,
+        leader_commit.saturating_sub(max_follower),
+        leader_commit.saturating_sub(min_follower),
     );
 
     (i, global.get_stats(), start_time.elapsed())
