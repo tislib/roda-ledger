@@ -14,7 +14,7 @@
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use roda_ledger::cluster::config::NodeServerSection;
-use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, PeerConfig};
+use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, Quorum, PeerConfig};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::grpc::GrpcServerSection;
 use roda_ledger::ledger::Ledger;
@@ -22,7 +22,6 @@ use roda_ledger::transaction::Operation;
 use spdlog::Level::Critical;
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -35,7 +34,7 @@ struct Args {
     duration: u64,
 
     /// Number of followers to boot and replicate to.
-    #[arg(short = 'f', long, default_value_t = 3)]
+    #[arg(short = 'f', long, default_value_t = 1)]
     follower_count: usize,
 
     /// Max bytes the leader ships per AppendEntries RPC.
@@ -197,13 +196,12 @@ async fn main() {
     let leader_handles = leader.run().await.expect("leader run");
     let leader_ledger = leader.ledger();
 
-    // Share-of-truth for replication progress. The leader's PeerManager
-    // updates `majority_commit_id` via `fetch_max` on every accepted
-    // `AppendEntries`; we read it directly here.
-    let majority_commit_id = leader_handles
-        .majority_commit_id
-        .clone()
-        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    // Source-of-truth for replication progress. The leader owns a
+    // `Quorum` that each peer task `advance`s after every accepted
+    // `AppendEntries`; we read it here via `.get()`.
+    let majority = leader_handles
+        .quorum()
+        .unwrap_or_else(|| Arc::new(Quorum::new(0)));
 
     // Give replication tasks a beat to connect before writes start.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -217,7 +215,7 @@ async fn main() {
     // Drive writes on a blocking thread so the tokio runtime keeps
     // servicing replication (which is async).
     let writer_followers = follower_ledgers.clone();
-    let writer_majority = majority_commit_id.clone();
+    let writer_majority = majority.clone();
     let writer = tokio::task::spawn_blocking(move || {
         run_writer(
             leader_ledger,
@@ -284,12 +282,13 @@ async fn main() {
     }
 }
 
-/// Blocking write loop. Reads `majority_commit_id` (published by the
-/// leader's `PeerManager`) and per-follower ledger commit ids each tick.
+/// Blocking write loop. Reads the shared `Quorum` (published by the
+/// leader's peer-replication tasks) and per-follower ledger commit ids
+/// each tick.
 fn run_writer(
     leader_ledger: Arc<Ledger>,
     followers: Vec<Arc<Ledger>>,
-    majority_commit_id: Arc<AtomicU64>,
+    majority: Arc<Quorum>,
     account_count: u64,
     duration: Duration,
     per_second: &mut [LatencyMeasurer],
@@ -341,13 +340,13 @@ fn run_writer(
                 second += 1;
                 let wall = start_time.elapsed();
                 let leader_commit = leader_ledger.last_commit_id();
-                let majority = majority_commit_id.load(Ordering::Acquire);
+                let majority_v = majority.get();
                 let (min_follower, max_follower) = follower_commit_stats(&followers);
                 let delta = leader_commit - last_leader;
                 let interval = now.duration_since(last_tick).as_secs_f64();
                 let tps = delta as f64 / interval;
                 let in_flight = i.saturating_sub(leader_commit);
-                let maj_lag = leader_commit.saturating_sub(majority);
+                let maj_lag = leader_commit.saturating_sub(majority_v);
                 let min_repl_lag = leader_commit.saturating_sub(max_follower);
                 let max_repl_lag = leader_commit.saturating_sub(min_follower);
 
@@ -364,7 +363,7 @@ fn run_writer(
                     wall.as_secs(),
                     format!("{:.0}", tps),
                     leader_commit,
-                    majority,
+                    majority_v,
                     fmt_ns(stats.p50),
                     fmt_ns(stats.p99),
                     in_flight,
@@ -389,23 +388,23 @@ fn run_writer(
     let drain_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let leader_commit = leader_ledger.last_commit_id();
-        let majority = majority_commit_id.load(Ordering::Acquire);
-        if majority >= leader_commit || Instant::now() >= drain_deadline {
+        let majority_v = majority.get();
+        if majority_v >= leader_commit || Instant::now() >= drain_deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 
     let leader_commit = leader_ledger.last_commit_id();
-    let majority = majority_commit_id.load(Ordering::Acquire);
+    let majority_v = majority.get();
     let (min_follower, max_follower) = follower_commit_stats(&followers);
     println!(
         "  drain: leader_commit={} majority={} min_follower={} max_follower={} maj_lag={} min_lag={} max_lag={}",
         leader_commit,
-        majority,
+        majority_v,
         min_follower,
         max_follower,
-        leader_commit.saturating_sub(majority),
+        leader_commit.saturating_sub(majority_v),
         leader_commit.saturating_sub(max_follower),
         leader_commit.saturating_sub(min_follower),
     );

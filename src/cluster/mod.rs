@@ -8,15 +8,19 @@
 //! `Ledger::append_wal_entries`.
 
 pub mod config;
+pub mod follower;
+pub mod leader;
 pub mod node;
-pub mod peer_manager;
 pub mod peer_replication;
+pub mod quorum;
 pub mod server;
 
 pub use config::{ClusterConfig, ClusterMode, PeerConfig};
-pub use node::Cluster;
-pub use peer_manager::PeerManager;
+pub use follower::{Follower, FollowerHandles};
+pub use leader::{Leader, LeaderHandles};
+pub use node::{Cluster, ClusterHandles};
 pub use peer_replication::{PeerReplication, ReplicationParams};
+pub use quorum::Quorum;
 
 pub mod proto {
     tonic::include_proto!("roda.node.v1");

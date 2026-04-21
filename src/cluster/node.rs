@@ -1,18 +1,14 @@
-//! `Cluster` — boots both the client-facing Ledger gRPC server and the
-//! peer-facing Node gRPC server; on the leader it also drives the
-//! replication fan-out.
+//! `Cluster` — thin dispatcher. Constructs the embedded `Ledger`, then
+//! hands control to [`Leader`] or [`Follower`] depending on `config.mode`.
+//! All role-specific bring-up lives in the role files.
 
+use crate::cluster::Quorum;
 use crate::cluster::config::{ClusterConfig, ClusterMode};
-use crate::cluster::peer_manager::PeerManager;
-use crate::cluster::peer_replication::ReplicationParams;
-use crate::cluster::proto::NodeRole;
-use crate::cluster::server::{NodeHandler, NodeServerRuntime};
-use crate::grpc::GrpcServer;
+use crate::cluster::follower::{Follower, FollowerHandles};
+use crate::cluster::leader::{Leader, LeaderHandles};
 use crate::ledger::Ledger;
-use spdlog::info;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 use tokio::task::JoinHandle;
 
 pub struct Cluster {
@@ -21,8 +17,8 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// Build (and start) the embedded Ledger. The gRPC servers and
-    /// replication thread are launched by [`Cluster::run`].
+    /// Build (and start) the embedded Ledger. The gRPC servers and, on
+    /// leaders, the replication fan-out are launched by [`Cluster::run`].
     pub fn new(config: ClusterConfig) -> std::io::Result<Self> {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start()?;
@@ -37,114 +33,86 @@ impl Cluster {
         &self.config
     }
 
-    /// Boot both servers and (on leaders) the replication fan-out. Returns
-    /// a `ClusterHandles` that owns every spawned task. Drop / `shutdown`
-    /// to stop.
+    /// Dispatch to the role-specific bring-up. Returns a unified
+    /// `ClusterHandles` so generic callers (tests, `load_cluster`) don't
+    /// need to branch on mode.
     pub async fn run(&self) -> Result<ClusterHandles, Box<dyn std::error::Error + Send + Sync>> {
-        let client_addr = self.config.server.socket_addr()?;
-        let node_addr = self.config.node.socket_addr()?;
-
-        let role = match self.config.mode {
-            ClusterMode::Leader => NodeRole::Leader,
-            ClusterMode::Follower => NodeRole::Follower,
-        };
-
-        // Client-facing Ledger server: read-only on followers.
-        let client_server = if self.config.mode == ClusterMode::Leader {
-            GrpcServer::new(self.ledger.clone(), client_addr)
-        } else {
-            GrpcServer::new_read_only(self.ledger.clone(), client_addr)
-        };
-        let client_handle = tokio::spawn(async move {
-            if let Err(e) = client_server.run().await {
-                spdlog::error!("ledger gRPC server exited: {}", e);
+        match self.config.mode {
+            ClusterMode::Leader => {
+                let leader = Leader::new(self.config.clone(), self.ledger.clone());
+                let handles = leader.run().await?;
+                Ok(ClusterHandles::Leader(handles))
             }
-        });
-
-        // Peer-facing Node server: always on, both sides.
-        let node_handler = NodeHandler::new(
-            self.ledger.clone(),
-            self.config.node_id,
-            self.config.term,
-            role,
-        );
-        // Size server decode/encode limits to cover the largest chunk the
-        // leader might ship plus protobuf framing overhead (doubled +4 KiB).
-        let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;
-        let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);
-        let node_handle = tokio::spawn(async move {
-            if let Err(e) = node_runtime.run().await {
-                spdlog::error!("node gRPC server exited: {}", e);
+            ClusterMode::Follower => {
+                let follower = Follower::new(self.config.clone(), self.ledger.clone());
+                let handles = follower.run().await?;
+                Ok(ClusterHandles::Follower(handles))
             }
-        });
-
-        // Replication: leader only. `PeerManager::spawn` is the only
-        // top-level `tokio::spawn` — it owns one supervisor task that
-        // spawns one child sub-task per peer.
-        let mut peer_manager_handle: Option<JoinHandle<()>> = None;
-        let mut peer_manager_running: Option<Arc<AtomicBool>> = None;
-        let mut majority_commit_id: Option<Arc<AtomicU64>> = None;
-        let mut peer_commit_ids: Option<Arc<Vec<Arc<AtomicU64>>>> = None;
-        if self.config.mode == ClusterMode::Leader && !self.config.peers.is_empty() {
-            let params = ReplicationParams::new(
-                self.config.node_id,
-                self.config.term,
-                self.config.append_entries_max_bytes,
-                Duration::from_millis(self.config.replication_poll_ms.max(1)),
-            );
-            let manager = PeerManager::new(
-                self.ledger.clone(),
-                self.config.peers.clone(),
-                params,
-            );
-            peer_manager_running = Some(manager.running());
-            majority_commit_id = Some(manager.majority_commit_id());
-            peer_commit_ids = Some(manager.peer_commit_ids());
-            peer_manager_handle = Some(manager.spawn());
-            info!(
-                "cluster: leader node_id={} replicating to {} peer(s)",
-                self.config.node_id,
-                self.config.peers.len()
-            );
         }
-
-        Ok(ClusterHandles {
-            client_handle,
-            node_handle,
-            peer_manager_handle,
-            peer_manager_running,
-            majority_commit_id,
-            peer_commit_ids,
-        })
     }
 }
 
-pub struct ClusterHandles {
-    pub client_handle: JoinHandle<()>,
-    pub node_handle: JoinHandle<()>,
-    /// Supervisor handle for the peer-replication subtree (leader only).
-    pub peer_manager_handle: Option<JoinHandle<()>>,
-    /// Shutdown flag owned by the peer manager; flipping it drains every
-    /// peer subtask without aborting.
-    pub peer_manager_running: Option<Arc<AtomicBool>>,
-    /// Cluster-wide majority commit watermark (leader only).
-    pub majority_commit_id: Option<Arc<AtomicU64>>,
-    /// Per-peer commit atomics, positionally aligned with `config.peers`.
-    pub peer_commit_ids: Option<Arc<Vec<Arc<AtomicU64>>>>,
+/// Unified handles view over a leader-or-follower bring-up. Enum-shaped
+/// so each variant exposes exactly the state that role produced.
+pub enum ClusterHandles {
+    Leader(LeaderHandles),
+    Follower(FollowerHandles),
 }
 
 impl ClusterHandles {
-    /// Abort every background task. Does NOT wait for graceful shutdown —
-    /// sufficient for tests; production paths can wire a real shutdown
-    /// channel via `NodeServerRuntime::run_with_shutdown`.
+    /// Abort every spawned task owned by this bring-up.
     pub fn abort(&self) {
-        self.client_handle.abort();
-        self.node_handle.abort();
-        if let Some(run) = &self.peer_manager_running {
-            run.store(false, std::sync::atomic::Ordering::Release);
+        match self {
+            ClusterHandles::Leader(h) => h.abort(),
+            ClusterHandles::Follower(h) => h.abort(),
         }
-        if let Some(h) = &self.peer_manager_handle {
-            h.abort();
+    }
+
+    /// Shared quorum tracker (leader only).
+    pub fn quorum(&self) -> Option<Arc<Quorum>> {
+        match self {
+            ClusterHandles::Leader(h) => Some(h.quorum.clone()),
+            ClusterHandles::Follower(_) => None,
+        }
+    }
+
+    /// Cooperative shutdown flag for the peer subtree (leader only).
+    pub fn running(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            ClusterHandles::Leader(h) => Some(h.running.clone()),
+            ClusterHandles::Follower(_) => None,
+        }
+    }
+
+    /// Borrow the underlying `LeaderHandles` if this bring-up is a leader.
+    pub fn as_leader(&self) -> Option<&LeaderHandles> {
+        match self {
+            ClusterHandles::Leader(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Borrow the underlying `FollowerHandles` if this bring-up is a follower.
+    pub fn as_follower(&self) -> Option<&FollowerHandles> {
+        match self {
+            ClusterHandles::Follower(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Client-facing Ledger gRPC server handle (always present).
+    pub fn client_handle(&self) -> &JoinHandle<()> {
+        match self {
+            ClusterHandles::Leader(h) => &h.client_handle,
+            ClusterHandles::Follower(h) => &h.client_handle,
+        }
+    }
+
+    /// Peer-facing Node gRPC server handle (always present).
+    pub fn node_handle(&self) -> &JoinHandle<()> {
+        match self {
+            ClusterHandles::Leader(h) => &h.node_handle,
+            ClusterHandles::Follower(h) => &h.node_handle,
         }
     }
 }

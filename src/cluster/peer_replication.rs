@@ -1,12 +1,13 @@
 //! Per-peer replication: owns one `WalTailer` cursor, one gRPC client, and
 //! the shipping window for a single follower. Its `run()` is the long-lived
-//! async task that `PeerManager` spawns.
+//! async task that `Leader` spawns (one per peer).
 //!
 //! The key state is `(from_tx_id, peer_last_tx)`:
 //! - `from_tx_id` is the next tx we still need to ship.
 //! - `peer_last_tx` is the high-water mark the follower has acked (stamped
 //!   onto every AppendEntries as `prev_tx_id` for Raft-style ordering).
 
+use crate::cluster::Quorum;
 use crate::cluster::config::PeerConfig;
 use crate::cluster::proto;
 use crate::cluster::proto::node_client::NodeClient;
@@ -14,7 +15,7 @@ use crate::ledger::Ledger;
 use crate::storage::WalTailer;
 use spdlog::{info, warn};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tonic::transport::{Channel, Endpoint};
@@ -56,46 +57,38 @@ impl ReplicationParams {
 /// Per-peer replicator. One per follower.
 pub struct PeerReplication {
     peer: PeerConfig,
+    /// Positional id (0-based) used as the `Quorum` slot.
+    peer_index: u32,
     ledger: Arc<Ledger>,
     params: ReplicationParams,
     running: Arc<AtomicBool>,
     tailer: WalTailer,
     from_tx_id: u64,
     peer_last_tx: u64,
-    /// This peer's last acked `commit_id` (the `last_tx_id` returned by
-    /// the follower on its most recent successful `AppendEntries`).
-    /// Shared with `PeerManager` for majority tracking.
-    last_commit_id: Arc<AtomicU64>,
-    /// All peers' `last_commit_id` atomics (including this one). Read by
-    /// every task to recompute the majority after its own ack.
-    peer_commit_ids: Arc<Vec<Arc<AtomicU64>>>,
-    /// Cluster-wide majority commit watermark owned by `PeerManager`.
-    /// Written via `fetch_max` so the value is monotonically non-decreasing.
-    majority_commit_id: Arc<AtomicU64>,
+    /// Shared majority-commit tracker owned by `Leader`.
+    majority: Arc<Quorum>,
 }
 
 impl PeerReplication {
     pub fn new(
         peer: PeerConfig,
+        peer_index: u32,
         ledger: Arc<Ledger>,
         params: ReplicationParams,
         running: Arc<AtomicBool>,
-        last_commit_id: Arc<AtomicU64>,
-        peer_commit_ids: Arc<Vec<Arc<AtomicU64>>>,
-        majority_commit_id: Arc<AtomicU64>,
+        majority: Arc<Quorum>,
     ) -> Self {
         let tailer = ledger.wal_tailer();
         Self {
             peer,
+            peer_index,
             ledger,
             params,
             running,
             tailer,
             from_tx_id: 1,
             peer_last_tx: 0,
-            last_commit_id,
-            peer_commit_ids,
-            majority_commit_id,
+            majority,
         }
     }
 
@@ -178,13 +171,10 @@ impl PeerReplication {
                         self.peer_last_tx = shipment_last_tx;
                         self.from_tx_id = shipment_last_tx + 1;
                         // Publish this peer's latest commit watermark and
-                        // recompute the cluster-wide majority. `fetch_max`
-                        // keeps `majority_commit_id` monotonic across the
-                        // concurrent updates from sibling peer tasks.
-                        self.last_commit_id
-                            .store(r.last_tx_id, Ordering::Release);
-                        let m = majority_of(&self.peer_commit_ids);
-                        self.majority_commit_id.fetch_max(m, Ordering::AcqRel);
+                        // let the shared tracker recompute the cluster
+                        // majority. `advance` is monotonically safe via
+                        // `fetch_max` inside `Quorum`.
+                        self.majority.advance(self.peer_index, r.last_tx_id);
                         return true;
                     }
                     warn!(
@@ -213,27 +203,6 @@ impl PeerReplication {
             }
         }
     }
-}
-
-/// Compute the cluster's majority commit watermark from per-peer atomics.
-///
-/// With `F` followers + 1 leader (total `N = F + 1`), a Raft-style majority
-/// requires `floor(N/2) + 1` nodes. The leader contributes 1 implicit ack,
-/// so we need `floor((F+1)/2)` follower acks. The (F-`required`)-th element
-/// of the ascending-sorted peer watermarks is the largest tx_id that at
-/// least `required` followers have reached.
-pub(crate) fn majority_of(peer_commit_ids: &[Arc<AtomicU64>]) -> u64 {
-    let n = peer_commit_ids.len();
-    if n == 0 {
-        return 0;
-    }
-    let mut vals: Vec<u64> = peer_commit_ids
-        .iter()
-        .map(|a| a.load(Ordering::Acquire))
-        .collect();
-    vals.sort_unstable();
-    let required = (n + 1) / 2;
-    vals[n - required]
 }
 
 async fn connect(
