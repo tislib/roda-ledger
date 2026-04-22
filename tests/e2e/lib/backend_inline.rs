@@ -1,13 +1,13 @@
 //! Inline backend — nodes run in-process with a gRPC server each.
 //!
-//! Each node boots a real `Ledger`, wraps it in a `GrpcServer`, and
+//! Each node boots a real `Ledger`, wraps it in a `Server`, and
 //! exposes a `LedgerClient` for the test to talk to. Fastest startup,
 //! easiest debugging, but cannot test crash recovery or process isolation.
 
 use crate::e2e::lib::profile::Profile;
 use roda_ledger::client::LedgerClient;
 use roda_ledger::cluster::Term;
-use roda_ledger::grpc::GrpcServer;
+use roda_ledger::cluster::Server;
 use roda_ledger::ledger::Ledger;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tokio::time::sleep;
 pub struct InlineNode {
     /// Keeps the ledger alive — dropped last to ensure clean shutdown.
     _ledger: Arc<Ledger>,
-    /// The spawned tokio task running `GrpcServer::run()`.
+    /// The spawned tokio task running `Server::run()`.
     server_task: JoinHandle<()>,
     /// gRPC client connected to this node.
     client: LedgerClient,
@@ -45,7 +45,7 @@ impl InlineNode {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).expect("open term log"));
         let server_task = tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr, term)
+            Server::new(server_ledger, addr, term)
                 .run()
                 .await
                 .unwrap();

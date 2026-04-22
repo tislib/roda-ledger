@@ -1,14 +1,14 @@
-//! Node service server. Handles peer-to-peer RPCs (`AppendEntries`, `Ping`).
+//! `NodeHandler` — gRPC service implementation for peer-to-peer RPCs
+//! (`AppendEntries`, `Ping`). The server runtime that hosts it lives in
+//! [`crate::cluster::server`].
 
 use crate::cluster::Term;
 use crate::cluster::proto::node as proto;
-use crate::cluster::proto::node::node_server::{Node, NodeServer};
+use crate::cluster::proto::node::node_server::Node;
 use crate::ledger::Ledger;
 use crate::wal_tail::decode_records;
-use spdlog::{info, warn};
-use std::net::SocketAddr;
+use spdlog::warn;
 use std::sync::Arc;
-use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 pub struct NodeHandler {
@@ -134,54 +134,5 @@ impl Node for NodeHandler {
         _request: Request<proto::InstallSnapshotRequest>,
     ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
         Err(Status::unimplemented("InstallSnapshot deferred to ADR-016"))
-    }
-}
-
-pub struct NodeServerRuntime {
-    addr: SocketAddr,
-    handler: NodeHandler,
-    max_message_bytes: usize,
-}
-
-impl NodeServerRuntime {
-    /// `max_message_bytes` bounds both inbound `AppendEntries` decoding and
-    /// outbound response encoding. Must be at least as large as the leader's
-    /// `append_entries_max_bytes` + protobuf framing overhead.
-    pub fn new(addr: SocketAddr, handler: NodeHandler, max_message_bytes: usize) -> Self {
-        Self {
-            addr,
-            handler,
-            max_message_bytes,
-        }
-    }
-
-    fn service(handler: NodeHandler, max_bytes: usize) -> NodeServer<NodeHandler> {
-        NodeServer::new(handler)
-            .max_decoding_message_size(max_bytes)
-            .max_encoding_message_size(max_bytes)
-    }
-
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Node gRPC server listening on {}", self.addr);
-        Server::builder()
-            .add_service(Self::service(self.handler, self.max_message_bytes))
-            .serve(self.addr)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn run_with_shutdown<F>(
-        self,
-        shutdown: F,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: Future<Output = ()>,
-    {
-        info!("Node gRPC server listening on {}", self.addr);
-        Server::builder()
-            .add_service(Self::service(self.handler, self.max_message_bytes))
-            .serve_with_shutdown(self.addr, shutdown)
-            .await?;
-        Ok(())
     }
 }

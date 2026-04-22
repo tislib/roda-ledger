@@ -1,9 +1,9 @@
-#[cfg(feature = "grpc")]
+#[cfg(feature = "cluster")]
 mod tests {
+    use roda_ledger::cluster::Server;
     use roda_ledger::cluster::Term;
-    use roda_ledger::grpc::GrpcServer;
-    use roda_ledger::grpc::proto::ledger_client::LedgerClient;
-    use roda_ledger::grpc::proto::{
+    use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
+    use roda_ledger::cluster::proto::ledger::{
         Deposit, GetBalanceRequest, GetBalancesRequest, GetPipelineIndexRequest, GetStatusRequest,
         GetStatusesRequest, SubmitBatchRequest, SubmitOperationRequest, Transfer, Withdrawal,
     };
@@ -28,7 +28,7 @@ mod tests {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            let server = GrpcServer::new(server_ledger, addr, term);
+            let server = Server::new(server_ledger, addr, term);
             server.run().await.unwrap();
         });
 
@@ -47,7 +47,7 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(Deposit {
+                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(Deposit {
                     account: 1,
                     amount: 1000,
                     user_ref: 123,
@@ -78,7 +78,7 @@ mod tests {
         client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 2000,
@@ -92,7 +92,7 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::grpc::proto::submit_operation_request::Operation::Withdrawal(
+                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Withdrawal(
                     Withdrawal {
                         account: 1,
                         amount: 500,
@@ -123,7 +123,7 @@ mod tests {
         client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -137,7 +137,7 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::grpc::proto::submit_operation_request::Operation::Transfer(Transfer {
+                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Transfer(Transfer {
                     from: 1,
                     to: 2,
                     amount: 400,
@@ -167,7 +167,7 @@ mod tests {
             operations: vec![
                 SubmitOperationRequest {
                     operation: Some(
-                        roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                        roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                             Deposit {
                                 account: 1,
                                 amount: 100,
@@ -178,7 +178,7 @@ mod tests {
                 },
                 SubmitOperationRequest {
                     operation: Some(
-                        roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                        roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                             Deposit {
                                 account: 2,
                                 amount: 200,
@@ -213,7 +213,7 @@ mod tests {
         client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 5,
                             amount: 500,
@@ -256,7 +256,7 @@ mod tests {
                 operations: vec![
                     SubmitOperationRequest {
                         operation: Some(
-                            roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                            roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                                 Deposit {
                                     account: 10,
                                     amount: 100,
@@ -267,7 +267,7 @@ mod tests {
                     },
                     SubmitOperationRequest {
                         operation: Some(
-                            roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                            roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                                 Deposit {
                                     account: 11,
                                     amount: 200,
@@ -310,7 +310,7 @@ mod tests {
         let res1 = client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -367,7 +367,7 @@ mod tests {
         let res = client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Deposit(
+                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -410,7 +410,7 @@ mod tests {
         let res = client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::grpc::proto::submit_operation_request::Operation::Withdrawal(
+                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Withdrawal(
                         Withdrawal {
                             account: 100,
                             amount: 1000,

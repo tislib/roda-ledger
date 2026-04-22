@@ -1,5 +1,5 @@
 fn main() {
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "cluster")]
     {
         use std::env;
         use std::path::PathBuf;

@@ -1,9 +1,9 @@
-#[cfg(feature = "grpc")]
+#[cfg(feature = "cluster")]
 mod tests {
     use roda_ledger::client::LedgerClient;
+    use roda_ledger::cluster::Server;
     use roda_ledger::cluster::Term;
-    use roda_ledger::grpc::GrpcServer;
-    use roda_ledger::grpc::proto::WaitLevel;
+    use roda_ledger::cluster::proto::ledger::WaitLevel;
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -23,7 +23,7 @@ mod tests {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr, term)
+            Server::new(server_ledger, addr, term)
                 .run()
                 .await
                 .unwrap();
@@ -284,7 +284,7 @@ mod tests {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let server_handle = tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr, term)
+            Server::new(server_ledger, addr, term)
                 .run()
                 .await
                 .unwrap();
@@ -309,7 +309,7 @@ mod tests {
         // original Arc<Term> was moved into the aborted task.
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            GrpcServer::new(ledger, addr, term).run().await.unwrap();
+            Server::new(ledger, addr, term).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;

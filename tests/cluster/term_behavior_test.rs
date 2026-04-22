@@ -13,7 +13,7 @@
 //! 4. `WaitForTransaction` short-circuits to `NOT_FOUND` on unknown tx
 //!    and `TERM_MISMATCH` on term fence failure.
 
-#![cfg(feature = "grpc")]
+#![cfg(feature = "cluster")]
 
 use roda_ledger::cluster::LedgerHandler;
 use roda_ledger::cluster::Term;

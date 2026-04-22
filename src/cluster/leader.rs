@@ -6,11 +6,12 @@
 //! The top-level `tokio::spawn` for peer supervision lives here —
 //! `Leader::run` spawns one child per peer.
 
-use crate::cluster::config::ClusterConfig;
-use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
+use crate::cluster::config::Config;
+use crate::cluster::handler_node::NodeHandler;
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
 use crate::cluster::proto::node::NodeRole;
-use crate::cluster::{GrpcServer, Quorum, Term};
+use crate::cluster::server::{NodeServerRuntime, Server};
+use crate::cluster::{Quorum, Term};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -20,13 +21,13 @@ use tokio::task::JoinHandle;
 
 /// Role-scoped bring-up for a leader node. Construct, then `run()`.
 pub struct Leader {
-    config: ClusterConfig,
+    config: Config,
     ledger: Arc<Ledger>,
     term: Arc<Term>,
 }
 
 impl Leader {
-    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
+    pub fn new(config: Config, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
         Self {
             config,
             ledger,
@@ -57,7 +58,8 @@ impl Leader {
         // Hands the shared Arc<Term> through so every submit and status
         // response can resolve the current + per-tx term without
         // round-tripping back to the leader state.
-        let client_server = GrpcServer::new(self.ledger.clone(), client_addr, self.term.clone());
+        let client_server =
+            Server::new(self.ledger.clone(), client_addr, self.term.clone());
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("leader ledger gRPC server exited: {}", e);

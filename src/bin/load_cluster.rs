@@ -14,9 +14,10 @@
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use roda_ledger::cluster::config::NodeServerSection;
-use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, PeerConfig, Quorum};
+use roda_ledger::cluster::{
+    self, ServerSection, ClusterNode, PeerConfig, Quorum,
+};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
-use roda_ledger::grpc::GrpcServerSection;
 use roda_ledger::ledger::Ledger;
 use roda_ledger::transaction::Operation;
 use spdlog::Level::Critical;
@@ -137,12 +138,12 @@ async fn main() {
     for (idx, (client_port, node_port)) in follower_ports.iter().enumerate() {
         // node_ids: 2..=follower_count+1 (1 reserved for leader).
         let node_id = (idx as u64) + 2;
-        let cfg = ClusterConfig {
-            mode: ClusterMode::Follower,
+        let cfg = cluster::Config {
+            mode: cluster::Mode::Follower,
             node_id,
             term: 1,
             peers: Vec::new(),
-            server: GrpcServerSection {
+            server: ServerSection {
                 host: "127.0.0.1".into(),
                 port: *client_port,
                 ..Default::default()
@@ -159,7 +160,7 @@ async fn main() {
             replication_poll_ms: args.replication_poll_ms,
             append_entries_max_bytes: args.append_entries_max_bytes,
         };
-        let cluster = Cluster::new(cfg).expect("follower ledger");
+        let cluster = ClusterNode::new(cfg).expect("follower ledger");
         let handles = cluster.run().await.expect("follower run");
         follower_ledgers.push(cluster.ledger());
         follower_handles.push(handles);
@@ -176,12 +177,12 @@ async fn main() {
         })
         .collect();
 
-    let leader_cfg = ClusterConfig {
-        mode: ClusterMode::Leader,
+    let leader_cfg = cluster::Config {
+        mode: cluster::Mode::Leader,
         node_id: 1,
         term: 1,
         peers,
-        server: GrpcServerSection {
+        server: ServerSection {
             host: "127.0.0.1".into(),
             port: leader_client_port,
             ..Default::default()
@@ -195,7 +196,7 @@ async fn main() {
         append_entries_max_bytes: args.append_entries_max_bytes,
     };
 
-    let leader = Cluster::new(leader_cfg).expect("leader ledger");
+    let leader = ClusterNode::new(leader_cfg).expect("leader ledger");
     let leader_handles = leader.run().await.expect("leader run");
     let leader_ledger = leader.ledger();
 

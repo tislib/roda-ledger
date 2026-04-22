@@ -6,10 +6,11 @@
 //! local ledger via `NodeHandler`, which also durably `observe()`s the
 //! leader's term on every accepted batch.
 
-use crate::cluster::config::ClusterConfig;
-use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
+use crate::cluster::config::Config;
+use crate::cluster::handler_node::NodeHandler;
 use crate::cluster::proto::node::NodeRole;
-use crate::cluster::{GrpcServer, Term};
+use crate::cluster::server::{NodeServerRuntime, Server};
+use crate::cluster::Term;
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -17,13 +18,13 @@ use tokio::task::JoinHandle;
 
 /// Role-scoped bring-up for a follower node. Construct, then `run()`.
 pub struct Follower {
-    config: ClusterConfig,
+    config: Config,
     ledger: Arc<Ledger>,
     term: Arc<Term>,
 }
 
 impl Follower {
-    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
+    pub fn new(config: Config, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
         Self {
             config,
             ledger,
@@ -42,7 +43,7 @@ impl Follower {
         // error-carrying field, and the query RPCs can resolve per-tx
         // term via Term::get_term_at_tx (hot ring / cold scan).
         let client_server =
-            GrpcServer::new_read_only(self.ledger.clone(), client_addr, self.term.clone());
+            Server::new_read_only(self.ledger.clone(), client_addr, self.term.clone());
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("follower ledger gRPC server exited: {}", e);

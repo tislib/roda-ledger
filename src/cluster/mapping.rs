@@ -104,6 +104,10 @@ impl From<proto::WaitLevel> for WaitLevel {
             proto::WaitLevel::Computed => WaitLevel::Computed,
             proto::WaitLevel::Committed => WaitLevel::Committed,
             proto::WaitLevel::Snapshot => WaitLevel::OnSnapshot,
+            // ADR-016 wire value; no internal equivalent yet.
+            proto::WaitLevel::ClusterCommit => unreachable!(
+                "WaitLevel::ClusterCommit is wire-only until ADR-016 quorum gating lands"
+            ),
         }
     }
 }

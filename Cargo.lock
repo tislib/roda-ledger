@@ -242,9 +242,6 @@ name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
-dependencies = [
- "serde_core",
-]
 
 [[package]]
 name = "bumpalo"
@@ -1665,7 +1662,6 @@ name = "roda-ledger"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "bitflags",
  "bytemuck",
  "clap",
  "crc32c",
@@ -1680,7 +1676,6 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "smallvec",
  "spdlog-rs",
  "sysinfo",
  "tempfile",

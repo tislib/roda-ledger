@@ -4,6 +4,22 @@
 **Date:** 2026-04-20
 **Last-Updated:** 2026-04-22
 
+> **2026-04-22 refactor notes** (in-tree rename; no semantic change):
+> - Cargo feature `grpc` → `cluster`. A single node is just a cluster
+>   with zero peers; the Cluster layer now owns all gRPC code.
+> - Single `roda-ledger` binary (the old `bin/server.rs` + separate
+>   `roda-cluster` are gone). `roda_ledger::cluster::Config` is loaded
+>   unconditionally; empty `peers` ⇒ single-node mode.
+> - Cluster-exported types drop the redundant `Cluster` prefix:
+>   `ClusterConfig → Config`, `ClusterMode → Mode`,
+>   `ClusterHandles → Handles`, `ClusterServer → Server`,
+>   `ClusterConfigError → ConfigError`.
+> - Module layout inside `src/cluster/`: `handler_ledger.rs`,
+>   `handler_node.rs`, `server.rs` (both gRPC runtimes),
+>   `mapping.rs` (was `proto_mapping.rs`).
+> - Integration tests live under `tests/cluster/` and compile into a
+>   single binary via `tests/cluster.rs`.
+
 ---
 
 ## Context
