@@ -139,6 +139,7 @@ enum WaitLevel {
   WAIT_LEVEL_COMPUTED = 0; // if omitted in request, used for async SubmitOperation
   WAIT_LEVEL_COMMITTED = 1;
   WAIT_LEVEL_SNAPSHOT = 2;
+  WAIT_LEVEL_CLUSTER_COMMIT = 3;
 }
 
 // Deposit credits an account from the system source.
