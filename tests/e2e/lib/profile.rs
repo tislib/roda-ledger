@@ -9,7 +9,7 @@
 //! temp directory).
 
 use roda_ledger::config::{LedgerConfig, StorageConfig};
-use roda_ledger::grpc::config::GrpcServerSection;
+use roda_ledger::grpc::GrpcServerSection;
 use roda_ledger::wait_strategy::WaitStrategy;
 use serde::Deserialize;
 use std::collections::HashMap;

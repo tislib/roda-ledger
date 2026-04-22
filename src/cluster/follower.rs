@@ -3,12 +3,13 @@
 //! Owns the client-facing Ledger gRPC server in **read-only** mode and the
 //! peer-facing Node gRPC server with `NodeRole::Follower`. No replication
 //! fan-out runs on this side; incoming `AppendEntries` are applied to the
-//! local ledger via `NodeHandler`.
+//! local ledger via `NodeHandler`, which also durably `observe()`s the
+//! leader's term on every accepted batch.
 
 use crate::cluster::config::ClusterConfig;
-use crate::cluster::proto::NodeRole;
-use crate::cluster::server::{NodeHandler, NodeServerRuntime};
-use crate::grpc::GrpcServer;
+use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
+use crate::cluster::proto::node::NodeRole;
+use crate::cluster::{GrpcServer, Term};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -18,11 +19,16 @@ use tokio::task::JoinHandle;
 pub struct Follower {
     config: ClusterConfig,
     ledger: Arc<Ledger>,
+    term: Arc<Term>,
 }
 
 impl Follower {
-    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>) -> Self {
-        Self { config, ledger }
+    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
+        Self {
+            config,
+            ledger,
+            term,
+        }
     }
 
     /// Spawn both gRPC servers and return their handles.
@@ -30,9 +36,13 @@ impl Follower {
         let client_addr = self.config.server.socket_addr()?;
         let node_addr = self.config.node.socket_addr()?;
 
-        // Client-facing Ledger server — read-only on followers. Every
-        // `submit_*` / `register_function` RPC returns FAILED_PRECONDITION.
-        let client_server = GrpcServer::new_read_only(self.ledger.clone(), client_addr);
+        // Client-facing Ledger server — read-only on followers.
+        // Attaches the shared Arc<Term> so the stub that returns
+        // FAILED_PRECONDITION still surfaces the current term in any
+        // error-carrying field, and the query RPCs can resolve per-tx
+        // term via Term::get_term_at_tx (hot ring / cold scan).
+        let client_server =
+            GrpcServer::new_read_only(self.ledger.clone(), client_addr, self.term.clone());
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("follower ledger gRPC server exited: {}", e);
@@ -40,10 +50,13 @@ impl Follower {
         });
 
         // Peer-facing Node server — accepts `AppendEntries` from the leader.
+        // The handler's Arc<Term> lets it `observe()` the incoming term
+        // and durably advance the follower's own term log in lock-step
+        // with replication.
         let node_handler = NodeHandler::new(
             self.ledger.clone(),
             self.config.node_id,
-            self.config.term,
+            self.term.clone(),
             NodeRole::Follower,
         );
         let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;

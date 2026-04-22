@@ -9,8 +9,8 @@
 
 use crate::cluster::Quorum;
 use crate::cluster::config::PeerConfig;
-use crate::cluster::proto;
-use crate::cluster::proto::node_client::NodeClient;
+use crate::cluster::proto::node as proto;
+use crate::cluster::proto::node::node_client::NodeClient;
 use crate::ledger::Ledger;
 use crate::storage::WalTailer;
 use spdlog::{info, warn};

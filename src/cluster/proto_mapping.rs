@@ -1,5 +1,5 @@
+use crate::cluster::proto::ledger as proto;
 use crate::entities::FailReason;
-use crate::grpc::proto;
 use crate::transaction::{Operation, TransactionStatus, WaitLevel};
 
 impl From<proto::Deposit> for Operation {
@@ -82,6 +82,7 @@ impl TryFrom<proto::SubmitAndWaitRequest> for Operation {
 impl From<TransactionStatus> for proto::TransactionStatus {
     fn from(status: TransactionStatus) -> Self {
         match status {
+            TransactionStatus::NotFound => proto::TransactionStatus::TxNotFound,
             TransactionStatus::Pending => proto::TransactionStatus::Pending,
             TransactionStatus::Computed => proto::TransactionStatus::Computed,
             TransactionStatus::Committed => proto::TransactionStatus::Committed,

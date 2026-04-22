@@ -6,12 +6,11 @@
 //! The top-level `tokio::spawn` for peer supervision lives here —
 //! `Leader::run` spawns one child per peer.
 
-use crate::cluster::Quorum;
 use crate::cluster::config::ClusterConfig;
+use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
-use crate::cluster::proto::NodeRole;
-use crate::cluster::server::{NodeHandler, NodeServerRuntime};
-use crate::grpc::GrpcServer;
+use crate::cluster::proto::node::NodeRole;
+use crate::cluster::{GrpcServer, Quorum, Term};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -23,22 +22,42 @@ use tokio::task::JoinHandle;
 pub struct Leader {
     config: ClusterConfig,
     ledger: Arc<Ledger>,
+    term: Arc<Term>,
 }
 
 impl Leader {
-    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>) -> Self {
-        Self { config, ledger }
+    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
+        Self {
+            config,
+            ledger,
+            term,
+        }
     }
 
     /// Spawn every task the leader role needs. Returns a `LeaderHandles`
     /// carrying the spawned handles plus shared shutdown/observability
     /// state (`running`, `majority`, `peer_handles`).
+    ///
+    /// Also bumps the leader's durable term by 1 at bring-up. This is a
+    /// temporary stand-in for a real election — see the ADR-016 work.
+    /// `start_tx_id` is seeded from the ledger's current `last_commit_id`
+    /// so `Term::get_term_at_tx` can answer for any subsequent write.
     pub async fn run(&self) -> Result<LeaderHandles, Box<dyn std::error::Error + Send + Sync>> {
         let client_addr = self.config.server.socket_addr()?;
         let node_addr = self.config.node.socket_addr()?;
 
+        let start_tx = self.ledger.last_commit_id();
+        let new_term = self.term.new_term(start_tx)?;
+        info!(
+            "leader: bumped term to {} at start_tx_id={} (node_id={})",
+            new_term, start_tx, self.config.node_id
+        );
+
         // Client-facing Ledger server — full read/write on the leader.
-        let client_server = GrpcServer::new(self.ledger.clone(), client_addr);
+        // Hands the shared Arc<Term> through so every submit and status
+        // response can resolve the current + per-tx term without
+        // round-tripping back to the leader state.
+        let client_server = GrpcServer::new(self.ledger.clone(), client_addr, self.term.clone());
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("leader ledger gRPC server exited: {}", e);
@@ -51,7 +70,7 @@ impl Leader {
         let node_handler = NodeHandler::new(
             self.ledger.clone(),
             self.config.node_id,
-            self.config.term,
+            self.term.clone(),
             NodeRole::Leader,
         );
         let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;
@@ -75,9 +94,13 @@ impl Leader {
                 self.config.node_id
             );
         } else {
+            // Stamp the *current* term (post-bump) on outgoing
+            // AppendEntries. Term bumps after peer-task spawn aren't
+            // reflected today; ADR-016 will replace this with an
+            // Arc<Term> read on each RPC.
             let params = ReplicationParams::new(
                 self.config.node_id,
-                self.config.term,
+                self.term.get_current_term(),
                 self.config.append_entries_max_bytes,
                 Duration::from_millis(self.config.replication_poll_ms.max(1)),
             );

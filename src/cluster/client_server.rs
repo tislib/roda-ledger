@@ -1,5 +1,6 @@
-use crate::grpc::handler::LedgerHandler;
-use crate::grpc::proto::ledger_server::LedgerServer;
+use crate::cluster::Term;
+use crate::cluster::client_handler::LedgerHandler;
+use crate::cluster::proto::ledger::ledger_server::LedgerServer;
 use crate::ledger::Ledger;
 use spdlog::info;
 use std::net::SocketAddr;
@@ -10,32 +11,40 @@ pub struct GrpcServer {
     ledger: Arc<Ledger>,
     addr: SocketAddr,
     read_only: bool,
+    /// Shared term state. Every submit/status/wait response stamps the
+    /// appropriate view of this value. Callers always supply one — a
+    /// "single-node" server is just a cluster with zero peers and its
+    /// own durable term log on disk.
+    term: Arc<Term>,
 }
 
 impl GrpcServer {
-    pub fn new(ledger: Arc<Ledger>, addr: SocketAddr) -> Self {
+    pub fn new(ledger: Arc<Ledger>, addr: SocketAddr, term: Arc<Term>) -> Self {
         Self {
             ledger,
             addr,
             read_only: false,
+            term,
         }
     }
 
     /// Build a server where every write RPC returns `FAILED_PRECONDITION`.
-    pub fn new_read_only(ledger: Arc<Ledger>, addr: SocketAddr) -> Self {
+    pub fn new_read_only(ledger: Arc<Ledger>, addr: SocketAddr, term: Arc<Term>) -> Self {
         Self {
             ledger,
             addr,
             read_only: true,
+            term,
         }
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let read_only = self.read_only;
+
         let handler = if read_only {
-            LedgerHandler::new_read_only(self.ledger)
+            LedgerHandler::new_read_only(self.ledger, self.term)
         } else {
-            LedgerHandler::new(self.ledger)
+            LedgerHandler::new(self.ledger, self.term)
         };
 
         info!(
