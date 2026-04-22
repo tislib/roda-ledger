@@ -17,23 +17,23 @@
 
 pub mod config;
 pub mod follower;
-pub mod ledger_handler;
-pub mod node_handler;
 pub mod leader;
+pub mod ledger_handler;
 pub mod mapping;
 pub mod node;
+pub mod node_handler;
 pub mod peer_replication;
 pub mod quorum;
 pub mod server;
 pub mod term;
 
 pub use crate::storage::TermRecord;
-pub use config::{ServerSection, Config, ConfigError, Mode, NodeServerSection, PeerConfig};
+pub use config::{Config, ConfigError, Mode, NodeServerSection, PeerConfig, ServerSection};
 pub use follower::{Follower, FollowerHandles};
-pub use ledger_handler::LedgerHandler;
-pub use node_handler::NodeHandler;
 pub use leader::{Leader, LeaderHandles};
+pub use ledger_handler::LedgerHandler;
 pub use node::{ClusterNode, Handles};
+pub use node_handler::NodeHandler;
 pub use peer_replication::{PeerReplication, ReplicationParams};
 pub use quorum::Quorum;
 pub use server::{NodeServerRuntime, Server};

@@ -246,11 +246,13 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(Deposit {
-                    account: 1,
-                    amount: 1000,
-                    user_ref: 0,
-                }),
+                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                    Deposit {
+                        account: 1,
+                        amount: 1000,
+                        user_ref: 0,
+                    },
+                ),
             ),
             wait_level: WaitLevel::Committed as i32,
         };
@@ -270,11 +272,13 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(Deposit {
-                    account: 5,
-                    amount: 500,
-                    user_ref: 0,
-                }),
+                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                    Deposit {
+                        account: 5,
+                        amount: 500,
+                        user_ref: 0,
+                    },
+                ),
             ),
             wait_level: WaitLevel::Snapshot as i32,
         };
@@ -471,11 +475,13 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(Deposit {
-                    account: 1,
-                    amount: 100,
-                    user_ref: 0,
-                }),
+                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                    Deposit {
+                        account: 1,
+                        amount: 100,
+                        user_ref: 0,
+                    },
+                ),
             ),
             wait_level: WaitLevel::Computed as i32,
         };

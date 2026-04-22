@@ -47,11 +47,13 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(Deposit {
-                    account: 1,
-                    amount: 1000,
-                    user_ref: 123,
-                }),
+                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                    Deposit {
+                        account: 1,
+                        amount: 1000,
+                        user_ref: 123,
+                    },
+                ),
             ),
         };
 
@@ -137,12 +139,14 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Transfer(Transfer {
-                    from: 1,
-                    to: 2,
-                    amount: 400,
-                    user_ref: 2,
-                }),
+                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Transfer(
+                    Transfer {
+                        from: 1,
+                        to: 2,
+                        amount: 400,
+                        user_ref: 2,
+                    },
+                ),
             ),
         };
 

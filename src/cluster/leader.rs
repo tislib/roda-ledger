@@ -60,8 +60,12 @@ impl Leader {
         // Hands the shared Arc<Term> through so every submit and status
         // response can resolve the current + per-tx term without
         // round-tripping back to the leader state.
-        let client_server =
-            Server::new(self.ledger.clone(), client_addr, self.term.clone(), Some(quorum.clone()));
+        let client_server = Server::new(
+            self.ledger.clone(),
+            client_addr,
+            self.term.clone(),
+            Some(quorum.clone()),
+        );
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("leader ledger gRPC server exited: {}", e);

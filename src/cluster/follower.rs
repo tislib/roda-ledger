@@ -6,11 +6,11 @@
 //! local ledger via `NodeHandler`, which also durably `observe()`s the
 //! leader's term on every accepted batch.
 
+use crate::cluster::Term;
 use crate::cluster::config::Config;
 use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::proto::node::NodeRole;
 use crate::cluster::server::{NodeServerRuntime, Server};
-use crate::cluster::Term;
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;

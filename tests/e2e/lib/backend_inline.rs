@@ -6,8 +6,8 @@
 
 use crate::e2e::lib::profile::Profile;
 use roda_ledger::client::LedgerClient;
-use roda_ledger::cluster::Term;
 use roda_ledger::cluster::Server;
+use roda_ledger::cluster::Term;
 use roda_ledger::ledger::Ledger;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,10 +45,7 @@ impl InlineNode {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).expect("open term log"));
         let server_task = tokio::spawn(async move {
-            Server::new(server_ledger, addr, term)
-                .run()
-                .await
-                .unwrap();
+            Server::new(server_ledger, addr, term).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;

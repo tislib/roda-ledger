@@ -10,7 +10,7 @@
 use lproto::submit_operation_request::Operation;
 use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
 use roda_ledger::cluster::proto::ledger::{self as lproto, Deposit, SubmitOperationRequest};
-use roda_ledger::cluster::{self, ServerSection, ClusterNode, PeerConfig};
+use roda_ledger::cluster::{self, ClusterNode, PeerConfig, ServerSection};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
 use roda_ledger::wait_strategy::WaitStrategy;

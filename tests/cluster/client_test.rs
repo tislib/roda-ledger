@@ -23,10 +23,7 @@ mod tests {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            Server::new(server_ledger, addr, term)
-                .run()
-                .await
-                .unwrap();
+            Server::new(server_ledger, addr, term).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;
@@ -284,10 +281,7 @@ mod tests {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let server_handle = tokio::spawn(async move {
-            Server::new(server_ledger, addr, term)
-                .run()
-                .await
-                .unwrap();
+            Server::new(server_ledger, addr, term).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;

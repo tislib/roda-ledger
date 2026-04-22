@@ -14,9 +14,7 @@
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use roda_ledger::cluster::config::NodeServerSection;
-use roda_ledger::cluster::{
-    self, ServerSection, ClusterNode, PeerConfig, Quorum,
-};
+use roda_ledger::cluster::{self, ClusterNode, PeerConfig, Quorum, ServerSection};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::ledger::Ledger;
 use roda_ledger::transaction::Operation;
