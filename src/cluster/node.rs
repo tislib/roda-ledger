@@ -2,10 +2,10 @@
 //! hands control to [`Leader`] or [`Follower`] depending on `config.mode`.
 //! All role-specific bring-up lives in the role files.
 
-use crate::cluster::Quorum;
 use crate::cluster::config::{ClusterConfig, ClusterMode};
 use crate::cluster::follower::{Follower, FollowerHandles};
 use crate::cluster::leader::{Leader, LeaderHandles};
+use crate::cluster::{Quorum, Term};
 use crate::ledger::Ledger;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -14,17 +14,21 @@ use tokio::task::JoinHandle;
 pub struct Cluster {
     config: ClusterConfig,
     ledger: Arc<Ledger>,
+    term: Arc<Term>,
 }
 
 impl Cluster {
-    /// Build (and start) the embedded Ledger. The gRPC servers and, on
+    /// Build (and start) the embedded Ledger, and open the durable term
+    /// log under `ledger.storage.data_dir`. The gRPC servers and, on
     /// leaders, the replication fan-out are launched by [`Cluster::run`].
     pub fn new(config: ClusterConfig) -> std::io::Result<Self> {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start()?;
+        let term = Arc::new(Term::open_in_dir(&config.ledger.storage.data_dir)?);
         Ok(Self {
             config,
             ledger: Arc::new(ledger),
+            term,
         })
     }
 
@@ -42,12 +46,14 @@ impl Cluster {
     pub async fn run(&self) -> Result<ClusterHandles, Box<dyn std::error::Error + Send + Sync>> {
         match self.config.mode {
             ClusterMode::Leader => {
-                let leader = Leader::new(self.config.clone(), self.ledger.clone());
+                let leader =
+                    Leader::new(self.config.clone(), self.ledger.clone(), self.term.clone());
                 let handles = leader.run().await?;
                 Ok(ClusterHandles::Leader(handles))
             }
             ClusterMode::Follower => {
-                let follower = Follower::new(self.config.clone(), self.ledger.clone());
+                let follower =
+                    Follower::new(self.config.clone(), self.ledger.clone(), self.term.clone());
                 let handles = follower.run().await?;
                 Ok(ClusterHandles::Follower(handles))
             }

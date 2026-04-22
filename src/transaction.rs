@@ -66,6 +66,7 @@ impl Transaction {
 #[derive(Default, Debug)]
 pub enum TransactionStatus {
     #[default]
+    NotFound, // Transaction isn't found in the pipeline
     Pending,
     Error(FailReason),
     Computed,   // By Transactor
@@ -76,6 +77,7 @@ pub enum TransactionStatus {
 impl TransactionStatus {
     pub fn is_committed(&self) -> bool {
         match self {
+            Self::NotFound => false,
             Self::Pending => false,
             Self::Error(_) => false,
             Self::Computed => false,
@@ -86,6 +88,7 @@ impl TransactionStatus {
 
     pub fn balance_ready(&self) -> bool {
         match self {
+            Self::NotFound => false,
             Self::Pending => false,
             Self::Error(_) => false,
             Self::Computed => false,
