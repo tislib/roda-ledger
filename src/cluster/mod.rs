@@ -17,8 +17,8 @@
 
 pub mod config;
 pub mod follower;
-pub mod handler_ledger;
-pub mod handler_node;
+pub mod ledger_handler;
+pub mod node_handler;
 pub mod leader;
 pub mod mapping;
 pub mod node;
@@ -30,8 +30,8 @@ pub mod term;
 pub use crate::storage::TermRecord;
 pub use config::{ServerSection, Config, ConfigError, Mode, NodeServerSection, PeerConfig};
 pub use follower::{Follower, FollowerHandles};
-pub use handler_ledger::LedgerHandler;
-pub use handler_node::NodeHandler;
+pub use ledger_handler::LedgerHandler;
+pub use node_handler::NodeHandler;
 pub use leader::{Leader, LeaderHandles};
 pub use node::{ClusterNode, Handles};
 pub use peer_replication::{PeerReplication, ReplicationParams};

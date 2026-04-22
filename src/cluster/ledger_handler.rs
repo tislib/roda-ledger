@@ -1,6 +1,6 @@
-use crate::cluster::Term;
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
+use crate::cluster::{Quorum, Term};
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::{Operation, WaitLevel};
@@ -16,26 +16,33 @@ pub struct LedgerHandler {
     /// Shared term state. In single-node mode the handler is constructed
     /// with a fresh in-memory-only term whose current value is 0.
     term: Arc<Term>,
+    pub quorum: Option<Arc<Quorum>>,
 }
 
 impl LedgerHandler {
     /// Full read/write handler. Caller supplies the shared `Arc<Term>`
     /// owned by `Leader` / `Follower`.
-    pub fn new(ledger: Arc<InternalLedger>, term: Arc<Term>) -> Self {
+    pub fn new(ledger: Arc<InternalLedger>, term: Arc<Term>, quorum: Option<Arc<Quorum>>) -> Self {
         Self {
             ledger,
             read_only: false,
             term,
+            quorum,
         }
     }
 
     /// Read-only handler: all `submit_*` / `register_function` /
     /// `unregister_function` RPCs return `FAILED_PRECONDITION`.
-    pub fn new_read_only(ledger: Arc<InternalLedger>, term: Arc<Term>) -> Self {
+    pub fn new_read_only(
+        ledger: Arc<InternalLedger>,
+        term: Arc<Term>,
+        quorum: Option<Arc<Quorum>>,
+    ) -> Self {
         Self {
             ledger,
             read_only: true,
             term,
+            quorum,
         }
     }
 
@@ -140,9 +147,7 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::SubmitAndWaitResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        let level = proto::WaitLevel::try_from(req.wait_level)
-            .map(WaitLevel::from)
-            .unwrap_or(WaitLevel::Committed);
+        let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
         let op = req.try_into()?;
 
         let tx_id = self.ledger.submit(op);
@@ -199,9 +204,7 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::SubmitBatchAndWaitResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        let level = proto::WaitLevel::try_from(req.wait_level)
-            .map(WaitLevel::from)
-            .unwrap_or(WaitLevel::Committed);
+        let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
 
         let len = req.operations.len();
         let mut operations: Vec<Operation> = Vec::with_capacity(len);
@@ -335,9 +338,7 @@ impl Ledger for LedgerHandler {
             }
         }
 
-        let level = proto::WaitLevel::try_from(req.wait_level)
-            .map(WaitLevel::from)
-            .unwrap_or(WaitLevel::Committed);
+        let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
         self.wait_for_transaction_level(tx_id, level).await;
 
         let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
@@ -516,30 +517,42 @@ fn map_registry_err(e: std::io::Error) -> Status {
         ErrorKind::NotFound => Status::not_found(e.to_string()),
         ErrorKind::InvalidInput => Status::invalid_argument(e.to_string()),
         ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
+        ErrorKind::TimedOut => Status::deadline_exceeded(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
 }
 
 impl LedgerHandler {
-    pub async fn wait_for_transaction_level(&self, transaction_id: u64, level: WaitLevel) {
+    pub async fn wait_for_transaction_level(
+        &self,
+        transaction_id: u64,
+        level: proto::WaitLevel,
+    ) -> std::io::Result<()> {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(20);
 
         loop {
             let reached = match level {
-                WaitLevel::Computed => self.ledger.last_compute_id() >= transaction_id,
-                WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
-                WaitLevel::OnSnapshot => self.ledger.last_snapshot_id() >= transaction_id,
+                proto::WaitLevel::Computed => self.ledger.last_compute_id() >= transaction_id,
+                proto::WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
+                proto::WaitLevel::Snapshot => self.ledger.last_snapshot_id() >= transaction_id,
+                proto::WaitLevel::ClusterCommit => {
+                    if let Some(ref quorum) = self.quorum {
+                        quorum.get() <= transaction_id
+                    } else {
+                        return Err(std::io::Error::other("no quorum"));
+                    }
+                }
             };
 
             if reached {
-                return;
+                return Ok(());
             }
 
             yield_now().await;
 
             if start_time.elapsed() >= timeout {
-                return;
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
             }
         }
     }

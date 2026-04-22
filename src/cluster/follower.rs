@@ -7,7 +7,7 @@
 //! leader's term on every accepted batch.
 
 use crate::cluster::config::Config;
-use crate::cluster::handler_node::NodeHandler;
+use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::proto::node::NodeRole;
 use crate::cluster::server::{NodeServerRuntime, Server};
 use crate::cluster::Term;
@@ -43,7 +43,7 @@ impl Follower {
         // error-carrying field, and the query RPCs can resolve per-tx
         // term via Term::get_term_at_tx (hot ring / cold scan).
         let client_server =
-            Server::new_read_only(self.ledger.clone(), client_addr, self.term.clone());
+            Server::new_read_only(self.ledger.clone(), client_addr, self.term.clone(), None);
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("follower ledger gRPC server exited: {}", e);

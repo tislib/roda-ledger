@@ -7,7 +7,7 @@
 //! `Leader::run` spawns one child per peer.
 
 use crate::cluster::config::Config;
-use crate::cluster::handler_node::NodeHandler;
+use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
 use crate::cluster::proto::node::NodeRole;
 use crate::cluster::server::{NodeServerRuntime, Server};
@@ -54,12 +54,14 @@ impl Leader {
             new_term, start_tx, self.config.node_id
         );
 
+        let quorum = Arc::new(Quorum::new(self.config.peers.len() + 1));
+
         // Client-facing Ledger server — full read/write on the leader.
         // Hands the shared Arc<Term> through so every submit and status
         // response can resolve the current + per-tx term without
         // round-tripping back to the leader state.
         let client_server =
-            Server::new(self.ledger.clone(), client_addr, self.term.clone());
+            Server::new(self.ledger.clone(), client_addr, self.term.clone(), Some(quorum.clone()));
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("leader ledger gRPC server exited: {}", e);
@@ -91,7 +93,6 @@ impl Leader {
         // This way the leader's own commit progress counts toward the
         // cluster majority (fixes quorum never including self).
         let running = Arc::new(AtomicBool::new(true));
-        let quorum = Arc::new(Quorum::new(self.config.peers.len() + 1));
 
         // Hook the leader's own commit stream into slot 0 of the quorum.
         // Must be registered after the ledger is started (commits are
