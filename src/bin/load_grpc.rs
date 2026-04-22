@@ -1,6 +1,7 @@
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use roda_ledger::client::LedgerClient;
+use roda_ledger::cluster::Term;
 use roda_ledger::grpc::GrpcServer;
 use roda_ledger::grpc::proto::WaitLevel;
 use roda_ledger::ledger::{Ledger, LedgerConfig};
@@ -66,15 +67,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     } else {
         println!("Starting in-process server on {} ...", addr);
-        let mut ledger = Ledger::new(LedgerConfig {
+        let cfg = LedgerConfig {
             max_accounts: args.account_count as usize,
             ..LedgerConfig::bench()
-        });
+        };
+        let data_dir = cfg.storage.data_dir.clone();
+        let mut ledger = Ledger::new(cfg);
         ledger.start()?;
         let ledger = Arc::new(ledger);
         let server_ledger = ledger.clone();
+        let term = Arc::new(Term::open_in_dir(&data_dir)?);
         tokio::spawn(async move {
-            if let Err(e) = GrpcServer::new(server_ledger, addr).run().await {
+            if let Err(e) = GrpcServer::new(server_ledger, addr, term).run().await {
                 eprintln!("server task exited with error: {}", e);
             }
         });

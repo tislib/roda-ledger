@@ -82,6 +82,7 @@ impl TryFrom<proto::SubmitAndWaitRequest> for Operation {
 impl From<TransactionStatus> for proto::TransactionStatus {
     fn from(status: TransactionStatus) -> Self {
         match status {
+            TransactionStatus::NotFound => proto::TransactionStatus::TxNotFound,
             TransactionStatus::Pending => proto::TransactionStatus::Pending,
             TransactionStatus::Computed => proto::TransactionStatus::Computed,
             TransactionStatus::Committed => proto::TransactionStatus::Committed,

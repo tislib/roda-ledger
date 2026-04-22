@@ -1,8 +1,10 @@
+use crate::cluster::Term;
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::{Operation, WaitLevel};
+use spdlog::warn;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
@@ -11,35 +13,54 @@ use tonic::{Request, Response, Status};
 pub struct LedgerHandler {
     ledger: Arc<InternalLedger>,
     read_only: bool,
-    /// Current leader term, stamped onto every submit response. `0` in
-    /// single-node mode where there is no cluster concept.
-    term: u64,
+    /// Shared term state. In single-node mode the handler is constructed
+    /// with a fresh in-memory-only term whose current value is 0.
+    term: Arc<Term>,
 }
 
 impl LedgerHandler {
-    pub fn new(ledger: Arc<InternalLedger>) -> Self {
+    /// Full read/write handler. Caller supplies the shared `Arc<Term>`
+    /// owned by `Leader` / `Follower`.
+    pub fn new(ledger: Arc<InternalLedger>, term: Arc<Term>) -> Self {
         Self {
             ledger,
             read_only: false,
-            term: 0,
+            term,
         }
     }
 
     /// Read-only handler: all `submit_*` / `register_function` /
     /// `unregister_function` RPCs return `FAILED_PRECONDITION`.
-    pub fn new_read_only(ledger: Arc<InternalLedger>) -> Self {
+    pub fn new_read_only(ledger: Arc<InternalLedger>, term: Arc<Term>) -> Self {
         Self {
             ledger,
             read_only: true,
-            term: 0,
+            term,
         }
     }
 
-    /// Override the term returned in submit responses. Used by the cluster
-    /// layer (`Leader` / `Follower`) to surface `ClusterConfig::term`.
-    pub fn with_term(mut self, term: u64) -> Self {
-        self.term = term;
-        self
+    /// Convenience — current leader term from the shared `Arc<Term>`.
+    #[inline]
+    fn current_term(&self) -> u64 {
+        self.term.get_current_term()
+    }
+
+    /// Resolve the term that covered `tx_id`. Hot-path ring read falls
+    /// back to a disk scan through `TermStorage` when the ring has
+    /// already rotated past `tx_id`.
+    ///
+    /// Returns `(term, term_start_tx_id)`. `(0, 0)` is the zero-value
+    /// fallback for single-node mode or unknown tx ids, matching the
+    /// proto's "no term context" meaning.
+    fn term_for_tx(&self, tx_id: u64) -> (u64, u64) {
+        match self.term.get_term_at_tx(tx_id) {
+            Ok(Some(rec)) => (rec.term, rec.start_tx_id),
+            Ok(None) => (0, 0),
+            Err(e) => {
+                warn!("term lookup for tx_id={} failed: {}", tx_id, e);
+                (0, 0)
+            }
+        }
     }
 
     // `Status` is the canonical tonic error; every handler method in this
@@ -55,6 +76,51 @@ impl LedgerHandler {
             Ok(())
         }
     }
+
+    /// Build a `GetStatusResponse` for `tx_id`, honouring the optional
+    /// `expected_term` fence. Three outcomes:
+    ///
+    /// - `expected_term != 0` and the tx's actual term differs →
+    ///   `status = TX_NOT_FOUND`, `term_mismatch = true`, `term` +
+    ///   `term_start_tx_id` set to the *actual* covering term so the
+    ///   caller can redirect.
+    /// - Ledger reports the tx itself as unknown → `status = TX_NOT_FOUND`,
+    ///   no term fence info (nothing meaningful to report).
+    /// - Normal case → pipeline stage from `ledger.get_transaction_status`
+    ///   plus the tx's term for observability.
+    fn build_status_response(
+        &self,
+        tx_id: u64,
+        expected_term: u64,
+    ) -> proto::GetStatusResponse {
+        // Check the term fence first so a wrong-term query can redirect
+        // the caller even before we look at pipeline state.
+        let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
+        if expected_term != 0 && tx_term != 0 && expected_term != tx_term {
+            return proto::GetStatusResponse {
+                status: proto::TransactionStatus::TxNotFound as i32,
+                fail_reason: 0,
+                term_mismatch: true,
+                term: tx_term,
+                term_start_tx_id: tx_term_start,
+            };
+        }
+
+        let status = self.ledger.get_transaction_status(tx_id);
+        let fail_reason = if status.is_err() {
+            status.error_reason().as_u8() as u32
+        } else {
+            0
+        };
+
+        proto::GetStatusResponse {
+            status: proto::TransactionStatus::from(status) as i32,
+            fail_reason,
+            term_mismatch: false,
+            term: tx_term,
+            term_start_tx_id: tx_term_start,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -68,7 +134,7 @@ impl Ledger for LedgerHandler {
         let transaction_id = self.ledger.submit(op);
         Ok(Response::new(proto::SubmitOperationResponse {
             transaction_id,
-            term: self.term,
+            term: self.current_term(),
         }))
     }
 
@@ -96,7 +162,7 @@ impl Ledger for LedgerHandler {
         Ok(Response::new(proto::SubmitAndWaitResponse {
             transaction_id: tx_id,
             fail_reason,
-            term: self.term,
+            term: self.current_term(),
         }))
     }
 
@@ -121,13 +187,13 @@ impl Ledger for LedgerHandler {
             let tx_id = start_transaction_id + i as u64;
             results.push(proto::SubmitOperationResponse {
                 transaction_id: tx_id,
-                term: self.term,
+                term: self.current_term(),
             });
         }
 
         Ok(Response::new(proto::SubmitBatchResponse {
             results,
-            term: self.term,
+            term: self.current_term(),
         }))
     }
 
@@ -167,14 +233,14 @@ impl Ledger for LedgerHandler {
                 proto::SubmitAndWaitResponse {
                     transaction_id: tx_id,
                     fail_reason,
-                    term: self.term,
+                    term: self.current_term(),
                 }
             })
             .collect();
 
         Ok(Response::new(proto::SubmitBatchAndWaitResponse {
             results,
-            term: self.term,
+            term: self.current_term(),
         }))
     }
 
@@ -216,21 +282,9 @@ impl Ledger for LedgerHandler {
         request: Request<proto::GetStatusRequest>,
     ) -> Result<Response<proto::GetStatusResponse>, Status> {
         let req = request.into_inner();
-        let status = self.ledger.get_transaction_status(req.transaction_id);
-
-        let fail_reason = if status.is_err() {
-            status.error_reason().as_u8() as u32
-        } else {
-            0
-        };
-
-        Ok(Response::new(proto::GetStatusResponse {
-            status: proto::TransactionStatus::from(status) as i32,
-            fail_reason,
-            term_mismatch: false,
-            term: self.term,
-            term_start_tx_id: 0,
-        }))
+        Ok(Response::new(
+            self.build_status_response(req.transaction_id, req.term),
+        ))
     }
 
     async fn get_transaction_statuses(
@@ -239,24 +293,11 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::GetStatusesResponse>, Status> {
         let req = request.into_inner();
         let mut results = Vec::with_capacity(req.transaction_ids.len());
-
+        // The batched RPC has no per-entry term field — pass 0 so every
+        // entry is treated as "no term fence requested".
         for transaction_id in req.transaction_ids {
-            let status = self.ledger.get_transaction_status(transaction_id);
-            let fail_reason = if status.is_err() {
-                status.error_reason().as_u8() as u32
-            } else {
-                0
-            };
-
-            results.push(proto::GetStatusResponse {
-                status: proto::TransactionStatus::from(status) as i32,
-                fail_reason,
-                term_mismatch: false,
-                term: self.term,
-                term_start_tx_id: 0,
-            });
+            results.push(self.build_status_response(transaction_id, 0));
         }
-
         Ok(Response::new(proto::GetStatusesResponse { results }))
     }
 
@@ -265,28 +306,49 @@ impl Ledger for LedgerHandler {
         request: Request<proto::WaitForTransactionRequest>,
     ) -> Result<Response<proto::WaitForTransactionResponse>, Status> {
         let req = request.into_inner();
+        let tx_id = req.transaction_id;
 
-        // Term fencing: caller passes `term = 0` to skip the check. If the
-        // caller's expected term doesn't match ours, their transaction is
-        // on a superseded branch (ADR-016 scaffolding).
-        if req.term != 0 && req.term != self.term {
+        // Unknown tx — return NOT_FOUND immediately, never block. A
+        // caller waiting on a tx that was never sequenced would never
+        // make progress; the proto's `WaitOutcome::NotFound` is exactly
+        // for this case.
+        if matches!(
+            self.ledger.get_transaction_status(tx_id),
+            crate::transaction::TransactionStatus::NotFound
+        ) {
             return Ok(Response::new(proto::WaitForTransactionResponse {
-                outcome: proto::WaitOutcome::TermMismatch as i32,
-                term: self.term,
+                outcome: proto::WaitOutcome::NotFound as i32,
+                term: 0,
                 term_start_tx_id: 0,
             }));
+        }
+
+        // Term fence (ADR-016 scaffolding): caller passes `term = 0` to
+        // opt out. Otherwise resolve the term that actually covered
+        // `tx_id` (hot ring → cold scan) and compare. A mismatch short-
+        // circuits to TermMismatch with the tx's real term + its start
+        // so the caller can replay against the correct branch.
+        if req.term != 0 {
+            let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
+            if tx_term != 0 && tx_term != req.term {
+                return Ok(Response::new(proto::WaitForTransactionResponse {
+                    outcome: proto::WaitOutcome::TermMismatch as i32,
+                    term: tx_term,
+                    term_start_tx_id: tx_term_start,
+                }));
+            }
         }
 
         let level = proto::WaitLevel::try_from(req.wait_level)
             .map(WaitLevel::from)
             .unwrap_or(WaitLevel::Committed);
-        self.wait_for_transaction_level(req.transaction_id, level)
-            .await;
+        self.wait_for_transaction_level(tx_id, level).await;
 
+        let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
         Ok(Response::new(proto::WaitForTransactionResponse {
             outcome: proto::WaitOutcome::Reached as i32,
-            term: self.term,
-            term_start_tx_id: 0,
+            term: tx_term,
+            term_start_tx_id: tx_term_start,
         }))
     }
 
@@ -298,7 +360,7 @@ impl Ledger for LedgerHandler {
             compute_index: self.ledger.last_compute_id(),
             commit_index: self.ledger.last_commit_id(),
             snapshot_index: self.ledger.last_snapshot_id(),
-            term: self.term,
+            term: self.current_term(),
         }))
     }
 

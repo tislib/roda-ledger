@@ -6,6 +6,7 @@
 
 use crate::e2e::lib::profile::Profile;
 use roda_ledger::client::LedgerClient;
+use roda_ledger::cluster::Term;
 use roda_ledger::grpc::GrpcServer;
 use roda_ledger::ledger::Ledger;
 use std::net::SocketAddr;
@@ -31,6 +32,7 @@ impl InlineNode {
     pub async fn start(profile: &Profile) -> Self {
         let mut config = profile.ledger_config_with_temp_dir();
         config.seal_check_internal = Duration::from_millis(10);
+        let data_dir = config.storage.data_dir.clone();
 
         let mut ledger = Ledger::new(config);
         ledger.start().expect("failed to start inline ledger node");
@@ -41,8 +43,9 @@ impl InlineNode {
         drop(listener);
 
         let server_ledger = ledger.clone();
+        let term = Arc::new(Term::open_in_dir(&data_dir).expect("open term log"));
         let server_task = tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr).run().await.unwrap();
+            GrpcServer::new(server_ledger, addr, term).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;

@@ -311,6 +311,16 @@ enum TransactionStatus {
   // violated (e.g. insufficient funds, zero-sum violation). A WAL record was written
   // for audit purposes. No balance changes occurred. Check fail_reason for the cause.
   ERROR = 4;
+
+  // TX_NOT_FOUND: The transaction_id was never sequenced by this node, OR the
+  // caller supplied `term != 0` and that term does not match the term that
+  // covered the transaction. In the wrong-term case, `term` and
+  // `term_start_tx_id` on the response identify the actual covering term
+  // so the caller can replay against the correct node/branch.
+  //
+  // The `TX_` prefix avoids the proto3 enum-value-sibling rule collision
+  // with `WaitOutcome::NOT_FOUND`.
+  TX_NOT_FOUND = 5;
 }
 
 // ---- Pipeline index ----

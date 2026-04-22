@@ -106,6 +106,11 @@ impl Ledger {
     }
 
     pub fn get_transaction_status(&self, transaction_id: u64) -> TransactionStatus {
+        // Transaction id 0 is never assigned (sequencer starts at 1), and
+        // ids above `last_sequenced_id` have never been issued on this node.
+        if transaction_id == 0 || transaction_id > self.pipeline.last_sequenced_id() {
+            return TransactionStatus::NotFound;
+        }
         if self.pipeline.last_compute_id() < transaction_id {
             TransactionStatus::Pending
         } else if let Some(reason) = self.transactor.transaction_rejection_reason(transaction_id) {

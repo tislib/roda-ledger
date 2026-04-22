@@ -1,5 +1,6 @@
 #[cfg(feature = "grpc")]
 mod tests {
+    use roda_ledger::cluster::Term;
     use roda_ledger::grpc::GrpcServer;
     use roda_ledger::grpc::proto::ledger_client::LedgerClient;
     use roda_ledger::grpc::proto::{
@@ -214,7 +215,9 @@ mod tests {
     // ---- gRPC tests ----
 
     async fn setup_grpc_server() -> (Arc<Ledger>, SocketAddr) {
-        let mut ledger = Ledger::new(LedgerConfig::temp());
+        let cfg = LedgerConfig::temp();
+        let data_dir = cfg.storage.data_dir.clone();
+        let mut ledger = Ledger::new(cfg);
         ledger.start().unwrap();
         let ledger = Arc::new(ledger);
 
@@ -223,8 +226,9 @@ mod tests {
         drop(listener);
 
         let server_ledger = ledger.clone();
+        let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            let server = GrpcServer::new(server_ledger, addr);
+            let server = GrpcServer::new(server_ledger, addr, term);
             server.run().await.unwrap();
         });
 

@@ -1,5 +1,6 @@
 //! Node service server. Handles peer-to-peer RPCs (`AppendEntries`, `Ping`).
 
+use crate::cluster::Term;
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_server::{Node, NodeServer};
 use crate::ledger::Ledger;
@@ -13,18 +14,32 @@ use tonic::{Request, Response, Status};
 pub struct NodeHandler {
     ledger: Arc<Ledger>,
     node_id: u64,
-    term: u64,
+    /// Shared term state. Followers `observe()` on every incoming
+    /// `AppendEntries` so their durable log tracks the leader's term
+    /// transitions; all handlers read `get_current_term()` for the
+    /// response `term` field.
+    term: Arc<Term>,
     role: proto::NodeRole,
 }
 
 impl NodeHandler {
-    pub fn new(ledger: Arc<Ledger>, node_id: u64, term: u64, role: proto::NodeRole) -> Self {
+    pub fn new(
+        ledger: Arc<Ledger>,
+        node_id: u64,
+        term: Arc<Term>,
+        role: proto::NodeRole,
+    ) -> Self {
         Self {
             ledger,
             node_id,
             term,
             role,
         }
+    }
+
+    #[inline]
+    fn current_term(&self) -> u64 {
+        self.term.get_current_term()
     }
 }
 
@@ -39,18 +54,40 @@ impl Node for NodeHandler {
         // Leader never accepts AppendEntries under ADR-015 (static roles).
         if self.role == proto::NodeRole::Leader {
             return Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.term,
+                term: self.current_term(),
                 success: false,
                 last_tx_id: 0,
                 reject_reason: proto::RejectReason::RejectNotFollower as u32,
             }));
         }
+
+        // Follower side: every AppendEntries carries the leader's current
+        // term + the first tx_id the leader was writing. Durably observe
+        // the term (no-op on same-term, error on regression) *before*
+        // applying any entries so the term log is always ≥ the committed
+        // log. `from_tx_id` is the start of the batch — a good proxy for
+        // the term's start when the leader bumps term on boot at tx 0.
+        if req.term != 0
+            && let Err(e) = self.term.observe(req.term, req.from_tx_id)
+        {
+            warn!(
+                "append_entries: term observe failed on node {} (incoming={}): {}",
+                self.node_id, req.term, e
+            );
+            return Ok(Response::new(proto::AppendEntriesResponse {
+                term: self.current_term(),
+                success: false,
+                last_tx_id: self.ledger.last_commit_id(),
+                reject_reason: proto::RejectReason::RejectTermStale as u32,
+            }));
+        }
+
         let last = self.ledger.last_commit_id();
 
         let entries = decode_records(&req.wal_bytes);
         if entries.is_empty() {
             return Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.term,
+                term: self.current_term(),
                 success: true,
                 last_tx_id: last,
                 reject_reason: proto::RejectReason::RejectNone as u32,
@@ -59,7 +96,7 @@ impl Node for NodeHandler {
 
         match self.ledger.append_wal_entries(entries) {
             Ok(()) => Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.term,
+                term: self.current_term(),
                 success: true,
                 last_tx_id: last,
                 reject_reason: proto::RejectReason::RejectNone as u32,
@@ -67,7 +104,7 @@ impl Node for NodeHandler {
             Err(e) => {
                 warn!("append_entries failed on node {}: {}", self.node_id, e);
                 Ok(Response::new(proto::AppendEntriesResponse {
-                    term: self.term,
+                    term: self.current_term(),
                     success: false,
                     last_tx_id: last,
                     reject_reason: proto::RejectReason::RejectWalAppendFailed as u32,
@@ -83,7 +120,7 @@ impl Node for NodeHandler {
         let req = request.into_inner();
         Ok(Response::new(proto::PingResponse {
             node_id: self.node_id,
-            term: self.term,
+            term: self.current_term(),
             last_tx_id: self.ledger.last_commit_id(),
             role: self.role as i32,
             nonce: req.nonce,

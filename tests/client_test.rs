@@ -1,6 +1,7 @@
 #[cfg(feature = "grpc")]
 mod tests {
     use roda_ledger::client::LedgerClient;
+    use roda_ledger::cluster::Term;
     use roda_ledger::grpc::GrpcServer;
     use roda_ledger::grpc::proto::WaitLevel;
     use roda_ledger::ledger::{Ledger, LedgerConfig};
@@ -9,7 +10,9 @@ mod tests {
     use tokio::time::{Duration, sleep};
 
     async fn setup() -> (Arc<Ledger>, LedgerClient) {
-        let mut ledger = Ledger::new(LedgerConfig::temp());
+        let cfg = LedgerConfig::temp();
+        let data_dir = cfg.storage.data_dir.clone();
+        let mut ledger = Ledger::new(cfg);
         ledger.start().unwrap();
         let ledger = Arc::new(ledger);
 
@@ -18,8 +21,12 @@ mod tests {
         drop(listener);
 
         let server_ledger = ledger.clone();
+        let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr).run().await.unwrap();
+            GrpcServer::new(server_ledger, addr, term)
+                .run()
+                .await
+                .unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;
@@ -264,6 +271,7 @@ mod tests {
     #[tokio::test]
     async fn test_deposit_restart_withdraw() {
         let config = LedgerConfig::temp();
+        let data_dir = config.storage.data_dir.clone();
 
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
@@ -274,8 +282,12 @@ mod tests {
         drop(listener);
 
         let server_ledger = ledger.clone();
+        let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let server_handle = tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr).run().await.unwrap();
+            GrpcServer::new(server_ledger, addr, term)
+                .run()
+                .await
+                .unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;
@@ -293,8 +305,11 @@ mod tests {
         server_handle.abort();
         sleep(Duration::from_millis(200)).await;
 
+        // Re-open the durable term log from the same data_dir — the
+        // original Arc<Term> was moved into the aborted task.
+        let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         tokio::spawn(async move {
-            GrpcServer::new(ledger, addr).run().await.unwrap();
+            GrpcServer::new(ledger, addr, term).run().await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;

@@ -38,7 +38,8 @@ pub use leader::{Leader, LeaderHandles};
 pub use node::{Cluster, ClusterHandles};
 pub use peer_replication::{PeerReplication, ReplicationParams};
 pub use quorum::Quorum;
-pub use term::{Term, TermRecord};
+pub use crate::storage::TermRecord;
+pub use term::Term;
 
 /// Generated protobuf types for both gRPC services owned by the cluster:
 ///
