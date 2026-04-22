@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(term.get_current_term(), RING_CAP as u64 + 50);
 
         // Hot lookup for a tx covered by the ring's oldest entry.
-        let oldest_start = (51 /* first retained term */) * 10;
+        let oldest_start = (51/* first retained term */) * 10;
         let hot = term.get_term_at_tx(oldest_start + 5).unwrap().unwrap();
         assert_eq!(hot.term, 51);
 

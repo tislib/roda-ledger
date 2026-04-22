@@ -45,7 +45,10 @@ impl InlineNode {
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).expect("open term log"));
         let server_task = tokio::spawn(async move {
-            GrpcServer::new(server_ledger, addr, term).run().await.unwrap();
+            GrpcServer::new(server_ledger, addr, term)
+                .run()
+                .await
+                .unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;

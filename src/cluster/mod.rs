@@ -27,6 +27,7 @@ pub mod proto_mapping;
 pub mod quorum;
 pub mod term;
 
+pub use crate::storage::TermRecord;
 pub use client_handler::LedgerHandler;
 pub use client_server::GrpcServer;
 pub use config::{
@@ -38,7 +39,6 @@ pub use leader::{Leader, LeaderHandles};
 pub use node::{Cluster, ClusterHandles};
 pub use peer_replication::{PeerReplication, ReplicationParams};
 pub use quorum::Quorum;
-pub use crate::storage::TermRecord;
 pub use term::Term;
 
 /// Generated protobuf types for both gRPC services owned by the cluster:

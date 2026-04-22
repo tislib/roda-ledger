@@ -88,11 +88,7 @@ impl LedgerHandler {
     ///   no term fence info (nothing meaningful to report).
     /// - Normal case → pipeline stage from `ledger.get_transaction_status`
     ///   plus the tx's term for observability.
-    fn build_status_response(
-        &self,
-        tx_id: u64,
-        expected_term: u64,
-    ) -> proto::GetStatusResponse {
+    fn build_status_response(&self, tx_id: u64, expected_term: u64) -> proto::GetStatusResponse {
         // Check the term fence first so a wrong-term query can redirect
         // the caller even before we look at pipeline state.
         let (tx_term, tx_term_start) = self.term_for_tx(tx_id);

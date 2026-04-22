@@ -46,20 +46,14 @@ impl Cluster {
     pub async fn run(&self) -> Result<ClusterHandles, Box<dyn std::error::Error + Send + Sync>> {
         match self.config.mode {
             ClusterMode::Leader => {
-                let leader = Leader::new(
-                    self.config.clone(),
-                    self.ledger.clone(),
-                    self.term.clone(),
-                );
+                let leader =
+                    Leader::new(self.config.clone(), self.ledger.clone(), self.term.clone());
                 let handles = leader.run().await?;
                 Ok(ClusterHandles::Leader(handles))
             }
             ClusterMode::Follower => {
-                let follower = Follower::new(
-                    self.config.clone(),
-                    self.ledger.clone(),
-                    self.term.clone(),
-                );
+                let follower =
+                    Follower::new(self.config.clone(), self.ledger.clone(), self.term.clone());
                 let handles = follower.run().await?;
                 Ok(ClusterHandles::Follower(handles))
             }

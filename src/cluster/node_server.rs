@@ -23,12 +23,7 @@ pub struct NodeHandler {
 }
 
 impl NodeHandler {
-    pub fn new(
-        ledger: Arc<Ledger>,
-        node_id: u64,
-        term: Arc<Term>,
-        role: proto::NodeRole,
-    ) -> Self {
+    pub fn new(ledger: Arc<Ledger>, node_id: u64, term: Arc<Term>, role: proto::NodeRole) -> Self {
         Self {
             ledger,
             node_id,
