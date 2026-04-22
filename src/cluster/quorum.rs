@@ -1,60 +1,67 @@
 //! Lock-free majority-commit tracker.
 //!
-//! One `AtomicU64` per peer plus a cached `majority_index`. Every successful
-//! `AppendEntries` calls `advance(peer_id, index)`; readers (e.g. the leader
-//! commit path, observability tools) call `get()`. No locks, no allocation
-//! after construction, no backwards movement of `majority_index`.
+//! One `AtomicU64` per cluster node (leader + every peer) plus a cached
+//! `majority_index`. Slot 0 is conventionally the leader itself —
+//! advanced via `Ledger::on_commit` so the leader's own commit progress
+//! counts toward the majority (Raft-style, N/2+1 out of N including self).
+//! Slots 1..=peer_count are the peers, advanced by each
+//! `PeerReplication` task on every successful `AppendEntries`.
+//!
+//! Readers (observability, future quorum-gated commit in ADR-016) call
+//! `get()`. No locks, no allocation after construction, no backwards
+//! movement of `majority_index`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Tracks per-peer match indices and the majority-committed index.
+/// Tracks per-node match indices and the majority-committed index.
 ///
-/// `peer_id` is positional — use it directly as an index into `match_index`.
+/// `node_index` is positional — use it directly as an index into
+/// `match_index`. Convention: slot 0 is the leader; 1..=peer_count are
+/// the peers in the same order as `Config::peers`.
 pub struct Quorum {
-    /// Per-peer replicated index; `peer_id` is used directly as the index.
+    /// Per-node replicated index; `node_index` is used directly as the index.
     match_index: Vec<AtomicU64>,
     /// Cached majority result. Monotonically non-decreasing via `fetch_max`.
     majority_index: AtomicU64,
-    /// Quorum size: `(peer_count / 2) + 1`.
+    /// Quorum size: `(node_count / 2) + 1`.
     majority: usize,
 }
 
 impl Quorum {
-    /// Build with `peer_count` positional peers. `majority = peer_count/2 + 1`.
-    pub fn new(peer_count: usize) -> Self {
-        let match_index: Vec<AtomicU64> = (0..peer_count).map(|_| AtomicU64::new(0)).collect();
+    /// Build with `node_count` slots (= leader + every peer).
+    /// `majority = node_count/2 + 1`.
+    pub fn new(node_count: usize) -> Self {
+        let match_index: Vec<AtomicU64> = (0..node_count).map(|_| AtomicU64::new(0)).collect();
         Self {
             match_index,
             majority_index: AtomicU64::new(0),
-            majority: peer_count / 2 + 1,
+            majority: node_count / 2 + 1,
         }
-    }
-
-    /// Number of peers this tracker was built with.
-    #[inline]
-    pub fn peer_count(&self) -> usize {
-        self.match_index.len()
     }
 
     /// Quorum size.
     #[inline]
-    pub fn majority(&self) -> usize {
+    fn majority(&self) -> usize {
         self.majority
     }
 
-    /// Publish `index` for `peer_id` and recompute the cached majority.
+    /// Publish `index` for `node_index` and recompute the cached majority.
     ///
-    /// - Writes `match_index[peer_id]` with `Release`.
-    /// - Snapshots every peer's value into a thread-local buffer with
+    /// Slot 0 is conventionally the leader; callers advance it via the
+    /// `Ledger::on_commit` hook. Peer replication tasks advance slots
+    /// `1..=peer_count` on every successful `AppendEntries`.
+    ///
+    /// - Writes `match_index[node_index]` with `Release`.
+    /// - Snapshots every slot's value into a thread-local buffer with
     ///   `Relaxed`, sorts descending, takes the `majority - 1` element.
     /// - Publishes the result via `majority_index.fetch_max(..., Release)`
     ///   so the visible value never regresses.
-    pub fn advance(&self, peer_id: u32, index: u64) {
-        let pid = peer_id as usize;
+    pub fn advance(&self, node_index: u32, index: u64) {
+        let pid = node_index as usize;
         debug_assert!(
             pid < self.match_index.len(),
-            "peer_id {} out of bounds (peer_count={})",
-            peer_id,
+            "node_index {} out of bounds (node_count={})",
+            node_index,
             self.match_index.len()
         );
 
@@ -69,7 +76,7 @@ impl Quorum {
             snapshot.push(a.load(Ordering::Relaxed));
         }
         // Sort descending so snapshot[majority - 1] is the largest index
-        // acked by at least `majority` peers.
+        // acked by at least `majority` nodes.
         snapshot.sort_unstable_by(|a, b| b.cmp(a));
         let candidate = snapshot[self.majority - 1];
 
@@ -82,10 +89,10 @@ impl Quorum {
         self.majority_index.load(Ordering::Acquire)
     }
 
-    /// Read a single peer's latest published index (observability).
+    /// Read a single slot's latest published index (observability).
     #[inline]
-    pub fn peer(&self, peer_id: u32) -> u64 {
-        let pid = peer_id as usize;
+    fn peer(&self, node_index: u32) -> u64 {
+        let pid = node_index as usize;
         debug_assert!(pid < self.match_index.len());
         self.match_index[pid].load(Ordering::Acquire)
     }

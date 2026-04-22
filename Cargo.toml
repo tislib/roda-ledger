@@ -74,6 +74,11 @@ harness = false
 name = "snapshot_bench"
 harness = false
 
+[[bench]]
+name = "quorum_bench"
+harness = false
+required-features = ["cluster"]
+
 [[bin]]
 name = "roda-ledger"
 path = "src/bin/cluster.rs"

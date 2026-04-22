@@ -16,8 +16,11 @@ use crate::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+/// Callback fired by the WAL stage whenever `commit_index` advances.
+pub type CommitHandler = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 
 /// Owns every inter-stage queue and every global progress index in the ledger.
 ///
@@ -47,6 +50,9 @@ pub struct Pipeline {
 
     /// Shared wait strategy used by every stage's idle/backpressure loops.
     wait_strategy: WaitStrategy,
+
+    /// Optional hook fired by the WAL stage every time `commit_index`
+    commit_handler: OnceLock<CommitHandler>,
 }
 
 impl Pipeline {
@@ -75,7 +81,20 @@ impl Pipeline {
 
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
+            commit_handler: OnceLock::new(),
         })
+    }
+
+    /// Install the commit-index callback. Returns `Err` if already set —
+    /// the hook is intentionally one-shot so the WAL stage can rely on
+    /// it being stable for the lifetime of the pipeline.
+    pub fn set_commit_handler(&self, handler: CommitHandler) -> Result<(), CommitHandler> {
+        self.commit_handler.set(handler)
+    }
+
+    #[inline]
+    fn commit_handler(&self) -> Option<&CommitHandler> {
+        self.commit_handler.get()
     }
 
     #[inline(always)]
@@ -298,9 +317,20 @@ impl WalContext {
         self.pipeline.commit_index.load(Ordering::Acquire)
     }
 
-    #[inline(always)]
-    pub fn set_processed_index(&self, id: u64) {
+    /// Publish a new commit-index and fire the registered `on_commit`
+    /// handler (if any). The handler runs synchronously on the WAL
+    /// commit thread — keep it fast and non-blocking.
+    #[inline]
+    pub fn set_commit_index(&self, id: u64) {
         self.pipeline.commit_index.store(id, Ordering::Release);
+        if let Some(handler) = self.pipeline.commit_handler() {
+            handler(id);
+        }
+    }
+
+    #[inline]
+    pub fn commit_index(&self) -> u64 {
+        self.pipeline.commit_index.load(Ordering::Acquire)
     }
 
     #[inline(always)]
