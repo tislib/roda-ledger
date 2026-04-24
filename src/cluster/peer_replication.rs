@@ -59,13 +59,14 @@ pub struct PeerReplication {
     peer: PeerConfig,
     /// Positional id (0-based) used as the `Quorum` slot.
     peer_index: u32,
-    ledger: Arc<Ledger>,
     params: ReplicationParams,
     running: Arc<AtomicBool>,
     tailer: WalTailer,
     from_tx_id: u64,
     peer_last_tx: u64,
-    /// Shared majority-commit tracker owned by `Leader`.
+    /// Shared majority-commit tracker owned by `Leader`. The
+    /// `leader_commit_tx_id` stamped on every outgoing AppendEntries
+    /// reads from here via `majority.get()`.
     majority: Arc<Quorum>,
 }
 
@@ -82,7 +83,6 @@ impl PeerReplication {
         Self {
             peer,
             peer_index,
-            ledger,
             params,
             running,
             tailer,
@@ -172,7 +172,7 @@ impl PeerReplication {
                 from_tx_id: self.from_tx_id,
                 to_tx_id: shipment_last_tx,
                 wal_bytes: bytes.clone(),
-                leader_commit_tx_id: self.ledger.last_commit_id(),
+                leader_commit_tx_id: self.majority.get(),
             };
 
             match client.append_entries(req).await {
@@ -225,7 +225,7 @@ impl PeerReplication {
             from_tx_id: self.from_tx_id,
             to_tx_id: self.peer_last_tx,
             wal_bytes: Vec::new(),
-            leader_commit_tx_id: self.ledger.last_commit_id(),
+            leader_commit_tx_id: self.majority.get(),
         };
         match client.append_entries(req).await {
             Ok(resp) => {

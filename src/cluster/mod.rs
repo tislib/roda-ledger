@@ -15,6 +15,7 @@
 //! followers via `AppendEntries`; followers decode and hand them to
 //! `Ledger::append_wal_entries`.
 
+pub mod cluster_commit;
 pub mod config;
 pub mod follower;
 pub mod leader;
@@ -28,6 +29,7 @@ pub mod server;
 pub mod term;
 
 pub use crate::storage::TermRecord;
+pub use cluster_commit::ClusterCommitIndex;
 pub use config::{Config, ConfigError, Mode, NodeServerSection, PeerConfig, ServerSection};
 pub use follower::{Follower, FollowerHandles};
 pub use leader::{Leader, LeaderHandles};

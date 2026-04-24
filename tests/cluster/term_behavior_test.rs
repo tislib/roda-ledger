@@ -15,10 +15,9 @@
 
 #![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::LedgerHandler;
-use roda_ledger::cluster::Term;
 use roda_ledger::cluster::proto::ledger as proto;
 use roda_ledger::cluster::proto::ledger::ledger_server::Ledger as LedgerSvc;
+use roda_ledger::cluster::{ClusterCommitIndex, LedgerHandler, Term};
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
@@ -46,7 +45,8 @@ fn setup() -> (TempDir, Arc<Ledger>, Arc<Term>, LedgerHandler) {
     let ledger = Arc::new(ledger);
 
     let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let handler = LedgerHandler::new(ledger.clone(), term.clone());
+    let cci = ClusterCommitIndex::from_ledger(&ledger);
+    let handler = LedgerHandler::new(ledger.clone(), term.clone(), cci);
     (td, ledger, term, handler)
 }
 

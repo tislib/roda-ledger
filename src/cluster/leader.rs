@@ -13,7 +13,7 @@ use crate::cluster::proto::node::NodeRole;
 use crate::cluster::server::{NodeServerRuntime, Server};
 use crate::cluster::{Quorum, Term};
 use crate::ledger::Ledger;
-use spdlog::{error, info, warn};
+use spdlog::{error, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -55,6 +55,7 @@ impl Leader {
         );
 
         let quorum = Arc::new(Quorum::new(self.config.peers.len() + 1));
+        let cluster_commit_index = quorum.cluster_commit_index();
 
         // Client-facing Ledger server — full read/write on the leader.
         // Hands the shared Arc<Term> through so every submit and status
@@ -64,7 +65,7 @@ impl Leader {
             self.ledger.clone(),
             client_addr,
             self.term.clone(),
-            Some(quorum.clone()),
+            cluster_commit_index,
         );
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
@@ -80,6 +81,7 @@ impl Leader {
             self.config.node_id,
             self.term.clone(),
             NodeRole::Leader,
+            None,
         );
         let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;
         let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);

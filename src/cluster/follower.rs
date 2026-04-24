@@ -6,11 +6,11 @@
 //! local ledger via `NodeHandler`, which also durably `observe()`s the
 //! leader's term on every accepted batch.
 
-use crate::cluster::Term;
 use crate::cluster::config::Config;
 use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::proto::node::NodeRole;
 use crate::cluster::server::{NodeServerRuntime, Server};
+use crate::cluster::{ClusterCommitIndex, Term};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -37,13 +37,22 @@ impl Follower {
         let client_addr = self.config.server.socket_addr()?;
         let node_addr = self.config.node.socket_addr()?;
 
+        // Shared watermark — written by NodeHandler on every successful
+        // AppendEntries, read by LedgerHandler for ClusterCommit waits
+        // and `GetPipelineIndex`.
+        let cluster_commit_index = ClusterCommitIndex::new();
+
         // Client-facing Ledger server — read-only on followers.
         // Attaches the shared Arc<Term> so the stub that returns
         // FAILED_PRECONDITION still surfaces the current term in any
         // error-carrying field, and the query RPCs can resolve per-tx
         // term via Term::get_term_at_tx (hot ring / cold scan).
-        let client_server =
-            Server::new_read_only(self.ledger.clone(), client_addr, self.term.clone(), None);
+        let client_server = Server::new_read_only(
+            self.ledger.clone(),
+            client_addr,
+            self.term.clone(),
+            cluster_commit_index.clone(),
+        );
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("follower ledger gRPC server exited: {}", e);
@@ -59,6 +68,7 @@ impl Follower {
             self.config.node_id,
             self.term.clone(),
             NodeRole::Follower,
+            Some(cluster_commit_index.clone()),
         );
         let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;
         let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);

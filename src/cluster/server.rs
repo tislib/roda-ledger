@@ -10,7 +10,7 @@ use crate::cluster::ledger_handler::LedgerHandler;
 use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::proto::ledger::ledger_server::LedgerServer;
 use crate::cluster::proto::node::node_server::NodeServer;
-use crate::cluster::{Quorum, Term};
+use crate::cluster::{ClusterCommitIndex, Term};
 use crate::ledger::Ledger;
 use spdlog::info;
 use std::net::SocketAddr;
@@ -28,7 +28,7 @@ pub struct Server {
     /// "single-node" server is just a cluster with zero peers and its
     /// own durable term log on disk.
     term: Arc<Term>,
-    pub quorum: Option<Arc<Quorum>>,
+    pub cluster_commit_index: Arc<ClusterCommitIndex>,
 }
 
 impl Server {
@@ -36,14 +36,14 @@ impl Server {
         ledger: Arc<Ledger>,
         addr: SocketAddr,
         term: Arc<Term>,
-        quorum: Option<Arc<Quorum>>,
+        cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
             ledger,
             addr,
             read_only: false,
             term,
-            quorum,
+            cluster_commit_index,
         }
     }
 
@@ -52,14 +52,14 @@ impl Server {
         ledger: Arc<Ledger>,
         addr: SocketAddr,
         term: Arc<Term>,
-        quorum: Option<Arc<Quorum>>,
+        cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
             ledger,
             addr,
             read_only: true,
             term,
-            quorum,
+            cluster_commit_index,
         }
     }
 
@@ -67,9 +67,9 @@ impl Server {
         let read_only = self.read_only;
 
         let handler = if read_only {
-            LedgerHandler::new_read_only(self.ledger, self.term, self.quorum)
+            LedgerHandler::new_read_only(self.ledger, self.term, self.cluster_commit_index)
         } else {
-            LedgerHandler::new(self.ledger, self.term, self.quorum)
+            LedgerHandler::new(self.ledger, self.term, self.cluster_commit_index)
         };
 
         info!(

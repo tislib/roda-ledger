@@ -1,9 +1,9 @@
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
-use crate::cluster::{Quorum, Term};
+use crate::cluster::{ClusterCommitIndex, Term};
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use crate::transaction::{Operation, WaitLevel};
+use crate::transaction::Operation;
 use spdlog::warn;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,18 +16,26 @@ pub struct LedgerHandler {
     /// Shared term state. In single-node mode the handler is constructed
     /// with a fresh in-memory-only term whose current value is 0.
     term: Arc<Term>,
-    pub quorum: Option<Arc<Quorum>>,
+    /// Cluster-commit watermark. Always present — `Server` only runs in
+    /// cluster mode. On a leader with zero peers the watermark tracks
+    /// the leader's own commit progress (Quorum slot 0 fed by
+    /// `Ledger::on_commit`), which equals `ledger.last_commit_id()`.
+    pub cluster_commit_index: Arc<ClusterCommitIndex>,
 }
 
 impl LedgerHandler {
     /// Full read/write handler. Caller supplies the shared `Arc<Term>`
     /// owned by `Leader` / `Follower`.
-    pub fn new(ledger: Arc<InternalLedger>, term: Arc<Term>, quorum: Option<Arc<Quorum>>) -> Self {
+    pub fn new(
+        ledger: Arc<InternalLedger>,
+        term: Arc<Term>,
+        cluster_commit_index: Arc<ClusterCommitIndex>,
+    ) -> Self {
         Self {
             ledger,
             read_only: false,
             term,
-            quorum,
+            cluster_commit_index,
         }
     }
 
@@ -36,13 +44,13 @@ impl LedgerHandler {
     pub fn new_read_only(
         ledger: Arc<InternalLedger>,
         term: Arc<Term>,
-        quorum: Option<Arc<Quorum>>,
+        cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
             ledger,
             read_only: true,
             term,
-            quorum,
+            cluster_commit_index,
         }
     }
 
@@ -151,7 +159,7 @@ impl Ledger for LedgerHandler {
         let op = req.try_into()?;
 
         let tx_id = self.ledger.submit(op);
-        self.wait_for_transaction_level(tx_id, level).await;
+        let _ = self.wait_for_transaction_level(tx_id, level).await;
 
         let status = self.ledger.get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
@@ -219,7 +227,7 @@ impl Ledger for LedgerHandler {
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
         let last_tx_id = start_transaction_id + (len - 1) as u64;
-        self.wait_for_transaction_level(last_tx_id, level).await;
+        let _ = self.wait_for_transaction_level(last_tx_id, level).await;
 
         let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
@@ -339,7 +347,7 @@ impl Ledger for LedgerHandler {
         }
 
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
-        self.wait_for_transaction_level(tx_id, level).await;
+        let _ = self.wait_for_transaction_level(tx_id, level).await;
 
         let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
         Ok(Response::new(proto::WaitForTransactionResponse {
@@ -358,6 +366,7 @@ impl Ledger for LedgerHandler {
             commit_index: self.ledger.last_commit_id(),
             snapshot_index: self.ledger.last_snapshot_id(),
             term: self.current_term(),
+            cluster_commit_index: self.cluster_commit_index.get(),
         }))
     }
 
@@ -537,12 +546,14 @@ impl LedgerHandler {
                 proto::WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
                 proto::WaitLevel::Snapshot => self.ledger.last_snapshot_id() >= transaction_id,
                 proto::WaitLevel::ClusterCommit => {
-                    if let Some(ref quorum) = self.quorum {
-                        self.ledger.last_snapshot_id() >= transaction_id
-                            && quorum.get() >= transaction_id
-                    } else {
-                        return Err(std::io::Error::other("no quorum"));
-                    }
+                    // Require all three watermarks to have passed the tx.
+                    // `cluster_commit_index` reflects the leader's view of
+                    // quorum replication; the local `commit_index` and
+                    // `snapshot_index` ensure the tx is also durably
+                    // stored and queryable on this node.
+                    self.ledger.last_snapshot_id() >= transaction_id
+                        && self.ledger.last_commit_id() >= transaction_id
+                        && self.cluster_commit_index.get() >= transaction_id
                 }
             };
 

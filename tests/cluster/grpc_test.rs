@@ -1,12 +1,11 @@
 #[cfg(feature = "cluster")]
 mod tests {
-    use roda_ledger::cluster::Server;
-    use roda_ledger::cluster::Term;
     use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
     use roda_ledger::cluster::proto::ledger::{
         Deposit, GetBalanceRequest, GetBalancesRequest, GetPipelineIndexRequest, GetStatusRequest,
         GetStatusesRequest, SubmitBatchRequest, SubmitOperationRequest, Transfer, Withdrawal,
     };
+    use roda_ledger::cluster::{ClusterCommitIndex, Server, Term};
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -27,8 +26,9 @@ mod tests {
 
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
+        let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
-            let server = Server::new(server_ledger, addr, term);
+            let server = Server::new(server_ledger, addr, term, cci);
             server.run().await.unwrap();
         });
 

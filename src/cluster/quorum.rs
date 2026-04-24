@@ -11,6 +11,8 @@
 //! `get()`. No locks, no allocation after construction, no backwards
 //! movement of `majority_index`.
 
+use crate::cluster::cluster_commit::ClusterCommitIndex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Tracks per-node match indices and the majority-committed index.
@@ -25,6 +27,10 @@ pub struct Quorum {
     majority_index: AtomicU64,
     /// Quorum size: `(node_count / 2) + 1`.
     majority: usize,
+    /// Shared cluster-commit watermark. `advance` mirrors the recomputed
+    /// majority into this atomic so readers (LedgerHandler) don't need to
+    /// hold a reference to `Quorum` itself.
+    cluster_commit_index: Arc<ClusterCommitIndex>,
 }
 
 impl Quorum {
@@ -36,10 +42,19 @@ impl Quorum {
             match_index,
             majority_index: AtomicU64::new(0),
             majority: node_count / 2 + 1,
+            cluster_commit_index: ClusterCommitIndex::new(),
         }
     }
 
+    /// Handle to the shared cluster-commit watermark. The leader hands
+    /// this to the client-facing `Server` / `LedgerHandler`.
+    #[inline]
+    pub fn cluster_commit_index(&self) -> Arc<ClusterCommitIndex> {
+        self.cluster_commit_index.clone()
+    }
+
     /// Quorum size.
+    #[cfg(test)]
     #[inline]
     fn majority(&self) -> usize {
         self.majority
@@ -81,6 +96,7 @@ impl Quorum {
         let candidate = snapshot[self.majority - 1];
 
         self.majority_index.fetch_max(candidate, Ordering::Release);
+        self.cluster_commit_index.set_from_quorum(candidate);
     }
 
     /// Read the cached majority-committed index.
@@ -90,6 +106,7 @@ impl Quorum {
     }
 
     /// Read a single slot's latest published index (observability).
+    #[cfg(test)]
     #[inline]
     fn peer(&self, node_index: u32) -> u64 {
         let pid = node_index as usize;
@@ -175,5 +192,22 @@ mod tests {
         assert_eq!(mi.peer(1), 7);
         assert_eq!(mi.peer(0), 0);
         assert_eq!(mi.peer(2), 0);
+    }
+
+    #[test]
+    fn advance_mirrors_majority_into_cluster_commit_index() {
+        let mi = Quorum::new(5);
+        let cci = mi.cluster_commit_index();
+
+        for (pid, idx) in [(0u32, 10u64), (1, 20), (2, 30), (3, 40), (4, 50)] {
+            mi.advance(pid, idx);
+            assert_eq!(cci.get(), mi.get(), "cci mirrors majority after advance");
+        }
+        assert_eq!(cci.get(), 30);
+
+        // A straggler's regression to 1 must not drop the watermark.
+        mi.advance(4, 1);
+        assert_eq!(cci.get(), 30);
+        assert_eq!(mi.get(), 30);
     }
 }
