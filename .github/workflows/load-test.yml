@@ -93,7 +93,6 @@ jobs:
           # Run load test
           echo "::group::Load Test Output"
           /root/.cargo/bin/cargo run --package roda-ledger --release --bin load 2>&1 | tee /root/load-test-output.txt
-          /root/.cargo/bin/cargo run --package roda-ledger --release --bin load_grpc --features="grpc" 2>&1 | tee /root/load-test-output-grpc.txt
           /root/.cargo/bin/cargo run --package roda-ledger --release --bin load_wasm 2>&1 | tee /root/load-test-output-wasm.txt
           echo "::endgroup::"
           SETUP_EOF
@@ -109,9 +108,6 @@ jobs:
           scp -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key \
             root@$SERVER_IP:/root/load-test-output.txt results/load-test-output.txt 2>/dev/null || \
             echo "No output file to retrieve" > results/load-test-output.txt
-          scp -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key \
-            root@$SERVER_IP:/root/load-test-output-grpc.txt results/load-test-output-grpc.txt 2>/dev/null || \
-            echo "No output file to retrieve" > results/load-test-output-grpc.txt
           scp -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key \
             root@$SERVER_IP:/root/load-test-output-wasm.txt results/load-test-output-wasm.txt 2>/dev/null || \
             echo "No output file to retrieve" > results/load-test-output-wasm.txt

@@ -6,11 +6,12 @@
 //! The top-level `tokio::spawn` for peer supervision lives here —
 //! `Leader::run` spawns one child per peer.
 
-use crate::cluster::config::ClusterConfig;
-use crate::cluster::node_server::{NodeHandler, NodeServerRuntime};
+use crate::cluster::config::Config;
+use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
 use crate::cluster::proto::node::NodeRole;
-use crate::cluster::{GrpcServer, Quorum, Term};
+use crate::cluster::server::{NodeServerRuntime, Server};
+use crate::cluster::{Quorum, Term};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -20,13 +21,13 @@ use tokio::task::JoinHandle;
 
 /// Role-scoped bring-up for a leader node. Construct, then `run()`.
 pub struct Leader {
-    config: ClusterConfig,
+    config: Config,
     ledger: Arc<Ledger>,
     term: Arc<Term>,
 }
 
 impl Leader {
-    pub fn new(config: ClusterConfig, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
+    pub fn new(config: Config, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
         Self {
             config,
             ledger,
@@ -53,11 +54,19 @@ impl Leader {
             new_term, start_tx, self.config.node_id
         );
 
+        let quorum = Arc::new(Quorum::new(self.config.peers.len() + 1));
+        let cluster_commit_index = quorum.cluster_commit_index();
+
         // Client-facing Ledger server — full read/write on the leader.
         // Hands the shared Arc<Term> through so every submit and status
         // response can resolve the current + per-tx term without
         // round-tripping back to the leader state.
-        let client_server = GrpcServer::new(self.ledger.clone(), client_addr, self.term.clone());
+        let client_server = Server::new(
+            self.ledger.clone(),
+            client_addr,
+            self.term.clone(),
+            cluster_commit_index,
+        );
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
                 error!("leader ledger gRPC server exited: {}", e);
@@ -72,6 +81,7 @@ impl Leader {
             self.config.node_id,
             self.term.clone(),
             NodeRole::Leader,
+            None,
         );
         let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;
         let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);
@@ -82,10 +92,30 @@ impl Leader {
         });
 
         // Replication: one child task per peer, all sharing one `Quorum`
-        // and one cooperative shutdown flag. Replaces the former
-        // `PeerManager` supervisor — the leader is the supervisor now.
+        // and one cooperative shutdown flag. Slot layout in the quorum
+        // tracker is:
+        //   [0]    → leader (this node, advanced via `ledger.on_commit`)
+        //   [1..N] → peers, positional with `config.peers`
+        // This way the leader's own commit progress counts toward the
+        // cluster majority (fixes quorum never including self).
         let running = Arc::new(AtomicBool::new(true));
-        let quorum = Arc::new(Quorum::new(self.config.peers.len()));
+
+        // Hook the leader's own commit stream into slot 0 of the quorum.
+        // Must be registered after the ledger is started (commits are
+        // already flowing) but before peer tasks start ACKing, so the
+        // leader slot isn't the lowest in the snapshot. Seed with the
+        // current commit id in case start-up committed anything before
+        // we got here.
+        let q_leader = quorum.clone();
+        if self
+            .ledger
+            .on_commit(Arc::new(move |tx_id| q_leader.advance(0, tx_id)))
+            .is_err()
+        {
+            panic!("leader: on_commit handler already registered; skipping");
+        }
+        quorum.advance(0, self.ledger.last_commit_id());
+
         let mut peer_handles: Vec<JoinHandle<()>> = Vec::with_capacity(self.config.peers.len());
 
         if self.config.peers.is_empty() {
@@ -105,9 +135,11 @@ impl Leader {
                 Duration::from_millis(self.config.replication_poll_ms.max(1)),
             );
             for (idx, peer) in self.config.peers.iter().enumerate() {
+                // Peer slots start at 1; slot 0 is the leader.
+                let peer_slot = (idx as u32) + 1;
                 let replicator = PeerReplication::new(
                     peer.clone(),
-                    idx as u32,
+                    peer_slot,
                     self.ledger.clone(),
                     params.clone(),
                     running.clone(),

@@ -9,7 +9,7 @@ use crate::e2e::lib::backend_inline::InlineNode;
 use crate::e2e::lib::backend_process::ProcessNode;
 use crate::e2e::lib::profile::Profile;
 use roda_ledger::client::{FunctionInfo, LedgerClient, SubmitResult};
-use roda_ledger::grpc::proto::WaitLevel;
+use roda_ledger::cluster::proto::ledger::WaitLevel;
 use std::net::SocketAddr;
 use tokio::time::{Duration, sleep};
 
