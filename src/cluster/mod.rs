@@ -27,8 +27,9 @@ pub mod peer_replication;
 pub mod quorum;
 pub mod server;
 pub mod term;
+pub mod vote;
 
-pub use crate::storage::TermRecord;
+pub use crate::storage::{TermRecord, VoteRecord};
 pub use cluster_commit::ClusterCommitIndex;
 pub use config::{Config, ConfigError, Mode, NodeServerSection, PeerConfig, ServerSection};
 pub use follower::{Follower, FollowerHandles};
@@ -40,6 +41,7 @@ pub use peer_replication::{PeerReplication, ReplicationParams};
 pub use quorum::Quorum;
 pub use server::{NodeServerRuntime, Server};
 pub use term::Term;
+pub use vote::Vote;
 
 /// Generated protobuf types for both gRPC services owned by the cluster:
 ///

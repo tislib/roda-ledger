@@ -1,7 +1,10 @@
 # ADR-0016: Leader Election and Log Divergence
 
-**Status:** Proposed
-**Date:** 2026-04-24
+**Status:** Proposed  
+**Date:** 2026-04-24  
+**Author:** Taleh Ibrahimli
+
+---
 
 ## Context
 
