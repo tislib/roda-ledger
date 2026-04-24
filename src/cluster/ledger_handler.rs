@@ -159,7 +159,7 @@ impl Ledger for LedgerHandler {
         let op = req.try_into()?;
 
         let tx_id = self.ledger.submit(op);
-        let _ = self.wait_for_transaction_level(tx_id, level).await;
+        self.wait_for_transaction_level(tx_id, level).await?;
 
         let status = self.ledger.get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
@@ -227,7 +227,7 @@ impl Ledger for LedgerHandler {
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
         let last_tx_id = start_transaction_id + (len - 1) as u64;
-        let _ = self.wait_for_transaction_level(last_tx_id, level).await;
+        self.wait_for_transaction_level(last_tx_id, level).await?;
 
         let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
@@ -347,7 +347,7 @@ impl Ledger for LedgerHandler {
         }
 
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
-        let _ = self.wait_for_transaction_level(tx_id, level).await;
+        self.wait_for_transaction_level(tx_id, level).await?;
 
         let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
         Ok(Response::new(proto::WaitForTransactionResponse {
