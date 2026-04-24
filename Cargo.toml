@@ -21,8 +21,6 @@ roda-latency-tracker = "0.1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.8"
-smallvec = { version = "1.13", features = ["serde"] }
-bitflags = { version = "2.8", features = ["serde"] }
 tonic = { version = "0.12", features = ["transport"], optional = true }
 spdlog-rs = "0.5.3"
 crc32c = "0.6"
@@ -45,8 +43,8 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:prost", "dep:tonic-build", "dep:tonic-reflection"]
-e2e_tests = ["grpc"]
+cluster = ["dep:tonic", "dep:prost", "dep:tonic-build", "dep:tonic-reflection"]
+e2e_tests = ["cluster"]
 
 [build-dependencies]
 tonic-build = { version = "0.12", optional = true }
@@ -76,10 +74,15 @@ harness = false
 name = "snapshot_bench"
 harness = false
 
+[[bench]]
+name = "quorum_bench"
+harness = false
+required-features = ["cluster"]
+
 [[bin]]
 name = "roda-ledger"
-path = "src/bin/server.rs"
-required-features = ["grpc"]
+path = "src/bin/cluster.rs"
+required-features = ["cluster"]
 
 [[bin]]
 name = "power-tune"
@@ -98,19 +101,9 @@ name = "load_wasm"
 path = "src/bin/load_wasm.rs"
 
 [[bin]]
-name = "load_grpc"
-path = "src/bin/load_grpc.rs"
-required-features = ["grpc"]
-
-[[bin]]
-name = "roda-cluster"
-path = "src/bin/cluster.rs"
-required-features = ["grpc"]
-
-[[bin]]
 name = "load_cluster"
 path = "src/bin/load_cluster.rs"
-required-features = ["grpc"]
+required-features = ["cluster"]
 
 [[bin]]
 name = "load_tail"

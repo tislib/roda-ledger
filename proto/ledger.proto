@@ -139,6 +139,7 @@ enum WaitLevel {
   WAIT_LEVEL_COMPUTED = 0; // if omitted in request, used for async SubmitOperation
   WAIT_LEVEL_COMMITTED = 1;
   WAIT_LEVEL_SNAPSHOT = 2;
+  WAIT_LEVEL_CLUSTER_COMMIT = 3;
 }
 
 // Deposit credits an account from the system source.
@@ -354,6 +355,12 @@ message GetPipelineIndexResponse {
   uint64 snapshot_index = 3;
 
   uint64 term = 4; // Current term
+
+  // cluster_commit_index: highest transaction_id known quorum-committed.
+  // On the leader this is Quorum::get(). On followers this is the watermark
+  // advertised by the most recent AppendEntries from the leader, clamped to
+  // the follower's last_commit_id. 0 in single-node mode.
+  uint64 cluster_commit_index = 5;
 }
 
 // ---- Transaction query (ADR-008) ----

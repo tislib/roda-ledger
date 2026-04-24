@@ -5,15 +5,14 @@
 //! - Leader's replication thread ships WAL bytes via AppendEntries.
 //! - Follower's balances catch up to the leader's.
 
-#![cfg(feature = "grpc")]
+#![cfg(feature = "cluster")]
 
 use lproto::submit_operation_request::Operation;
-use roda_ledger::cluster::{Cluster, ClusterConfig, ClusterMode, PeerConfig};
+use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
+use roda_ledger::cluster::proto::ledger::{self as lproto, Deposit, SubmitOperationRequest};
+use roda_ledger::cluster::{self, ClusterNode, PeerConfig, ServerSection};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
-use roda_ledger::grpc::GrpcServerSection;
-use roda_ledger::grpc::proto::ledger_client::LedgerClient;
-use roda_ledger::grpc::proto::{self as lproto, Deposit, SubmitOperationRequest};
 use roda_ledger::wait_strategy::WaitStrategy;
 use spdlog::Level;
 use std::net::TcpListener;
@@ -57,15 +56,15 @@ async fn cluster_leader_replicates_to_follower() {
     let follower_client_port = free_port();
     let follower_node_port = free_port();
 
-    let leader_cfg = ClusterConfig {
-        mode: ClusterMode::Leader,
+    let leader_cfg = cluster::Config {
+        mode: cluster::Mode::Leader,
         node_id: 1,
         term: 1,
         peers: vec![PeerConfig {
             id: 2,
             node_addr: format!("http://127.0.0.1:{}", follower_node_port),
         }],
-        server: GrpcServerSection {
+        server: ServerSection {
             host: "127.0.0.1".to_string(),
             port: leader_client_port,
             ..Default::default()
@@ -79,12 +78,12 @@ async fn cluster_leader_replicates_to_follower() {
         append_entries_max_bytes: 256 * 1024,
     };
 
-    let follower_cfg = ClusterConfig {
-        mode: ClusterMode::Follower,
+    let follower_cfg = cluster::Config {
+        mode: cluster::Mode::Follower,
         node_id: 2,
         term: 1,
         peers: Vec::new(),
-        server: GrpcServerSection {
+        server: ServerSection {
             host: "127.0.0.1".to_string(),
             port: follower_client_port,
             ..Default::default()
@@ -100,10 +99,10 @@ async fn cluster_leader_replicates_to_follower() {
 
     // Follower first so its node port is listening when the leader's replication
     // task attempts to connect.
-    let follower = Cluster::new(follower_cfg).expect("follower ledger");
+    let follower = ClusterNode::new(follower_cfg).expect("follower ledger");
     let follower_handles = follower.run().await.expect("follower run");
 
-    let leader = Cluster::new(leader_cfg).expect("leader ledger");
+    let leader = ClusterNode::new(leader_cfg).expect("leader ledger");
     let leader_handles = leader.run().await.expect("leader run");
 
     // Wait for both gRPC servers to be bound.

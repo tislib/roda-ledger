@@ -1,6 +1,7 @@
 use crate::balance::Balance;
 pub use crate::config::{LedgerConfig, StorageConfig};
 use crate::entities::WalEntry;
+pub use crate::pipeline::CommitHandler;
 use crate::pipeline::Pipeline;
 use crate::recover::Recover;
 use crate::seal::Seal;
@@ -248,6 +249,11 @@ impl Ledger {
 
     pub fn get_rejected_count(&self) -> u64 {
         self.transactor.get_rejected_count()
+    }
+
+    /// Register a callback fired every time the WAL commit-index advances.
+    pub fn on_commit(&self, handler: CommitHandler) -> Result<(), CommitHandler> {
+        self.pipeline.set_commit_handler(handler)
     }
 
     // ── Cluster Mode Surface (ADR-015) ────────────────────────────────────

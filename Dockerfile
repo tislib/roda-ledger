@@ -16,8 +16,8 @@ COPY tests ./tests
 COPY examples ./examples
 COPY config.toml ./config.toml
 
-# Build the project with grpc feature in release mode
-RUN cargo build --release --features grpc --bin roda-ledger
+# Build the project with cluster feature in release mode
+RUN cargo build --release --features cluster --bin roda-ledger
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

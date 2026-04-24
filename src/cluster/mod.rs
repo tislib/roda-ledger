@@ -3,42 +3,42 @@
 //!
 //! The cluster owns both gRPC surfaces:
 //!
-//! - **Client-facing Ledger service** (`client_handler` + `client_server`)
+//! - **Client-facing Ledger service** (`handler_ledger` + `server::Server`)
 //!   — the external submit/query API. On leaders it is writable; on
 //!   followers it runs in read-only mode. A "single node" setup is just
 //!   a cluster with zero peers.
-//! - **Peer-facing Node service** (`node_server`) — leader ↔ follower
-//!   replication RPCs (`AppendEntries`, `Ping`, future `RequestVote` /
-//!   `InstallSnapshot`).
+//! - **Peer-facing Node service** (`handler_node` + `server::NodeServerRuntime`)
+//!   — leader ↔ follower replication RPCs (`AppendEntries`, `Ping`,
+//!   future `RequestVote` / `InstallSnapshot`).
 //!
 //! The leader tails its own WAL via `WalTailer` and ships bytes to
 //! followers via `AppendEntries`; followers decode and hand them to
 //! `Ledger::append_wal_entries`.
 
-pub mod client_handler;
-pub mod client_server;
+pub mod cluster_commit;
 pub mod config;
 pub mod follower;
 pub mod leader;
+pub mod ledger_handler;
+pub mod mapping;
 pub mod node;
-pub mod node_server;
+pub mod node_handler;
 pub mod peer_replication;
-pub mod proto_mapping;
 pub mod quorum;
+pub mod server;
 pub mod term;
 
 pub use crate::storage::TermRecord;
-pub use client_handler::LedgerHandler;
-pub use client_server::GrpcServer;
-pub use config::{
-    ClusterConfig, ClusterMode, GrpcServerSection, NodeServerSection, PeerConfig, ServerConfig,
-    ServerConfigError,
-};
+pub use cluster_commit::ClusterCommitIndex;
+pub use config::{Config, ConfigError, Mode, NodeServerSection, PeerConfig, ServerSection};
 pub use follower::{Follower, FollowerHandles};
 pub use leader::{Leader, LeaderHandles};
-pub use node::{Cluster, ClusterHandles};
+pub use ledger_handler::LedgerHandler;
+pub use node::{ClusterNode, Handles};
+pub use node_handler::NodeHandler;
 pub use peer_replication::{PeerReplication, ReplicationParams};
 pub use quorum::Quorum;
+pub use server::{NodeServerRuntime, Server};
 pub use term::Term;
 
 /// Generated protobuf types for both gRPC services owned by the cluster:

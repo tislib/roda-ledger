@@ -8,8 +8,8 @@
 //! profile as defaults. Backends override them at startup (e.g. free port,
 //! temp directory).
 
+use roda_ledger::cluster::ServerSection;
 use roda_ledger::config::{LedgerConfig, StorageConfig};
-use roda_ledger::grpc::GrpcServerSection;
 use roda_ledger::wait_strategy::WaitStrategy;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use std::path::Path;
 struct ProfileDef {
     nodes: usize,
     #[serde(default)]
-    server: GrpcServerSection,
+    server: ServerSection,
     #[serde(default)]
     ledger: LedgerConfig,
 }
@@ -30,7 +30,7 @@ struct ProfileDef {
 pub struct Profile {
     pub name: String,
     pub nodes: usize,
-    pub server: GrpcServerSection,
+    pub server: ServerSection,
     pub ledger: LedgerConfig,
 }
 

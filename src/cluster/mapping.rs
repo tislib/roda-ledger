@@ -1,6 +1,6 @@
 use crate::cluster::proto::ledger as proto;
 use crate::entities::FailReason;
-use crate::transaction::{Operation, TransactionStatus, WaitLevel};
+use crate::transaction::{Operation, TransactionStatus};
 
 impl From<proto::Deposit> for Operation {
     fn from(d: proto::Deposit) -> Self {
@@ -95,15 +95,5 @@ impl From<TransactionStatus> for proto::TransactionStatus {
 impl From<FailReason> for u32 {
     fn from(reason: FailReason) -> Self {
         reason.as_u8() as u32
-    }
-}
-
-impl From<proto::WaitLevel> for WaitLevel {
-    fn from(level: proto::WaitLevel) -> Self {
-        match level {
-            proto::WaitLevel::Computed => WaitLevel::Computed,
-            proto::WaitLevel::Committed => WaitLevel::Committed,
-            proto::WaitLevel::Snapshot => WaitLevel::OnSnapshot,
-        }
     }
 }

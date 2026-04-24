@@ -24,13 +24,11 @@ impl Wal {
 
     pub fn start(&self, ctx: WalContext) -> std::io::Result<[JoinHandle<()>; 2]> {
         let last_written_tx_id = Arc::new(AtomicU64::new(0));
-        let last_committed_tx_id = Arc::new(AtomicU64::new(0));
         let active_segment_sync: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
 
         let mut wal_runner = WalRunner::new(
             self.storage.clone(),
             last_written_tx_id.clone(),
-            last_committed_tx_id.clone(),
             active_segment_sync.clone(),
             &ctx,
         );
@@ -44,7 +42,6 @@ impl Wal {
         let mut wal_committer = WalCommitter {
             active_segment: active_segment_sync,
             last_written_tx_id,
-            last_committed_tx_id,
         };
         let wal_commit_th = std::thread::Builder::new()
             .name("wal_commit".to_string())
@@ -60,7 +57,6 @@ pub struct WalRunner {
     storage: Arc<Storage>,
     pending_records: u8,
     last_written_tx_id: Arc<AtomicU64>,
-    last_committed_tx_id: Arc<AtomicU64>,
     active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
     retry_count: u64,
     active_segment: Segment,
@@ -74,7 +70,6 @@ impl WalRunner {
     pub fn new(
         storage: Arc<Storage>,
         last_written_tx_id: Arc<AtomicU64>,
-        last_committed_tx_id: Arc<AtomicU64>,
         active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
         ctx: &WalContext,
     ) -> Self {
@@ -94,7 +89,6 @@ impl WalRunner {
             storage,
             pending_records: 0,
             last_written_tx_id,
-            last_committed_tx_id,
             active_segment_sync,
             retry_count: 0,
             active_segment,
@@ -157,13 +151,13 @@ impl WalRunner {
                 && tx_per_seg > 0
                 && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg
             {
-                self.rotate();
+                self.rotate(&ctx);
             }
 
             // Push committed entries to the outbound queue.
             while let Some(entry) = self.buffer.pop_front() {
                 let tx_id = entry.tx_id();
-                if tx_id > self.last_committed_tx_id.load(Acquire) {
+                if tx_id > ctx.commit_index() {
                     // return back
                     self.buffer.push_front(entry);
                     break;
@@ -171,7 +165,6 @@ impl WalRunner {
                 if !self.push_outbound(&ctx, entry) {
                     break;
                 }
-                ctx.set_processed_index(tx_id);
             }
         }
     }
@@ -188,7 +181,7 @@ impl WalRunner {
         }
     }
 
-    fn rotate(&mut self) {
+    fn rotate(&mut self, ctx: &WalContext) {
         let last_written_tx_id = self.last_written_tx_id.load(Acquire);
 
         self.active_segment
@@ -198,7 +191,7 @@ impl WalRunner {
                 self.active_segment.record_count(),
             ))]);
 
-        self.commit_sync();
+        self.commit_sync(ctx);
 
         self.active_segment
             .close()
@@ -253,17 +246,15 @@ impl WalRunner {
         }
     }
 
-    pub fn commit_sync(&mut self) {
+    pub fn commit_sync(&mut self, ctx: &WalContext) {
         let mut syncer = self.active_segment.syncer().expect("Failed to get syncer");
         syncer.sync().expect("Failed to sync segment");
-        self.last_committed_tx_id
-            .store(self.last_written_tx_id.load(Acquire), Release);
+        ctx.set_commit_index(self.last_written_tx_id.load(Acquire));
     }
 }
 
 struct WalCommitter {
     last_written_tx_id: Arc<AtomicU64>,
-    last_committed_tx_id: Arc<AtomicU64>,
     active_segment: Arc<ArcSwap<Option<Syncer>>>,
 }
 
@@ -274,7 +265,7 @@ impl WalCommitter {
         let mut sync: Option<Syncer> = None;
         let mut sync_id = 0;
         while ctx.is_running() {
-            if self.last_written_tx_id.load(Acquire) <= self.last_committed_tx_id.load(Acquire) {
+            if self.last_written_tx_id.load(Acquire) <= ctx.commit_index() {
                 retry_count += 1;
                 wait_strategy.retry(retry_count);
                 continue;
@@ -291,16 +282,16 @@ impl WalCommitter {
             }
 
             if let Some(syncer) = sync.as_mut() {
-                self.commit_sync(syncer);
+                self.commit_sync(&ctx, syncer);
             }
         }
     }
 
-    pub fn commit_sync(&mut self, syncer: &mut Syncer) {
+    pub fn commit_sync(&mut self, ctx: &WalContext, syncer: &mut Syncer) {
         let commit_tx_id = self.last_written_tx_id.load(Acquire);
 
         syncer.sync().expect("Failed to sync segment");
 
-        self.last_committed_tx_id.store(commit_tx_id, Release);
+        ctx.set_commit_index(commit_tx_id);
     }
 }

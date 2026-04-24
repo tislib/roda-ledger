@@ -1,10 +1,8 @@
 //! Static cluster configuration for ADR-015. Leader and peers are fixed;
 //! dynamic membership and elections are deferred to ADR-016.
 //!
-//! The client-facing gRPC server section (`GrpcServerSection`) and the
-//! legacy `ServerConfig` used by the single-node `roda-ledger` binary
-//! also live here — a "single node" is modelled as a cluster with zero
-//! peers.
+//! A "single node" is modelled as a `Config` with zero peers — the
+//! binary (`roda-ledger`, `src/bin/cluster.rs`) always loads one of these.
 
 use crate::config::LedgerConfig;
 use serde::Deserialize;
@@ -15,14 +13,14 @@ use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
-pub struct GrpcServerSection {
+pub struct ServerSection {
     pub host: String,
     pub port: u16,
     pub max_connections: usize,
     pub max_message_size_bytes: usize,
 }
 
-impl Default for GrpcServerSection {
+impl Default for ServerSection {
     fn default() -> Self {
         Self {
             host: "0.0.0.0".to_string(),
@@ -33,75 +31,15 @@ impl Default for GrpcServerSection {
     }
 }
 
-impl GrpcServerSection {
+impl ServerSection {
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.host, self.port).parse()
     }
 }
 
-// ── Legacy single-node config (bin/server.rs) ───────────────────────────────
-
-/// Root object deserialised from `config.toml` by the single-node
-/// `roda-ledger` binary. Retained as a convenience wrapper so the
-/// single-node launch path stays short; the cluster binary uses
-/// [`ClusterConfig`] directly.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct ServerConfig {
-    pub server: GrpcServerSection,
-    pub ledger: LedgerConfig,
-}
-
-#[derive(Debug)]
-pub enum ServerConfigError {
-    Io(std::io::Error),
-    Parse(toml::de::Error),
-}
-
-impl std::fmt::Display for ServerConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "failed to read config file: {}", e),
-            Self::Parse(e) => write!(f, "failed to parse config toml: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for ServerConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Parse(e) => Some(e),
-        }
-    }
-}
-
-impl From<std::io::Error> for ServerConfigError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<toml::de::Error> for ServerConfigError {
-    fn from(e: toml::de::Error) -> Self {
-        Self::Parse(e)
-    }
-}
-
-impl ServerConfig {
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ServerConfigError> {
-        let contents = std::fs::read_to_string(path.as_ref())?;
-        Self::from_toml_str(&contents)
-    }
-
-    pub fn from_toml_str(s: &str) -> Result<Self, ServerConfigError> {
-        Ok(toml::from_str(s)?)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ClusterMode {
+pub enum Mode {
     Leader,
     Follower,
 }
@@ -137,12 +75,12 @@ impl NodeServerSection {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
-pub struct ClusterConfig {
-    pub mode: ClusterMode,
+pub struct Config {
+    pub mode: Mode,
     pub node_id: u64,
     pub term: u64,
     pub peers: Vec<PeerConfig>,
-    pub server: GrpcServerSection,
+    pub server: ServerSection,
     pub node: NodeServerSection,
     pub ledger: LedgerConfig,
     /// How often the replication thread ticks when idle (ms).
@@ -151,14 +89,14 @@ pub struct ClusterConfig {
     pub append_entries_max_bytes: usize,
 }
 
-impl Default for ClusterConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
-            mode: ClusterMode::Leader,
+            mode: Mode::Leader,
             node_id: 1,
             term: 1,
             peers: Vec::new(),
-            server: GrpcServerSection::default(),
+            server: ServerSection::default(),
             node: NodeServerSection::default(),
             ledger: LedgerConfig::default(),
             replication_poll_ms: 5,
@@ -168,12 +106,12 @@ impl Default for ClusterConfig {
 }
 
 #[derive(Debug)]
-pub enum ClusterConfigError {
+pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
 }
 
-impl std::fmt::Display for ClusterConfigError {
+impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "failed to read cluster config: {}", e),
@@ -182,32 +120,32 @@ impl std::fmt::Display for ClusterConfigError {
     }
 }
 
-impl std::error::Error for ClusterConfigError {}
+impl std::error::Error for ConfigError {}
 
-impl From<std::io::Error> for ClusterConfigError {
+impl From<std::io::Error> for ConfigError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
     }
 }
 
-impl From<toml::de::Error> for ClusterConfigError {
+impl From<toml::de::Error> for ConfigError {
     fn from(e: toml::de::Error) -> Self {
         Self::Parse(e)
     }
 }
 
-impl ClusterConfig {
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ClusterConfigError> {
+impl Config {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path.as_ref())?;
         Self::from_toml_str(&contents)
     }
 
-    pub fn from_toml_str(s: &str) -> Result<Self, ClusterConfigError> {
+    pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(s)?)
     }
 
     pub fn is_leader(&self) -> bool {
-        matches!(self.mode, ClusterMode::Leader)
+        matches!(self.mode, Mode::Leader)
     }
 }
 
@@ -242,7 +180,7 @@ mod tests {
             [ledger.storage]
             data_dir = "/tmp/leader"
         "#;
-        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        let cfg = Config::from_toml_str(toml).unwrap();
         assert!(cfg.is_leader());
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].id, 2);

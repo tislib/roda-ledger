@@ -89,7 +89,7 @@ jobs:
           echo "::group::E2E Test Output"
           E2E_BACKEND=process /root/.cargo/bin/cargo test \
             --test e2e_tests \
-            --features "e2e_tests,grpc" \
+            --features "e2e_tests,cluster" \
             --release \
             -- --test-threads=1 --nocapture 2>&1 | tee /root/e2e-test-output.txt
           echo "::endgroup::"

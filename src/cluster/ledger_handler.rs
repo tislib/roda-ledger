@@ -1,9 +1,9 @@
-use crate::cluster::Term;
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
+use crate::cluster::{ClusterCommitIndex, Term};
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use crate::transaction::{Operation, WaitLevel};
+use crate::transaction::Operation;
 use spdlog::warn;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,26 +16,41 @@ pub struct LedgerHandler {
     /// Shared term state. In single-node mode the handler is constructed
     /// with a fresh in-memory-only term whose current value is 0.
     term: Arc<Term>,
+    /// Cluster-commit watermark. Always present — `Server` only runs in
+    /// cluster mode. On a leader with zero peers the watermark tracks
+    /// the leader's own commit progress (Quorum slot 0 fed by
+    /// `Ledger::on_commit`), which equals `ledger.last_commit_id()`.
+    pub cluster_commit_index: Arc<ClusterCommitIndex>,
 }
 
 impl LedgerHandler {
     /// Full read/write handler. Caller supplies the shared `Arc<Term>`
     /// owned by `Leader` / `Follower`.
-    pub fn new(ledger: Arc<InternalLedger>, term: Arc<Term>) -> Self {
+    pub fn new(
+        ledger: Arc<InternalLedger>,
+        term: Arc<Term>,
+        cluster_commit_index: Arc<ClusterCommitIndex>,
+    ) -> Self {
         Self {
             ledger,
             read_only: false,
             term,
+            cluster_commit_index,
         }
     }
 
     /// Read-only handler: all `submit_*` / `register_function` /
     /// `unregister_function` RPCs return `FAILED_PRECONDITION`.
-    pub fn new_read_only(ledger: Arc<InternalLedger>, term: Arc<Term>) -> Self {
+    pub fn new_read_only(
+        ledger: Arc<InternalLedger>,
+        term: Arc<Term>,
+        cluster_commit_index: Arc<ClusterCommitIndex>,
+    ) -> Self {
         Self {
             ledger,
             read_only: true,
             term,
+            cluster_commit_index,
         }
     }
 
@@ -140,13 +155,11 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::SubmitAndWaitResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        let level = proto::WaitLevel::try_from(req.wait_level)
-            .map(WaitLevel::from)
-            .unwrap_or(WaitLevel::Committed);
+        let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
         let op = req.try_into()?;
 
         let tx_id = self.ledger.submit(op);
-        self.wait_for_transaction_level(tx_id, level).await;
+        self.wait_for_transaction_level(tx_id, level).await?;
 
         let status = self.ledger.get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
@@ -199,9 +212,7 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::SubmitBatchAndWaitResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        let level = proto::WaitLevel::try_from(req.wait_level)
-            .map(WaitLevel::from)
-            .unwrap_or(WaitLevel::Committed);
+        let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
 
         let len = req.operations.len();
         let mut operations: Vec<Operation> = Vec::with_capacity(len);
@@ -216,7 +227,7 @@ impl Ledger for LedgerHandler {
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
         let last_tx_id = start_transaction_id + (len - 1) as u64;
-        self.wait_for_transaction_level(last_tx_id, level).await;
+        self.wait_for_transaction_level(last_tx_id, level).await?;
 
         let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
@@ -335,10 +346,8 @@ impl Ledger for LedgerHandler {
             }
         }
 
-        let level = proto::WaitLevel::try_from(req.wait_level)
-            .map(WaitLevel::from)
-            .unwrap_or(WaitLevel::Committed);
-        self.wait_for_transaction_level(tx_id, level).await;
+        let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
+        self.wait_for_transaction_level(tx_id, level).await?;
 
         let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
         Ok(Response::new(proto::WaitForTransactionResponse {
@@ -357,6 +366,7 @@ impl Ledger for LedgerHandler {
             commit_index: self.ledger.last_commit_id(),
             snapshot_index: self.ledger.last_snapshot_id(),
             term: self.current_term(),
+            cluster_commit_index: self.cluster_commit_index.get(),
         }))
     }
 
@@ -516,30 +526,45 @@ fn map_registry_err(e: std::io::Error) -> Status {
         ErrorKind::NotFound => Status::not_found(e.to_string()),
         ErrorKind::InvalidInput => Status::invalid_argument(e.to_string()),
         ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
+        ErrorKind::TimedOut => Status::deadline_exceeded(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
 }
 
 impl LedgerHandler {
-    pub async fn wait_for_transaction_level(&self, transaction_id: u64, level: WaitLevel) {
+    pub async fn wait_for_transaction_level(
+        &self,
+        transaction_id: u64,
+        level: proto::WaitLevel,
+    ) -> std::io::Result<()> {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(20);
 
         loop {
             let reached = match level {
-                WaitLevel::Computed => self.ledger.last_compute_id() >= transaction_id,
-                WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
-                WaitLevel::OnSnapshot => self.ledger.last_snapshot_id() >= transaction_id,
+                proto::WaitLevel::Computed => self.ledger.last_compute_id() >= transaction_id,
+                proto::WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
+                proto::WaitLevel::Snapshot => self.ledger.last_snapshot_id() >= transaction_id,
+                proto::WaitLevel::ClusterCommit => {
+                    // Require all three watermarks to have passed the tx.
+                    // `cluster_commit_index` reflects the leader's view of
+                    // quorum replication; the local `commit_index` and
+                    // `snapshot_index` ensure the tx is also durably
+                    // stored and queryable on this node.
+                    self.ledger.last_snapshot_id() >= transaction_id
+                        && self.ledger.last_commit_id() >= transaction_id
+                        && self.cluster_commit_index.get() >= transaction_id
+                }
             };
 
             if reached {
-                return;
+                return Ok(());
             }
 
             yield_now().await;
 
             if start_time.elapsed() >= timeout {
-                return;
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
             }
         }
     }
