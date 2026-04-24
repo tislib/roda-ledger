@@ -4,21 +4,48 @@
 **Date:** 2026-04-20
 **Last-Updated:** 2026-04-22
 
-> **2026-04-22 refactor notes** (in-tree rename; no semantic change):
-> - Cargo feature `grpc` → `cluster`. A single node is just a cluster
->   with zero peers; the Cluster layer now owns all gRPC code.
-> - Single `roda-ledger` binary (the old `bin/server.rs` + separate
->   `roda-cluster` are gone). `roda_ledger::cluster::Config` is loaded
->   unconditionally; empty `peers` ⇒ single-node mode.
-> - Cluster-exported types drop the redundant `Cluster` prefix:
->   `ClusterConfig → Config`, `ClusterMode → Mode`,
->   `ClusterHandles → Handles`, `ClusterServer → Server`,
->   `ClusterConfigError → ConfigError`.
-> - Module layout inside `src/cluster/`: `handler_ledger.rs`,
->   `handler_node.rs`, `server.rs` (both gRPC runtimes),
->   `mapping.rs` (was `proto_mapping.rs`).
-> - Integration tests live under `tests/cluster/` and compile into a
->   single binary via `tests/cluster.rs`.
+## 2026-04-22 Decisions
+
+These decisions formalise changes made since the original draft. They
+update the ADR's shape; implementation lives in the code.
+
+1. **The Cluster layer owns all replication and all gRPC.**
+   A "single node" is a cluster with zero peers. There is no separate
+   server-only mode, no separate server binary, and no feature flag for
+   gRPC that is distinct from cluster.
+
+2. **One entry point, one configuration shape.**
+   The same configuration object describes both single-node and
+   multi-node deployments; the only difference is the peer list. There
+   is no single-node-specific config type.
+
+3. **The leader counts itself toward the quorum.**
+   Previously the quorum tracker only observed peer acks, so a leader's
+   own commit progress was invisible to majority calculations. The
+   leader is now a first-class participant in quorum (Raft-style:
+   majority of `peers + 1`). This is a correctness fix, not a new
+   feature.
+
+4. **Ledger exposes a commit-advance hook.**
+   The Ledger now offers a single, narrow extension point: a callback
+   fired when its commit index advances. The Cluster layer uses it to
+   feed the leader's own commit progress into the quorum tracker. The
+   hook is part of the minimal Ledger surface — it does not expand
+   Ledger's responsibilities, only its observability.
+
+5. **Cluster-commit is exposed as a client wait level.**
+   Clients can submit a transaction and block until it has reached
+   quorum across the cluster, not just the local leader. This is an
+   opt-in durability guarantee on the submit path — callers who don't
+   need it continue to use the local commit or snapshot wait levels.
+   The leader's own commit watermark still advances from its own WAL
+   stage; only the client's wait choice determines whether "committed"
+   means locally or cluster-wide.
+
+6. **Naming follows role, not transport.**
+   Within the cluster module, types are named by their role (leader,
+   follower, handler, server, config) rather than by the transport
+   (gRPC) that implements them. Transport is an internal detail.
 
 ---
 
@@ -36,7 +63,14 @@ distributed-systems concerns.
 
 ## Minimal Ledger Surface (the contract)
 
-Two additions to Ledger. Nothing else changes.
+Three additions to Ledger. Nothing else changes.
+
+1. A follower-side write path that accepts a pre-validated batch and
+   hands it to the WAL stage, bypassing the Transactor.
+2. A stateful raw-WAL byte tailer for the leader side.
+3. A one-shot hook that fires when the commit index advances, so the
+   Cluster layer can observe the leader's own commit progress without
+   Ledger having to know anything about clusters.
 
 ```rust
 /// Append pre-validated WAL entries produced externally (follower path).
@@ -258,36 +292,39 @@ pub struct Quorum {
 - `peer(&self, peer_id: u32) -> u64` — observability accessor for a
   single follower's last published index.
 
-**Integration.** `Leader::run` constructs
-`Arc<Quorum>::new(self.config.peers.len())` and hands a clone to every
-spawned `PeerReplication`. On every successful `AppendEntries` the
-peer task calls `self.quorum.advance(self.peer_index, r.last_tx_id)`;
-on every idle heartbeat it does the same. `LeaderHandles::quorum`
-(exposed via `ClusterHandles::quorum()`) lets external observers —
-tests, `load_cluster`, monitoring tooling — read the cluster-wide
-watermark without going through the peer tasks.
+**Integration.** The leader is a first-class participant in the
+quorum tracker. It occupies one slot and advances it from its own
+commit-index hook; every peer occupies one additional slot and
+advances it on each successful `AppendEntries` (including idle
+heartbeats). Majority is computed over `peers + 1` nodes (Raft-style),
+not over peers alone. External observers read the cluster-wide
+watermark through the handle the leader exposes.
 
 **Invariants.**
 
-- `peer_id` is positional: `peer_id == config.peers[peer_id].id`'s
-  index in the config list. `Leader::run` passes `idx as u32` when it
-  constructs each `PeerReplication`, so the slot and the config entry
-  line up.
-- `majority_index` is monotonically non-decreasing. A follower that
-  reports a regression (restart, stale response) only updates its own
-  slot; the cached majority stays at the high-water mark via
-  `fetch_max`.
-- No locks. No allocation after construction. `advance` allocates a
-  small per-call snapshot buffer of `peer_count` `u64`s.
+- Each node (leader or peer) has exactly one slot. The leader's slot
+  reflects its local commit progress; each peer's slot reflects the
+  watermark returned on its most recent RPC.
+- The published majority is monotonically non-decreasing. A regression
+  on any one slot (restart, stale response) never lowers the cached
+  value.
+- Lock-free. No allocation after construction beyond a small per-call
+  snapshot.
 
-**Currently observational.** `Quorum::get()` is used today for
-external visibility (`load_cluster`'s `majority` column, `maj_lag`
-metric) and as the aggregation primitive for future quorum-gated
-leader commit work. The leader's own `last_commit_id` still advances
-independently from its own WAL stage, as in single-node mode; the
-Cluster layer is a fan-out replicator plus a watermark aggregator.
-Gating leader commit on `quorum.get()` is straightforward once the
-surrounding protocol work (ADR-016) lands.
+**Uses today.** The majority watermark serves two purposes:
+
+- **Client wait level.** `submit_and_wait` exposes a cluster-commit
+  wait option that blocks the caller until the transaction's id is at
+  or below the current quorum watermark. Clients that need
+  cluster-level durability opt in here; clients that only need local
+  commit do not pay for it.
+- **Observability.** Tests, the cluster load generator, and monitoring
+  tooling read the same watermark to report replication lag.
+
+The leader still advances its own commit watermark from its local WAL
+stage, independent of quorum. Making that advancement itself
+quorum-gated (so even non-waiting clients implicitly get cluster-level
+durability) is the remaining ADR-016 work.
 
 ---
 
@@ -473,8 +510,10 @@ pass-through that duplicated state already owned by `Leader`.
 - Read-from-follower semantics (the follower's read RPCs are exposed
   today purely as a side-effect of running the Ledger gRPC service in
   read-only mode; formal semantics → ADR-016)
-- Quorum-gated leader commit (aggregation in `Quorum` is implemented;
-  the commit-advance hook on the leader's WAL stage is not)
+- Quorum-gated *leader commit*. Clients can already wait on
+  cluster-commit via the submit wait level, but the leader's own
+  advertised commit watermark still tracks its local WAL, not quorum.
+  Making the leader's watermark itself quorum-gated is deferred.
 - `FetchSegment` RPC and historical backfill (designed, not implemented)
 
 ---

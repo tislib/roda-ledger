@@ -538,7 +538,8 @@ impl LedgerHandler {
                 proto::WaitLevel::Snapshot => self.ledger.last_snapshot_id() >= transaction_id,
                 proto::WaitLevel::ClusterCommit => {
                     if let Some(ref quorum) = self.quorum {
-                        quorum.get() <= transaction_id
+                        self.ledger.last_snapshot_id() >= transaction_id
+                            && quorum.get() >= transaction_id
                     } else {
                         return Err(std::io::Error::other("no quorum"));
                     }
