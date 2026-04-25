@@ -71,13 +71,11 @@ WAL/transaction representation never require variable-length parameter blocks.
 
 ### §1.6 WAL record format invariants
 
-Every WAL record is exactly 40 bytes; the size is enforced by compile-time
-`const _: () = assert!(size_of::<...>() == 40)` for every record type. The
-first byte of every record is its `entry_type` discriminant, which makes the
-WAL stream `[record][record][record]…` self-describing without a separate
-length-prefix or framing layer. All record `#[repr(C)]` structs are laid out
-without implicit padding so they satisfy `bytemuck::Pod` for zero-copy
-serialization.
+Every WAL record is exactly 40 bytes — a hard invariant for every record
+type. The first byte of every record is its `entry_type` discriminant, which
+makes the WAL stream `[record][record][record]…` self-describing without a
+separate length-prefix or framing layer. Records are laid out for zero-copy
+serialization: the bytes on the wire are the bytes in memory.
 
 ### §1.7 The six WAL record kinds
 
@@ -189,56 +187,44 @@ machine on disk and makes status a pure function of the pipeline.
 
 ### §2.3 Pipeline ownership and context slicing
 
-`Pipeline` is a singleton `Arc<Pipeline>` and is the sole owner of every
-inter-stage queue, every progress index, the shutdown flag, and the shared
-wait strategy. Stages never own this state directly — each receives a typed
-context wrapper (`SequencerContext`, `TransactorContext`, `WalContext`,
-`SnapshotContext`, `SealContext`, `LedgerContext`) that exposes only the
-slice that stage may legally read or publish. The contexts are thin Arc
-clones; the wrapping is purely for type-level encapsulation.
+The Pipeline is the sole owner of every inter-stage queue, every progress
+index, the shutdown flag, and the shared wait strategy. Stages never own
+this state directly — each receives a typed context that exposes only the
+slice it may legally read or publish. The wrapping is purely for type-level
+encapsulation; there is no runtime cost.
 
 ### §2.4 Inter-stage queues
 
-The three inter-stage channels are `crossbeam::ArrayQueue` instances —
-lock-free, fixed-capacity, single-producer / single-consumer:
+The three inter-stage channels are lock-free, fixed-capacity,
+single-producer / single-consumer queues:
 
-- `sequencer → transactor`: `TransactionInput`.
-- `transactor → wal`: `WalEntry`.
-- `wal → snapshot`: `SnapshotMessage`.
+- `sequencer → transactor`
+- `transactor → wal`
+- `wal → snapshot`
 
-Capacity is fixed at construction from `queue_size` (§15.2). A full queue is
-the only backpressure signal; producers spin/yield until space exists. There
-is no other flow-control mechanism.
+Capacity is fixed at construction from `queue_size` (§15.2). A full queue
+is the only backpressure signal; producers spin/yield until space exists.
+There is no other flow-control mechanism.
 
 ### §2.5 Global progress indexes
 
-The pipeline holds five `CachePadded` atomic indexes plus one shutdown flag:
+The pipeline holds five monotonic atomic counters and one shutdown flag:
 
-- `sequencer_index: AtomicU64` — next `tx_id` to be handed out.
-- `compute_index: AtomicU64` — last `tx_id` executed by the Transactor.
-- `commit_index: AtomicU64` — last `tx_id` durably written by the WAL.
-- `snapshot_index: AtomicU64` — last `tx_id` reflected in the Snapshotter.
-- `seal_index: AtomicU32` — last segment id sealed.
-- `running: AtomicBool` — global shutdown flag.
+- `sequencer_index` — next `tx_id` to be handed out.
+- `compute_index` — last `tx_id` executed by the Transactor.
+- `commit_index` — last `tx_id` durably written by the WAL.
+- `snapshot_index` — last `tx_id` reflected in the Snapshotter.
+- `seal_index` — last segment id sealed.
+- `running` — global shutdown flag.
 
-`CachePadded` is non-negotiable: progress updates from one stage must not
-invalidate the cache line of an adjacent index. All indexes are monotonic —
-they only ever move forward. The mapping `commit_index ≥ N` ⇒ every
-transaction `≤ N` is committed (no committed gaps) is what makes per-call
-wait levels (§14) meaningful. Memory ordering is `Release` on publication,
-`Acquire` on observation; `running` uses `Relaxed` because shutdown
-propagation is eventual.
+The indexes are padded to separate cache lines so that a publication on one
+does not invalidate the cache line of an adjacent index. They are
+strictly monotonic and never go backwards. The mapping
+`commit_index ≥ N` ⇒ every transaction `≤ N` is committed (no committed
+gaps) is what makes per-call wait levels (§14) meaningful: a single
+threshold check on a single counter resolves any wait.
 
-### §2.6 Index initialisation
-
-`sequencer_index` initialises to `1` (not `0`); `last_sequenced_id` is
-therefore `sequencer_index − 1`. All other indexes initialise to `0`. The
-pre-increment avoids any collision with the sentinel value `0` and means a
-freshly constructed pipeline that has assigned no IDs reports
-`last_sequenced_id == 0`. On startup `sequencer_index` is restored to
-`last_committed_tx_id + 1` (§16.2), preserving the same invariant.
-
-### §2.7 Backpressure and shutdown
+### §2.6 Backpressure and shutdown
 
 Backpressure is implicit and propagates through queue saturation alone: a
 slow Snapshotter fills the wal→snapshot queue, which stalls the WAL, which
@@ -246,8 +232,8 @@ fills the transactor→wal queue, which stalls the Transactor, which fills the
 sequencer→transactor queue, which stalls `submit()`. There is no rate
 limiter, leaky bucket, or admission control. Shutdown is the inverse signal:
 `Pipeline::shutdown()` clears `running`; every stage's idle loop checks the
-flag and exits. The shutdown read is `Relaxed` because eventual visibility
-is sufficient — the queues drain to a safe state regardless of the precise
+flag and exits. The shutdown signal does not need to be observed
+immediately — the queues drain to a safe state regardless of the precise
 moment a stage notices.
 
 ---
@@ -264,7 +250,7 @@ latency.
 
 ### §3.2 ID assignment
 
-ID assignment is a single `fetch_add(count, Acquire)` on `sequencer_index`.
+ID assignment is a single atomic increment of `sequencer_index`.
 `submit(operation)` reserves one ID and stamps the resulting `Transaction`.
 `submit_batch(operations)` reserves a contiguous run of `len(operations)`
 IDs in one atomic step; per-operation IDs inside the batch are
@@ -281,12 +267,11 @@ there are no holes to fill or gaps to wait on.
 
 ### §3.4 Backpressure spin/yield policy
 
-When the sequencer→transactor queue is full, the submitter spin-loops on
-`crossbeam_queue::ArrayQueue::push`, calling `std::hint::spin_loop()` on
-each retry and `std::thread::yield_now()` every 10 000 retries. There is no
-timeout — `submit` returns only after the operation is queued. The choice
-of *yield every 10 000* trades a small amount of pathological-case CPU for
-the latency of being first in line when space appears.
+When the sequencer→transactor queue is full, the submitter spins, yielding
+the thread periodically while the spin persists. There is no timeout —
+`submit` returns only after the operation is queued. Spinning (rather than
+parking) is preferred here because submit-side latency is the primary
+concern: a parked thread misses the moment space appears.
 
 ---
 
@@ -304,27 +289,25 @@ write throughput. [ADR-0001]
 
 ### §4.2 Thread-local state
 
-`TransactorState` holds the balance vector, the per-step entries buffer,
-the `position` marker, the current `tx_id`, and the current `fail_reason`.
-It lives in `Rc<RefCell<...>>` and never crosses a thread boundary —
-neither does anything that holds it (notably the `WasmRuntimeEngine`, which
-is `!Send`). All host-call implementations borrow `RefCell` mutably, but
-because the Transactor thread is the only thread that touches the state,
-there is no contention and `RefCell`'s runtime check costs only a single
-flag bit per borrow.
+The Transactor's working state — balance cache, per-step entries buffer,
+position marker, current `tx_id`, current `fail_reason` — lives entirely
+on the Transactor thread and never crosses a thread boundary. The WASM
+runtime instance bound to a Transactor inherits this constraint. Single
+ownership means no locks are needed on the hot path; host calls (§6.7)
+mutate the same state through interior mutability with no contention.
 
 ### §4.3 Balance cache layout
 
-The Transactor's balance cache is a `Vec<Balance>` indexed directly by
-`account_id`. Lookups and updates are O(1) array accesses with no hashing.
-The vector is pre-allocated to `max_accounts` at construction and never
-resized. [ADR-0002]
+The Transactor's balance cache is a flat array indexed directly by
+`account_id`. Lookups and updates are O(1) array accesses with no hashing,
+no probing, no resizing. The array is pre-allocated to `max_accounts` at
+construction and never grows. [ADR-0002]
 
 ### §4.4 The `max_accounts` ceiling
 
 Any operation referencing an `account_id ≥ max_accounts` is rejected with
 `ACCOUNT_LIMIT_EXCEEDED` (§1.12) before the operation can mutate any state.
-This is the price of the direct-indexed `Vec<Balance>` layout (§4.3) — the
+This is the price of the direct-indexed array layout (§4.3) — the
 account-ID space must be sized at startup. Resizing would require pausing
 the Transactor and reallocating every read-side cache (§8.3), which is not
 worth the complexity given how rarely a deployed ledger needs to grow its
@@ -341,20 +324,19 @@ same guarantee.
 
 ### §4.6 Per-step entries buffer
 
-`TransactorState` carries a `Vec<WalEntry>` that accumulates every record
-produced during a step (a step may execute many transactions in sequence).
-The buffer is flushed as a single batch onto the transactor→wal queue.
-Batching here amortises the cost of queue contention and gives the WAL
-stage a contiguous slice to write into its in-memory buffer.
+The Transactor accumulates every WAL record it produces during a step (a
+step may execute many transactions in sequence) into a buffer, then flushes
+the buffer as a single batch onto the transactor→wal queue. Batching
+amortises the cost of queue handoff and gives the WAL stage a contiguous
+slice to write.
 
 ### §4.7 The `position` marker
 
-While accumulating entries, the Transactor maintains a `position: usize`
-pointer into the entries buffer marking the start of the *current*
-transaction's records. `verify` (§4.11), `rollback` (§4.12), and CRC
-computation (§4.10) all scope their iteration to `entries[position..]`
-without searching. Incrementing `position` after a transaction completes
-is what advances the per-step cursor.
+While accumulating entries, the Transactor tracks the start of the
+*current* transaction's records in the buffer. Verify (§4.11), rollback
+(§4.12), and CRC computation (§4.10) all scope their work to that
+transaction's records only — they never re-walk earlier transactions in
+the same batch.
 
 ### §4.8 Built-in operation semantics
 
@@ -445,16 +427,15 @@ to advance past their `tx_id` or use `submit_wait(snapshot)`.
 
 ### §4.16 `tx_id` is on state, not on the host call
 
-The current `tx_id` is set on `TransactorState` at the start of each
-transaction and read by host calls (§6.7) via the shared
-`Rc<RefCell<TransactorState>>`. It is never passed across the WASM
-host-call boundary as a parameter. This avoids both the cost of an
-extra wasmtime call argument and the risk of a function caching or
-forging a stale `tx_id`.
+The current `tx_id` is set on the Transactor's thread-local state at
+the start of each transaction; host calls (§6.7) read it from there.
+It is never passed across the WASM host-call boundary as a parameter.
+This avoids the cost of an extra call argument and removes the risk of
+a function caching or forging a stale `tx_id`.
 
 ### §4.17 Rejection registry
 
-Rejected transactions are recorded in `Arc<SkipMap<u64, FailReason>>`,
+Rejected transactions are recorded in a concurrent map keyed by `tx_id`,
 shared with the Ledger so that status queries can resolve `Error(reason)`
 for any failed `tx_id` (§2.2). The map is sparse — successes are not
 recorded — because in steady state the overwhelming majority of
@@ -473,9 +454,9 @@ system-wide. The only opt-out is per-transaction (§5.4).
 
 The active window size equals `transaction_count_per_segment` — the same
 number that drives WAL segment rotation (§7.6). The dedup cache is two
-`FxHashMap<user_ref, tx_id>` maps, `active` and `previous`. When `tx_id`
-crosses the segment boundary, the maps flip: `active` becomes `previous`,
-the previous map's allocation is reused as the new (cleared) `active`.
+`user_ref → tx_id` hash maps, *active* and *previous*. When `tx_id`
+crosses the segment boundary, the maps flip: *active* becomes *previous*,
+the previous map's storage is reused as the new (cleared) *active*.
 Effective dedup coverage is therefore `N..2N` transactions — at least one
 full window, at most two.
 
@@ -502,13 +483,12 @@ retry, not just a "rejected" status. [ADR-0009]
 
 ### §5.6 Recovery seeding
 
-On startup, `DedupCache::recover_entry(user_ref, tx_id, last_tx_id)` is
-called for each WAL transaction inside the active window (§12.3). Entries
-outside `2 × window` are dropped; entries within the window are placed
-into the correct half (`active` vs `previous`) based on their relative
-position. Post-recovery dedup behaviour is therefore identical to
-pre-crash — a duplicate submitted before and after a restart is rejected
-the same way.
+On startup, the dedup cache is seeded by walking each WAL transaction
+inside the active window (§12.3). Entries outside `2 × window` are
+dropped; entries within the window are placed into the correct half
+(*active* vs *previous*) based on their relative position. Post-recovery
+dedup behaviour is therefore identical to pre-crash — a duplicate
+submitted before and after a restart is rejected the same way.
 
 ---
 
@@ -535,33 +515,32 @@ snapshotting, and replay treat function-produced entries identically to
 native ones. There is no second persistence path, no second recovery
 path, no second wait-level mechanism.
 
-### §6.3 One Engine, one Linker per ledger
+### §6.3 One engine, one linker per ledger
 
-There is one `wasmtime::Engine` and one `Linker<WasmStoreData>` per
-ledger, both held behind `Arc<WasmRuntime>` and cheap to clone. The
-Linker carries the host imports (§6.7); the Engine compiles and caches
-modules. Constructing either is expensive and is therefore done exactly
-once.
+There is one wasmtime engine and one host-import linker per ledger,
+shared across every Transactor. The linker carries the host imports
+(§6.7); the engine compiles and caches modules. Constructing either is
+expensive, so a ledger does it once.
 
 ### §6.4 Shared registry
 
-The shared registry is a small `RwLock<HashMap<name, Registered{version,
-crc32c, Arc<Module>}>>`. It is touched only on register, unregister, and
-cache miss / revalidation — never on every transaction. The hot path
-(§6.5) avoids the lock entirely.
+The shared registry maps `name → (version, crc32c, compiled module)`. It
+is protected by a reader-writer lock and is touched only on register,
+unregister, and cache miss / revalidation — never on every transaction.
+The hot path (§6.5) avoids the lock entirely.
 
 ### §6.5 Per-Transactor caller cache
 
-Each Transactor holds a thread-local `HashMap<name, CachedHandler>`
-where `CachedHandler` carries the compiled `TypedFunc` plus the
-`update_seq` of the registry it was verified against. Resolution is:
+Each Transactor holds its own local cache of `name → compiled handler`,
+tagged with a sequence number that records the registry version the
+entry was verified against. Resolution is:
 
 1. Look up `name` in the local cache.
-2. If the cached `update_seq` matches the registry's current value,
-   the cached `TypedFunc` is used directly with no lock.
-3. Otherwise, take the registry read lock, fetch the current
-   `(version, crc32c, Module)`, instantiate, install into the cache,
-   stamp the entry with the new `update_seq`.
+2. If the cached sequence matches the registry's current value, use the
+   cached handler directly with no lock.
+3. Otherwise, take the registry read lock, fetch the current entry,
+   instantiate, install into the local cache, stamp the entry with the
+   new sequence.
 
 Cache invalidation is per-name: registering or unregistering `foo` does
 not evict the cached entry for `bar`.
@@ -582,10 +561,10 @@ The host module is `"ledger"` and exports exactly three imports:
 - `ledger.debit(account_id: i64, amount: i64) → ()`
 - `ledger.get_balance(account_id: i64) → i64`
 
-Each call borrows `Rc<RefCell<TransactorState>>` and either appends a
-`TxEntry` to the per-step buffer (`credit`/`debit`) or reads from the
-balance cache (`get_balance`). The `tx_id` is pulled from the state
-(§4.16), not the call. [ADR-0014]
+Each call mutates the Transactor's thread-local state (§4.2): `credit`
+and `debit` append a `TxEntry` to the per-step buffer; `get_balance`
+reads the live balance cache. The current `tx_id` is pulled from the
+state (§4.16), not passed through the call. [ADR-0014]
 
 ### §6.8 Determinism rule
 
@@ -608,13 +587,14 @@ enables the future cluster (Stage 3).
 
 ### §6.10 Atomicity of function execution
 
-Host-call effects accumulate in an isolated host-side execution context
-inside `TransactorState`. Nothing is applied to the live balance cache
-until *all* of the following hold: `execute` returned `0`, the captured
-credits and debits balance (§4.11), and no wasmtime-layer error
-occurred. If any of those fail, the entire batch of host calls is
-discarded — exactly as a built-in operation rollback (§4.12). The WAL
-queue therefore never sees a partial function execution.
+Host-call effects accumulate in an isolated execution context on the
+Transactor side, not in WASM-visible globals. Nothing is applied to the
+live balance cache until *all* of the following hold: `execute` returned
+`0`, the captured credits and debits balance (§4.11), and no
+wasmtime-layer error occurred. If any of those fail, the entire batch
+of host calls is discarded — the same rollback machinery as a built-in
+operation (§4.12). The WAL queue therefore never sees a partial function
+execution.
 
 ### §6.11 Wasmtime-layer failure mapping
 
@@ -668,7 +648,7 @@ identifies the executing binary in every transaction. [ADR-0014]
 `RegisterFunction` only returns after all four of the following have
 happened: the binary has been validated, written atomically to disk, a
 `FunctionRegistered` WAL record has been committed, and the compiled
-handler has been installed in the live `WasmRuntime`. A subsequent
+handler has been installed in the live WASM runtime. A subsequent
 `Operation::Function` is therefore guaranteed to see the new version.
 After a crash, recovery rebuilds the registry from a paired function
 snapshot plus the `FunctionRegistered` records that follow it (§12.4) —
@@ -686,10 +666,10 @@ authoritative; the on-disk file is a secondary signal. [ADR-0014]
 
 `FunctionRegistered` records flow through the WAL like any other record
 (§7.4). The Snapshotter (§8.7) is the stage that actually loads or
-unloads the compiled handler into the shared `WasmRuntime` — calling
-`storage.read_function(name, version)` to fetch the binary on a load,
-`unload_function(name)` on an unregister. This is what keeps the live
-runtime synchronised with the WAL on every node, leader or follower.
+unloads the compiled handler in the shared WASM runtime: it reads the
+binary off disk on a load, and unloads on an unregister. This is what
+keeps the live runtime synchronised with the WAL on every node, leader
+or follower.
 
 ---
 
@@ -706,123 +686,104 @@ hot path is dominated by `fdatasync` latency (~hundreds of µs on NVMe);
 isolating it from record writes is what lets the WAL keep up with the
 Transactor. [ADR-0011]
 
-### §7.2 Atomics and shared state
+### §7.2 Coordination between Writer and Committer
 
-The two threads coordinate through three shared values:
+The two threads share two counters and one segment handle:
 
-- `last_written_tx_id: Arc<AtomicU64>` — the highest `tx_id` whose record
-  has been written to the active segment file (Writer publishes with
-  Release; Committer reads with Acquire).
-- `last_committed_tx_id: Arc<AtomicU64>` — the highest `tx_id` whose
-  record has been `fdatasync`'d (Committer publishes with Release; Writer
-  reads with Acquire). This is what `commit_index` exposes to the rest
-  of the pipeline (§2.5) and what the `wal` wait level gates on (§14.1).
-- `active_segment_sync: Arc<ArcSwap<Option<Syncer>>>` — a hot-swappable
-  handle to the active segment's syncer. The Writer publishes a fresh
-  `Syncer` on every rotation (§7.6); the Committer picks up the new
-  handle on its next iteration.
+- *last-written* — the highest `tx_id` whose record has been written
+  (but not necessarily synced) to the active segment file. The Writer
+  publishes; the Committer observes.
+- *last-committed* — the highest `tx_id` whose record has been
+  `fdatasync`'d. The Committer publishes; the Writer observes. This is
+  what `commit_index` exposes to the rest of the pipeline (§2.5) and
+  what the `wal` wait level (§14.1) gates on.
+- The active segment's sync handle, swappable across rotations (§7.6)
+  so the Committer always syncs the segment that is currently open.
 
 There is no other coordination — no condvars, no channels.
 
 ### §7.3 Writer buffer
 
-The Writer owns a `VecDeque<WalEntry>` sized to `input_capacity * 16`. It
-serves two purposes: it is the read-ahead window for entries that have
-been written to disk but not yet forwarded to the Snapshotter, and it
-gives the Writer a place to look ahead by an entire transaction without
-blocking the inbound queue. The buffer is never resized after
-construction; if it would overflow, the Writer simply slows its
-intake — the inbound queue then back-pressures the Transactor (§2.7).
+The Writer holds a bounded queue of WAL records that have been written
+to the segment file but not yet forwarded to the Snapshotter. The
+buffer is sized so the Writer can stay ahead of the Committer while it
+syncs, and is sized in advance — never resized — so the WAL stage's
+memory footprint is fixed.
 
 ### §7.4 Writer per-iteration loop
 
-Each iteration the Writer does the following, in order:
+On each iteration the Writer does the following, in order:
 
-1. Pop up to `min(inbound.len(), buffer_remaining_capacity)` entries from
-   the transactor→wal queue. Each popped entry is appended to the active
-   segment's pending write buffer (`append_pending_entry`) and pushed to
-   the back of the local `VecDeque`. As entries are popped, the
-   `pending_records` counter (§7.5) is updated.
-2. If any entries were popped this iteration, flush the segment's pending
-   write buffer (`write_pending_entries`) and publish
-   `last_written_tx_id` with Release.
-3. If the transaction-count threshold is met, rotate the segment (§7.6).
-4. Drain the local `VecDeque` to the Snapshotter — but only entries whose
-   `tx_id ≤ last_committed_tx_id` (Acquire). Entries whose `tx_id` is
-   still pending an `fdatasync` are pushed back to the front of the
-   buffer and the drain stops; they will be retried on the next
-   iteration after the Committer advances. As each entry is forwarded,
-   the pipeline's `commit_index` (§2.5) is advanced via
-   `ctx.set_processed_index(tx_id)`.
+1. Pop entries from the transactor→wal queue, append each to the active
+   segment's pending-write buffer, and push it onto the local buffer.
+   While popping, the per-record bookkeeping (§7.5) tracks which
+   transactions are now complete.
+2. Flush the segment's pending-write buffer (one syscall per
+   iteration, not per record) and publish *last-written*.
+3. If the transaction-count threshold is met, rotate the segment
+   (§7.6).
+4. Drain the local buffer toward the Snapshotter, but only entries
+   whose `tx_id ≤ last-committed`. Entries whose transaction is still
+   pending an `fdatasync` are left in the buffer and retried next
+   iteration. As each entry is forwarded, `commit_index` (§2.5)
+   advances.
 
-### §7.5 Forwarding rule and `pending_records`
+### §7.5 Forwarding rule and per-record bookkeeping
 
-Entries flow from the WAL to the Snapshotter only after they are durable.
-This is the *durability rule*: the Snapshotter — and therefore
-`get_balance`, queries, and the snapshot wait level — never sees a
-transaction that is not yet on disk. The Writer enforces this in step 4
-of §7.4 by gating the drain on `last_committed_tx_id`. The
-`pending_records: u8` counter on the Writer tracks how many records of
-the current transaction (from `TxMetadata.entry_count + link_count`) are
-still expected from the inbound queue; it is decremented as `TxEntry`
-and `TxLink` records arrive and is what allows the Writer to detect end
-of transaction without parsing semantics. The Writer keeps consuming the
-inbound queue while `pending_records > 0` even if there is no more
-buffer space — a partial transaction would otherwise leak into the wrong
-segment.
+Entries flow from the WAL to the Snapshotter only *after* they are
+durable. This is the **durability rule**: the Snapshotter — and
+therefore `get_balance`, queries, and the snapshot wait level — never
+sees a transaction that is not yet on disk. Step 4 of §7.4 enforces
+this by gating the drain on *last-committed*. The Writer also tracks
+how many records of the current transaction it still expects (from
+`TxMetadata.entry_count + link_count`) and keeps consuming the inbound
+queue until that count reaches zero, even if buffer space is tight —
+a partial transaction must never leak across a segment boundary.
 
 ### §7.6 Segment rotation
 
-The Writer rotates segments on a transaction-count threshold:
-when `last_received_tx_id - segment_start_tx_id ≥
-transaction_count_per_segment`. This is the same boundary that drives
+The Writer rotates segments on a transaction-count threshold: when the
+number of transactions in the active segment reaches
+`transaction_count_per_segment`. This is the same boundary that drives
 dedup window flips (§5.2) and hot-index sizing (§9.6). Rotation appends
-a `SegmentSealed` record (`segment_id`, `last_tx_id`, `record_count`),
-performs a *synchronous* `fdatasync` (`commit_sync` — the Writer cannot
-defer this one to the Committer because the next step closes the file),
-closes the segment, opens the next one, writes a fresh `SegmentHeader`
-record, and publishes the new `Syncer` into `active_segment_sync` so
-the Committer picks it up. Rotation is a transient cost: the rest of
-the pipeline is paused only for the synchronous sync and the
-`open + header` of the next file. [ADR-0013]
+a `SegmentSealed` record, performs a *synchronous* `fdatasync` (the
+Writer cannot defer this one to the Committer because the next step
+closes the file), closes the segment, opens the next one, writes a
+fresh `SegmentHeader` record, and hands the new sync handle to the
+Committer. Rotation is a transient cost: the pipeline pauses only for
+the synchronous sync and the open of the next file. [ADR-0013]
 
 ### §7.7 Committer loop
 
-The Committer runs a tight loop driven by the shared `WaitStrategy`
+The Committer runs a tight loop driven by the shared wait strategy
 (§13.2). On each iteration:
 
-1. If `last_written_tx_id ≤ last_committed_tx_id`, there is nothing to
-   sync; back off via the wait strategy and continue.
-2. Load `active_segment_sync` via `ArcSwap::load`. If the syncer's id
-   has changed since the previous iteration (i.e. the Writer rotated),
-   clone it into the local handle.
-3. Sample `last_written_tx_id`, call `syncer.sync()` (which is the
-   actual `fdatasync`), publish that sample to `last_committed_tx_id`
-   with Release.
+1. If *last-written* has not advanced past *last-committed*, there is
+   nothing to sync; back off and continue.
+2. Pick up a new sync handle from the Writer if rotation has happened.
+3. Sample *last-written*, call `fdatasync`, publish that sample as
+   *last-committed*.
 
-The Committer never parses entries, never touches the buffer, never
-inspects the queue. Its single responsibility is moving
-`last_committed_tx_id` forward as fast as the storage allows.
+The Committer never parses entries, never touches the Writer's buffer,
+never inspects any queue. Its single responsibility is moving
+*last-committed* forward as fast as the storage allows.
 
 ### §7.8 Backpressure on the outbound queue
 
-The Writer's drain to the Snapshotter (`push_outbound`) yields when the
-wal→snapshot queue is full and re-checks `running` on each yield so a
-shutdown is observed promptly. A persistently slow Snapshotter therefore
-fills the wal→snapshot queue, which in turn slows the drain, which fills
-the local `VecDeque`, which throttles intake from the inbound queue,
-which back-pressures the Transactor (§2.7). The same mechanism that
-gives the WAL its throughput is the one that protects it from a slow
-reader.
+A persistently slow Snapshotter fills the wal→snapshot queue, which
+slows the Writer's drain (§7.4 step 4), which fills the Writer's local
+buffer, which throttles intake from the inbound queue, which
+back-pressures the Transactor (§2.6). The same mechanism that gives the
+WAL its throughput is the one that protects it from a slow reader.
 
 ### §7.9 Failure handling
 
-`syncer.sync()` and `write_all` are `expect`'d — a sync or write
-failure is a hard panic. There is no retry loop on durability failures;
-returning an `Err` to a submitter that has already been told its
-transaction was committed would be a worse violation of the contract
-than a process exit. Recovery (§12) is responsible for putting the WAL
-back into a consistent state on restart.
+A failed write or `fdatasync` is a hard panic. There is no retry loop
+on durability failures: returning an error to a submitter that has
+already been told its transaction was committed would be a worse
+violation of the contract than a process exit. Recovery (§12) is
+responsible for putting the WAL back into a consistent state on
+restart.
 
 ---
 
@@ -847,10 +808,9 @@ threads.
 
 ### §8.3 Read-side balance cache
 
-The read-side cache is `Arc<Vec<AtomicI64>>`, sized to `max_accounts`. The
-Snapshotter publishes balance updates with `Release`; readers
-(`get_balance`) load with `Acquire`. Multiple concurrent readers can call
-`get_balance` without locks. The vector is pre-allocated at startup and
+The read-side cache is a flat array of atomic balances, sized to
+`max_accounts`. The Snapshotter writes; many readers can load
+concurrently without locks. The array is pre-allocated at startup and
 never resized. [ADR-0002]
 
 ### §8.4 SnapshotMessage and the single FIFO
@@ -866,29 +826,25 @@ query enqueued after a write is enqueued *after* the write's entries
 and is therefore guaranteed to see them applied. There is no second
 queue, no priority lane, no out-of-band query path.
 
-### §8.5 Apply algorithm and `last_processed_tx_id`
+### §8.5 Apply algorithm
 
-Per `Entry(WalEntry)`, the Snapshotter dispatches by record kind:
+For each WAL entry the Snapshotter dispatches by record kind:
 
-- `Metadata(m)` — call `indexer.insert_tx(m.tx_id, m.entry_count)`,
-  set `pending_records = m.entry_count + m.link_count`,
-  set `last_processed_tx_id = m.tx_id`.
-- `Entry(e)` — call
-  `indexer.insert_entry(tx_id, account_id, amount, kind, computed_balance)`
-  to update circle2 and the per-account chain (§9.4); store
-  `e.computed_balance` into `balances[e.account_id]` with Release;
-  decrement `pending_records`.
-- `Link(l)` — call
-  `indexer.insert_link(last_processed_tx_id, l.kind, l.to_tx_id)`;
-  decrement `pending_records`.
-- `SegmentHeader` / `SegmentSealed` — ignored by the Snapshotter.
-- `FunctionRegistered(f)` — handled per §8.7.
+- `TxMetadata` — register the transaction in the hot index, remember
+  how many records are still expected (`entry_count + link_count`),
+  remember the current `tx_id`.
+- `TxEntry` — write the entry into the hot index (updating circle2 and
+  the per-account chain — §9.4) and publish the carried
+  `computed_balance` to the read-side balance cache.
+- `TxLink` — record the link against the current `tx_id` in the hot
+  index.
+- `SegmentHeader` / `SegmentSealed` — ignored.
+- `FunctionRegistered` — handled per §8.7.
 
-Once `pending_records == 0` for the current transaction, the
-Snapshotter publishes `last_processed_tx_id` to `snapshot_index` via
-`ctx.set_processed_index(...)`. This is the only point at which the
-pipeline's read-side index advances — readers therefore never observe a
-partially-applied transaction.
+Once every record of a transaction has been applied, the Snapshotter
+publishes that `tx_id` as the new `snapshot_index` (§2.5). This is the
+*only* point at which the pipeline's read-side index advances — readers
+therefore never observe a partially-applied transaction.
 
 ### §8.6 `last_tx_id` as the freshness signal
 
@@ -902,17 +858,15 @@ caller waits for `last_tx_id` to pass their `tx_id`, or uses
 
 ### §8.7 FunctionRegistered handling
 
-`FunctionRegistered` records do not participate in `pending_records` and
-do not advance `snapshot_index`. On a register record, the Snapshotter
-calls `storage.read_function(name, version)` to read the binary off
-disk, then `wasm_runtime.load_function(name, &binary, version, crc32c)`
-to install it in the shared registry (§6.4). On an unregister record
-(`crc32c == 0`, §1.11), the Snapshotter calls
-`wasm_runtime.unload_function(name)`. Errors at either step are logged;
-they do not stop the apply loop. The Snapshotter is therefore the
-*only* stage that mutates the live runtime registry once the system is
-running — the Transactor reads through the per-Transactor caller cache
-(§6.5).
+`FunctionRegistered` records are not financial transactions and do not
+advance `snapshot_index`. On a register record, the Snapshotter reads
+the binary off disk and installs it in the shared WASM registry
+(§6.4). On an unregister record (`crc32c == 0`, §1.11), the Snapshotter
+unloads the function from the registry. Errors at either step are
+logged; they do not stop the apply loop. The Snapshotter is therefore
+the *only* stage that mutates the live runtime registry while the
+system is running — the Transactor reads through its per-Transactor
+caller cache (§6.5), which revalidates lazily on miss.
 
 ### §8.8 Snapshotter is the bottleneck for queries
 
@@ -930,91 +884,90 @@ thread.
 
 ### §9.1 Three buffers, all pre-allocated
 
-The hot transaction index is a single struct `TransactionIndexer` owning
-three pre-allocated buffers, sized at construction and never resized:
+The hot transaction index is a single in-memory structure with three
+pre-allocated buffers, sized at construction and never resized:
 
-- `circle1: Vec<TxSlot>` — per-`tx_id` entry-list pointer.
-- `circle2: Vec<IndexedTxEntry>` — entry storage with per-account chain
-  links.
-- `account_heads: Vec<(u64, u32)>` — per-account latest-entry pointer.
+- **circle1** — for each `tx_id`, a pointer to that transaction's
+  entries in circle2.
+- **circle2** — entry storage with per-account chain links.
+- **account_heads** — for each account, a pointer to that account's
+  latest entry in circle2.
 
-A separate `links: HashMap<u64, Vec<IndexedTxLink>>` holds link records
-keyed by `tx_id`. Links are sparse — most transactions have none — so a
-`HashMap` is an acceptable concession to non-pre-allocated storage. The
-three array sizes must all be powers of two; this is asserted at
-construction. [ADR-0008]
+A separate map keyed by `tx_id` holds link records (sparse — most
+transactions have none — so a hash map is acceptable here). All three
+array sizes must be powers of two. [ADR-0008]
 
 ### §9.2 Why power-of-two
 
-All three lookups reduce `id & mask` to find a slot, where
-`mask = size - 1`. The power-of-two requirement makes the lookup a
-single bitwise AND with no division. The cost is at most ~2× memory in
-the pathological case where the desired size is just over a power of
-two; the alternative (modulo) costs an integer division on every query,
-which is far more expensive at ledger throughput.
+All three lookups reduce to "id AND mask" to find a slot, where mask is
+`size − 1`. The power-of-two requirement turns the lookup into a single
+bitwise operation. The cost is at most ~2× memory in the worst case
+(desired size just above a power of two); the alternative (modulo)
+costs a division on every query, which is far more expensive at ledger
+throughput.
 
-### §9.3 `circle1` — direct-mapped tx slot table
+### §9.3 circle1 — direct-mapped tx slot table
 
-`TxSlot` is 16 bytes: `(tx_id: u64, offset: u32, entry_count: u8)`. The
-slot index is `(tx_id as usize) & circle1_mask`. A slot with
-`tx_id == 0` is empty. A slot whose stored `tx_id` does not match the
-queried `tx_id` is *evicted* — overwritten by a colliding tx that
-mapped to the same slot. Eviction is silent: the slot simply now belongs
-to a newer transaction. There is no eviction queue, no cleanup pass.
-Lookups detect eviction by comparing the slot's `tx_id` to the queried
-one and falling back to disk on mismatch (§10.2).
+Each circle1 slot stores a `tx_id`, an offset into circle2, and the
+entry count for that transaction. The slot index for a transaction is
+its `tx_id` masked by the circle1 size. A slot whose stored `tx_id`
+does not match the queried `tx_id` is **evicted** — overwritten by a
+colliding transaction that mapped to the same slot. Eviction is silent:
+the slot simply now belongs to a newer transaction. There is no
+eviction queue, no cleanup pass. Lookups detect eviction by comparing
+the slot's `tx_id` to the queried one and falling back to disk on
+mismatch (§10.2).
 
-### §9.4 `circle2` — entry storage and per-account chains
+### §9.4 circle2 — entry storage and per-account chains
 
-`IndexedTxEntry` is 48 bytes: `tx_id`, `account_id`, `amount`, `kind`,
-`computed_balance`, plus a `prev_link: u32`. `circle2` is written
-sequentially via a `write_head2` counter that advances monotonically and
-wraps via `& circle2_mask` on each access. On `insert_entry`, the
-indexer reads `account_heads[account_id & mask]`; if the stored
-account_id matches, the entry's `prev_link` is set to that head's
-`circle2_idx + 1` (1-based: `0` is the sentinel meaning "no previous"),
-otherwise `prev_link = 0`. Then the new entry is written at
-`circle2[write_head2 & mask]`, `account_heads` is updated to point at
-this slot, and `write_head2` is advanced. Account history walks
-(§10.3) follow `prev_link − 1` to step backwards in time until either
-the chain ends (`prev_link == 0`), an evicted slot is detected
-(`account_id` mismatch), the transaction predates `from_tx_id`, or
-`limit` entries have been collected.
+Each circle2 slot stores one `TxEntry`'s payload (`tx_id`, `account_id`,
+`amount`, `kind`, `computed_balance`) plus a *previous-link* — the
+circle2 index of the same account's previous entry, or zero if there
+is no previous. circle2 is written sequentially with a write head that
+advances on every insert and wraps modulo circle2's size. On insert,
+the indexer reads the account's head from `account_heads`; if the head
+is for the same account, the new entry's previous-link is set to it,
+otherwise the link is empty. Then the entry is written, `account_heads`
+is updated to point at the new slot, and the write head advances.
+Account history walks (§10.3) follow the previous-link chain backwards
+in time until the chain ends, an evicted slot is detected (account-id
+mismatch), the transaction predates the requested lower bound, or the
+caller's limit is reached.
 
-### §9.5 `account_heads` — direct-mapped account head table
+### §9.5 account_heads — direct-mapped account head table
 
-`account_heads[i] = (account_id, circle2_idx)`. The slot index is
-`(account_id as usize) & account_heads_mask`. The size is
-`next_power_of_two(max_accounts)`. The slot stores the *account_id* it
-belongs to so a colliding lookup can detect eviction the same way
-`circle1` does — a mismatch on `account_id` means the head was
-overwritten, the chain head is gone, and the caller must fall back to
-disk for any history older than the current chain. The sizing means in
-practice every account has its own slot; collisions only occur when the
-account-id space is sparser than `next_power_of_two(max_accounts)`.
+Each `account_heads` slot stores `(account_id, circle2_idx)`. The slot
+index is the account id masked by the account_heads size. The slot
+stores the account id it belongs to so a colliding lookup can detect
+eviction the same way circle1 does: a mismatch means the head was
+overwritten and the chain head is gone, and the caller must fall back
+to disk for any history older than the current chain. The size is
+`next_power_of_two(max_accounts)`, which means in practice every
+account has its own slot; collisions only occur if the account-id space
+is sparser than the table.
 
 ### §9.6 Sizing rule
 
-Sizes are derived from `transaction_count_per_segment`:
+The three sizes are derived from `transaction_count_per_segment` and
+`max_accounts`:
 
-- `circle1_size = next_power_of_two(transaction_count_per_segment)` —
-  one slot per transaction in the active window.
-- `circle2_size = next_power_of_two(2 × transaction_count_per_segment)` —
-  enough entry slots for the active window assuming an average of two
-  entries per transaction (transfers).
-- `account_heads_size = next_power_of_two(max_accounts)`.
+- circle1 — one slot per transaction in the active window, rounded up
+  to a power of two.
+- circle2 — enough entry slots for the active window assuming roughly
+  two entries per transaction (transfers), rounded up.
+- account_heads — one slot per account, rounded up.
 
 Changing the active window changes the hot indexes and the dedup window
 in lockstep; there are no separate knobs. [ADR-0013]
 
 ### §9.7 Recovery seeding
 
-The Snapshotter exposes recovery hooks (`recover_index_tx_metadata`,
-`recover_index_tx_entry`, `recover_index_tx_link`) so the recovery
-sequence (§12) can replay WAL records from the last snapshot through
-the active segment's tail directly into the indexer. By the time the
-Snapshotter thread starts, the indexer is already populated for
-everything that lives in the active window.
+The recovery sequence (§12) seeds the indexer directly: as it walks
+WAL records from the last snapshot through the active segment's tail,
+each metadata, entry, and link record is replayed into the indexer
+through the Snapshotter's recovery hooks. By the time the Snapshotter
+thread starts, the indexer is already populated for everything in the
+active window.
 
 ---
 
@@ -1028,11 +981,11 @@ Two query types reach the Snapshotter through the FIFO (§8.4):
   transaction.
 - `GetAccountHistory { account_id, from_tx_id, limit }` — return up to
   `limit` entries that touched `account_id`, newest first, stopping at
-  `from_tx_id` (exclusive lower bound; `0` disables the lower bound).
+  `from_tx_id` (exclusive lower bound; can be omitted).
 
 A third query type — `get_balance(account_id)` — is *not* routed
-through the Snapshotter. It is a direct atomic load against the
-read-side cache (§8.3) and never blocks.
+through the Snapshotter. It is a direct read against the read-side
+cache (§8.3) and never blocks.
 
 ### §10.2 `GetTransaction` resolution
 
@@ -1075,25 +1028,23 @@ and the caller reissues against the cold-tier API.
 
 ### §10.5 Synchronous response via callback
 
-`QueryRequest` carries a `respond: Box<dyn FnOnce(QueryResponse) +
-Send>` callback. The convention is: caller creates a per-request
-oneshot channel (`mpsc::sync_channel(1)`), wraps `tx.send` in a
-closure, enqueues the request, and blocks on `rx.recv()`. The
-Snapshotter computes the response inline (§8.8) and invokes the
-callback before continuing the apply loop. There is no separate response
-channel, no shared state for partial results, no async runtime.
+A query carries a one-shot callback. The convention is: caller creates
+a per-request channel, wraps the sender in a closure, enqueues the
+request, and blocks on the receiver. The Snapshotter computes the
+response inline (§8.8) and invokes the callback before continuing the
+apply loop. There is no separate response channel, no shared state for
+partial results, no async runtime.
 
 ### §10.6 Status and balance queries
 
 Two non-FIFO query paths exist:
 
-- `get_balance(account_id)` — a direct `Acquire` load on
-  `balances[account_id]`. Does not block, does not touch the
-  Snapshotter, returns whatever balance the read-side cache currently
-  holds along with `last_tx_id` (§8.6).
+- `get_balance(account_id)` — a direct atomic load on the read-side
+  balance cache. Does not block, does not touch the Snapshotter,
+  returns whatever balance the cache currently holds along with
+  `last_tx_id` (§8.6).
 - `get_transaction_status(tx_id)` — derived (§2.2) from the pipeline
-  indexes (`compute_index`, `commit_index`, `snapshot_index`) plus the
-  rejection registry (§4.17). Does not block.
+  indexes plus the rejection registry (§4.17). Does not block.
 
 Neither of these traverses the Snapshotter FIFO; both serve very high
 read volumes without contention.
@@ -1129,43 +1080,38 @@ interval.
 
 ### §11.3 Per-segment seal procedure
 
-For each segment whose status is not `SEALED`, Seal performs:
+For each closed-but-unsealed segment, Seal performs:
 
-1. `segment.load()` — open the closed segment.
-2. `segment.seal()` — compute the file-level CRC, write the `.crc` and
-   `.seal` sidecar files, mark the segment SEALED. Disk format details:
-   Stage 2.
-3. `segment.build_indexes()` — build the on-disk transaction index and
-   account index files for this segment. These are what cold-tier
-   queries (§10.4) walk when the hot index misses.
-4. Replay the segment's WAL records into the Seal runner's *own*
-   balance vector and *own* function map (§11.4) so the next snapshot
-   has accurate state.
-5. If `segment.id() % snapshot_frequency == 0`, write a balance
-   snapshot and a function snapshot for this segment (§11.5).
-6. Publish the sealed segment id to the pipeline via
-   `ctx.set_processed_index(id)` (advances `seal_index`, §2.5).
+1. Open the closed segment.
+2. Compute its file-level CRC and write the integrity sidecar files
+   that mark the segment as sealed. Disk format details: Stage 2.
+3. Build the on-disk transaction index and account index files for
+   this segment. These are what cold-tier queries (§10.4) walk when
+   the hot index misses.
+4. Replay the segment's WAL records into Seal's own balance vector and
+   function map (§11.4) so the next snapshot has accurate state.
+5. If this segment's id is on the snapshot boundary (§11.5), write a
+   balance snapshot and a function snapshot.
+6. Publish the sealed segment id (advances `seal_index`, §2.5).
 
-A failure in step 2 or 3 is logged; the segment is left unsealed and
+A failure in steps 2 or 3 is logged; the segment is left unsealed and
 retried on the next poll.
 
 ### §11.4 Why Seal owns its own balance vector and function map
 
-The Seal runner holds two pieces of state separate from the rest of
-the pipeline:
+Seal holds two pieces of state separate from the rest of the pipeline:
 
-- `balances: Vec<i64>` (sized to `max_accounts`) — updated as each
-  `TxEntry` from the segment passes by, using
-  `e.computed_balance` directly. This vector is the source for the
-  balance snapshot (§11.5) and is not the read-side cache (§8.3).
-- `functions: FxHashMap<String, (version, crc32c)>` — updated on each
+- A balance array sized to `max_accounts`, updated from each entry's
+  `computed_balance` as Seal walks the segment. This is the source
+  for the balance snapshot (§11.5); it is *not* the read-side cache
+  (§8.3).
+- A map of `name → (version, crc32c)`, updated on each
   `FunctionRegistered` record. Unregister records (`crc32c == 0`) are
   kept in the map so the snapshot preserves the audit trail.
 
 Why a separate copy: Seal must snapshot the *committed-and-sealed*
-state, which lags `commit_index` and certainly lags
-`compute_index`. The Snapshotter's read-side cache is the
-*latest-committed* state and can race ahead. A snapshot taken from
+state, which lags `commit_index`. The Snapshotter's read-side cache is
+the *latest-committed* state and can race ahead. A snapshot taken from
 either of those would either include uncommitted state or be racy.
 Reading off the segment, on a thread that does not care about the
 freshest tx, gives Seal a consistent point-in-time view at zero
@@ -1173,31 +1119,30 @@ synchronisation cost.
 
 ### §11.5 `snapshot_frequency` rule
 
-When `snapshot_frequency > 0` and `segment_id % snapshot_frequency == 0`,
-Seal emits two snapshot files for this segment:
+When `snapshot_frequency > 0` and the just-sealed segment's id is a
+multiple of `snapshot_frequency`, Seal emits two snapshot files for
+that segment:
 
-- A balance snapshot — Seal filters `balances` to non-zero entries,
-  sorts by `account_id`, and writes them via `segment.save_snapshot`.
-- A function snapshot — Seal serialises `functions` (sorted by name for
-  determinism) via `storage.save_function_snapshot`. The function
-  snapshot is written even when the registry is empty so recovery can
+- A **balance snapshot** — only non-zero balances, sorted by account
+  id for determinism.
+- A **function snapshot** — every entry from Seal's function map,
+  sorted by name. Written even when the map is empty so recovery can
   always jump straight to the latest snapshot boundary instead of
   replaying WAL from segment 1. [ADR-0014]
 
-When `snapshot_frequency == 0`, no snapshots are emitted; the system
-will replay from segment 1 on every recovery. The default is
+When `snapshot_frequency == 0`, no snapshots are emitted and the
+system must replay from segment 1 on every recovery. The default is
 `snapshot_frequency = 4`.
 
 ### §11.6 Pre-seal during recovery
 
 Recovery (§12) may discover a closed-but-unsealed segment from a crash
 between WAL rotation and the next Seal poll. Rather than start the
-Seal thread early, Recover calls `Seal::recover_pre_seal(segment)`
-synchronously, which performs the same `process_seal` as the running
-Seal thread and publishes the resulting segment id. After recovery
-finishes, the Seal thread starts and resumes its normal poll. This
-keeps the Seal thread's lifecycle simple: one thread, one loop, one
-shutdown — no special "first iteration" mode.
+Seal thread early, Recover invokes the same per-segment seal procedure
+(§11.3) synchronously and publishes the resulting segment id. After
+recovery finishes, the Seal thread starts and resumes its normal poll.
+This keeps the Seal thread's lifecycle simple: one thread, one loop,
+one shutdown — no special "first iteration" mode.
 
 ### §11.7 Seal does not touch the live indexes
 
@@ -1234,37 +1179,34 @@ at `last_committed_tx_id` immediately before the previous shutdown.
 ### §12.2 Pre-seal of unsealed segments
 
 The first thing Recover does is scan for closed-but-unsealed segments
-(§11.6). For each one it calls `Seal::recover_pre_seal`, which seals
-the segment and publishes it to `seal_index`. After this step every
-segment on disk except the active one is in `SEALED` state.
+(§11.6). For each one it runs the per-segment seal procedure
+synchronously and publishes the resulting id. After this step every
+segment on disk except the active one is sealed.
 
 ### §12.3 Snapshot load and WAL replay
 
 Recovery proceeds in this fixed order:
 
-1. **Find the latest balance snapshot** — its `segment_id` defines the
+1. **Find the latest balance snapshot** — its segment id defines the
    replay starting point. The snapshot's records are loaded into the
-   Transactor's balance vector (§4.3), the Seal runner's balance vector
-   (§11.4), and the Snapshotter's read-side cache (§8.3) via
-   `recover_balances`.
+   Transactor's balance cache (§4.3), Seal's balance vector (§11.4),
+   and the read-side balance cache (§8.3).
 2. **Find the latest function snapshot** — load each
-   `(name, version, crc32c)` triple. The Seal runner's `functions` map
-   is seeded via `Seal::recover_function`. The WASM runtime is loaded by
-   reading each binary off disk and calling `wasm_runtime.load_function`.
-3. **Replay sealed segments after the snapshot** — for each segment
-   strictly newer than the snapshot's `segment_id`, walk every record:
-   - `TxEntry`: update Transactor balance, Seal balance, Snapshotter
-     balance, and the hot indexer (`recover_index_tx_entry`); update
-     dedup if the matching `TxMetadata`'s `user_ref ≠ 0`.
-   - `TxMetadata`: update `last_tx_id`, hot index
-     (`recover_index_tx_metadata`), dedup (`recover_entry`).
-   - `TxLink`: update hot index (`recover_index_tx_link`).
-   - `FunctionRegistered`: load/unload through `wasm_runtime`; update
-     Seal's `functions` map.
+   `(name, version, crc32c)` triple. Seal's function map is seeded;
+   each binary is read off disk and installed in the WASM runtime.
+3. **Replay sealed segments after the snapshot** — for every segment
+   strictly newer than the snapshot's segment id, walk every record:
+   - `TxEntry`: update each balance cache; update the hot index;
+     update dedup if the owning transaction has `user_ref ≠ 0`.
+   - `TxMetadata`: advance `last_tx_id`; update the hot index; update
+     dedup.
+   - `TxLink`: update the hot index.
+   - `FunctionRegistered`: load or unload through the WASM runtime;
+     update Seal's function map.
 4. **Replay the active segment** — same as step 3 but against the
-   `wal.bin` file. Per-record CRC validation governs how far the
-   active segment can be trusted; details (sidecar, broken-tail
-   tolerance) are in Stage 2.
+   active (un-rotated) segment file. Per-record CRC validation governs
+   how far the active segment can be trusted; details (sidecar,
+   broken-tail tolerance) are in Stage 2.
 5. **Restore `sequencer_index`** to `last_tx_id + 1` (§16.2).
 
 ### §12.4 Order requirement
@@ -1312,33 +1254,33 @@ a known-good state.
 
 ### §13.1 Lock-free SPSC queues
 
-Every inter-stage queue is `crossbeam::ArrayQueue` — single-producer,
-single-consumer, lock-free, fixed-capacity. Each stage owns its data
-completely; no shared mutable state crosses stage boundaries. The fixed
-capacity is sized at construction from `queue_size` (§15.2).
+Every inter-stage queue is single-producer, single-consumer, lock-free,
+fixed-capacity. Each stage owns its data completely; no shared mutable
+state crosses stage boundaries. The fixed capacity is sized at
+construction from `queue_size` (§15.2).
 
 ### §13.2 Wait strategies
 
-Every stage's idle / backpressure loop is driven by the shared
-`WaitStrategy`. Four variants exist:
+Every stage's idle / backpressure loop is driven by the shared wait
+strategy. Four variants exist:
 
-- `LowLatency` — every iteration is `spin_loop()`. CPU is burned
-  unconditionally; latency is minimised. Suitable for dedicated cores.
-- `Balanced` (default) — ~32 spins, then ~16 K `yield_now()` calls, then
-  `park_timeout(1 ms)`. Adapts: under load it behaves like `LowLatency`;
-  when idle it costs nothing.
-- `LowCpu` — no spins, ~100 yields, then park. For deployments where
+- **LowLatency** — pure spin. CPU is burned unconditionally; latency
+  is minimised. Suitable for dedicated cores.
+- **Balanced** (default) — short spin, then yield, then park briefly.
+  Adapts: under load it behaves like `LowLatency`; when idle it costs
+  nothing.
+- **LowCpu** — no spin, short yield, then park. For deployments where
   background CPU cost matters more than latency.
-- `Custom` — exposes the spin / yield / park parameters explicitly.
+- **Custom** — explicit spin / yield / park parameters.
 
-A single `WaitStrategy` value is shared by every stage of one Pipeline;
-there is no per-stage override.
+A single wait strategy is shared by every stage of one Pipeline; there
+is no per-stage override.
 
 ### §13.3 Backpressure as queue saturation
 
 There is no rate limiter, leaky bucket, or admission control. Slowness
 in any stage propagates upstream as queue fullness, eventually stalling
-`submit()` (§2.7). This is intentional: the queues are the only place
+`submit()` (§2.6). This is intentional: the queues are the only place
 where stages observe each other's progress, and turning them into the
 backpressure mechanism keeps the design free of explicit coordination.
 
@@ -1362,10 +1304,10 @@ The caller picks one of four wait levels per submission:
 
 ### §14.2 Implementation
 
-`wait_for_transaction_level(tx_id, level)` polls the relevant pipeline
-index against the requested threshold using the shared `WaitStrategy`
-(§13.2). The polling read uses `Acquire` so that a successful wait
-synchronises with every store that produced the index advance.
+A wait is a poll of the relevant pipeline index against the requested
+`tx_id`, driven by the shared wait strategy (§13.2). When the index
+passes the threshold, the wait completes and synchronises with every
+store that produced the advance.
 
 ### §14.3 Per-call dial
 
@@ -1399,12 +1341,10 @@ read-side and seal-side duplicates.
 
 ### §15.2 `queue_size`
 
-Capacity of every inter-stage `ArrayQueue`. Default `1 << 14 = 16_384`.
-Not exposed via `config.toml` (it is a `#[serde(skip)]` field). At
-runtime, the Sequencer→Transactor, Transactor→WAL, and WAL→Snapshot
-queues are *all* sized from this single value — there is no separate
-WAL queue knob despite the constructor's `wal_queue_size` parameter
-name.
+Capacity of every inter-stage queue. Default `16 384`. Not exposed via
+`config.toml`; an internal tuning knob. The Sequencer→Transactor,
+Transactor→WAL, and WAL→Snapshot queues are all sized from this single
+value.
 
 ### §15.3 `wait_strategy`
 
@@ -1414,9 +1354,9 @@ Pipeline.
 
 ### §15.4 `log_level`
 
-Default `Info`. Not exposed via `config.toml`; set programmatically via
-`LedgerConfig::log_level`. `LedgerConfig::temp` and `LedgerConfig::bench`
-both lower this to `Critical` to keep test output clean.
+Default `Info`. Not exposed via `config.toml`; set programmatically.
+The temp and bench config presets both lower this to `Critical` to
+keep test output clean.
 
 ### §15.5 `transaction_count_per_segment` (drives multiple subsystems)
 
@@ -1453,10 +1393,10 @@ operation.
 
 ### §15.9 Hot-index sizes are derived
 
-Circle sizes (§9.6) are computed by `LedgerConfig::index_circle1_size()`
-and `index_circle2_size()` from `transaction_count_per_segment`
-(§15.5). There is no separate ledger-side knob; changing the active
-window changes both the hot indexes and the dedup window in lockstep.
+Hot-index sizes (§9.6) are derived from `transaction_count_per_segment`
+(§15.5) and `max_accounts` (§15.1). There are no separate knobs;
+changing the active window changes both the hot indexes and the dedup
+window in lockstep.
 
 ---
 
