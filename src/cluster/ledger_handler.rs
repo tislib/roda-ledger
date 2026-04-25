@@ -1,7 +1,6 @@
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
-use crate::cluster::{ClusterCommitIndex, RoleFlag, Term};
-use crate::ledger::Ledger as InternalLedger;
+use crate::cluster::{ClusterCommitIndex, LedgerSlot, RoleFlag, Term};
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::Operation;
 use spdlog::warn;
@@ -11,7 +10,10 @@ use tokio::task::yield_now;
 use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
-    ledger: Arc<InternalLedger>,
+    /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9). Cloned
+    /// out under a brief mutex on every RPC; supervisor swaps the
+    /// underlying `Arc` during a divergence reseed.
+    ledger_slot: Arc<LedgerSlot>,
     /// Shared role state (ADR-0016 §2). The handler is writable iff
     /// `role.is_leader()`; every other role rejects writes with
     /// `FAILED_PRECONDITION`. The supervisor flips this atomically on
@@ -33,13 +35,13 @@ impl LedgerHandler {
     /// every RPC by reading `role.is_leader()` — there is no separate
     /// read-only constructor.
     pub fn new(
-        ledger: Arc<InternalLedger>,
+        ledger_slot: Arc<LedgerSlot>,
         role: Arc<RoleFlag>,
         term: Arc<Term>,
         cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
-            ledger,
+            ledger_slot,
             role,
             term,
             cluster_commit_index,
@@ -112,7 +114,7 @@ impl LedgerHandler {
             };
         }
 
-        let status = self.ledger.get_transaction_status(tx_id);
+        let status = self.ledger_slot.ledger().get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
             status.error_reason().as_u8() as u32
         } else {
@@ -137,7 +139,7 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::SubmitOperationResponse>, Status> {
         self.ensure_writable()?;
         let op = request.into_inner().try_into()?;
-        let transaction_id = self.ledger.submit(op);
+        let transaction_id = self.ledger_slot.ledger().submit(op);
         Ok(Response::new(proto::SubmitOperationResponse {
             transaction_id,
             term: self.current_term(),
@@ -153,10 +155,10 @@ impl Ledger for LedgerHandler {
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
         let op = req.try_into()?;
 
-        let tx_id = self.ledger.submit(op);
+        let tx_id = self.ledger_slot.ledger().submit(op);
         self.wait_for_transaction_level(tx_id, level).await?;
 
-        let status = self.ledger.get_transaction_status(tx_id);
+        let status = self.ledger_slot.ledger().get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
             status.error_reason().as_u8() as u32
         } else {
@@ -185,7 +187,7 @@ impl Ledger for LedgerHandler {
             operations.push(op);
         }
 
-        let start_transaction_id = self.ledger.submit_batch(operations);
+        let start_transaction_id = self.ledger_slot.ledger().submit_batch(operations);
 
         for i in 0..len {
             let tx_id = start_transaction_id + i as u64;
@@ -217,7 +219,7 @@ impl Ledger for LedgerHandler {
             operations.push(op);
         }
 
-        let start_transaction_id = self.ledger.submit_batch(operations);
+        let start_transaction_id = self.ledger_slot.ledger().submit_batch(operations);
 
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
@@ -226,7 +228,7 @@ impl Ledger for LedgerHandler {
 
         let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
-                let status = self.ledger.get_transaction_status(tx_id);
+                let status = self.ledger_slot.ledger().get_transaction_status(tx_id);
                 let fail_reason = if status.is_err() {
                     status.error_reason().as_u8() as u32
                 } else {
@@ -251,8 +253,8 @@ impl Ledger for LedgerHandler {
         request: Request<proto::GetBalanceRequest>,
     ) -> Result<Response<proto::GetBalanceResponse>, Status> {
         let req = request.into_inner();
-        let balance = self.ledger.get_balance(req.account_id);
-        let last_snapshot_tx_id = self.ledger.last_snapshot_id();
+        let balance = self.ledger_slot.ledger().get_balance(req.account_id);
+        let last_snapshot_tx_id = self.ledger_slot.ledger().last_snapshot_id();
 
         Ok(Response::new(proto::GetBalanceResponse {
             balance,
@@ -268,10 +270,10 @@ impl Ledger for LedgerHandler {
         let mut balances = Vec::with_capacity(req.account_ids.len());
 
         for account_id in req.account_ids {
-            balances.push(self.ledger.get_balance(account_id));
+            balances.push(self.ledger_slot.ledger().get_balance(account_id));
         }
 
-        let last_snapshot_tx_id = self.ledger.last_snapshot_id();
+        let last_snapshot_tx_id = self.ledger_slot.ledger().last_snapshot_id();
 
         Ok(Response::new(proto::GetBalancesResponse {
             balances,
@@ -315,7 +317,7 @@ impl Ledger for LedgerHandler {
         // make progress; the proto's `WaitOutcome::NotFound` is exactly
         // for this case.
         if matches!(
-            self.ledger.get_transaction_status(tx_id),
+            self.ledger_slot.ledger().get_transaction_status(tx_id),
             crate::transaction::TransactionStatus::NotFound
         ) {
             return Ok(Response::new(proto::WaitForTransactionResponse {
@@ -357,9 +359,9 @@ impl Ledger for LedgerHandler {
         _request: Request<proto::GetPipelineIndexRequest>,
     ) -> Result<Response<proto::GetPipelineIndexResponse>, Status> {
         Ok(Response::new(proto::GetPipelineIndexResponse {
-            compute_index: self.ledger.last_compute_id(),
-            commit_index: self.ledger.last_commit_id(),
-            snapshot_index: self.ledger.last_snapshot_id(),
+            compute_index: self.ledger_slot.ledger().last_compute_id(),
+            commit_index: self.ledger_slot.ledger().last_commit_id(),
+            snapshot_index: self.ledger_slot.ledger().last_snapshot_id(),
             term: self.current_term(),
             cluster_commit_index: self.cluster_commit_index.get(),
         }))
@@ -372,7 +374,7 @@ impl Ledger for LedgerHandler {
         let tx_id = request.into_inner().tx_id;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        self.ledger.query(QueryRequest {
+        self.ledger_slot.ledger().query(QueryRequest {
             kind: QueryKind::GetTransaction { tx_id },
             respond: Box::new(move |resp| {
                 let _ = tx.send(resp);
@@ -422,7 +424,7 @@ impl Ledger for LedgerHandler {
         } as usize;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        self.ledger.query(QueryRequest {
+        self.ledger_slot.ledger().query(QueryRequest {
             kind: QueryKind::GetAccountHistory {
                 account_id: req.account_id,
                 from_tx_id: req.from_tx_id,
@@ -469,7 +471,8 @@ impl Ledger for LedgerHandler {
         self.ensure_writable()?;
         let req = request.into_inner();
         match self
-            .ledger
+            .ledger_slot
+            .ledger()
             .register_function(&req.name, &req.binary, req.override_existing)
         {
             Ok((version, crc32c)) => Ok(Response::new(proto::RegisterFunctionResponse {
@@ -486,7 +489,7 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::UnregisterFunctionResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        match self.ledger.unregister_function(&req.name) {
+        match self.ledger_slot.ledger().unregister_function(&req.name) {
             Ok(version) => Ok(Response::new(proto::UnregisterFunctionResponse {
                 version: version as u32,
             })),
@@ -499,7 +502,8 @@ impl Ledger for LedgerHandler {
         _request: Request<proto::ListFunctionsRequest>,
     ) -> Result<Response<proto::ListFunctionsResponse>, Status> {
         let functions = self
-            .ledger
+            .ledger_slot
+            .ledger()
             .list_functions()
             .into_iter()
             .map(|info| proto::FunctionInfo {
@@ -537,17 +541,17 @@ impl LedgerHandler {
 
         loop {
             let reached = match level {
-                proto::WaitLevel::Computed => self.ledger.last_compute_id() >= transaction_id,
-                proto::WaitLevel::Committed => self.ledger.last_commit_id() >= transaction_id,
-                proto::WaitLevel::Snapshot => self.ledger.last_snapshot_id() >= transaction_id,
+                proto::WaitLevel::Computed => self.ledger_slot.ledger().last_compute_id() >= transaction_id,
+                proto::WaitLevel::Committed => self.ledger_slot.ledger().last_commit_id() >= transaction_id,
+                proto::WaitLevel::Snapshot => self.ledger_slot.ledger().last_snapshot_id() >= transaction_id,
                 proto::WaitLevel::ClusterCommit => {
                     // Require all three watermarks to have passed the tx.
                     // `cluster_commit_index` reflects the leader's view of
                     // quorum replication; the local `commit_index` and
                     // `snapshot_index` ensure the tx is also durably
                     // stored and queryable on this node.
-                    self.ledger.last_snapshot_id() >= transaction_id
-                        && self.ledger.last_commit_id() >= transaction_id
+                    self.ledger_slot.ledger().last_snapshot_id() >= transaction_id
+                        && self.ledger_slot.ledger().last_commit_id() >= transaction_id
                         && self.cluster_commit_index.get() >= transaction_id
                 }
             };

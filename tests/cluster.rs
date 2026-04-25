@@ -10,6 +10,7 @@ mod cluster {
     pub mod append_entries_prev_check_test;
     pub mod basic_test;
     pub mod client_test;
+    pub mod divergence_reseed_test;
     pub mod grpc_test;
     pub mod manual_replication_test;
     pub mod standalone_test;

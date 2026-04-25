@@ -15,7 +15,9 @@
 use crate::cluster::config::Config;
 use crate::cluster::server::Server;
 use crate::cluster::supervisor::{RoleSupervisor, SupervisorHandles};
-use crate::cluster::{ClusterCommitIndex, Quorum, RoleFlag, Term, role_flag::Role};
+use crate::cluster::{
+    ClusterCommitIndex, LedgerSlot, Quorum, RoleFlag, Term, role_flag::Role,
+};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -24,7 +26,10 @@ use tokio::task::JoinHandle;
 
 pub struct ClusterNode {
     config: Config,
-    ledger: Arc<Ledger>,
+    /// Wrapping the live `Arc<Ledger>` in a slot lets the
+    /// supervisor swap it during a divergence reseed (ADR-0016 §9)
+    /// without tearing down the gRPC servers.
+    ledger_slot: Arc<LedgerSlot>,
     /// Always opened, even in standalone mode (so the term log
     /// advances on every restart per ADR-0016 §11). Cluster code
     /// paths share it across handlers via `Arc::clone`.
@@ -39,11 +44,6 @@ impl ClusterNode {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start()?;
         let term = Arc::new(Term::open_in_dir(&config.ledger.storage.data_dir)?);
-        // Bump the term once on every successful start, recording the
-        // current `last_commit_id` as the new term's start_tx_id —
-        // mirrors what an election does in Stage 4. This holds for
-        // both standalone and clustered deployments so on-disk
-        // term.log shape is identical across modes.
         let start_tx = ledger.last_commit_id();
         let new_term = term.new_term(start_tx)?;
         info!(
@@ -54,13 +54,21 @@ impl ClusterNode {
         );
         Ok(Self {
             config,
-            ledger: Arc::new(ledger),
+            ledger_slot: Arc::new(LedgerSlot::new(Arc::new(ledger))),
             term,
         })
     }
 
+    /// Return the **currently-live** `Arc<Ledger>`. After a
+    /// divergence reseed the returned `Arc` may differ from the one
+    /// observed before — callers must not retain it across reseeds.
     pub fn ledger(&self) -> Arc<Ledger> {
-        self.ledger.clone()
+        self.ledger_slot.ledger()
+    }
+
+    /// Internal accessor to the slot itself (for the supervisor).
+    pub fn ledger_slot(&self) -> &Arc<LedgerSlot> {
+        &self.ledger_slot
     }
 
     pub fn config(&self) -> &Config {
@@ -78,7 +86,7 @@ impl ClusterNode {
             let role = Arc::new(RoleFlag::new(Role::Leader));
             let cluster_commit_index = ClusterCommitIndex::new();
             let server = Server::new(
-                self.ledger.clone(),
+                self.ledger_slot.clone(),
                 client_addr,
                 role,
                 self.term.clone(),
@@ -95,8 +103,11 @@ impl ClusterNode {
 
         // Clustered: hand off to the supervisor, which owns the
         // long-lived gRPC servers + role-specific dispatch.
-        let supervisor =
-            RoleSupervisor::new(self.config.clone(), self.ledger.clone(), self.term.clone())?;
+        let supervisor = RoleSupervisor::new(
+            self.config.clone(),
+            self.ledger_slot.clone(),
+            self.term.clone(),
+        )?;
         let handles = supervisor.run().await?;
         Ok(Handles::Cluster(handles))
     }

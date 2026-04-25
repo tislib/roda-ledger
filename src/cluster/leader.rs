@@ -15,8 +15,7 @@
 
 use crate::cluster::config::Config;
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
-use crate::cluster::{Quorum, Term};
-use crate::ledger::Ledger;
+use crate::cluster::{LedgerSlot, Quorum, Term};
 use spdlog::info;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,15 +26,15 @@ use tokio::task::JoinHandle;
 /// [`Leader::run_role_tasks`] from the supervisor.
 pub struct Leader {
     config: Config,
-    ledger: Arc<Ledger>,
+    ledger_slot: Arc<LedgerSlot>,
     term: Arc<Term>,
 }
 
 impl Leader {
-    pub fn new(config: Config, ledger: Arc<Ledger>, term: Arc<Term>) -> Self {
+    pub fn new(config: Config, ledger_slot: Arc<LedgerSlot>, term: Arc<Term>) -> Self {
         Self {
             config,
-            ledger,
+            ledger_slot,
             term,
         }
     }
@@ -84,20 +83,20 @@ impl Leader {
             .expect("validate() guarantees self is present in cluster.peers")
             as u32;
 
-        // Hook the leader's own commit stream into the self slot.
-        // Must be registered after the ledger is started (commits are
-        // already flowing) but before peer tasks start ACKing. Seed
-        // with the current commit id in case start-up committed
-        // anything before we got here.
+        // Snapshot the live ledger once at bring-up so we can both
+        // register the on-commit hook and seed the quorum slot. If a
+        // reseed swaps the ledger underneath, role tasks will be
+        // re-spawned (Stage 4 work) and re-register against the new
+        // ledger — Stage 3c only reseeds in non-Leader roles.
+        let ledger_for_leader = self.ledger_slot.ledger();
         let q_leader = quorum.clone();
-        if self
-            .ledger
+        if ledger_for_leader
             .on_commit(Arc::new(move |tx_id| q_leader.advance(self_slot, tx_id)))
             .is_err()
         {
             panic!("leader: on_commit handler already registered; skipping");
         }
-        quorum.advance(self_slot, self.ledger.last_commit_id());
+        quorum.advance(self_slot, ledger_for_leader.last_commit_id());
 
         let other_count = self.config.other_peers().count();
         let mut peer_handles: Vec<JoinHandle<()>> = Vec::with_capacity(other_count);
@@ -126,7 +125,7 @@ impl Leader {
                 let replicator = PeerReplication::new(
                     peer.clone(),
                     peer_slot,
-                    self.ledger.clone(),
+                    ledger_for_leader.clone(),
                     params.clone(),
                     running.clone(),
                     quorum.clone(),

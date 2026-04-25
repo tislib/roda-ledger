@@ -10,8 +10,7 @@ use crate::cluster::ledger_handler::LedgerHandler;
 use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::proto::ledger::ledger_server::LedgerServer;
 use crate::cluster::proto::node::node_server::NodeServer;
-use crate::cluster::{ClusterCommitIndex, RoleFlag, Term};
-use crate::ledger::Ledger;
+use crate::cluster::{ClusterCommitIndex, LedgerSlot, RoleFlag, Term};
 use spdlog::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,7 +19,8 @@ use tonic::transport::Server as TonicServer;
 // ── Client-facing Ledger server ─────────────────────────────────────────────
 
 pub struct Server {
-    ledger: Arc<Ledger>,
+    /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9).
+    ledger_slot: Arc<LedgerSlot>,
     addr: SocketAddr,
     /// Shared role state. The constructed [`LedgerHandler`] reads
     /// this on every RPC to decide write/read permissions; the
@@ -36,14 +36,14 @@ pub struct Server {
 
 impl Server {
     pub fn new(
-        ledger: Arc<Ledger>,
+        ledger_slot: Arc<LedgerSlot>,
         addr: SocketAddr,
         role: Arc<RoleFlag>,
         term: Arc<Term>,
         cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
-            ledger,
+            ledger_slot,
             addr,
             role,
             term,
@@ -53,7 +53,7 @@ impl Server {
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let handler = LedgerHandler::new(
-            self.ledger,
+            self.ledger_slot,
             self.role.clone(),
             self.term,
             self.cluster_commit_index,

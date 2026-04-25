@@ -228,7 +228,7 @@ mod tests {
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
-            let server = Server::new(server_ledger, addr, std::sync::Arc::new(RoleFlag::new(Role::Leader)), term, cci);
+            let server = Server::new(std::sync::Arc::new(roda_ledger::cluster::LedgerSlot::new(server_ledger)), addr, std::sync::Arc::new(RoleFlag::new(Role::Leader)), term, cci);
             server.run().await.unwrap();
         });
 

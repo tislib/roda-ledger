@@ -18,8 +18,7 @@
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_server::Node;
 use crate::cluster::role_flag::Role;
-use crate::cluster::{ClusterCommitIndex, RoleFlag, Term, Vote};
-use crate::ledger::Ledger;
+use crate::cluster::{ClusterCommitIndex, LedgerSlot, RoleFlag, Term, Vote};
 use crate::wal_tail::decode_records;
 use spdlog::warn;
 use std::sync::Arc;
@@ -32,7 +31,11 @@ use tonic::{Request, Response, Status};
 /// process lifetime; the gRPC server holds an `Arc` and observes
 /// every supervisor-driven mutation atomically.
 pub struct NodeHandlerCore {
-    pub ledger: Arc<Ledger>,
+    /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9). Cloned
+    /// out under a brief mutex on every RPC; the supervisor swaps
+    /// the underlying `Arc` during a divergence reseed without
+    /// having to tear down the gRPC server.
+    pub ledger: Arc<LedgerSlot>,
     pub node_id: u64,
     /// Shared term state. Followers `observe()` on every incoming
     /// `AppendEntries` so their durable log tracks the leader's term
@@ -73,7 +76,7 @@ pub struct NodeHandlerCore {
 
 impl NodeHandlerCore {
     pub fn new(
-        ledger: Arc<Ledger>,
+        ledger: Arc<LedgerSlot>,
         node_id: u64,
         term: Arc<Term>,
         vote: Arc<Vote>,
@@ -136,7 +139,7 @@ impl NodeHandlerCore {
         if prev_tx_id == 0 {
             return Ok(());
         }
-        let our_last = self.ledger.last_commit_id();
+        let our_last = self.ledger.ledger().last_commit_id();
         if prev_tx_id > our_last {
             return Err(proto::RejectReason::RejectPrevMismatch);
         }
@@ -215,6 +218,11 @@ impl Node for NodeHandler {
         // observations and writes appear atomic to peers.
         let _guard = core.node_mutex.lock().await;
 
+        // Snapshot the live ledger once. If a supervisor reseed
+        // races (ADR-0016 §9), this RPC finishes against the old
+        // ledger; the next RPC sees the new one.
+        let ledger = core.ledger.ledger();
+
         let req = request.into_inner();
 
         // Leader rejects incoming AppendEntries; only Follower /
@@ -246,7 +254,7 @@ impl Node for NodeHandler {
             return Ok(Response::new(proto::AppendEntriesResponse {
                 term: core.current_term(),
                 success: false,
-                last_tx_id: core.ledger.last_commit_id(),
+                last_tx_id: ledger.last_commit_id(),
                 reject_reason: proto::RejectReason::RejectTermStale as u32,
             }));
         }
@@ -261,12 +269,12 @@ impl Node for NodeHandler {
             return Ok(Response::new(proto::AppendEntriesResponse {
                 term: core.current_term(),
                 success: false,
-                last_tx_id: core.ledger.last_commit_id(),
+                last_tx_id: ledger.last_commit_id(),
                 reject_reason: reason as u32,
             }));
         }
 
-        let last = core.ledger.last_commit_id();
+        let last = ledger.last_commit_id();
 
         let entries = decode_records(&req.wal_bytes);
         if entries.is_empty() {
@@ -279,7 +287,7 @@ impl Node for NodeHandler {
             }));
         }
 
-        match core.ledger.append_wal_entries(entries) {
+        match ledger.append_wal_entries(entries) {
             Ok(()) => {
                 core.advance_cluster_commit(req.leader_commit_tx_id);
                 Ok(Response::new(proto::AppendEntriesResponse {
@@ -310,7 +318,7 @@ impl Node for NodeHandler {
         Ok(Response::new(proto::PingResponse {
             node_id: core.node_id,
             term: core.current_term(),
-            last_tx_id: core.ledger.last_commit_id(),
+            last_tx_id: core.ledger.ledger().last_commit_id(),
             role: core.role.get().as_proto() as i32,
             nonce: req.nonce,
         }))

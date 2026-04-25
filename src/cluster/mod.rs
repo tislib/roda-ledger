@@ -19,6 +19,7 @@ pub mod cluster_commit;
 pub mod config;
 pub mod election_timer;
 pub mod leader;
+pub mod ledger_slot;
 pub mod ledger_handler;
 pub mod mapping;
 pub mod node;
@@ -39,6 +40,7 @@ pub use config::{
 };
 pub use leader::{Leader, LeaderHandles};
 pub use ledger_handler::LedgerHandler;
+pub use ledger_slot::LedgerSlot;
 pub use node::{ClusterNode, Handles};
 pub use node_handler::{NodeHandler, NodeHandlerCore};
 pub use peer_replication::{PeerReplication, ReplicationParams};

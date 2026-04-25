@@ -11,7 +11,7 @@
 
 use roda_ledger::cluster::proto::node as proto;
 use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{NodeHandler, NodeHandlerCore, Role, RoleFlag, Term, Vote};
+use roda_ledger::cluster::{LedgerSlot, NodeHandler, NodeHandlerCore, Role, RoleFlag, Term, Vote};
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
@@ -41,7 +41,7 @@ fn setup() -> (TempDir, Arc<Ledger>, Arc<Term>, NodeHandler) {
     let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
     let role = Arc::new(RoleFlag::new(Role::Follower));
     let core = Arc::new(NodeHandlerCore::new(
-        ledger.clone(),
+        Arc::new(LedgerSlot::new(ledger.clone())),
         /* node_id */ 2,
         term.clone(),
         vote,
@@ -259,7 +259,7 @@ async fn leader_role_rejects_append_entries() {
     let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
     let role = Arc::new(RoleFlag::new(Role::Leader));
     let core = Arc::new(NodeHandlerCore::new(
-        ledger.clone(),
+        Arc::new(LedgerSlot::new(ledger.clone())),
         1,
         term.clone(),
         vote,
@@ -312,7 +312,7 @@ async fn cold_lookup_path_via_term_storage_also_detects_divergence() {
     let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
     let role = Arc::new(RoleFlag::new(Role::Follower));
     let core = Arc::new(NodeHandlerCore::new(
-        ledger.clone(),
+        Arc::new(LedgerSlot::new(ledger.clone())),
         2,
         term.clone(),
         vote,
