@@ -140,12 +140,13 @@ impl Handles {
         }
     }
 
-    /// Shared quorum tracker (clustered + currently-Leader only).
-    /// `None` in standalone or when the cluster booted in a
-    /// non-Leader role (Initializing).
+    /// Shared quorum tracker (clustered only). The supervisor owns
+    /// the `Arc<Quorum>` for the process lifetime; reading
+    /// `quorum.get()` returns the cluster-wide majority watermark
+    /// regardless of which role this node is currently playing.
     pub fn quorum(&self) -> Option<Arc<Quorum>> {
         match self {
-            Handles::Cluster(h) => h.leader.as_ref().map(|l| l.quorum.clone()),
+            Handles::Cluster(h) => Some(h.quorum.clone()),
             _ => None,
         }
     }

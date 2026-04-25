@@ -60,6 +60,26 @@ impl Quorum {
         self.majority
     }
 
+    /// Reset every slot **except** the leader's own (slot 0 by
+    /// convention) to `0`. Called by the supervisor on Leader entry
+    /// (ADR-0016 §3.3a) so a re-elected leader doesn't see stale
+    /// match indices left over from a previous leadership window
+    /// or from a different leader's perspective. The leader's own
+    /// slot is left untouched — its commit watermark is monotonic
+    /// and will be re-published via the on-commit hook anyway.
+    ///
+    /// Lock-free `Relaxed` stores; the next `advance` call publishes
+    /// a fresh snapshot via `Release`.
+    pub fn reset_peers(&self, leader_slot: u32) {
+        let leader = leader_slot as usize;
+        for (idx, slot) in self.match_index.iter().enumerate() {
+            if idx == leader {
+                continue;
+            }
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Publish `index` for `node_index` and recompute the cached majority.
     ///
     /// Slot 0 is conventionally the leader; callers advance it via the

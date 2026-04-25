@@ -15,6 +15,7 @@
 
 use crate::cluster::config::Config;
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
+use crate::cluster::supervisor::TransitionTx;
 use crate::cluster::{LedgerSlot, Quorum, Term};
 use spdlog::info;
 use std::sync::Arc;
@@ -24,18 +25,31 @@ use tokio::task::JoinHandle;
 
 /// Role-scoped bring-up for a leader node. Construct, then call
 /// [`Leader::run_role_tasks`] from the supervisor.
+///
+/// The Quorum is **supervisor-owned** (Stage 4) and lives across
+/// role transitions; Leader just resets stale peer slots on entry
+/// and spawns the per-peer replication tasks. The `Ledger::on_commit`
+/// hook is also supervisor-owned and re-registered on every ledger
+/// swap, so it keeps publishing into the same Quorum across reseeds.
 pub struct Leader {
     config: Config,
     ledger_slot: Arc<LedgerSlot>,
     term: Arc<Term>,
+    quorum: Arc<Quorum>,
 }
 
 impl Leader {
-    pub fn new(config: Config, ledger_slot: Arc<LedgerSlot>, term: Arc<Term>) -> Self {
+    pub fn new(
+        config: Config,
+        ledger_slot: Arc<LedgerSlot>,
+        term: Arc<Term>,
+        quorum: Arc<Quorum>,
+    ) -> Self {
         Self {
             config,
             ledger_slot,
             term,
+            quorum,
         }
     }
 
@@ -51,6 +65,8 @@ impl Leader {
     pub async fn run_role_tasks(
         &self,
         running: Arc<AtomicBool>,
+        supervisor_running: Arc<AtomicBool>,
+        transition_tx: TransitionTx,
     ) -> Result<LeaderHandles, Box<dyn std::error::Error + Send + Sync>> {
         let cluster = self
             .config
@@ -64,17 +80,12 @@ impl Leader {
             self.config.node_id()
         );
 
-        // Quorum sized to the full cluster (peers list now includes
-        // self under ADR-0016 §1, so no `+1` adjustment is needed).
-        let quorum = Arc::new(Quorum::new(self.config.cluster_size()));
-
-        // Replication: one child task per *other* peer. Slot layout
-        // in the quorum tracker is positional with
-        // `config.cluster.peers`:
-        //   [k] → the peer at index k in `config.cluster.peers`
-        // Self has its own slot (the index where its peer_id lives in
-        // the membership list); the leader's own commit progress
-        // updates that slot via `ledger.on_commit`.
+        // The supervisor owns `self.quorum` for the process
+        // lifetime. On Leader entry we wipe stale per-peer slots
+        // (matches ADR-0016 §3.3a — leftover indices from a
+        // previous leadership window or different leader's
+        // perspective don't pollute the new leader's view). Self's
+        // own slot is monotonic, untouched by `reset_peers`.
         let self_id = self.config.node_id();
         let self_slot: u32 = cluster
             .peers
@@ -82,21 +93,17 @@ impl Leader {
             .position(|p| p.peer_id == self_id)
             .expect("validate() guarantees self is present in cluster.peers")
             as u32;
+        self.quorum.reset_peers(self_slot);
 
-        // Snapshot the live ledger once at bring-up so we can both
-        // register the on-commit hook and seed the quorum slot. If a
-        // reseed swaps the ledger underneath, role tasks will be
-        // re-spawned (Stage 4 work) and re-register against the new
-        // ledger — Stage 3c only reseeds in non-Leader roles.
+        // Snapshot the live ledger once at bring-up. The on-commit
+        // hook that publishes leader-commit progress into the
+        // quorum is supervisor-owned and re-registered on every
+        // ledger swap, so we don't touch it here.
         let ledger_for_leader = self.ledger_slot.ledger();
-        let q_leader = quorum.clone();
-        if ledger_for_leader
-            .on_commit(Arc::new(move |tx_id| q_leader.advance(self_slot, tx_id)))
-            .is_err()
-        {
-            panic!("leader: on_commit handler already registered; skipping");
-        }
-        quorum.advance(self_slot, ledger_for_leader.last_commit_id());
+        // Seed the quorum from whatever the ledger has already
+        // committed at bring-up time.
+        self.quorum
+            .advance(self_slot, ledger_for_leader.last_commit_id());
 
         let other_count = self.config.other_peers().count();
         let mut peer_handles: Vec<JoinHandle<()>> = Vec::with_capacity(other_count);
@@ -128,7 +135,9 @@ impl Leader {
                     ledger_for_leader.clone(),
                     params.clone(),
                     running.clone(),
-                    quorum.clone(),
+                    supervisor_running.clone(),
+                    self.quorum.clone(),
+                    transition_tx.clone(),
                 );
                 peer_handles.push(tokio::spawn(async move { replicator.run().await }));
             }
@@ -138,23 +147,18 @@ impl Leader {
             );
         }
 
-        Ok(LeaderHandles {
-            peer_handles,
-            quorum,
-        })
+        Ok(LeaderHandles { peer_handles })
     }
 }
 
 /// Handles + shared state produced by a successful
-/// [`Leader::run_role_tasks`]. The supervisor owns the gRPC servers;
-/// this is just the leader's role-specific sub-tree.
+/// [`Leader::run_role_tasks`]. The supervisor owns the gRPC servers
+/// and the long-lived `Quorum`; this is just the leader's
+/// role-specific sub-tree.
 pub struct LeaderHandles {
     /// One handle per peer replication task. Positional with
     /// `config.cluster.peers` (with self filtered out).
     pub peer_handles: Vec<JoinHandle<()>>,
-    /// Cluster-wide majority tracker. Callers read `quorum.get()`
-    /// for the latest majority-committed index.
-    pub quorum: Arc<Quorum>,
 }
 
 impl LeaderHandles {

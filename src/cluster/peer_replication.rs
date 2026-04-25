@@ -11,6 +11,7 @@ use crate::cluster::Quorum;
 use crate::cluster::config::PeerConfig;
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_client::NodeClient;
+use crate::cluster::supervisor::{Transition, TransitionTx};
 use crate::ledger::Ledger;
 use crate::storage::WalTailer;
 use spdlog::{info, warn};
@@ -60,7 +61,18 @@ pub struct PeerReplication {
     /// Positional id (0-based) used as the `Quorum` slot.
     peer_index: u32,
     params: ReplicationParams,
+    /// Per-leader-instance cancellation. Flipped to `false` by the
+    /// supervisor when this Leader steps down (higher term observed,
+    /// divergence reseed, etc.). Distinct from `supervisor_running`
+    /// so a step-down doesn't drag the whole supervisor with it.
     running: Arc<AtomicBool>,
+    /// Process-wide supervisor flag. Flipped to `false` by
+    /// `SupervisorHandles::abort`. Critical for failover tests:
+    /// without checking this, an aborted leader's peer tasks would
+    /// outlive the abort and keep shipping zombie heartbeats to
+    /// surviving followers, resetting their election timers and
+    /// preventing re-election.
+    supervisor_running: Arc<AtomicBool>,
     tailer: WalTailer,
     from_tx_id: u64,
     peer_last_tx: u64,
@@ -68,6 +80,12 @@ pub struct PeerReplication {
     /// `leader_commit_tx_id` stamped on every outgoing AppendEntries
     /// reads from here via `majority.get()`.
     majority: Arc<Quorum>,
+    /// Channel back to the supervisor's role driver. Used to push a
+    /// `StepDownHigherTerm` transition when a peer responds with
+    /// `term > params.term` (ADR-0016 §5, §11). On step-down this
+    /// task self-terminates by clearing the cooperative `running`
+    /// flag's local view through an early return.
+    transition_tx: TransitionTx,
 }
 
 impl PeerReplication {
@@ -77,7 +95,9 @@ impl PeerReplication {
         ledger: Arc<Ledger>,
         params: ReplicationParams,
         running: Arc<AtomicBool>,
+        supervisor_running: Arc<AtomicBool>,
         majority: Arc<Quorum>,
+        transition_tx: TransitionTx,
     ) -> Self {
         let tailer = ledger.wal_tailer();
         Self {
@@ -85,11 +105,44 @@ impl PeerReplication {
             peer_index,
             params,
             running,
+            supervisor_running,
             tailer,
             from_tx_id: 1,
             peer_last_tx: 0,
             majority,
+            transition_tx,
         }
+    }
+
+    /// True iff both the per-leader cancel flag and the
+    /// supervisor-wide running flag are still set. Either being
+    /// `false` is sufficient cause to drain.
+    #[inline]
+    fn alive(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+            && self.supervisor_running.load(Ordering::Relaxed)
+    }
+
+    /// If the peer's response carries a strictly-higher term, push a
+    /// step-down transition to the supervisor and return `true` so
+    /// the caller can return early. The mpsc channel uses
+    /// `try_send`; on a momentarily-full channel we degrade
+    /// gracefully (the next response will retry — and the supervisor
+    /// only needs *one* such signal to step down).
+    fn maybe_step_down(&self, peer_term: u64) -> bool {
+        if peer_term > self.params.term {
+            warn!(
+                "replication: peer {} responded with term {} > our {}; signalling step-down",
+                self.peer.peer_id, peer_term, self.params.term
+            );
+            let _ = self
+                .transition_tx
+                .try_send(Transition::StepDownHigherTerm {
+                    observed: peer_term,
+                });
+            return true;
+        }
+        false
     }
 
     /// Long-lived async driver. Runs until `running` is cleared or an
@@ -102,7 +155,7 @@ impl PeerReplication {
         );
 
         let mut client = loop {
-            if !self.running.load(Ordering::Relaxed) {
+            if !self.alive() {
                 return;
             }
             match connect(&self.peer.host, self.params.rpc_message_size_limit).await {
@@ -119,7 +172,7 @@ impl PeerReplication {
 
         let mut buf = vec![0u8; self.params.max_bytes_per_rpc];
 
-        while self.running.load(Ordering::Relaxed) {
+        while self.alive() {
             let n = self.tailer.tail(self.from_tx_id, &mut buf) as usize;
             if n == 0 {
                 // Idle heartbeat: send an empty `AppendEntries` so the
@@ -129,7 +182,11 @@ impl PeerReplication {
                 // the value the follower returned on the previous
                 // non-empty RPC — which is always one batch stale, since
                 // `append_wal_entries` queues-then-returns on the follower.
-                self.send_heartbeat(&mut client).await;
+                if !self.send_heartbeat(&mut client).await {
+                    // step-down observed on the heartbeat — exit
+                    // cleanly so the supervisor can drain us.
+                    return;
+                }
                 sleep(self.params.poll_interval).await;
                 continue;
             }
@@ -161,7 +218,7 @@ impl PeerReplication {
         shipment_last_tx: u64,
     ) -> bool {
         loop {
-            if !self.running.load(Ordering::Relaxed) {
+            if !self.alive() {
                 return false;
             }
             let req = proto::AppendEntriesRequest {
@@ -178,6 +235,13 @@ impl PeerReplication {
             match client.append_entries(req).await {
                 Ok(resp) => {
                     let r = resp.into_inner();
+                    // Inspect term *before* committing to the
+                    // success/reject branches: a term > ours
+                    // unconditionally triggers step-down (ADR-0016
+                    // §5/§11) regardless of `success`.
+                    if self.maybe_step_down(r.term) {
+                        return false;
+                    }
                     if r.success {
                         self.peer_last_tx = shipment_last_tx;
                         self.from_tx_id = shipment_last_tx + 1;
@@ -216,7 +280,13 @@ impl PeerReplication {
     /// `last_commit_id` in our `Quorum`. Failures are swallowed — the
     /// next heartbeat (or real shipment) will retry; the purpose here is
     /// purely observational.
-    async fn send_heartbeat(&mut self, client: &mut NodeClient<Channel>) {
+    ///
+    /// Returns `false` iff the heartbeat response carried a strictly
+    /// higher term — the caller must exit immediately so the
+    /// supervisor's leader-drain can collect us. All other outcomes
+    /// (success, transport error, ignored reject) return `true` and
+    /// the run loop carries on.
+    async fn send_heartbeat(&mut self, client: &mut NodeClient<Channel>) -> bool {
         let req = proto::AppendEntriesRequest {
             leader_id: self.params.leader_id,
             term: self.params.term,
@@ -230,20 +300,30 @@ impl PeerReplication {
         match client.append_entries(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
+                // Even an idle heartbeat must observe a higher term:
+                // a fresh leader could have been elected while we
+                // were silent, in which case we step down here
+                // before the next shipment loop iteration ever
+                // wakes.
+                if self.maybe_step_down(r.term) {
+                    return false;
+                }
                 if r.success {
                     self.majority.advance(self.peer_index, r.last_tx_id);
                 }
+                true
             }
             Err(_) => {
                 // Transport hiccup on an idle heartbeat is not worth
                 // acting on — the next cycle will reconnect via the
                 // normal `ship_until_accepted` path.
+                true
             }
         }
     }
 }
 
-async fn connect(
+pub(crate) async fn connect(
     addr: &str,
     max_message_bytes: usize,
 ) -> Result<NodeClient<Channel>, tonic::transport::Error> {

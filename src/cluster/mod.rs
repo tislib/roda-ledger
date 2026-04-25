@@ -15,6 +15,7 @@
 //! followers via `AppendEntries`; followers decode and hand them to
 //! `Ledger::append_wal_entries`.
 
+pub mod candidate;
 pub mod cluster_commit;
 pub mod config;
 pub mod election_timer;

@@ -15,6 +15,7 @@
 //!   behind `Arc`. Sharing the core via `Arc` already gives every
 //!   call site the same lock instance.
 
+use crate::cluster::election_timer::ElectionTimer;
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_server::Node;
 use crate::cluster::role_flag::Role;
@@ -72,6 +73,14 @@ pub struct NodeHandlerCore {
     /// and resets this from a single thread, so a plain `AtomicU64`
     /// is sufficient.
     pub last_divergence_watermark: AtomicU64,
+    /// Shared election timer (ADR-0016 §3.8 / §5). The supervisor
+    /// owns the role driver that awaits `await_expiry`; the handler
+    /// resets the timer on every event that, per Raft, must keep
+    /// the current leader in office: a valid `AppendEntries`
+    /// (including a heartbeat) and a granted `RequestVote`.
+    /// `None` only in unit tests that construct a `NodeHandlerCore`
+    /// outside a real supervisor.
+    pub election_timer: Option<Arc<ElectionTimer>>,
 }
 
 impl NodeHandlerCore {
@@ -92,6 +101,39 @@ impl NodeHandlerCore {
             cluster_commit_index,
             node_mutex: AsyncMutex::new(()),
             last_divergence_watermark: AtomicU64::new(0),
+            election_timer: None,
+        }
+    }
+
+    /// Builder-style override used by the supervisor to inject the
+    /// shared election timer. Tests that don't care about timer
+    /// behaviour can omit this and the handler reduces to a no-op
+    /// for `reset_election_timer`.
+    pub fn with_election_timer(mut self, timer: Arc<ElectionTimer>) -> Self {
+        self.election_timer = Some(timer);
+        self
+    }
+
+    /// Reset the shared election timer if one is wired in. No-op
+    /// when this `Core` was built without one (test contexts).
+    #[inline]
+    fn reset_election_timer(&self) {
+        if let Some(t) = self.election_timer.as_ref() {
+            t.reset();
+        }
+    }
+
+    /// Transition `Initializing` or `Candidate` to `Follower`. Called
+    /// after a successful term-observation on `AppendEntries`: per
+    /// Raft, any valid leader RPC defeats an in-flight election and
+    /// settles the recipient as a follower. Idempotent — repeated
+    /// calls when already a `Follower` are a no-op.
+    fn settle_as_follower(&self) {
+        match self.role.get() {
+            Role::Initializing | Role::Candidate => {
+                self.role.set(Role::Follower);
+            }
+            Role::Follower | Role::Leader => {}
         }
     }
 
@@ -259,6 +301,13 @@ impl Node for NodeHandler {
             }));
         }
 
+        // Term observation succeeded. Per Raft (ADR-0016 §5), any
+        // valid leader RPC defeats an in-flight election: settle as
+        // Follower if we were Initializing or Candidate, and bump
+        // the election deadline.
+        core.settle_as_follower();
+        core.reset_election_timer();
+
         // ADR-0016 §8 prev-log-entry consistency check. Runs after
         // term observation so a higher-term advance is still durably
         // recorded even on rejection — Raft's term invariant must
@@ -326,10 +375,120 @@ impl Node for NodeHandler {
 
     async fn request_vote(
         &self,
-        _request: Request<proto::RequestVoteRequest>,
+        request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
-        let _guard = self.core.node_mutex.lock().await;
-        Err(Status::unimplemented("RequestVote deferred to ADR-016"))
+        // ADR-0016 §6 — Raft §5.4.1 verbatim. The per-node mutex
+        // serialises this against `AppendEntries` so a candidate
+        // and an arriving leader cannot race against the same
+        // `(currentTerm, votedFor, log)` snapshot.
+        let core = &self.core;
+        let _guard = core.node_mutex.lock().await;
+        let req = request.into_inner();
+
+        let our_term_before = core.term.get_current_term();
+
+        // 1. Stale-term reject.
+        if req.term < our_term_before {
+            return Ok(Response::new(proto::RequestVoteResponse {
+                term: our_term_before,
+                vote_granted: false,
+            }));
+        }
+
+        // 2. Higher-term observation: durably advance our term and
+        // clear `voted_for` so we can grant in this new term. Both
+        // the term log (`Term::observe`) and the vote log
+        // (`Vote::observe_term`) are fdatasync'd before we proceed.
+        // We use the candidate's `last_tx_id` as `start_tx_id`
+        // because it's a tx the new term will logically span (the
+        // candidate is asking us to assent to its leadership).
+        if req.term > our_term_before {
+            if let Err(e) = core.term.observe(req.term, req.last_tx_id) {
+                warn!(
+                    "request_vote: term observe failed on node {} (incoming={}): {}",
+                    core.node_id, req.term, e
+                );
+                return Ok(Response::new(proto::RequestVoteResponse {
+                    term: core.term.get_current_term(),
+                    vote_granted: false,
+                }));
+            }
+            if let Err(e) = core.vote.observe_term(req.term) {
+                warn!(
+                    "request_vote: vote observe_term failed on node {} (incoming={}): {}",
+                    core.node_id, req.term, e
+                );
+                return Ok(Response::new(proto::RequestVoteResponse {
+                    term: core.term.get_current_term(),
+                    vote_granted: false,
+                }));
+            }
+        }
+
+        // 3. Already-voted check. If we voted for someone else in
+        // this term, reject. If we voted for *this* candidate
+        // (idempotent retry), the vote-grant path below will
+        // observe that and return success.
+        if let Some(prev) = core.vote.get_voted_for()
+            && prev != req.candidate_id
+        {
+            return Ok(Response::new(proto::RequestVoteResponse {
+                term: core.term.get_current_term(),
+                vote_granted: false,
+            }));
+        }
+
+        // 4. Up-to-date-log check (Raft §5.4.1). The candidate must
+        // have a log at least as up-to-date as ours: their
+        // `(last_term, last_tx_id)` must be ≥ ours by lex order.
+        let our_last_tx_id = core.ledger.ledger().last_commit_id();
+        let our_last_term = core
+            .term
+            .last_record()
+            .map(|r| r.term)
+            .unwrap_or(0);
+        let candidate_more_up_to_date = (req.last_term, req.last_tx_id)
+            >= (our_last_term, our_last_tx_id);
+        if !candidate_more_up_to_date {
+            return Ok(Response::new(proto::RequestVoteResponse {
+                term: core.term.get_current_term(),
+                vote_granted: false,
+            }));
+        }
+
+        // 5. Grant — durably persist the vote *before* we reply.
+        // On a clean grant the same call re-applies on retry
+        // (idempotent for the same `candidate_id`).
+        match core.vote.vote(req.term, req.candidate_id) {
+            Ok(true) => {
+                // Per Raft §5.2: a server that grants a vote in a
+                // term defers to that election. Reset our timer so
+                // we don't immediately become a Candidate ourselves.
+                core.reset_election_timer();
+                Ok(Response::new(proto::RequestVoteResponse {
+                    term: core.term.get_current_term(),
+                    vote_granted: true,
+                }))
+            }
+            Ok(false) => {
+                // Another vote landed in this term first; we cannot
+                // double-vote.
+                Ok(Response::new(proto::RequestVoteResponse {
+                    term: core.term.get_current_term(),
+                    vote_granted: false,
+                }))
+            }
+            Err(e) => {
+                warn!(
+                    "request_vote: durable vote write failed on node {}: {}",
+                    core.node_id, e
+                );
+                Ok(Response::new(proto::RequestVoteResponse {
+                    term: core.term.get_current_term(),
+                    vote_granted: false,
+                }))
+            }
+        }
     }
 
     async fn install_snapshot(

@@ -10,6 +10,8 @@
 use lproto::submit_operation_request::Operation;
 use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
 use roda_ledger::cluster::proto::ledger::{self as lproto, Deposit, SubmitOperationRequest};
+use roda_ledger::cluster::proto::node as nproto;
+use roda_ledger::cluster::proto::node::node_client::NodeClient;
 use roda_ledger::cluster::{
     self, ClusterNode, ClusterNodeSection, ClusterSection, PeerConfig, ServerSection,
 };
@@ -51,36 +53,37 @@ fn ledger_cfg(data_dir: &str, tx_per_seg: u64) -> LedgerConfig {
     }
 }
 
-// Stage 3b puts multi-node clusters in `Initializing` on boot —
-// no leader exists until Stage 4 elections run, so this end-to-end
-// "leader replicates to follower" test cannot make progress yet.
-// Re-enable when Stage 4 lands real `RequestVote` + Candidate loop.
-#[ignore = "multi-node leader pending Stage 4 elections (ADR-0016 §5)"]
+// Stage 4: with the Candidate loop landed, multi-node clusters
+// elect a leader from cold boot — no static role is assigned. The
+// follower no longer rejects writes deterministically (whichever
+// node loses the election becomes the follower), so this test
+// drives writes against the elected leader, identified via the
+// `Ping` RPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_leader_replicates_to_follower() {
-    let leader_client_port = free_port();
-    let leader_node_port = free_port();
-    let follower_client_port = free_port();
-    let follower_node_port = free_port();
+    let n1_client_port = free_port();
+    let n1_node_port = free_port();
+    let n2_client_port = free_port();
+    let n2_node_port = free_port();
 
     // Symmetric peer list — both nodes see each other plus self.
     let all_peers = vec![
         PeerConfig {
             peer_id: 1,
-            host: format!("http://127.0.0.1:{}", leader_node_port),
+            host: format!("http://127.0.0.1:{}", n1_node_port),
         },
         PeerConfig {
             peer_id: 2,
-            host: format!("http://127.0.0.1:{}", follower_node_port),
+            host: format!("http://127.0.0.1:{}", n2_node_port),
         },
     ];
 
-    let leader_cfg = cluster::Config {
+    let n1_cfg = cluster::Config {
         cluster: Some(ClusterSection {
             node: ClusterNodeSection {
                 node_id: 1,
                 host: "127.0.0.1".to_string(),
-                port: leader_node_port,
+                port: n1_node_port,
             },
             peers: all_peers.clone(),
             replication_poll_ms: 2,
@@ -88,18 +91,18 @@ async fn cluster_leader_replicates_to_follower() {
         }),
         server: ServerSection {
             host: "127.0.0.1".to_string(),
-            port: leader_client_port,
+            port: n1_client_port,
             ..Default::default()
         },
-        ledger: ledger_cfg(&tmp_dir("leader"), 10_000_000),
+        ledger: ledger_cfg(&tmp_dir("n1"), 10_000_000),
     };
 
-    let follower_cfg = cluster::Config {
+    let n2_cfg = cluster::Config {
         cluster: Some(ClusterSection {
             node: ClusterNodeSection {
                 node_id: 2,
                 host: "127.0.0.1".to_string(),
-                port: follower_node_port,
+                port: n2_node_port,
             },
             peers: all_peers,
             replication_poll_ms: 2,
@@ -107,24 +110,34 @@ async fn cluster_leader_replicates_to_follower() {
         }),
         server: ServerSection {
             host: "127.0.0.1".to_string(),
-            port: follower_client_port,
+            port: n2_client_port,
             ..Default::default()
         },
-        ledger: ledger_cfg(&tmp_dir("follower"), 20_000),
+        ledger: ledger_cfg(&tmp_dir("n2"), 20_000),
     };
 
-    // Follower first so its node port is listening when the leader's replication
-    // task attempts to connect.
-    let follower = ClusterNode::new(follower_cfg).expect("follower ledger");
-    let follower_handles = follower.run().await.expect("follower run");
+    let n2 = ClusterNode::new(n2_cfg).expect("n2 ledger");
+    let n2_handles = n2.run().await.expect("n2 run");
 
-    let leader = ClusterNode::new(leader_cfg).expect("leader ledger");
-    let leader_handles = leader.run().await.expect("leader run");
+    let n1 = ClusterNode::new(n1_cfg).expect("n1 ledger");
+    let n1_handles = n1.run().await.expect("n1 run");
 
     // Wait for both gRPC servers to be bound.
-    wait_for_tcp(format!("127.0.0.1:{}", leader_client_port)).await;
-    wait_for_tcp(format!("127.0.0.1:{}", follower_client_port)).await;
-    wait_for_tcp(format!("127.0.0.1:{}", follower_node_port)).await;
+    wait_for_tcp(format!("127.0.0.1:{}", n1_client_port)).await;
+    wait_for_tcp(format!("127.0.0.1:{}", n2_client_port)).await;
+    wait_for_tcp(format!("127.0.0.1:{}", n1_node_port)).await;
+    wait_for_tcp(format!("127.0.0.1:{}", n2_node_port)).await;
+
+    // ── Wait for an election to settle on a unique Leader ───────────────
+    let (leader_node_id, leader_client_port, follower_client_port) = wait_for_leader(&[
+        (1, n1_node_port, n1_client_port),
+        (2, n2_node_port, n2_client_port),
+    ])
+    .await;
+    eprintln!(
+        "election settled: node_id={} is leader (client port {})",
+        leader_node_id, leader_client_port
+    );
 
     // ── Connect clients to both Ledger servers ───────────────────────────
     let mut leader_client =
@@ -172,8 +185,11 @@ async fn cluster_leader_replicates_to_follower() {
     }
 
     // ── Wait for follower to catch up ────────────────────────────────────
-    let leader_ledger = leader.ledger();
-    let follower_ledger = follower.ledger();
+    let (leader_ledger, follower_ledger) = if leader_node_id == 1 {
+        (n1.ledger(), n2.ledger())
+    } else {
+        (n2.ledger(), n1.ledger())
+    };
 
     // Leader commit first.
     wait_for(Duration::from_secs(30), "leader commit_index", || {
@@ -211,8 +227,54 @@ async fn cluster_leader_replicates_to_follower() {
     );
 
     // ── Shutdown ────────────────────────────────────────────────────────
-    leader_handles.abort();
-    follower_handles.abort();
+    n1_handles.abort();
+    n2_handles.abort();
+}
+
+/// Poll every node's `Ping` endpoint until exactly one reports
+/// `NodeRole::Leader`. Returns `(leader_node_id, leader_client_port,
+/// follower_client_port)`. Panics on timeout (5 s) or on observing
+/// two simultaneous leaders.
+///
+/// Each tuple is `(node_id, peer_node_port, client_port)`. Only
+/// peer-facing ports run the `Node` gRPC service.
+async fn wait_for_leader(nodes: &[(u64, u16, u16)]) -> (u64, u16, u16) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut leaders: Vec<(u64, u16)> = Vec::new();
+        let mut other_clients: Vec<u16> = Vec::new();
+        for (node_id, node_port, client_port) in nodes {
+            let role = ping_role(*node_port).await;
+            if matches!(role, Some(nproto::NodeRole::Leader)) {
+                leaders.push((*node_id, *client_port));
+            } else {
+                other_clients.push(*client_port);
+            }
+        }
+        match leaders.len() {
+            1 => return (leaders[0].0, leaders[0].1, other_clients[0]),
+            n if n > 1 => panic!("two leaders observed simultaneously: {:?}", leaders),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            panic!("no leader elected within 5s");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn ping_role(node_port: u16) -> Option<nproto::NodeRole> {
+    let mut client = NodeClient::connect(format!("http://127.0.0.1:{}", node_port))
+        .await
+        .ok()?;
+    let resp = client
+        .ping(nproto::PingRequest {
+            from_node_id: 0,
+            nonce: 0,
+        })
+        .await
+        .ok()?;
+    nproto::NodeRole::try_from(resp.into_inner().role).ok()
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
