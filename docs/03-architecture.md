@@ -2,7 +2,7 @@
 
 This document explains the design of roda-ledger — what each part does, why it exists, and the reasoning behind key tradeoffs. 
 
-[//]: # (Implementation details &#40;data structures, binary formats, lock mechanics&#41; are in [Internals]&#40;./04-internals.md&#41;.)
+[//]: # (Implementation details, invariants, and decisions are in [Internal]&#40;./internal.md&#41;.)
 
 If you haven't already, read [Concepts](./01-concepts.md) first — it defines the terminology and guarantees this document builds on.
 
