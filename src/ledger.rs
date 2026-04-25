@@ -256,6 +256,34 @@ impl Ledger {
         self.pipeline.set_commit_handler(handler)
     }
 
+    /// Drive the cluster-commit gate consulted by the seal stage
+    /// (ADR-0016 §10). The seal stage refuses to seal a segment whose
+    /// last `tx_id` exceeds this value — guaranteeing sealed segments
+    /// only ever contain cluster-committed transactions, so a future
+    /// `start_with_recovery_until` reseed never has to unseal.
+    ///
+    /// The cluster supervisor wires this to:
+    /// - leader: `Quorum::get()` advances (Stage 3 work).
+    /// - follower: `leader_commit_tx_id` from incoming `AppendEntries`
+    ///   (Stage 3 work).
+    ///
+    /// Plain `store` semantics — caller is responsible for advancing
+    /// monotonically. Both Quorum and leader_commit are monotonically
+    /// non-decreasing per Raft, so the supervisor can thread them
+    /// straight through.
+    ///
+    /// Standalone (non-cluster) callers do not need to call this; the
+    /// default `u64::MAX` leaves seal cadence unchanged.
+    pub fn set_seal_watermark(&self, tx_id: u64) {
+        self.pipeline.set_seal_watermark(tx_id);
+    }
+
+    /// Read the current seal watermark — observability for tests and
+    /// the cluster's `Ping` / `GetStatus` surfaces.
+    pub fn get_seal_watermark(&self) -> u64 {
+        self.pipeline.get_seal_watermark()
+    }
+
     // ── Cluster Mode Surface (ADR-015) ────────────────────────────────────
 
     /// Follower write path: hand a pre-validated batch to the WAL stage as
@@ -354,7 +382,7 @@ impl Ledger {
             )
         })?;
 
-        self.recover().map_err(|e| {
+        self.recover(u64::MAX).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("failed to recover ledger during start: {}", e),
@@ -391,7 +419,7 @@ impl Ledger {
         Ok(())
     }
 
-    fn recover(&mut self) -> std::io::Result<()> {
+    fn recover(&mut self, watermark: u64) -> std::io::Result<()> {
         let mut recover = Recover::new(
             &mut self.transactor,
             &mut self.snapshot,
@@ -401,9 +429,115 @@ impl Ledger {
             &self.wasm_runtime,
         );
 
-        recover.recover().map_err(|e| {
+        recover.recover_until(watermark).map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to recover ledger state: {}", e))
         })
+    }
+
+    /// Boot variant of [`Self::start`] used by the cluster's
+    /// recovery-mode reseed path (ADR-0016 §9 / §10). Truncates any
+    /// WAL content above `watermark`, replays snapshot + WAL up to and
+    /// including `watermark`, then spawns the pipeline stages — matching
+    /// `start()`'s behaviour from that point onward.
+    ///
+    /// Intended use is **boot-time only**, on a freshly constructed
+    /// `Ledger` whose stages have not been started yet. The cluster
+    /// supervisor invokes this exactly once when it detects log
+    /// divergence on an incoming `AppendEntries`: it drops the live
+    /// `Arc<Ledger>` and reconstructs through this path with
+    /// `watermark = leader_commit_tx_id` from the rejecting request.
+    /// No leader code path ever calls this.
+    ///
+    /// Sequence:
+    /// 1. ADR-006 crash-recovery on the active `wal.bin`.
+    /// 2. Physical truncation: delete every segment fully past
+    ///    `watermark`, byte-truncate the segment that straddles it,
+    ///    discard stale snapshots, recompute `last_segment_id`.
+    /// 3. Replay snapshot + WAL bounded by `watermark`. Pipeline
+    ///    indices are clamped to `min(replayed_last_tx, watermark)`.
+    /// 4. Spawn transactor/wal/snapshot/(seal) — same as `start()`.
+    ///
+    /// `watermark = u64::MAX` is equivalent to `start()` (no
+    /// truncation, no snapshot filter, no clamp).
+    pub fn start_with_recovery_until(&mut self, watermark: u64) -> std::io::Result<()> {
+        info!("Starting Ledger with recovery watermark = {}...", watermark);
+
+        // Crash recovery first: a torn tail in wal.bin should be fixed
+        // before we reason about which records cross the watermark.
+        Recover::crash_recover_if_needed(&self.storage).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed crash recovery during start_with_recovery_until: {}",
+                    e
+                ),
+            )
+        })?;
+
+        // Physical truncation — fail fast if we cannot uphold the
+        // watermark on disk. Idempotent: re-running on already-truncated
+        // state is a no-op.
+        self.storage.truncate_wal_above(watermark).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed truncate_wal_above({}) during start: {}", watermark, e),
+            )
+        })?;
+
+        // Pin the seal-stage gate to the recovery watermark BEFORE
+        // recovery's pre-seal pass and before spawning stages.
+        // Without this, both the recovery pre-seal and the freshly
+        // spawned seal stage would observe the default `u64::MAX` and
+        // seal segments whose last_tx sits above the cluster-commit
+        // watermark — turning recoverable diverged tail into
+        // immutable sealed history (ADR-0016 §10). The cluster
+        // supervisor will advance this watermark forward as new
+        // commits arrive.
+        if watermark != u64::MAX {
+            self.pipeline.set_seal_watermark(watermark);
+        }
+
+        self.recover(watermark).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed bounded recovery (watermark={}) during start: {}",
+                    watermark, e
+                ),
+            )
+        })?;
+
+        self.handles.push(
+            self.transactor
+                .start(self.pipeline.transactor_context())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
+                })?,
+        );
+        self.handles.extend(
+            self.wal.start(self.pipeline.wal_context()).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
+            })?,
+        );
+        self.handles.push(
+            self.snapshot
+                .start(self.pipeline.snapshot_context())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
+                })?,
+        );
+        if !self.config.disable_seal {
+            self.handles
+                .push(self.seal.start(self.pipeline.seal_context()).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
+                })?);
+        }
+
+        info!(
+            "Ledger started successfully via start_with_recovery_until(watermark={}).",
+            watermark
+        );
+        Ok(())
     }
 }
 

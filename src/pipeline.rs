@@ -45,6 +45,21 @@ pub struct Pipeline {
     /// Last segment id sealed by the seal stage.
     seal_index: CachePadded<AtomicU32>,
 
+    /// Cluster-commit gate consulted by the seal stage (ADR-0016 §10).
+    /// A segment may only be sealed once **every** transaction it
+    /// contains has `tx_id <= seal_watermark`. The cluster supervisor
+    /// drives this atomic from `Quorum::get()` advances on the leader
+    /// and from `leader_commit_tx_id` arriving in `AppendEntries` on
+    /// followers. Default `u64::MAX` means "no cluster gate" — the
+    /// behaviour every standalone (non-cluster) `Ledger` user gets.
+    ///
+    /// The invariant this enforces: sealed segments contain only
+    /// cluster-committed transactions, so `start_with_recovery_until`
+    /// never has to unseal anything during a recovery-mode reseed
+    /// (sealed segments are by construction always at or below the
+    /// reseed watermark, since the cluster watermark is monotonic).
+    seal_watermark: CachePadded<AtomicU64>,
+
     /// Global shutdown flag. Cleared by `shutdown()` to stop every stage.
     running: CachePadded<AtomicBool>,
 
@@ -78,6 +93,7 @@ impl Pipeline {
             commit_index: CachePadded::new(AtomicU64::new(0)),
             snapshot_index: CachePadded::new(AtomicU64::new(0)),
             seal_index: CachePadded::new(AtomicU32::new(0)),
+            seal_watermark: CachePadded::new(AtomicU64::new(u64::MAX)),
 
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
@@ -199,6 +215,30 @@ impl Pipeline {
 
     pub(crate) fn set_seal_index(&self, id: u32) {
         self.seal_index.store(id, Ordering::Release);
+    }
+
+    // ─── cluster-driven seal gate (ADR-0016 §10) ────────────────────────────
+
+    /// Public so the cluster supervisor can drive the seal watermark
+    /// from `Quorum::get()` advances (leader) or `leader_commit_tx_id`
+    /// from incoming `AppendEntries` (follower). Standalone Ledger
+    /// users never call this — the default `u64::MAX` keeps the
+    /// pre-cluster sealing cadence intact.
+    ///
+    /// Plain store, not `fetch_max`: the default value is `u64::MAX`
+    /// (the "no gate" sentinel), so a `fetch_max(N)` against it would
+    /// never lower the gate. The cluster supervisor is responsible for
+    /// driving this value monotonically within its own lifecycle —
+    /// `Quorum::get()` and `leader_commit_tx_id` are both
+    /// monotonically non-decreasing per Raft, so the supervisor can
+    /// just thread their values straight through.
+    pub fn set_seal_watermark(&self, tx_id: u64) {
+        self.seal_watermark.store(tx_id, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn get_seal_watermark(&self) -> u64 {
+        self.seal_watermark.load(Ordering::Acquire)
     }
 }
 
@@ -400,6 +440,15 @@ impl SealContext {
     #[inline(always)]
     pub fn wait_strategy(&self) -> WaitStrategy {
         self.pipeline.wait_strategy
+    }
+
+    /// Cluster-commit gate (ADR-0016 §10). The seal stage refuses to
+    /// seal a segment whose last `tx_id` is above this value, so
+    /// sealed segments only ever contain cluster-committed
+    /// transactions.
+    #[inline(always)]
+    pub fn seal_watermark(&self) -> u64 {
+        self.pipeline.get_seal_watermark()
     }
 }
 

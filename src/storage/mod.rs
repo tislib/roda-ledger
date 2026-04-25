@@ -6,6 +6,7 @@ mod segment;
 mod snapshot;
 mod syncer;
 pub mod term;
+mod truncate;
 pub mod vote;
 mod wal_reader;
 mod wal_serializer;

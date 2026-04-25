@@ -24,18 +24,18 @@ pub enum SegmentStaus {
 
 pub struct Segment {
     // init parameters
-    data_dir: String,
-    segment_id: u32,
-    loaded: bool,
+    pub(super) data_dir: String,
+    pub(super) segment_id: u32,
+    pub(super) loaded: bool,
 
     // wal
     wal_file: Option<File>, // if unloaded, wal_file is None
-    wal_data: Vec<u8>,      // in case of closed or sealed mode
-    status: SegmentStaus,
+    pub(super) wal_data: Vec<u8>, // in case of closed or sealed mode
+    pub(super) status: SegmentStaus,
 
     // active segment only
     wal_buffer: Vec<u8>,
-    wal_position: usize,
+    pub(super) wal_position: usize,
     record_count: u64,
 }
 
@@ -366,6 +366,127 @@ impl Segment {
         Ok(())
     }
 
+    /// Highest `tx_id` present in this segment's WAL records, or `0`
+    /// if the segment contains no transactional records (an empty
+    /// active, or a segment with only `SegmentHeader` /
+    /// `SegmentSealed` / `FunctionRegistered`).
+    ///
+    /// Walks **backwards** record-by-record (each record is 40 bytes)
+    /// and returns the first non-zero `tx_id` encountered. O(1) in
+    /// the typical case where the segment ends with an `Entry` /
+    /// `Link` of the most recent transaction. Used by the seal stage's
+    /// cluster gate (ADR-0016 §10) to decide whether a CLOSED segment
+    /// is yet eligible for sealing without paying the cost of a full
+    /// forward scan.
+    pub(crate) fn last_tx_id_in_wal_data(&self) -> Result<u64, Error> {
+        assert!(
+            self.loaded,
+            "Segment is not loaded, cannot inspect last tx_id",
+        );
+        if !self.wal_data.len().is_multiple_of(40) {
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL data is corrupted, cannot read records (is not aligned to 40 bytes)",
+            ));
+        }
+        let mut offset = self.wal_data.len();
+        while offset >= 40 {
+            offset -= 40;
+            let entry = parse_wal_record(&self.wal_data[offset..offset + 40])?;
+            let tx = entry.tx_id();
+            if tx > 0 {
+                return Ok(tx);
+            }
+        }
+        Ok(0)
+    }
+
+    /// Locate the byte offset of the `Metadata` record carrying a
+    /// specific `tx_id` in this segment's WAL data, or `None` if no
+    /// such record is present.
+    ///
+    /// Forward scan, record-by-record. The returned offset points at
+    /// the start of the `Metadata`; the caller can read it back with
+    /// `parse_wal_record` to inspect (e.g. to verify the term that
+    /// covered `prev_tx_id` per ADR-0016 §8), find its followers
+    /// immediately after, or treat the offset as the truncation point
+    /// that drops this transaction and everything after it.
+    ///
+    /// This is an **exact-match** probe. For "first tx beyond a
+    /// threshold" semantics (the truncation use case) use
+    /// [`Self::locate_tx_watermark`] instead — that handles the case
+    /// where every tx in the segment is already above the threshold,
+    /// which exact-match cannot.
+    #[allow(dead_code)] // first user lands in Phase 2b (prev_tx_id check)
+    pub(crate) fn locate_tx_position(&self, target_tx_id: u64) -> Result<Option<usize>, Error> {
+        assert!(
+            self.loaded,
+            "Segment is not loaded, cannot locate tx position",
+        );
+        if !self.wal_data.len().is_multiple_of(40) {
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL data is corrupted, cannot read records (is not aligned to 40 bytes)",
+            ));
+        }
+        let mut offset = 0usize;
+        while offset + 40 <= self.wal_data.len() {
+            let entry = parse_wal_record(&self.wal_data[offset..offset + 40])?;
+            if let WalEntry::Metadata(meta) = &entry
+                && meta.tx_id == target_tx_id
+            {
+                return Ok(Some(offset));
+            }
+            offset += 40;
+        }
+        Ok(None)
+    }
+
+    /// Locate the byte offset of the **first** `Metadata` record
+    /// whose `tx_id > watermark`, or `None` if every `Metadata` in
+    /// this segment is already at or below the watermark.
+    ///
+    /// This is the truncation primitive (ADR-0016 §9): slicing the
+    /// WAL at the returned offset preserves all earlier complete
+    /// transactions intact (their followers live between the previous
+    /// metadata and this one). The caller treats `None` as "segment
+    /// fully ≤ watermark — nothing to truncate".
+    ///
+    /// Distinct from [`Self::locate_tx_position`]: that takes an
+    /// exact `tx_id` and cannot represent "this segment is entirely
+    /// above the threshold" because the specific `watermark + 1` that
+    /// the caller would probe with may not exist (segments can start
+    /// well above the watermark when the diverged tail spans the
+    /// whole segment).
+    ///
+    /// Non-transactional records (`SegmentHeader`, `SegmentSealed`,
+    /// `FunctionRegistered`) all carry `tx_id = 0` per
+    /// `WalEntry::tx_id`, so they never trigger truncation on their
+    /// own — they are kept alongside the transactions that bound them.
+    pub(crate) fn locate_tx_watermark(&self, watermark: u64) -> Result<Option<usize>, Error> {
+        assert!(
+            self.loaded,
+            "Segment is not loaded, cannot locate tx watermark",
+        );
+        if !self.wal_data.len().is_multiple_of(40) {
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL data is corrupted, cannot read records (is not aligned to 40 bytes)",
+            ));
+        }
+        let mut offset = 0usize;
+        while offset + 40 <= self.wal_data.len() {
+            let entry = parse_wal_record(&self.wal_data[offset..offset + 40])?;
+            if let WalEntry::Metadata(meta) = &entry
+                && meta.tx_id > watermark
+            {
+                return Ok(Some(offset));
+            }
+            offset += 40;
+        }
+        Ok(None)
+    }
+
     pub(crate) fn current_wal_offset(&self) -> usize {
         self.wal_position
     }
@@ -379,23 +500,6 @@ impl Segment {
         self.wal_data.clone()
     }
 
-    /// Truncates the active WAL file to `new_len` bytes.
-    pub(crate) fn truncate_wal(&mut self, new_len: u64) -> Result<(), Error> {
-        let data_dir_path = Path::new(&self.data_dir);
-        let wal_file_path = active_wal_path(data_dir_path);
-        let file = OpenOptions::new().write(true).open(&wal_file_path)?;
-        file.set_len(new_len)?;
-        file.sync_all()?;
-
-        // Re-read the truncated data so visit_wal_records sees the correct state.
-        if new_len > 0 {
-            self.wal_data = read_wal_data(&wal_file_path)?;
-        } else {
-            self.wal_data.clear();
-        }
-        self.wal_position = new_len as usize;
-        Ok(())
-    }
 
     // ── wal.stop marker (physical abstraction) ──────────────────────────────
 

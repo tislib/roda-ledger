@@ -1,9 +1,9 @@
 use crate::config::StorageConfig;
-use crate::storage::Segment;
 use crate::storage::function_snapshot::{self, FunctionSnapshotData, FunctionSnapshotRecord};
-use crate::storage::layout::parse_segment_id;
+use crate::storage::layout::{active_wal_path, parse_segment_id};
 use crate::storage::wal_tail::WalTailer;
-use spdlog::info;
+use crate::storage::{Segment, SegmentStaus};
+use spdlog::{info, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -113,6 +113,215 @@ impl Storage {
     /// an independent cursor.
     pub fn wal_tailer(self: &Arc<Self>) -> WalTailer {
         WalTailer::new(self.clone())
+    }
+
+    /// Physically remove every WAL byte (and dependent snapshot file)
+    /// whose `tx_id > watermark`. Boot-time mechanism behind
+    /// [`crate::ledger::Ledger::start_with_recovery_until`] (ADR-0016 §9).
+    ///
+    /// **Iteration order: newest segment first.** Truncation only ever
+    /// affects the *tail* of the on-disk log, so working from the
+    /// active segment down through the closed segments lets us
+    /// short-circuit as soon as we hit a segment whose every record
+    /// is at or below `watermark` — the rest of history is
+    /// guaranteed to be too. Avoiding a full backwards walk keeps the
+    /// reseed cost bounded by the diverged tail size, not by the
+    /// entire local history.
+    ///
+    /// **Sealed segments are immutable.** ADR-0016 §10's seal-watermark
+    /// gate (`Ledger::set_seal_watermark`) guarantees a sealed segment
+    /// only ever contains cluster-committed transactions, so its last
+    /// `tx_id` is always at or below any future recovery watermark
+    /// (the cluster watermark is monotonically non-decreasing). If
+    /// truncation logic encounters a sealed segment that *would* need
+    /// truncation or deletion, the cluster invariant has been broken
+    /// — return `InvalidData` rather than silently rewriting durable
+    /// committed history.
+    ///
+    /// For each non-sealed segment processed (active first, then
+    /// closed segments newest → oldest):
+    /// - **Entirely past `watermark`** (`trunc_offset == 0` while the
+    ///   segment has bytes): delete every artefact
+    ///   (`wal_{id}.{bin,crc,seal}`, `wal_index_{id}.bin`,
+    ///   `account_index_{id}.bin`, `snapshot_{id}.{bin,crc}`,
+    ///   `function_snapshot_{id}.{bin,crc}`). For the active `wal.bin`
+    ///   the file itself is unlinked.
+    /// - **Straddles `watermark`**: byte-truncate the file to the
+    ///   offset before the first over-watermark `Metadata`, and
+    ///   discard this segment's snapshot pair (it captured state past
+    ///   the watermark and is no longer trustworthy). After this, the
+    ///   walk terminates — earlier segments are entirely below the
+    ///   watermark by construction.
+    /// - **Entirely at or below `watermark`**: untouched, walk
+    ///   terminates.
+    ///
+    /// After all file ops, `last_segment_id` is recomputed from the
+    /// surviving `wal_NNNNNN.bin` files so a follow-up `recover_until`
+    /// or `recover` opens the correct active segment.
+    ///
+    /// Calling this **on a running ledger is undefined**: the active
+    /// segment's mutable state inside the WAL stage is not
+    /// coordinated with these file-system mutations. Callers must
+    /// ensure no pipeline thread is touching the segment when this
+    /// runs — which is exactly the situation in
+    /// `start_with_recovery_until`, pre-`start`.
+    pub fn truncate_wal_above(&self, watermark: u64) -> Result<(), std::io::Error> {
+        let data_dir = self.config.data_dir.clone();
+        let data_dir_path = Path::new(&data_dir);
+
+        // ── Active segment (`wal.bin`) — newest of all ────────────────
+        //
+        // Three outcomes:
+        // - Fully past `watermark` → delete `wal.bin`. Closed segments
+        //   may still be past, so we KEEP iterating them.
+        // - Straddles `watermark`  → truncate. Closed segments are by
+        //   construction older than active (lower tx ids), so we know
+        //   they're entirely below the watermark — short-circuit.
+        // - Fully ≤ `watermark`    → leave alone. We do NOT
+        //   short-circuit here, because the active segment may be
+        //   empty / structural-only (e.g. just a SegmentHeader from a
+        //   previous recovery cycle), in which case some CLOSED
+        //   segment still ahead of it in tx-space could be past the
+        //   watermark and need work. The closed-segment walk will
+        //   short-circuit on its own first "fully ≤" hit.
+        let active_path = active_wal_path(data_dir_path);
+        let mut continue_with_closed = true;
+        if active_path.exists() {
+            let mut active = self.active_segment().map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("truncate_wal_above: failed to open active segment: {}", e),
+                )
+            })?;
+            let active_id = active.id();
+            // `None` here means "every tx in this segment is at or
+            // below the watermark" → no truncation needed; the offset
+            // is the full length. `Some(offset)` is the start of the
+            // first Metadata > watermark — the truncation cut-point.
+            let total_len = active.wal_data_len();
+            let trunc_offset = active
+                .locate_tx_watermark(watermark)?
+                .unwrap_or(total_len);
+
+            if trunc_offset == 0 && total_len > 0 {
+                warn!(
+                    "truncate_wal_above: removing active wal.bin (segment {}, entirely past watermark={})",
+                    active_id, watermark
+                );
+                drop(active);
+                std::fs::remove_file(&active_path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("truncate_wal_above: failed to remove wal.bin: {}", e),
+                    )
+                })?;
+                Segment::delete_snapshot_files_for_segment(&data_dir, active_id)?;
+            } else if trunc_offset < total_len {
+                warn!(
+                    "truncate_wal_above: truncating active wal.bin from {} to {} bytes (watermark={})",
+                    total_len, trunc_offset, watermark
+                );
+                active.truncate_wal(trunc_offset as u64)?;
+                Segment::delete_snapshot_files_for_segment(&data_dir, active_id)?;
+                continue_with_closed = false;
+            }
+            // else: trunc_offset == total_len → active fully ≤ watermark
+            // (or empty). Keep walking closed; the loop short-circuits
+            // on its own when it finds a fully-≤ segment.
+        }
+
+        // ── Closed/sealed segments, newest-first ──────────────────────
+        if continue_with_closed {
+            let mut segments = self.list_all_segments()?;
+            // list_all_segments returns ascending; reverse for tail-first walk.
+            segments.reverse();
+
+            for seg in segments.iter_mut() {
+                seg.load().map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "truncate_wal_above: failed to load segment {}: {}",
+                            seg.id(),
+                            e
+                        ),
+                    )
+                })?;
+
+                let total_len = seg.wal_data_len();
+                let trunc_offset = seg.locate_tx_watermark(watermark)?.unwrap_or(total_len);
+                let seg_id = seg.id();
+
+                if trunc_offset == total_len {
+                    // Entirely ≤ watermark. Earlier segments are too —
+                    // we're done.
+                    break;
+                }
+
+                // Either entirely past watermark (trunc_offset == 0)
+                // or straddling — both require file-system mutation.
+                // Sealed segments must NEVER reach this branch under
+                // the ADR-0016 §10 cluster invariant.
+                if seg.status() == SegmentStaus::SEALED {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "truncate_wal_above: sealed segment {} would need truncation \
+                             at watermark={} (total_len={}, trunc_offset={}). \
+                             Sealed segments must hold only cluster-committed transactions \
+                             (see seal_watermark / ADR-0016 §10); reaching this state \
+                             indicates a broken cluster invariant.",
+                            seg_id, watermark, total_len, trunc_offset
+                        ),
+                    ));
+                }
+
+                if trunc_offset == 0 {
+                    warn!(
+                        "truncate_wal_above: deleting segment {} (entirely past watermark={})",
+                        seg_id, watermark
+                    );
+                    Segment::delete_all_files_for_segment(&data_dir, seg_id)?;
+                    // Continue: an even-older segment may still hold
+                    // tx > watermark if some weirdness exists, but
+                    // ordinarily we hit a "fully ≤" segment soon.
+                } else {
+                    // Straddles watermark — byte-truncate, drop stale
+                    // snapshot, and stop. Earlier segments are below.
+                    warn!(
+                        "truncate_wal_above: truncating segment {} from {} to {} bytes (watermark={})",
+                        seg_id, total_len, trunc_offset, watermark
+                    );
+                    seg.truncate_wal(trunc_offset as u64)?;
+                    Segment::delete_snapshot_files_for_segment(&data_dir, seg_id)?;
+                    break;
+                }
+            }
+        }
+
+        // ── Recompute last_segment_id from surviving sealed/closed files ──
+        let mut surviving_ids: Vec<u32> = std::fs::read_dir(&data_dir)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "truncate_wal_above: failed to re-read data dir at {}: {}",
+                        data_dir, e
+                    ),
+                )
+            })?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| parse_segment_id(&e.file_name().to_string_lossy()))
+            .collect();
+        surviving_ids.sort();
+        let new_last = surviving_ids.last().copied().unwrap_or(0) + 1;
+        self.last_segment_id.store(new_last, Ordering::Release);
+
+        info!(
+            "truncate_wal_above: complete (watermark={}, last_segment_id now={})",
+            watermark, new_last
+        );
+        Ok(())
     }
 
     // ─── WASM function binaries (ADR-014) ──────────────────────────────────
