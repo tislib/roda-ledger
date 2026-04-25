@@ -199,9 +199,7 @@ impl Storage {
             // is the full length. `Some(offset)` is the start of the
             // first Metadata > watermark — the truncation cut-point.
             let total_len = active.wal_data_len();
-            let trunc_offset = active
-                .locate_tx_watermark(watermark)?
-                .unwrap_or(total_len);
+            let trunc_offset = active.locate_tx_watermark(watermark)?.unwrap_or(total_len);
 
             if trunc_offset == 0 && total_len > 0 {
                 warn!(

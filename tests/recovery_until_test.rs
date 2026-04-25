@@ -141,7 +141,11 @@ fn truncated_transactions_are_lost_across_plain_restart() {
             "after a plain restart, commit index must STILL be at the watermark — \
              truncated transactions are gone from disk forever"
         );
-        assert_eq!(ledger.get_balance(1), 100, "account 1 still 100 on cold boot");
+        assert_eq!(
+            ledger.get_balance(1),
+            100,
+            "account 1 still 100 on cold boot"
+        );
         assert_eq!(
             ledger.get_balance(2),
             0,
@@ -156,7 +160,8 @@ fn truncated_transactions_are_lost_across_plain_restart() {
             user_ref: 0,
         });
         assert_eq!(
-            next, watermark + 1,
+            next,
+            watermark + 1,
             "sequencer must resume from watermark + 1, not from the original N + 1"
         );
         ledger.wait_for_transaction(next);

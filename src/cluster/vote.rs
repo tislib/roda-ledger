@@ -163,7 +163,10 @@ impl Vote {
         if term < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("vote: term regression incoming={} current={}", term, current),
+                format!(
+                    "vote: term regression incoming={} current={}",
+                    term, current
+                ),
             ));
         }
 
@@ -173,10 +176,7 @@ impl Vote {
             return Ok(());
         }
 
-        let rec = VoteRecord {
-            term,
-            voted_for: 0,
-        };
+        let rec = VoteRecord { term, voted_for: 0 };
         writer.append(rec)?;
         self.voted_for.store(0, Ordering::Release);
         self.current_term.store(term, Ordering::Release);

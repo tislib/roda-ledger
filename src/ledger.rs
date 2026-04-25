@@ -480,7 +480,10 @@ impl Ledger {
         self.storage.truncate_wal_above(watermark).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("failed truncate_wal_above({}) during start: {}", watermark, e),
+                format!(
+                    "failed truncate_wal_above({}) during start: {}",
+                    watermark, e
+                ),
             )
         })?;
 

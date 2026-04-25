@@ -29,7 +29,7 @@ pub struct Segment {
     pub(super) loaded: bool,
 
     // wal
-    wal_file: Option<File>, // if unloaded, wal_file is None
+    wal_file: Option<File>,       // if unloaded, wal_file is None
     pub(super) wal_data: Vec<u8>, // in case of closed or sealed mode
     pub(super) status: SegmentStaus,
 
@@ -499,7 +499,6 @@ impl Segment {
     pub(crate) fn wal_data_copy(&self) -> Vec<u8> {
         self.wal_data.clone()
     }
-
 
     // ── wal.stop marker (physical abstraction) ──────────────────────────────
 
