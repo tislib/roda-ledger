@@ -1,24 +1,21 @@
-//! `Cluster` — thin dispatcher.
+//! `ClusterNode` — top-level entry point for both deployment shapes.
 //!
-//! Three deployment shapes:
+//! - **Standalone** (`config.cluster.is_none()`): spawns only the
+//!   writable client-facing Ledger gRPC server. No Node service, no
+//!   replication. Returns [`Handles::Standalone`].
+//! - **Clustered**: builds a [`RoleSupervisor`] which owns the
+//!   long-lived gRPC servers and the role-state atomics, then
+//!   dispatches the boot role's role-specific tasks. Returns
+//!   [`Handles::Cluster`].
 //!
-//! - **Standalone** — `config.cluster.is_none()`. Spawns only the
-//!   client-facing Ledger gRPC server in writable mode. No Node gRPC,
-//!   no replication, no peers. The Ledger still bumps term on
-//!   `start()`, so its `term.log` advances on every restart in
-//!   lock-step with the future cluster path.
-//! - **Clustered, seed leader** — `is_seed_leader()` is true. Routes
-//!   into [`Leader::run`].
-//! - **Clustered, follower** — otherwise. Routes into [`Follower::run`].
-//!
-//! The Stage-3a leader-detection heuristic (lowest `peer_id`) is a
-//! placeholder until Stage 4 lands real elections.
+//! Stage 3b: the cluster path always goes through the supervisor.
+//! Per-role bring-ups (`Leader`, future `Follower`/`Candidate`) no
+//! longer own gRPC servers — only their role-task sub-trees.
 
 use crate::cluster::config::Config;
-use crate::cluster::follower::{Follower, FollowerHandles};
-use crate::cluster::leader::{Leader, LeaderHandles};
 use crate::cluster::server::Server;
-use crate::cluster::{ClusterCommitIndex, Quorum, Term};
+use crate::cluster::supervisor::{RoleSupervisor, SupervisorHandles};
+use crate::cluster::{ClusterCommitIndex, Quorum, RoleFlag, Term, role_flag::Role};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -70,38 +67,20 @@ impl ClusterNode {
         &self.config
     }
 
-    /// Stage-3a placeholder for the role state machine. Returns
-    /// `true` if **this** node should bring up as Leader given the
-    /// current `cluster.peers` membership. Lowest `peer_id` wins.
-    ///
-    /// Caller must guarantee `config.is_clustered()` — standalone
-    /// configs never call this; they take the standalone branch in
-    /// [`Self::run`] instead.
-    fn is_seed_leader(&self) -> bool {
-        let cluster = self
-            .config
-            .cluster
-            .as_ref()
-            .expect("is_seed_leader called on a standalone config");
-        let self_id = self.config.node_id();
-        let min_id = cluster.peers.iter().map(|p| p.peer_id).min().unwrap_or(self_id);
-        self_id == min_id
-    }
-
-    /// Dispatch to the standalone or role-specific bring-up. Returns
-    /// a unified `Handles` so generic callers (tests, `load_cluster`)
-    /// don't need to branch.
+    /// Dispatch to the standalone or clustered bring-up. Returns a
+    /// unified `Handles`.
     pub async fn run(&self) -> Result<Handles, Box<dyn std::error::Error + Send + Sync>> {
         if !self.config.is_clustered() {
             // Standalone: just the writable client-facing Ledger gRPC.
+            // Construct a Leader-pinned `RoleFlag` so the LedgerHandler
+            // accepts writes; nothing else mutates it in standalone.
             let client_addr = self.config.server.socket_addr()?;
-            // ClusterCommitIndex isn't meaningful here, but the
-            // Server constructor takes one. Hand it a fresh empty
-            // index — no one will advance it.
+            let role = Arc::new(RoleFlag::new(Role::Leader));
             let cluster_commit_index = ClusterCommitIndex::new();
             let server = Server::new(
                 self.ledger.clone(),
                 client_addr,
+                role,
                 self.term.clone(),
                 cluster_commit_index,
             );
@@ -114,27 +93,19 @@ impl ClusterNode {
             return Ok(Handles::Standalone(StandaloneHandles { client_handle }));
         }
 
-        if self.is_seed_leader() {
-            let leader =
-                Leader::new(self.config.clone(), self.ledger.clone(), self.term.clone());
-            let handles = leader.run().await?;
-            Ok(Handles::Leader(handles))
-        } else {
-            let follower =
-                Follower::new(self.config.clone(), self.ledger.clone(), self.term.clone());
-            let handles = follower.run().await?;
-            Ok(Handles::Follower(handles))
-        }
+        // Clustered: hand off to the supervisor, which owns the
+        // long-lived gRPC servers + role-specific dispatch.
+        let supervisor =
+            RoleSupervisor::new(self.config.clone(), self.ledger.clone(), self.term.clone())?;
+        let handles = supervisor.run().await?;
+        Ok(Handles::Cluster(handles))
     }
 }
 
-/// Unified handles view across standalone / leader / follower
-/// bring-ups. Enum-shaped so each variant exposes exactly the state
-/// that bring-up produced.
+/// Unified handles view across standalone / clustered bring-ups.
 pub enum Handles {
     Standalone(StandaloneHandles),
-    Leader(LeaderHandles),
-    Follower(FollowerHandles),
+    Cluster(SupervisorHandles),
 }
 
 /// Handles produced by a successful standalone bring-up. Single
@@ -154,39 +125,32 @@ impl Handles {
     pub fn abort(&self) {
         match self {
             Handles::Standalone(h) => h.abort(),
-            Handles::Leader(h) => h.abort(),
-            Handles::Follower(h) => h.abort(),
+            Handles::Cluster(h) => h.abort(),
         }
     }
 
-    /// Shared quorum tracker (leader only).
+    /// Shared quorum tracker (clustered + currently-Leader only).
+    /// `None` in standalone or when the cluster booted in a
+    /// non-Leader role (Initializing).
     pub fn quorum(&self) -> Option<Arc<Quorum>> {
         match self {
-            Handles::Leader(h) => Some(h.quorum.clone()),
+            Handles::Cluster(h) => h.leader.as_ref().map(|l| l.quorum.clone()),
             _ => None,
         }
     }
 
-    /// Cooperative shutdown flag for the peer subtree (leader only).
+    /// Cooperative shutdown flag for clustered peer sub-tasks.
     pub fn running(&self) -> Option<Arc<AtomicBool>> {
         match self {
-            Handles::Leader(h) => Some(h.running.clone()),
+            Handles::Cluster(h) => Some(h.running.clone()),
             _ => None,
         }
     }
 
-    /// Borrow the underlying `LeaderHandles` if this bring-up is a leader.
-    pub fn as_leader(&self) -> Option<&LeaderHandles> {
+    /// Borrow the supervisor handles for a clustered bring-up.
+    pub fn as_cluster(&self) -> Option<&SupervisorHandles> {
         match self {
-            Handles::Leader(h) => Some(h),
-            _ => None,
-        }
-    }
-
-    /// Borrow the underlying `FollowerHandles` if this bring-up is a follower.
-    pub fn as_follower(&self) -> Option<&FollowerHandles> {
-        match self {
-            Handles::Follower(h) => Some(h),
+            Handles::Cluster(h) => Some(h),
             _ => None,
         }
     }
@@ -195,18 +159,16 @@ impl Handles {
     pub fn client_handle(&self) -> &JoinHandle<()> {
         match self {
             Handles::Standalone(h) => &h.client_handle,
-            Handles::Leader(h) => &h.client_handle,
-            Handles::Follower(h) => &h.client_handle,
+            Handles::Cluster(h) => &h.client_handle,
         }
     }
 
-    /// Peer-facing Node gRPC server handle. `None` in standalone mode
-    /// (no Node service runs).
+    /// Peer-facing Node gRPC server handle. `None` in standalone
+    /// mode (no Node service runs).
     pub fn node_handle(&self) -> Option<&JoinHandle<()>> {
         match self {
             Handles::Standalone(_) => None,
-            Handles::Leader(h) => Some(&h.node_handle),
-            Handles::Follower(h) => Some(&h.node_handle),
+            Handles::Cluster(h) => Some(&h.node_handle),
         }
     }
 }

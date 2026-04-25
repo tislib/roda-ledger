@@ -17,7 +17,7 @@
 
 pub mod cluster_commit;
 pub mod config;
-pub mod follower;
+pub mod election_timer;
 pub mod leader;
 pub mod ledger_handler;
 pub mod mapping;
@@ -25,23 +25,27 @@ pub mod node;
 pub mod node_handler;
 pub mod peer_replication;
 pub mod quorum;
+pub mod role_flag;
 pub mod server;
+pub mod supervisor;
 pub mod term;
 pub mod vote;
 
 pub use crate::storage::{TermRecord, VoteRecord};
 pub use cluster_commit::ClusterCommitIndex;
+pub use election_timer::{ElectionTimer, ElectionTimerConfig};
 pub use config::{
     ClusterNodeSection, ClusterSection, Config, ConfigError, PeerConfig, ServerSection,
 };
-pub use follower::{Follower, FollowerHandles};
 pub use leader::{Leader, LeaderHandles};
 pub use ledger_handler::LedgerHandler;
 pub use node::{ClusterNode, Handles};
-pub use node_handler::NodeHandler;
+pub use node_handler::{NodeHandler, NodeHandlerCore};
 pub use peer_replication::{PeerReplication, ReplicationParams};
 pub use quorum::Quorum;
+pub use role_flag::{Role, RoleFlag};
 pub use server::{NodeServerRuntime, Server};
+pub use supervisor::{RoleSupervisor, SupervisorHandles};
 pub use term::Term;
 pub use vote::Vote;
 

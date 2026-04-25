@@ -17,7 +17,7 @@
 
 use roda_ledger::cluster::proto::ledger as proto;
 use roda_ledger::cluster::proto::ledger::ledger_server::Ledger as LedgerSvc;
-use roda_ledger::cluster::{ClusterCommitIndex, LedgerHandler, Term};
+use roda_ledger::cluster::{ClusterCommitIndex, LedgerHandler, Role, RoleFlag, Term};
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
@@ -46,7 +46,9 @@ fn setup() -> (TempDir, Arc<Ledger>, Arc<Term>, LedgerHandler) {
 
     let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
     let cci = ClusterCommitIndex::from_ledger(&ledger);
-    let handler = LedgerHandler::new(ledger.clone(), term.clone(), cci);
+    // Leader role so writable RPCs proceed.
+    let role = Arc::new(RoleFlag::new(Role::Leader));
+    let handler = LedgerHandler::new(ledger.clone(), role, term.clone(), cci);
     (td, ledger, term, handler)
 }
 

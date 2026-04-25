@@ -51,6 +51,11 @@ fn ledger_cfg(data_dir: &str, tx_per_seg: u64) -> LedgerConfig {
     }
 }
 
+// Stage 3b puts multi-node clusters in `Initializing` on boot —
+// no leader exists until Stage 4 elections run, so this end-to-end
+// "leader replicates to follower" test cannot make progress yet.
+// Re-enable when Stage 4 lands real `RequestVote` + Candidate loop.
+#[ignore = "multi-node leader pending Stage 4 elections (ADR-0016 §5)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_leader_replicates_to_follower() {
     let leader_client_port = free_port();

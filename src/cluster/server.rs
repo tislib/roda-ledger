@@ -10,7 +10,7 @@ use crate::cluster::ledger_handler::LedgerHandler;
 use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::proto::ledger::ledger_server::LedgerServer;
 use crate::cluster::proto::node::node_server::NodeServer;
-use crate::cluster::{ClusterCommitIndex, Term};
+use crate::cluster::{ClusterCommitIndex, RoleFlag, Term};
 use crate::ledger::Ledger;
 use spdlog::info;
 use std::net::SocketAddr;
@@ -22,11 +22,14 @@ use tonic::transport::Server as TonicServer;
 pub struct Server {
     ledger: Arc<Ledger>,
     addr: SocketAddr,
-    read_only: bool,
-    /// Shared term state. Every submit/status/wait response stamps the
-    /// appropriate view of this value. Callers always supply one — a
-    /// "single-node" server is just a cluster with zero peers and its
-    /// own durable term log on disk.
+    /// Shared role state. The constructed [`LedgerHandler`] reads
+    /// this on every RPC to decide write/read permissions; the
+    /// supervisor flips it on role transitions, so a single
+    /// long-lived `Server` instance serves every role without
+    /// restart.
+    role: Arc<RoleFlag>,
+    /// Shared term state. Every submit/status/wait response stamps
+    /// the appropriate view of this value.
     term: Arc<Term>,
     pub cluster_commit_index: Arc<ClusterCommitIndex>,
 }
@@ -35,47 +38,28 @@ impl Server {
     pub fn new(
         ledger: Arc<Ledger>,
         addr: SocketAddr,
+        role: Arc<RoleFlag>,
         term: Arc<Term>,
         cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
             ledger,
             addr,
-            read_only: false,
-            term,
-            cluster_commit_index,
-        }
-    }
-
-    /// Build a server where every write RPC returns `FAILED_PRECONDITION`.
-    pub fn new_read_only(
-        ledger: Arc<Ledger>,
-        addr: SocketAddr,
-        term: Arc<Term>,
-        cluster_commit_index: Arc<ClusterCommitIndex>,
-    ) -> Self {
-        Self {
-            ledger,
-            addr,
-            read_only: true,
+            role,
             term,
             cluster_commit_index,
         }
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let read_only = self.read_only;
-
-        let handler = if read_only {
-            LedgerHandler::new_read_only(self.ledger, self.term, self.cluster_commit_index)
-        } else {
-            LedgerHandler::new(self.ledger, self.term, self.cluster_commit_index)
-        };
-
-        info!(
-            "Ledger gRPC server listening on {} (read_only={})",
-            self.addr, read_only
+        let handler = LedgerHandler::new(
+            self.ledger,
+            self.role.clone(),
+            self.term,
+            self.cluster_commit_index,
         );
+
+        info!("Ledger gRPC server listening on {}", self.addr);
 
         let reflection_service = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(include_bytes!(concat!(

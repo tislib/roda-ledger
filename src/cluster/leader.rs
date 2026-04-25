@@ -1,25 +1,30 @@
-//! `Leader` — role-specific bring-up for the leader side of the cluster.
+//! `Leader` — role-specific bring-up for the **role-task** part of
+//! the leader role. Stage 3b moves the gRPC servers into
+//! [`crate::cluster::supervisor::RoleSupervisor`] (so they can stay
+//! up across role transitions); what remains here is the leader's
+//! exclusive sub-tree:
 //!
-//! Owns everything the leader role needs: the client-facing Ledger gRPC
-//! server (writable), the peer-facing Node gRPC server (role = Leader),
-//! and direct supervision of one [`PeerReplication`] sub-task per peer.
-//! The top-level `tokio::spawn` for peer supervision lives here —
-//! `Leader::run` spawns one child per peer.
+//! - one `PeerReplication` per peer in `cluster.peers` (excluding self),
+//! - the cluster-wide `Arc<Quorum>` they advance,
+//! - the `Ledger::on_commit` hook that publishes the leader's own
+//!   commit watermark into its quorum slot.
+//!
+//! `LeaderHandles` carries the per-task `JoinHandle`s plus the shared
+//! `Quorum` so tests + the load harness can read the cluster-wide
+//! majority watermark.
 
 use crate::cluster::config::Config;
-use crate::cluster::node_handler::NodeHandler;
 use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
-use crate::cluster::proto::node::NodeRole;
-use crate::cluster::server::{NodeServerRuntime, Server};
 use crate::cluster::{Quorum, Term};
 use crate::ledger::Ledger;
-use spdlog::{error, info};
+use spdlog::info;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// Role-scoped bring-up for a leader node. Construct, then `run()`.
+/// Role-scoped bring-up for a leader node. Construct, then call
+/// [`Leader::run_role_tasks`] from the supervisor.
 pub struct Leader {
     config: Config,
     ledger: Arc<Ledger>,
@@ -35,27 +40,25 @@ impl Leader {
         }
     }
 
-    /// Spawn every task the leader role needs. Returns a `LeaderHandles`
-    /// carrying the spawned handles plus shared shutdown/observability
-    /// state (`running`, `majority`, `peer_handles`).
+    /// Spawn the role-specific tasks the leader needs (peer
+    /// replication × N) and wire the on-commit hook that publishes
+    /// the leader's local commit progress into its `Quorum` slot.
+    /// Returns a `LeaderHandles` carrying the spawned handles plus
+    /// the shared `Quorum`.
     ///
-    /// Also bumps the leader's durable term by 1 at bring-up. This is a
-    /// temporary stand-in for a real election — see the ADR-016 work.
-    /// `start_tx_id` is seeded from the ledger's current `last_commit_id`
-    /// so `Term::get_term_at_tx` can answer for any subsequent write.
-    pub async fn run(&self) -> Result<LeaderHandles, Box<dyn std::error::Error + Send + Sync>> {
+    /// The supervisor owns the gRPC servers and the cooperative
+    /// `Arc<AtomicBool> running` flag — both come in as parameters
+    /// so peer tasks can drain on supervisor shutdown.
+    pub async fn run_role_tasks(
+        &self,
+        running: Arc<AtomicBool>,
+    ) -> Result<LeaderHandles, Box<dyn std::error::Error + Send + Sync>> {
         let cluster = self
             .config
             .cluster
             .as_ref()
-            .expect("Leader::run requires a clustered config");
-        let client_addr = self.config.server.socket_addr()?;
-        let node_addr = cluster.node.socket_addr()?;
+            .expect("Leader::run_role_tasks requires a clustered config");
 
-        // Term bumping happens in `Ledger::start` for both standalone
-        // and clustered paths so the term log is always one step
-        // ahead of the next write. Read the (now-current) term for
-        // logging only — no further bump here.
         info!(
             "leader: started under term {} (node_id={})",
             self.term.get_current_term(),
@@ -65,53 +68,14 @@ impl Leader {
         // Quorum sized to the full cluster (peers list now includes
         // self under ADR-0016 §1, so no `+1` adjustment is needed).
         let quorum = Arc::new(Quorum::new(self.config.cluster_size()));
-        let cluster_commit_index = quorum.cluster_commit_index();
 
-        // Client-facing Ledger server — full read/write on the leader.
-        // Hands the shared Arc<Term> through so every submit and status
-        // response can resolve the current + per-tx term without
-        // round-tripping back to the leader state.
-        let client_server = Server::new(
-            self.ledger.clone(),
-            client_addr,
-            self.term.clone(),
-            cluster_commit_index,
-        );
-        let client_handle = tokio::spawn(async move {
-            if let Err(e) = client_server.run().await {
-                error!("leader ledger gRPC server exited: {}", e);
-            }
-        });
-
-        // Peer-facing Node server. The leader advertises NodeRole::Leader
-        // so followers that misconfigure themselves as peer-targets of
-        // this node get `RejectNotFollower` rather than silent success.
-        let node_handler = NodeHandler::new(
-            self.ledger.clone(),
-            self.config.node_id(),
-            self.term.clone(),
-            NodeRole::Leader,
-            None,
-        );
-        let node_max_bytes = cluster.append_entries_max_bytes * 2 + 4 * 1024;
-        let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);
-        let node_handle = tokio::spawn(async move {
-            if let Err(e) = node_runtime.run().await {
-                error!("leader node gRPC server exited: {}", e);
-            }
-        });
-
-        // Replication: one child task per *other* peer (self is
-        // excluded), all sharing one `Quorum` and one cooperative
-        // shutdown flag. Slot layout in the quorum tracker is
-        // positional with `config.cluster.peers`:
+        // Replication: one child task per *other* peer. Slot layout
+        // in the quorum tracker is positional with
+        // `config.cluster.peers`:
         //   [k] → the peer at index k in `config.cluster.peers`
         // Self has its own slot (the index where its peer_id lives in
         // the membership list); the leader's own commit progress
-        // updates that slot via `ledger.on_commit`. This makes the
-        // quorum tracker symmetric across the cluster.
-        let running = Arc::new(AtomicBool::new(true));
-
+        // updates that slot via `ledger.on_commit`.
         let self_id = self.config.node_id();
         let self_slot: u32 = cluster
             .peers
@@ -145,9 +109,9 @@ impl Leader {
             );
         } else {
             // Stamp the *current* term (post-bump) on outgoing
-            // AppendEntries. Term bumps after peer-task spawn aren't
-            // reflected today; ADR-016 will replace this with an
-            // Arc<Term> read on each RPC.
+            // AppendEntries. Stage 4 will replace this snapshot with
+            // an `Arc<Term>` read on each RPC so term bumps after
+            // peer-task spawn are visible.
             let params = ReplicationParams::new(
                 self_id,
                 self.term.get_current_term(),
@@ -176,38 +140,39 @@ impl Leader {
         }
 
         Ok(LeaderHandles {
-            client_handle,
-            node_handle,
             peer_handles,
-            running,
             quorum,
         })
     }
 }
 
-/// Handles + shared state produced by a successful `Leader::run`.
+/// Handles + shared state produced by a successful
+/// [`Leader::run_role_tasks`]. The supervisor owns the gRPC servers;
+/// this is just the leader's role-specific sub-tree.
 pub struct LeaderHandles {
-    pub client_handle: JoinHandle<()>,
-    pub node_handle: JoinHandle<()>,
-    /// One handle per peer replication task. Positional with `config.peers`.
+    /// One handle per peer replication task. Positional with
+    /// `config.cluster.peers` (with self filtered out).
     pub peer_handles: Vec<JoinHandle<()>>,
-    /// Cooperative shutdown flag shared with every peer sub-task. Flip
-    /// to drain peer tasks without aborting.
-    pub running: Arc<AtomicBool>,
-    /// Cluster-wide majority tracker. Callers read `quorum.get()` for
-    /// the latest majority-committed index.
+    /// Cluster-wide majority tracker. Callers read `quorum.get()`
+    /// for the latest majority-committed index.
     pub quorum: Arc<Quorum>,
 }
 
 impl LeaderHandles {
-    /// Stop every leader-role task. Tests use this; production paths can
-    /// wire a real shutdown channel via `NodeServerRuntime::run_with_shutdown`.
+    /// Abort every peer task. The supervisor's gRPC servers are
+    /// independent and have to be aborted separately.
     pub fn abort(&self) {
-        self.client_handle.abort();
-        self.node_handle.abort();
-        self.running.store(false, Ordering::Release);
         for h in &self.peer_handles {
             h.abort();
         }
+    }
+
+    /// Cooperative drain — flip the supervisor's `running` flag and
+    /// peer tasks exit on their next loop iteration. Caller is
+    /// responsible for `await`ing `peer_handles` if drain order
+    /// matters. Provided as a static helper so the supervisor can
+    /// drain without holding a `&mut LeaderHandles`.
+    pub fn drain(running: &Arc<AtomicBool>) {
+        running.store(false, Ordering::Release);
     }
 }

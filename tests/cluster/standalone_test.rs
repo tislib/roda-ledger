@@ -86,8 +86,7 @@ async fn standalone_serves_writes_with_no_node_grpc() {
     // No Node gRPC handle exposed in standalone.
     assert!(handles.node_handle().is_none());
     assert!(handles.quorum().is_none());
-    assert!(handles.as_leader().is_none());
-    assert!(handles.as_follower().is_none());
+    assert!(handles.as_cluster().is_none());
 
     // Standalone is writable: a client can submit and observe a tx_id.
     let mut client = LedgerClient::connect(format!("http://127.0.0.1:{}", client_port))

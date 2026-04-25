@@ -1,10 +1,24 @@
 //! `NodeHandler` — gRPC service implementation for peer-to-peer RPCs
-//! (`AppendEntries`, `Ping`). The server runtime that hosts it lives in
-//! [`crate::cluster::server`].
+//! (`AppendEntries`, `Ping`, scaffolded `RequestVote` / `InstallSnapshot`).
+//!
+//! Stage 3b split: the mutating state lives in [`NodeHandlerCore`],
+//! which the supervisor + the gRPC handler share via `Arc`. The
+//! `NodeHandler` itself is a thin wrapper that delegates every RPC
+//! to its `core`. This lets the gRPC server bind once at startup
+//! and keep serving across role transitions, while the supervisor
+//! mutates the shared state (role, ledger, term, vote, divergence
+//! watermark) underneath.
+//!
+//! - `role` is an `Arc<RoleFlag>` shared with the LedgerHandler and
+//!   the supervisor. Every handler reads it on the hot path.
+//! - `node_mutex` (per ADR-0016 §7) is owned by the core, not held
+//!   behind `Arc`. Sharing the core via `Arc` already gives every
+//!   call site the same lock instance.
 
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_server::Node;
-use crate::cluster::{ClusterCommitIndex, Term};
+use crate::cluster::role_flag::Role;
+use crate::cluster::{ClusterCommitIndex, RoleFlag, Term, Vote};
 use crate::ledger::Ledger;
 use crate::wal_tail::decode_records;
 use spdlog::warn;
@@ -13,19 +27,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
-pub struct NodeHandler {
-    ledger: Arc<Ledger>,
-    node_id: u64,
+/// State shared across the gRPC service handler and the supervisor.
+/// Constructed once when the cluster comes up and kept alive for the
+/// process lifetime; the gRPC server holds an `Arc` and observes
+/// every supervisor-driven mutation atomically.
+pub struct NodeHandlerCore {
+    pub ledger: Arc<Ledger>,
+    pub node_id: u64,
     /// Shared term state. Followers `observe()` on every incoming
     /// `AppendEntries` so their durable log tracks the leader's term
     /// transitions; all handlers read `get_current_term()` for the
     /// response `term` field.
-    term: Arc<Term>,
-    role: proto::NodeRole,
+    pub term: Arc<Term>,
+    /// Durable Raft persistent vote (ADR-0016 §4). Stage 4's
+    /// `RequestVote` handler grants/observes through this; Stage 3b
+    /// holds it but doesn't consult it on the hot path yet.
+    pub vote: Arc<Vote>,
+    /// Shared role state. The handlers consult this on every RPC
+    /// (e.g. `AppendEntries` rejects with `REJECT_NOT_FOLLOWER` when
+    /// `role == Leader`). Supervisor flips it on transitions.
+    pub role: Arc<RoleFlag>,
     /// Follower-only: watermark updated on every successful
     /// `AppendEntries`. `None` on the leader (its NodeHandler rejects
     /// incoming AppendEntries and never reaches the success path).
-    cluster_commit_index: Option<Arc<ClusterCommitIndex>>,
+    pub cluster_commit_index: Option<Arc<ClusterCommitIndex>>,
     /// ADR-0016 §7. Single per-node mutex serialising every Node
     /// service handler that mutates persistent state
     /// (`AppendEntries`, `RequestVote`, `InstallSnapshot`). tonic
@@ -33,36 +58,37 @@ pub struct NodeHandler {
     /// `(currentTerm, votedFor, log)` invariant could be violated by
     /// interleaved handlers. `Ping` is read-only and intentionally
     /// **not** gated by this lock.
-    node_mutex: Arc<AsyncMutex<()>>,
+    pub node_mutex: AsyncMutex<()>,
     /// ADR-0016 §9. Whenever `append_entries` detects log divergence
     /// (`prev_tx_id` exists locally but the term that covered it does
     /// not match `prev_term`), the rejecting request's
-    /// `leader_commit_tx_id` is stashed here for the cluster
-    /// supervisor (Stage 3) to consume as the recovery-mode reseed
-    /// watermark.
+    /// `leader_commit_tx_id` is stashed here for the supervisor
+    /// (Stage 3c) to consume as the recovery-mode reseed watermark.
     ///
     /// `0` means "no divergence observed yet". The supervisor reads
     /// and resets this from a single thread, so a plain `AtomicU64`
     /// is sufficient.
-    last_divergence_watermark: Arc<AtomicU64>,
+    pub last_divergence_watermark: AtomicU64,
 }
 
-impl NodeHandler {
+impl NodeHandlerCore {
     pub fn new(
         ledger: Arc<Ledger>,
         node_id: u64,
         term: Arc<Term>,
-        role: proto::NodeRole,
+        vote: Arc<Vote>,
+        role: Arc<RoleFlag>,
         cluster_commit_index: Option<Arc<ClusterCommitIndex>>,
     ) -> Self {
         Self {
             ledger,
             node_id,
             term,
+            vote,
             role,
             cluster_commit_index,
-            node_mutex: Arc::new(AsyncMutex::new(())),
-            last_divergence_watermark: Arc::new(AtomicU64::new(0)),
+            node_mutex: AsyncMutex::new(()),
+            last_divergence_watermark: AtomicU64::new(0),
         }
     }
 
@@ -74,7 +100,7 @@ impl NodeHandler {
     /// Read (and clear) the most recent divergence watermark stashed
     /// by `append_entries`. Returns `None` when no divergence has
     /// been observed since the last call. Used by the cluster
-    /// supervisor (Stage 3) to drive the recovery-mode reseed.
+    /// supervisor (Stage 3c) to drive the recovery-mode reseed.
     pub fn take_divergence_watermark(&self) -> Option<u64> {
         let v = self.last_divergence_watermark.swap(0, Ordering::AcqRel);
         if v == 0 { None } else { Some(v) }
@@ -99,24 +125,8 @@ impl NodeHandler {
         }
     }
 
-    /// ADR-0016 §8 prev-log-entry consistency check.
-    ///
-    /// Returns `Ok(())` when the follower's log at `prev_tx_id` was
-    /// written under `prev_term` (Raft's §5.3 log-matching guarantee
-    /// is locally satisfied), `Err(reject_reason)` otherwise.
-    ///
-    /// Specifically:
-    /// - `prev_tx_id == 0` is the leader's "I have nothing before
-    ///   `from_tx_id`" sentinel — accept unconditionally.
-    /// - `prev_tx_id > our last_commit_id` → gap; we don't have it
-    ///   yet. The leader will retry on the next tick after we
-    ///   advertise our `last_tx_id` in the response.
-    /// - We have `prev_tx_id` but the term that covered it differs
-    ///   from `prev_term` → **divergence**. Stash
-    ///   `leader_commit_tx_id` as the reseed watermark for the
-    ///   supervisor and reject. Idempotent: if a previous divergence
-    ///   was stashed and not yet consumed, we update to the latest
-    ///   value.
+    /// ADR-0016 §8 prev-log-entry consistency check. See `NodeHandler`
+    /// docs for full semantics.
     fn check_prev_log(
         &self,
         prev_tx_id: u64,
@@ -142,11 +152,6 @@ impl NodeHandler {
                 Err(proto::RejectReason::RejectPrevMismatch)
             }
             Ok(None) => {
-                // Our log knows about prev_tx_id (it's ≤ last_commit_id)
-                // but the term log doesn't have a covering record.
-                // That's only possible if term records older than the
-                // hot ring AND not on disk — in practice a corruption.
-                // Treat as divergence to be safe.
                 warn!(
                     "append_entries: no term record covering tx {} on node {}; treating as divergence",
                     prev_tx_id, self.node_id
@@ -166,23 +171,59 @@ impl NodeHandler {
     }
 }
 
+/// Thin wrapper that owns an `Arc<NodeHandlerCore>` and implements
+/// the tonic `Node` service. The supervisor builds **one** `core`
+/// per process and constructs a `NodeHandler` over it; the gRPC
+/// server then lives for the process lifetime.
+pub struct NodeHandler {
+    core: Arc<NodeHandlerCore>,
+}
+
+impl NodeHandler {
+    pub fn new(core: Arc<NodeHandlerCore>) -> Self {
+        Self { core }
+    }
+
+    /// Test/observability accessor — exposes the shared core so tests
+    /// can drive role transitions or read the divergence watermark.
+    pub fn core(&self) -> &Arc<NodeHandlerCore> {
+        &self.core
+    }
+
+    /// Convenience accessor used by tests that previously called
+    /// `handler.take_divergence_watermark()` directly.
+    pub fn take_divergence_watermark(&self) -> Option<u64> {
+        self.core.take_divergence_watermark()
+    }
+
+    /// Convenience accessor used by tests for non-destructive reads.
+    pub fn divergence_watermark(&self) -> u64 {
+        self.core.divergence_watermark()
+    }
+}
+
 #[tonic::async_trait]
 impl Node for NodeHandler {
     async fn append_entries(
         &self,
         request: Request<proto::AppendEntriesRequest>,
     ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
+        let core = &self.core;
+
         // ADR-0016 §7: serialise every mutating Node-service handler.
         // Held for the entire body so `(currentTerm, votedFor, log)`
         // observations and writes appear atomic to peers.
-        let _guard = self.node_mutex.lock().await;
+        let _guard = core.node_mutex.lock().await;
 
         let req = request.into_inner();
 
-        // Leader never accepts AppendEntries under ADR-015 (static roles).
-        if self.role == proto::NodeRole::Leader {
+        // Leader rejects incoming AppendEntries; only Follower /
+        // Initializing are eligible to apply leader-shipped bytes.
+        // Read role atomically so transitions made by the supervisor
+        // since this RPC was queued take effect immediately.
+        if matches!(core.role.get(), Role::Leader) {
             return Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.current_term(),
+                term: core.current_term(),
                 success: false,
                 last_tx_id: 0,
                 reject_reason: proto::RejectReason::RejectNotFollower as u32,
@@ -196,16 +237,16 @@ impl Node for NodeHandler {
         // log. `from_tx_id` is the start of the batch — a good proxy for
         // the term's start when the leader bumps term on boot at tx 0.
         if req.term != 0
-            && let Err(e) = self.term.observe(req.term, req.from_tx_id)
+            && let Err(e) = core.term.observe(req.term, req.from_tx_id)
         {
             warn!(
                 "append_entries: term observe failed on node {} (incoming={}): {}",
-                self.node_id, req.term, e
+                core.node_id, req.term, e
             );
             return Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.current_term(),
+                term: core.current_term(),
                 success: false,
-                last_tx_id: self.ledger.last_commit_id(),
+                last_tx_id: core.ledger.last_commit_id(),
                 reject_reason: proto::RejectReason::RejectTermStale as u32,
             }));
         }
@@ -215,46 +256,43 @@ impl Node for NodeHandler {
         // recorded even on rejection — Raft's term invariant must
         // outlive the per-RPC outcome.
         if let Err(reason) =
-            self.check_prev_log(req.prev_tx_id, req.prev_term, req.leader_commit_tx_id)
+            core.check_prev_log(req.prev_tx_id, req.prev_term, req.leader_commit_tx_id)
         {
             return Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.current_term(),
+                term: core.current_term(),
                 success: false,
-                last_tx_id: self.ledger.last_commit_id(),
+                last_tx_id: core.ledger.last_commit_id(),
                 reject_reason: reason as u32,
             }));
         }
 
-        let last = self.ledger.last_commit_id();
+        let last = core.ledger.last_commit_id();
 
         let entries = decode_records(&req.wal_bytes);
         if entries.is_empty() {
-            // Empty heartbeat: publish the leader's advertised watermark.
-            // Readers also consult this follower's own commit / snapshot
-            // indices, so there's no correctness need to clamp here.
-            self.advance_cluster_commit(req.leader_commit_tx_id);
+            core.advance_cluster_commit(req.leader_commit_tx_id);
             return Ok(Response::new(proto::AppendEntriesResponse {
-                term: self.current_term(),
+                term: core.current_term(),
                 success: true,
                 last_tx_id: last,
                 reject_reason: proto::RejectReason::RejectNone as u32,
             }));
         }
 
-        match self.ledger.append_wal_entries(entries) {
+        match core.ledger.append_wal_entries(entries) {
             Ok(()) => {
-                self.advance_cluster_commit(req.leader_commit_tx_id);
+                core.advance_cluster_commit(req.leader_commit_tx_id);
                 Ok(Response::new(proto::AppendEntriesResponse {
-                    term: self.current_term(),
+                    term: core.current_term(),
                     success: true,
                     last_tx_id: last,
                     reject_reason: proto::RejectReason::RejectNone as u32,
                 }))
             }
             Err(e) => {
-                warn!("append_entries failed on node {}: {}", self.node_id, e);
+                warn!("append_entries failed on node {}: {}", core.node_id, e);
                 Ok(Response::new(proto::AppendEntriesResponse {
-                    term: self.current_term(),
+                    term: core.current_term(),
                     success: false,
                     last_tx_id: last,
                     reject_reason: proto::RejectReason::RejectWalAppendFailed as u32,
@@ -267,13 +305,13 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::PingRequest>,
     ) -> Result<Response<proto::PingResponse>, Status> {
-        // Read-only — intentionally NOT serialised through node_mutex.
+        let core = &self.core;
         let req = request.into_inner();
         Ok(Response::new(proto::PingResponse {
-            node_id: self.node_id,
-            term: self.current_term(),
-            last_tx_id: self.ledger.last_commit_id(),
-            role: self.role as i32,
+            node_id: core.node_id,
+            term: core.current_term(),
+            last_tx_id: core.ledger.last_commit_id(),
+            role: core.role.get().as_proto() as i32,
             nonce: req.nonce,
         }))
     }
@@ -282,10 +320,7 @@ impl Node for NodeHandler {
         &self,
         _request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
-        // Acquire the per-node mutex so that when Stage 4 lands the
-        // real implementation, vote-grant durability is automatically
-        // serialised against `AppendEntries` term observations.
-        let _guard = self.node_mutex.lock().await;
+        let _guard = self.core.node_mutex.lock().await;
         Err(Status::unimplemented("RequestVote deferred to ADR-016"))
     }
 
@@ -293,7 +328,7 @@ impl Node for NodeHandler {
         &self,
         _request: Request<proto::InstallSnapshotRequest>,
     ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
-        let _guard = self.node_mutex.lock().await;
+        let _guard = self.core.node_mutex.lock().await;
         Err(Status::unimplemented("InstallSnapshot deferred to ADR-016"))
     }
 }

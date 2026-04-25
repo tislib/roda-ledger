@@ -11,7 +11,7 @@
 
 use roda_ledger::cluster::proto::node as proto;
 use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{NodeHandler, Term};
+use roda_ledger::cluster::{NodeHandler, NodeHandlerCore, Role, RoleFlag, Term, Vote};
 use roda_ledger::ledger::{Ledger, LedgerConfig};
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
@@ -38,13 +38,17 @@ fn setup() -> (TempDir, Arc<Ledger>, Arc<Term>, NodeHandler) {
     let ledger = Arc::new(ledger);
 
     let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let handler = NodeHandler::new(
+    let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
+    let role = Arc::new(RoleFlag::new(Role::Follower));
+    let core = Arc::new(NodeHandlerCore::new(
         ledger.clone(),
         /* node_id */ 2,
         term.clone(),
-        proto::NodeRole::Follower,
+        vote,
+        role,
         /* cluster_commit_index */ None,
-    );
+    ));
+    let handler = NodeHandler::new(core);
     (td, ledger, term, handler)
 }
 
@@ -252,13 +256,17 @@ async fn leader_role_rejects_append_entries() {
     ledger.start().unwrap();
     let ledger = Arc::new(ledger);
     let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let handler = NodeHandler::new(
+    let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
+    let role = Arc::new(RoleFlag::new(Role::Leader));
+    let core = Arc::new(NodeHandlerCore::new(
         ledger.clone(),
         1,
         term.clone(),
-        proto::NodeRole::Leader,
+        vote,
+        role,
         None,
-    );
+    ));
+    let handler = NodeHandler::new(core);
 
     let resp = handler
         .append_entries(Request::new(make_request(1, 0, 0, 0)))
@@ -301,13 +309,17 @@ async fn cold_lookup_path_via_term_storage_also_detects_divergence() {
     ledger.start().unwrap();
     let ledger = Arc::new(ledger);
     let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let handler = NodeHandler::new(
+    let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
+    let role = Arc::new(RoleFlag::new(Role::Follower));
+    let core = Arc::new(NodeHandlerCore::new(
         ledger.clone(),
         2,
         term.clone(),
-        proto::NodeRole::Follower,
+        vote,
+        role,
         None,
-    );
+    ));
+    let handler = NodeHandler::new(core);
 
     let tx1 = ledger.submit(Operation::Deposit {
         account: 1,

@@ -4,7 +4,7 @@ mod tests {
     use roda_ledger::cluster::proto::ledger::{
         Deposit, SubmitAndWaitRequest, SubmitBatchAndWaitRequest, Transfer, WaitLevel, Withdrawal,
     };
-    use roda_ledger::cluster::{ClusterCommitIndex, Server, Term};
+    use roda_ledger::cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use roda_ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
     use std::net::SocketAddr;
@@ -228,7 +228,7 @@ mod tests {
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
-            let server = Server::new(server_ledger, addr, term, cci);
+            let server = Server::new(server_ledger, addr, std::sync::Arc::new(RoleFlag::new(Role::Leader)), term, cci);
             server.run().await.unwrap();
         });
 

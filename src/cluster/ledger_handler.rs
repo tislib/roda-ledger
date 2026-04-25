@@ -1,6 +1,6 @@
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
-use crate::cluster::{ClusterCommitIndex, Term};
+use crate::cluster::{ClusterCommitIndex, RoleFlag, Term};
 use crate::ledger::Ledger as InternalLedger;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::Operation;
@@ -12,7 +12,12 @@ use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
     ledger: Arc<InternalLedger>,
-    read_only: bool,
+    /// Shared role state (ADR-0016 §2). The handler is writable iff
+    /// `role.is_leader()`; every other role rejects writes with
+    /// `FAILED_PRECONDITION`. The supervisor flips this atomically on
+    /// boot and on future role transitions, so a single long-lived
+    /// gRPC server can serve every role without restart.
+    role: Arc<RoleFlag>,
     /// Shared term state. In single-node mode the handler is constructed
     /// with a fresh in-memory-only term whose current value is 0.
     term: Arc<Term>,
@@ -24,31 +29,18 @@ pub struct LedgerHandler {
 }
 
 impl LedgerHandler {
-    /// Full read/write handler. Caller supplies the shared `Arc<Term>`
-    /// owned by `Leader` / `Follower`.
+    /// Construct a role-aware handler. Writability is decided at
+    /// every RPC by reading `role.is_leader()` — there is no separate
+    /// read-only constructor.
     pub fn new(
         ledger: Arc<InternalLedger>,
+        role: Arc<RoleFlag>,
         term: Arc<Term>,
         cluster_commit_index: Arc<ClusterCommitIndex>,
     ) -> Self {
         Self {
             ledger,
-            read_only: false,
-            term,
-            cluster_commit_index,
-        }
-    }
-
-    /// Read-only handler: all `submit_*` / `register_function` /
-    /// `unregister_function` RPCs return `FAILED_PRECONDITION`.
-    pub fn new_read_only(
-        ledger: Arc<InternalLedger>,
-        term: Arc<Term>,
-        cluster_commit_index: Arc<ClusterCommitIndex>,
-    ) -> Self {
-        Self {
-            ledger,
-            read_only: true,
+            role,
             term,
             cluster_commit_index,
         }
@@ -83,12 +75,15 @@ impl LedgerHandler {
     // `.map_err` at every call site for no benefit.
     #[allow(clippy::result_large_err)]
     fn ensure_writable(&self) -> Result<(), Status> {
-        if self.read_only {
-            Err(Status::failed_precondition(
-                "node is a follower; writes are not accepted",
-            ))
-        } else {
+        if self.role.is_leader() {
             Ok(())
+        } else {
+            // Initializing / Follower / Candidate all reject writes
+            // with the same tonic status. The wire-format details
+            // (e.g. leader_hint) land in a future ADR-0016 follow-up.
+            Err(Status::failed_precondition(
+                "node is not a leader; writes are not accepted",
+            ))
         }
     }
 
