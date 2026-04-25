@@ -157,7 +157,7 @@ let tx_id = ledger.submit(Operation::Transfer {
 
 Every operation carries a `user_ref` — a `uint64` supplied by the caller. It serves two purposes:
 
-- **Idempotency key** — when `user_ref > 0`, if the same `user_ref` appears within the active window (the last `transaction_count_per_segment` transactions), the second submission is detected as a duplicate. It is sequenced and recorded, but linked to the original via a `TxLinkRecord { kind: DUPLICATE }` rather than re-executed. This prevents double-processing on client retries. Deduplication is always on and cannot be disabled. Pass `user_ref = 0` to opt out of the idempotency check for individual transactions.
+- **Idempotency key** — when `user_ref > 0`, if the same `user_ref` appears within the active window — the deduplication cache uses a flip-flop (active + previous) keyed off `transaction_count_per_segment`, giving an effective window of N to 2N transactions — the second submission is detected as a duplicate. It is sequenced and recorded, but linked to the original via a `TxLinkRecord { kind: DUPLICATE }` rather than re-executed. This prevents double-processing on client retries. Deduplication is always on and cannot be disabled. Pass `user_ref = 0` to opt out of the idempotency check for individual transactions.
 - **Correlation reference** — stored in the WAL alongside the transaction. Use it to link to your own database record — an order ID, payment ID, or any external reference.
 
 ---
@@ -196,7 +196,7 @@ use roda_ledger::transaction::WaitLevel;
 
 let result = ledger.submit_and_wait(
     Operation::Deposit { account: 1, amount: 1000, user_ref: 46 },
-    WaitLevel::Snapshotted,
+    WaitLevel::OnSnapshot,
 );
 
 if result.fail_reason.is_none() {
@@ -206,11 +206,11 @@ if result.fail_reason.is_none() {
 
 **Wait levels:**
 
-| Level       | gRPC | Library                  |
-|-------------|---|--------------------------|
-| Computed    | `WAIT_LEVEL_COMPUTED` | `WaitLevel::Computed`    |
-| Committed   | `WAIT_LEVEL_COMMITTED` | `WaitLevel::Committed`   |
-| Snapshotted | `WAIT_LEVEL_SNAPSHOT` | `WaitLevel::Snapshotted` |
+| Level        | gRPC                   | Library                 |
+|--------------|------------------------|-------------------------|
+| Computed     | `WAIT_LEVEL_COMPUTED`  | `WaitLevel::Computed`   |
+| Committed    | `WAIT_LEVEL_COMMITTED` | `WaitLevel::Committed`  |
+| On Snapshot  | `WAIT_LEVEL_SNAPSHOT`  | `WaitLevel::OnSnapshot` |
 
 **`WAIT_LEVEL_COMPUTED`** — The Transactor has executed the operation. Validation has run. If the operation violated any constraint (insufficient funds, zero-sum violation, etc.), `fail_reason` is set and the transaction is permanently rejected. If `fail_reason = 0`, the transaction is accepted and balance changes are live in memory — but not yet durable. A crash at this point would lose the transaction.
 
@@ -375,7 +375,7 @@ grpcurl -plaintext -d '{
 
 ```rust
 // Library
-ledger.submit_and_wait(op, WaitLevel::Snapshotted);
+ledger.submit_and_wait(op, WaitLevel::OnSnapshot);
 let balance = ledger.get_balance(1); // linearizable
 ```
 

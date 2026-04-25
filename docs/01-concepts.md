@@ -18,7 +18,7 @@ An **account** is an identifier — a `u64` that represents a participant in the
 
 A **balance** is the current state of an account, represented as an `i64`. Balances can be positive or negative. By default, roda-ledger protects accounts from going below zero — a transaction that would produce a negative balance is rejected. This protection can be intentionally bypassed via WASM-defined functions that explicitly check `get_balance` themselves (for example, to model overdraft accounts or internal system accounts).
 
-**Account 0** is the system account. It serves as the source and sink for all money entering or leaving the ledger. Deposits credit a user account and debit account 0. Withdrawals debit a user account and credit account 0. This is not a convention — it is required by the zero-sum invariant described below.
+**Account 0** is the system account. It serves as the source and sink for all money entering or leaving the ledger. A `Deposit` produces a debit on the user account (balance goes up) and a credit on account 0; a `Withdrawal` produces a credit on the user account (balance goes down) and a debit on account 0. The convention used throughout the engine and the WASM host API is **`debit` adds, `credit` subtracts** — see the [WASM Runtime guide](./wasm-runtime.md#host-api) for the host-call contract. This is not a stylistic choice — it is required by the zero-sum invariant described below.
 
 ---
 
@@ -28,9 +28,9 @@ These two terms are distinct and the distinction matters.
 
 An **operation** is the client's intent. roda-ledger provides four operation types:
 
-- **Deposit** — credits a user account, debiting account 0 as the source
-- **Withdrawal** — debits a user account, crediting account 0 as the sink
-- **Transfer** — moves an amount from one account to another
+- **Deposit** — debits the user account (balance up), credits account 0 (the source)
+- **Withdrawal** — credits the user account (balance down), debits account 0 (the sink)
+- **Transfer** — moves an amount from one account to another (credit on the sender, debit on the receiver). If `from == to`, the operation is a no-op — sequenced and recorded but emits no `TxEntry` records.
 - **Function** — invokes a previously registered WebAssembly module by name, with up to eight `i64` parameters. The module produces credits and debits via host calls and runs atomically as a single transaction. This is the **programmable ledger** entry point and the only extension surface: any multi-account, multi-step logic that does not fit the named types is expressed as a registered function.
 
 Every operation carries a `user_ref` — a caller-supplied value that serves two purposes: an idempotency key to prevent duplicate processing, and a reference stored alongside the transaction for correlation or auditing. Idempotency is described in detail below.
@@ -39,7 +39,7 @@ The client submits operations. It never writes transactions directly.
 
 A **transaction** is the ledger's immutable record of what happened. When an operation is accepted and executed, roda-ledger creates a transaction — a permanent, ordered fact in the log. Transactions are never modified, never deleted, and never reordered. The caller can query a transaction directly to check its status or inspect its details.
 
-When querying a transaction, the caller sees **entries** — the individual credits and debits the Transactor produced from the original operation — not the operation itself. A `Transfer` becomes two entries: a debit on the sender and a credit on the receiver. A `Function` becomes one entry per `credit` / `debit` host call it issued. The operation is the intent; the entries are the facts.
+When querying a transaction, the caller sees **entries** — the individual credits and debits the Transactor produced from the original operation — not the operation itself. A `Transfer` becomes two entries: a credit on the sender and a debit on the receiver (recall: credit subtracts, debit adds). A `Function` becomes one entry per `credit` / `debit` host call it issued. The operation is the intent; the entries are the facts.
 
 The client thinks in operations. The ledger thinks in transactions. The Transactor translates between the two.
 
@@ -61,7 +61,7 @@ Every transaction must net to zero. The sum of all credits in a transaction must
 
 Because every individual transaction nets to zero, the sum of all balances across all accounts in the ledger is always zero. This is not a configuration option — it is an emergent property of the per-transaction invariant. Money is never created or destroyed inside the ledger. It only moves.
 
-This is why account 0 exists. When money enters the system (a deposit), it must come from somewhere — account 0 is debited. When money leaves the system (a withdrawal), it must go somewhere — account 0 is credited. The ledger always balances.
+This is why account 0 exists. When money enters the system (a deposit), it must come from somewhere — account 0 is credited (its balance goes down). When money leaves the system (a withdrawal), it must go somewhere — account 0 is debited (its balance goes up). The ledger always balances.
 
 ---
 
@@ -93,7 +93,7 @@ The updated balances are written to the snapshot, making them visible to readers
 
 The gap between Stage 3 and Stage 4 is typically tens to hundreds of nanoseconds — the Snapshotter runs continuously as part of the pipeline and is not a slow checkpoint process.
 
-The significant gap is between Stage 2 and Stage 3. WAL writes are batched dynamically and flushed to disk via `fdatasync`. The throughput and latency of this step are bounded by sequential disk write speed. The maximum batch buffer size is configurable.
+The significant gap is between Stage 2 and Stage 3. WAL writes are batched dynamically: the WAL Writer drains everything available from its input queue, writes it, and only then yields to `fdatasync` (driven by an independent WAL Committer thread). Throughput and latency of this stage are bounded by sequential disk write speed.
 
 ---
 
@@ -107,15 +107,15 @@ Every transaction is executed by the single Transactor against the latest in-mem
 **Linearizability — on the read path, opt-in**
 By default, `get_balance` reads from the snapshot, which may be a few nanoseconds behind the latest committed transaction. The response includes `last_tx_id` — the ID of the most recent transaction reflected in the returned balance. The caller can use this to reason about freshness without blocking.
 
-If the caller needs a linearizable read — a guarantee that the balance reflects all transactions up to and including a specific one — they use `submit_wait(snapshot)`. This blocks until the Snapshotter has processed the transaction, after which `get_balance` is guaranteed to reflect it and everything before it.
+If the caller needs a linearizable read — a guarantee that the balance reflects all transactions up to and including a specific one — they submit with `WaitLevel::OnSnapshot` (gRPC: `WAIT_LEVEL_SNAPSHOT`). This blocks until the Snapshotter has processed the transaction, after which `get_balance` is guaranteed to reflect it and everything before it.
 
 To summarize:
 
 | Path | Consistency | How |
 |---|---|---|
 | Write | Always linearizable | Single Transactor, in-memory latest state |
-| Read (default) | Eventually consistent | `get_balance` returns balance + `last_tx_id` |
-| Read (explicit wait) | Linearizable | `submit_wait(snapshot)` then `get_balance` |
+| Read (default) | Eventually consistent | `get_balance` returns balance + `last_snapshot_tx_id` |
+| Read (explicit wait) | Linearizable | Submit with `WaitLevel::OnSnapshot`, then `get_balance` |
 
 ---
 
@@ -139,12 +139,12 @@ roda-ledger is designed around two dimensions of flexibility that set it apart f
 
 **Choose your guarantee level.** The staged pipeline exposes a dial between performance and consistency. The caller chooses how much to wait per submission:
 
-- `submit` — returns a transaction ID immediately, waits for nothing. Maximum throughput.
-- `submit_wait(transactor)` — waits for execution. The caller knows whether the transaction committed or was rejected.
-- `submit_wait(wal)` — waits for durability. The transaction is on disk and survives a crash.
-- `submit_wait(snapshot)` — waits for the balance to be visible. Guarantees linearizable reads via `get_balance`.
+- `SubmitOperation` (gRPC) / `submit` (Rust) — returns a transaction ID immediately, waits for nothing. Maximum throughput.
+- `WaitLevel::Computed` — waits for execution. The caller knows whether the transaction committed or was rejected.
+- `WaitLevel::Committed` — waits for durability. The transaction is on disk and survives a crash.
+- `WaitLevel::OnSnapshot` — waits for the balance to be visible. Guarantees linearizable reads via `get_balance`.
 
-The caller makes this choice per submission based on what their use case requires.
+The caller makes this choice per submission based on what their use case requires. See the [API](./02-api.md#submit-and-wait) for the exact gRPC and Rust call shapes.
 
 ---
 

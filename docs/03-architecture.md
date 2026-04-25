@@ -171,10 +171,10 @@ A segment moves through three states:
 | State | File on disk | Description |
 |---|---|---|
 | `ACTIVE` | `wal.bin` | Currently being written. One at a time. |
-| `CLOSED` | `segment_NNN.wal` | WAL Writer rotated away. Immutable, awaiting Seal. |
-| `SEALED` | `segment_NNN.wal` + `.crc` + `.seal` | Verified, safe for recovery. May have snapshot. |
+| `CLOSED` | `wal_NNNNNN.bin` | WAL Writer rotated away. Immutable, awaiting Seal. |
+| `SEALED` | `wal_NNNNNN.bin` + `.crc` + `.seal` | Verified, safe for recovery. May have snapshot. |
 
-**ACTIVE → CLOSED:** transaction count threshold hit → WAL Writer writes `SegmentSealed` entry, `fdatasync`, renames `wal.bin` to `segment_NNN.wal`, opens new `wal.bin`.
+**ACTIVE → CLOSED:** transaction count threshold hit → WAL Writer writes `SegmentSealed` entry, `fdatasync`, renames `wal.bin` to `wal_NNNNNN.bin`, opens new `wal.bin`.
 
 **CLOSED → SEALED:** Seal process picks it up on a timer, computes CRC32, writes `.crc` and `.seal` sidecar files.
 
@@ -239,7 +239,7 @@ Stages communicate exclusively through **SPSC lock-free queues** — one produce
 
 **Backpressure** propagates naturally: WAL pressure fills the Transactor-to-WAL queue, stalling the Transactor, which fills the Sequencer-to-Transactor queue, which eventually stalls `submit()`. No explicit flow control needed.
 
-The wait strategy under backpressure is controlled by `pipeline_mode`: `low_latency` (spin forever), `balanced` (spin → yield → park), `low_cpu` (park quickly).
+The wait strategy under backpressure is controlled by the `wait_strategy` config field (see [API → Setup](./02-api.md#grpc-server)): `low_latency` (spin forever), `balanced` (spin → yield → park), `low_cpu` (park quickly).
 
 ---
 

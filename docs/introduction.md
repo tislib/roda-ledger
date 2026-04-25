@@ -51,7 +51,7 @@ Roda-Ledger's documentation is organized into four levels. Start at the top and 
 | 1 | [Concepts](./01-concepts.md) | Mental model, guarantees, invariants. Read this first. |
 | 2 | [API](./02-api.md) | Operations, wait levels, gRPC reference. |
 | 3 | [Architecture](./03-architecture.md) | Pipeline design, stage internals, recovery. |
-| 4 | [Contributing](./05-contributing.md) | How to set up, run benchmarks, and extend the system. |
+| 4 | [WASM Runtime](./wasm-runtime.md) | Programmable functions: ABI, registration, recovery. |
 
 If you want to understand what roda-ledger guarantees and why, start with **[Concepts](./01-concepts.md)**.
 
