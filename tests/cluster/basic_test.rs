@@ -10,7 +10,9 @@
 use lproto::submit_operation_request::Operation;
 use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
 use roda_ledger::cluster::proto::ledger::{self as lproto, Deposit, SubmitOperationRequest};
-use roda_ledger::cluster::{self, ClusterNode, PeerConfig, ServerSection};
+use roda_ledger::cluster::{
+    self, ClusterNode, ClusterNodeSection, ClusterSection, PeerConfig, ServerSection,
+};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
 use roda_ledger::wait_strategy::WaitStrategy;
@@ -56,45 +58,54 @@ async fn cluster_leader_replicates_to_follower() {
     let follower_client_port = free_port();
     let follower_node_port = free_port();
 
+    // Symmetric peer list — both nodes see each other plus self.
+    let all_peers = vec![
+        PeerConfig {
+            peer_id: 1,
+            host: format!("http://127.0.0.1:{}", leader_node_port),
+        },
+        PeerConfig {
+            peer_id: 2,
+            host: format!("http://127.0.0.1:{}", follower_node_port),
+        },
+    ];
+
     let leader_cfg = cluster::Config {
-        mode: cluster::Mode::Leader,
-        node_id: 1,
-        term: 1,
-        peers: vec![PeerConfig {
-            id: 2,
-            node_addr: format!("http://127.0.0.1:{}", follower_node_port),
-        }],
+        cluster: Some(ClusterSection {
+            node: ClusterNodeSection {
+                node_id: 1,
+                host: "127.0.0.1".to_string(),
+                port: leader_node_port,
+            },
+            peers: all_peers.clone(),
+            replication_poll_ms: 2,
+            append_entries_max_bytes: 256 * 1024,
+        }),
         server: ServerSection {
             host: "127.0.0.1".to_string(),
             port: leader_client_port,
             ..Default::default()
         },
-        node: roda_ledger::cluster::config::NodeServerSection {
-            host: "127.0.0.1".to_string(),
-            port: leader_node_port,
-        },
         ledger: ledger_cfg(&tmp_dir("leader"), 10_000_000),
-        replication_poll_ms: 2,
-        append_entries_max_bytes: 256 * 1024,
     };
 
     let follower_cfg = cluster::Config {
-        mode: cluster::Mode::Follower,
-        node_id: 2,
-        term: 1,
-        peers: Vec::new(),
+        cluster: Some(ClusterSection {
+            node: ClusterNodeSection {
+                node_id: 2,
+                host: "127.0.0.1".to_string(),
+                port: follower_node_port,
+            },
+            peers: all_peers,
+            replication_poll_ms: 2,
+            append_entries_max_bytes: 256 * 1024,
+        }),
         server: ServerSection {
             host: "127.0.0.1".to_string(),
             port: follower_client_port,
             ..Default::default()
         },
-        node: roda_ledger::cluster::config::NodeServerSection {
-            host: "127.0.0.1".to_string(),
-            port: follower_node_port,
-        },
         ledger: ledger_cfg(&tmp_dir("follower"), 20_000),
-        replication_poll_ms: 2,
-        append_entries_max_bytes: 256 * 1024,
     };
 
     // Follower first so its node port is listening when the leader's replication

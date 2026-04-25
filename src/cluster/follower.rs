@@ -34,8 +34,13 @@ impl Follower {
 
     /// Spawn both gRPC servers and return their handles.
     pub async fn run(&self) -> Result<FollowerHandles, Box<dyn std::error::Error + Send + Sync>> {
+        let cluster = self
+            .config
+            .cluster
+            .as_ref()
+            .expect("Follower::run requires a clustered config");
         let client_addr = self.config.server.socket_addr()?;
-        let node_addr = self.config.node.socket_addr()?;
+        let node_addr = cluster.node.socket_addr()?;
 
         // Shared watermark — written by NodeHandler on every successful
         // AppendEntries, read by LedgerHandler for ClusterCommit waits
@@ -65,12 +70,12 @@ impl Follower {
         // with replication.
         let node_handler = NodeHandler::new(
             self.ledger.clone(),
-            self.config.node_id,
+            self.config.node_id(),
             self.term.clone(),
             NodeRole::Follower,
             Some(cluster_commit_index.clone()),
         );
-        let node_max_bytes = self.config.append_entries_max_bytes * 2 + 4 * 1024;
+        let node_max_bytes = cluster.append_entries_max_bytes * 2 + 4 * 1024;
         let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);
         let node_handle = tokio::spawn(async move {
             if let Err(e) = node_runtime.run().await {
@@ -78,7 +83,7 @@ impl Follower {
             }
         });
 
-        info!("follower: node_id={} up", self.config.node_id);
+        info!("follower: node_id={} up", self.config.node_id());
         Ok(FollowerHandles {
             client_handle,
             node_handle,

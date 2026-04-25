@@ -12,6 +12,7 @@ mod cluster {
     pub mod client_test;
     pub mod grpc_test;
     pub mod manual_replication_test;
+    pub mod standalone_test;
     pub mod surface_test;
     pub mod sync_submit_test;
     pub mod term_behavior_test;

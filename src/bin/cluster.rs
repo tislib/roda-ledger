@@ -30,10 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?;
 
     info!(
-        "starting roda-ledger (node_id={}, mode={:?}, peers={}) from {}",
-        cfg.node_id,
-        cfg.mode,
-        cfg.peers.len(),
+        "starting roda-ledger (node_id={}, cluster_size={}) from {}",
+        cfg.node_id(),
+        cfg.cluster_size(),
         config_path.display()
     );
 

@@ -31,7 +31,9 @@ pub mod vote;
 
 pub use crate::storage::{TermRecord, VoteRecord};
 pub use cluster_commit::ClusterCommitIndex;
-pub use config::{Config, ConfigError, Mode, NodeServerSection, PeerConfig, ServerSection};
+pub use config::{
+    ClusterNodeSection, ClusterSection, Config, ConfigError, PeerConfig, ServerSection,
+};
 pub use follower::{Follower, FollowerHandles};
 pub use leader::{Leader, LeaderHandles};
 pub use ledger_handler::LedgerHandler;

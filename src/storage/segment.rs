@@ -366,6 +366,38 @@ impl Segment {
         Ok(())
     }
 
+    /// Lowest `tx_id` present in this segment's WAL records, or `0`
+    /// if the segment contains no transactional records.
+    ///
+    /// Walks **forwards** record-by-record and returns the first
+    /// non-zero `tx_id` encountered. Typically O(1) — the very first
+    /// record after `SegmentHeader` is a transaction's `Metadata`.
+    /// Used by `Storage::truncate_wal_above` to distinguish "segment
+    /// fully past watermark" from "segment straddles watermark"
+    /// (ADR-0016 §9).
+    pub(crate) fn first_tx_id_in_wal_data(&self) -> Result<u64, Error> {
+        assert!(
+            self.loaded,
+            "Segment is not loaded, cannot inspect first tx_id",
+        );
+        if !self.wal_data.len().is_multiple_of(40) {
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL data is corrupted, cannot read records (is not aligned to 40 bytes)",
+            ));
+        }
+        let mut offset = 0usize;
+        while offset + 40 <= self.wal_data.len() {
+            let entry = parse_wal_record(&self.wal_data[offset..offset + 40])?;
+            let tx = entry.tx_id();
+            if tx > 0 {
+                return Ok(tx);
+            }
+            offset += 40;
+        }
+        Ok(0)
+    }
+
     /// Highest `tx_id` present in this segment's WAL records, or `0`
     /// if the segment contains no transactional records (an empty
     /// active, or a segment with only `SegmentHeader` /

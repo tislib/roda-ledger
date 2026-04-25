@@ -11,7 +11,29 @@ use roda_ledger::storage::StorageConfig;
 use roda_ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Deterministic wait that goes further than `wait_for_transaction`:
+/// requires both `last_commit_id` AND `last_snapshot_id` to be at or
+/// past `tx_id` so balance reads + last_commit_id assertions are
+/// consistent. Avoids the memory-ordering race we've seen with the
+/// pipeline's per-stage indices when the seal stage is doing extra
+/// work under the cluster gate.
+fn wait_for_commit_and_snapshot(ledger: &Ledger, tx_id: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ledger.last_commit_id() >= tx_id && ledger.last_snapshot_id() >= tx_id {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!(
+        "tx {} not commit+snapshot durable within 10s (commit={}, snapshot={})",
+        tx_id,
+        ledger.last_commit_id(),
+        ledger.last_snapshot_id()
+    );
+}
 
 /// Small segment, **no snapshots** — exercises the multi-segment
 /// truncation path through pure WAL replay.
@@ -74,31 +96,40 @@ fn truncated_transactions_are_lost_across_plain_restart() {
 
         // 100 deposits to account 1 (tx_id 1..=100). Allow these to
         // seal — they are "cluster-committed" in our test model.
+        // Submit in two waves of 50 each to give the WAL stage's
+        // per-loop-iteration rotation check room to fire on the
+        // segment boundary (50-tx segments).
         ledger.set_seal_watermark(100);
-        for _ in 0..100 {
-            ledger.submit(Operation::Deposit {
-                account: 1,
-                amount: 1,
-                user_ref: 0,
-            });
+        for _ in 0..2 {
+            for _ in 0..50 {
+                ledger.submit(Operation::Deposit {
+                    account: 1,
+                    amount: 1,
+                    user_ref: 0,
+                });
+            }
+            wait_for_commit_and_snapshot(&ledger, ledger.last_commit_id().max(1));
         }
-        // Wait for tx 100 to be committed before submitting the
-        // next batch — otherwise the seal stage might not have
-        // processed all the segments containing 1..=100 yet.
-        ledger.wait_for_transaction(100);
+        wait_for_commit_and_snapshot(&ledger, 100);
 
         // 100 deposits to account 2 (tx 101..=200). seal_watermark
         // stays at 100 so segments containing these txs DO NOT seal.
-        let last = ledger.submit_batch(
-            (0..100)
-                .map(|_| Operation::Deposit {
-                    account: 2,
-                    amount: 1,
-                    user_ref: 0,
-                })
-                .collect(),
-        );
-        ledger.wait_for_transaction(last);
+        // Same wave-of-50 pattern. Note: `submit_batch` returns the
+        // batch's *first* tx_id (`start_id`), not the last — so the
+        // wait target is `start_id + 49`.
+        for _ in 0..2 {
+            let start_id = ledger.submit_batch(
+                (0..50)
+                    .map(|_| Operation::Deposit {
+                        account: 2,
+                        amount: 1,
+                        user_ref: 0,
+                    })
+                    .collect(),
+            );
+            let last_id = start_id + 49;
+            wait_for_commit_and_snapshot(&ledger, last_id);
+        }
 
         assert_eq!(ledger.last_commit_id(), n);
         assert_eq!(ledger.get_balance(1), 100);
@@ -282,17 +313,33 @@ fn start_with_recovery_until_errors_when_sealed_segment_would_need_truncation() 
         let mut ledger = Ledger::new(small_segment_no_snapshot_config(&temp_dir));
         ledger.start().unwrap();
         // Default seal_watermark = u64::MAX → segments seal freely.
-        for _ in 0..150 {
-            ledger.submit(Operation::Deposit {
-                account: 1,
-                amount: 1,
-                user_ref: 0,
-            });
+        //
+        // The WAL stage's rotation check fires once per outer loop
+        // iteration, comparing `last_received - segment_start >=
+        // tx_per_seg`. After a rotation, `segment_start_tx_id` is
+        // reset to 0 and re-set on the *next* ingested tx. So a
+        // segment is fully filled only when one outer iteration
+        // ingests `tx_per_seg + 1` consecutive txs since segment
+        // start. To deterministically produce 2+ sealed segments we
+        // need 4 waves of `tx_per_seg = 50`: rotate after wave 2
+        // (seg 1 sealed) and rotate again after wave 4 (seg 2
+        // sealed).
+        for _ in 0..4 {
+            for _ in 0..50 {
+                ledger.submit(Operation::Deposit {
+                    account: 1,
+                    amount: 1,
+                    user_ref: 0,
+                });
+            }
+            ledger.wait_for_pass();
+            ledger.wait_for_seal();
         }
-        ledger.wait_for_transaction(150);
-        // Give the seal thread a couple ticks to actually seal the
-        // closed segments. seal_check_internal = 1ms.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            ledger.last_sealed_segment_id() >= 2,
+            "expected ≥2 sealed segments, got {}",
+            ledger.last_sealed_segment_id()
+        );
     }
 
     // Asking for a watermark inside the second segment should fail
@@ -320,8 +367,8 @@ fn start_with_recovery_until_errors_when_sealed_segment_would_need_truncation() 
     {
         let mut ledger = Ledger::new(small_segment_no_snapshot_config(&temp_dir));
         ledger.start().unwrap();
-        assert_eq!(ledger.last_commit_id(), 150);
-        assert_eq!(ledger.get_balance(1), 150);
+        assert_eq!(ledger.last_commit_id(), 200);
+        assert_eq!(ledger.get_balance(1), 200);
     }
 
     let _ = fs::remove_dir_all(&temp_dir);

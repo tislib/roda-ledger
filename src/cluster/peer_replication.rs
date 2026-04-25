@@ -98,19 +98,19 @@ impl PeerReplication {
     pub async fn run(mut self) {
         info!(
             "replication: starting peer-task for node_id={} ({})",
-            self.peer.id, self.peer.node_addr
+            self.peer.peer_id, self.peer.host
         );
 
         let mut client = loop {
             if !self.running.load(Ordering::Relaxed) {
                 return;
             }
-            match connect(&self.peer.node_addr, self.params.rpc_message_size_limit).await {
+            match connect(&self.peer.host, self.params.rpc_message_size_limit).await {
                 Ok(c) => break c,
                 Err(e) => {
                     warn!(
                         "replication: connect to {} failed: {}",
-                        self.peer.node_addr, e
+                        self.peer.host, e
                     );
                     sleep(Duration::from_millis(200)).await;
                 }
@@ -148,7 +148,7 @@ impl PeerReplication {
 
         info!(
             "replication: peer-task for node_id={} stopped",
-            self.peer.id
+            self.peer.peer_id
         );
     }
 
@@ -190,20 +190,20 @@ impl PeerReplication {
                     }
                     warn!(
                         "replication: peer {} rejected append (reason={}, last_tx_id={})",
-                        self.peer.id, r.reject_reason, r.last_tx_id
+                        self.peer.peer_id, r.reject_reason, r.last_tx_id
                     );
                     sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => {
                     warn!(
                         "replication: AppendEntries to peer {} failed (code={:?}): {}",
-                        self.peer.id,
+                        self.peer.peer_id,
                         e.code(),
                         e.message()
                     );
                     sleep(Duration::from_millis(50)).await;
                     if let Ok(c) =
-                        connect(&self.peer.node_addr, self.params.rpc_message_size_limit).await
+                        connect(&self.peer.host, self.params.rpc_message_size_limit).await
                     {
                         *client = c;
                     }
