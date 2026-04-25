@@ -9,7 +9,7 @@
 - [Architecture](03-architecture.md)
 - [WASM Runtime](wasm-runtime.md)
 
-[//]: # (- [Internals]&#40;04-internals.md&#41;)
+- [Internal](internal.md)
 - [Load Testing](load.md)
 
 ---
