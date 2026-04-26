@@ -68,30 +68,7 @@ async fn assert_zero_sum(client: &LedgerClient) {
 //    duplicates; the next 100 are new.
 // 5. Final balance equals 200 × AMOUNT — no doubles, no losses, no torn
 //    state. `system + account == 0`.
-//
-// NOTE: This test currently FAILS and is `#[ignore]`d. It surfaces a real
-// safety bug, not a test bug:
-//
-//   `Ledger::append_wal_entries` (the follower write path) pushes WAL
-//   bytes straight to the pipeline, bypassing the Transactor. The
-//   Transactor's `DedupCache` is therefore never updated as a follower
-//   replicates entries — it only ever reflects what was loaded by
-//   `Recover` at boot. When a follower is promoted to leader and starts
-//   processing client submits, its dedup cache has NO record of any
-//   user_ref that landed during its follower window, and identical
-//   client retries are double-applied.
-//
-//   To make this test pass, the cluster must either (a) update the
-//   leader's dedup cache from replicated WAL entries, or (b) trigger a
-//   bounded WAL re-scan of the recent dedup window on Leader entry in
-//   `RoleSupervisor::run_leader_role`. Both are implementation choices
-//   beyond the scope of "write the test." `companion_diagnoses_dedup_*`
-//   below documents the current (broken) shape so a future fix can
-//   delete it together with the `#[ignore]`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "FIXME(safety): dedup cache not maintained on followers; \
-            promotes-to-leader double-applies retried user_refs. See \
-            comment block above and companion_diagnoses_dedup_gap_on_failover."]
 async fn idempotent_retry_across_failover() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_idempotent".to_string(),
@@ -219,26 +196,31 @@ async fn idempotent_retry_across_failover() {
     ctl.stop_all();
 }
 
-// Companion regression tripwire for `idempotent_retry_across_failover`.
+// ─────────────────────────────────────────────────────────────────────────
 //
-// Today, when a follower is promoted to leader, its dedup cache does NOT
-// reflect any user_ref that landed during its follower window (the
-// follower write path bypasses the Transactor — see comment block on
-// `idempotent_retry_across_failover`). This test pins down the
-// observable consequence: a client retry of the same `user_ref` against
-// the new leader is NOT rejected with `FailReason::DUPLICATE`.
+// Balance staleness across failover.
 //
-// We do NOT assert exact balances here — the precise number depends on
-// which follower happened to be the most-up-to-date at failover and on
-// internal sequencing — but `dup == 0` is enough to prove that dedup is
-// not protecting clients across role transitions. The day someone fixes
-// the underlying bug this assertion will start failing and force a
-// deliberate decision to delete it together with the `#[ignore]` on
-// `idempotent_retry_across_failover`.
+// When a follower is promoted to leader, its `Transactor::balances`
+// must reflect every replicated tx — otherwise validation on new ops
+// uses out-of-date state and silently mis-decides
+// (e.g. `INSUFFICIENT_FUNDS` on a transfer that should succeed).
+//
+// 1. 3-node cluster. Fund account A with 1000 on leader L1, ack
+//    ClusterCommit (so the deposit is on majority of WALs).
+// 2. Kill L1.
+// 3. New leader L2 emerges (it was a follower; received tx 1 via
+//    replication; its Transactor MUST have applied it to balances).
+// 4. On L2, attempt `transfer(A → B, 600)` and ack ClusterCommit.
+//    Without the routing fix, L2's stale `balances[A] == 0` rejects
+//    this with INSUFFICIENT_FUNDS. With the fix, the transfer
+//    succeeds; final A=400, B=600.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn companion_diagnoses_dedup_gap_on_failover() {
+async fn balance_state_in_sync_after_failover() {
+    const ACC_A: u64 = 71;
+    const ACC_B: u64 = 72;
+
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
-        label: "safety_dedup_gap".to_string(),
+        label: "safety_balance_failover".to_string(),
         replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
@@ -247,49 +229,89 @@ async fn companion_diagnoses_dedup_gap_on_failover() {
     .expect("start");
 
     let leader1_idx = wait_leader(&ctl, Duration::from_secs(10)).await;
+    let l1_node_id = ctl.node_id(leader1_idx).expect("node_id");
     let l1_client = ctl.leader_client().await.expect("L1 client");
 
-    // Phase 1: 50 deposits, ClusterCommit, user_refs 1..=50.
-    let half: u64 = 50;
-    let total: u64 = 100;
-    let first_half: Vec<(u64, u64, u64)> =
-        (1..=half).map(|ur| (ACCOUNT, AMOUNT, ur)).collect();
-    let r1 = l1_client
-        .deposit_batch_and_wait(&first_half, WaitLevel::ClusterCommit)
+    // Fund A with 1000 on the leader; ack ClusterCommit so it's on
+    // majority of WALs (and replicated to whichever survivor wins).
+    let r = l1_client
+        .deposit_and_wait(ACC_A, 1000, /*user_ref=*/ 1, WaitLevel::ClusterCommit)
         .await
-        .expect("phase 1");
-    for r in &r1 {
-        assert_eq!(r.fail_reason, 0);
-    }
+        .expect("fund A");
+    assert_eq!(r.fail_reason, 0);
 
+    let pre_a = l1_client.get_balance(ACC_A).await.expect("balance A").balance;
+    assert_eq!(pre_a, 1000);
+
+    // Kill L1. Drop client first so its in-flight RPCs don't linger.
     drop(l1_client);
     ctl.stop_node(leader1_idx).expect("stop L1");
     sleep(Duration::from_millis(150)).await;
 
-    let _l2 = wait_leader(&ctl, Duration::from_secs(10)).await;
+    // New leader emerges from the followers — its Transactor's
+    // `balances[A]` is what we're testing.
+    let leader2_idx = wait_leader(&ctl, Duration::from_secs(10)).await;
+    assert_ne!(
+        ctl.node_id(leader2_idx).unwrap(),
+        l1_node_id,
+        "killed leader cannot be the new one"
+    );
     let l2_client = ctl.leader_client().await.expect("L2 client");
 
-    // Phase 2: retry the full 100-op batch (first 50 user_refs collide
-    // with phase-1).
-    let full_batch: Vec<(u64, u64, u64)> =
-        (1..=total).map(|ur| (ACCOUNT, AMOUNT, ur)).collect();
-    let r2 = l2_client
-        .deposit_batch_and_wait(&full_batch, WaitLevel::ClusterCommit)
+    // Transfer 600 from A to B on the new leader. The new leader's
+    // Transactor must validate against an up-to-date `balances[A]`.
+    let r = l2_client
+        .transfer_and_wait(ACC_A, ACC_B, 600, /*user_ref=*/ 2, WaitLevel::ClusterCommit)
         .await
-        .expect("phase 2");
-
-    let dup = r2
-        .iter()
-        .filter(|r| r.fail_reason == duplicate_code())
-        .count();
-
+        .expect("transfer A→B");
     assert_eq!(
-        dup, 0,
-        "REGRESSION TRIPWIRE: today's leader-after-failover does not \
-         detect user_ref duplicates from its follower-period replicated \
-         WAL. If this assertion ever fails because `dup > 0`, the \
-         safety bug has been fixed — delete this test and remove the \
-         #[ignore] on `idempotent_retry_across_failover`."
+        r.fail_reason, 0,
+        "new leader must not reject transfer due to stale balance: \
+         got fail_reason={}",
+        r.fail_reason
+    );
+
+    let post_a = l2_client.get_balance(ACC_A).await.expect("balance A").balance;
+    let post_b = l2_client.get_balance(ACC_B).await.expect("balance B").balance;
+    let post_sys = l2_client
+        .get_balance(SYSTEM_ACCOUNT_ID)
+        .await
+        .expect("balance system")
+        .balance;
+    assert_eq!(post_a, 400, "A's balance after 1000 deposit + 600 transfer out");
+    assert_eq!(post_b, 600, "B's balance after 600 transfer in");
+    assert_eq!(
+        post_a + post_b + post_sys,
+        0,
+        "zero-sum invariant: A + B + system must be 0; got {} + {} + {} = {}",
+        post_a, post_b, post_sys,
+        post_a + post_b + post_sys,
+    );
+
+    // Cross-node convergence: surviving follower agrees.
+    let follower_idx = ctl
+        .first_follower_index()
+        .await
+        .expect("a non-leader survives");
+    let follower_client = ctl.client(follower_idx).await.expect("follower client");
+    ctl.wait_for(Duration::from_secs(15), "follower commit catches up", || {
+        let fc = follower_client.clone();
+        async move {
+            fc.get_pipeline_index()
+                .await
+                .map(|i| i.commit >= 2)
+                .unwrap_or(false)
+        }
+    })
+    .await
+    .expect("follower catch-up");
+    assert_eq!(
+        follower_client.get_balance(ACC_A).await.unwrap().balance,
+        400
+    );
+    assert_eq!(
+        follower_client.get_balance(ACC_B).await.unwrap().balance,
+        600
     );
 
     ctl.stop_all();

@@ -319,6 +319,21 @@ impl TransactorContext {
         self.pipeline.compute_index.store(id, Ordering::Relaxed);
     }
 
+    /// Follower path: when a replicated batch with `max_tx_id_seen` is
+    /// applied, raise the sequencer's next-id high-water mark to at
+    /// least `max_tx_id_seen + 1`. On a future role transition to
+    /// Leader, the Sequencer's next `fetch_add(1)` returns an id that
+    /// does NOT collide with replicated tx_ids already in the WAL.
+    /// `fetch_max` semantics are safe even if a leader-side sequencer
+    /// has independently advanced the index past this point.
+    #[inline]
+    pub fn bump_sequencer_to_at_least(&self, max_tx_id_seen: u64) {
+        let next = max_tx_id_seen.saturating_add(1);
+        self.pipeline
+            .sequencer_index
+            .fetch_max(next, Ordering::AcqRel);
+    }
+
     #[inline(always)]
     pub fn is_running(&self) -> bool {
         self.pipeline.running.load(Ordering::Relaxed)
@@ -467,13 +482,32 @@ impl LedgerContext {
             .map_err(|wi| wi.single())
     }
 
-    /// Non-blocking batch push as a single `WalInput::Multi` slot (ADR-015).
+    /// Non-blocking push of follower-replicated WAL entries through the
+    /// Transactor (NOT directly to the WAL stage). The Transactor mirrors
+    /// the entries' effects onto its `balances` and `dedup` state, then
+    /// forwards them to the WAL stage as `WalInput::Multi`. Returns the
+    /// entries back on a full queue so the caller can retry.
+    ///
+    /// Routing through the Transactor is what keeps a follower's
+    /// in-memory state in sync with the WAL — without it, a promotion
+    /// to leader would start from stale state and silently double-apply
+    /// user retries (`dedup` gap) or mis-validate ops (`balances` gap).
     #[inline]
-    pub fn push_wal_entries(&self, entries: Vec<WalEntry>) -> Result<(), Vec<WalEntry>> {
-        self.pipeline
-            .wal_input
-            .push(WalInput::Multi(entries))
-            .map_err(|wi| wi.multi())
+    pub fn push_replicated_entries(
+        &self,
+        entries: Vec<WalEntry>,
+    ) -> Result<(), Vec<WalEntry>> {
+        match self
+            .pipeline
+            .sequencer_to_transactor
+            .push(crate::transaction::TransactionInput::Replicated(entries))
+        {
+            Ok(()) => Ok(()),
+            Err(crate::transaction::TransactionInput::Replicated(returned)) => Err(returned),
+            Err(_) => unreachable!(
+                "push_replicated_entries pushed Replicated; only Replicated can come back"
+            ),
+        }
     }
 
     #[inline(always)]

@@ -286,8 +286,15 @@ impl Ledger {
 
     // ── Cluster Mode Surface (ADR-015) ────────────────────────────────────
 
-    /// Follower write path: hand a pre-validated batch to the WAL stage as
-    /// one `WalInput::Multi` slot, bypassing the Transactor.
+    /// Follower write path: hand a pre-validated batch to the
+    /// **Transactor** as `TransactionInput::Replicated`. The Transactor
+    /// mirrors the entries' effects onto its `balances` and `dedup`
+    /// state and then forwards the entries to the WAL stage as
+    /// `WalInput::Multi`. Routing through the Transactor (rather than
+    /// pushing straight to WAL) keeps the follower's in-memory state
+    /// in sync with the WAL — without this, a promotion to leader
+    /// starts from stale state and silently double-applies user retries
+    /// or mis-validates ops.
     pub fn append_wal_entries(&self, entries: Vec<WalEntry>) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -305,7 +312,7 @@ impl Ledger {
                     "ledger pipeline shut down before append_wal_entries completed",
                 ));
             }
-            match ctx.push_wal_entries(pending) {
+            match ctx.push_replicated_entries(pending) {
                 Ok(()) => return Ok(()),
                 Err(returned) => {
                     pending = returned;
