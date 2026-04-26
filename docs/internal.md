@@ -6,17 +6,19 @@ where an ADR exists for a decision it is cited as `[ADR-NNNN]`.
 
 Stages:
 
-1. **The Ledger** — `§1..§16` (this document, current).
-2. **The Storage** — pending. Covers the on-disk file format (segment file
-   layout, WAL record byte layout, sidecar files, snapshot file format, function
-   binary storage, on-disk index file format, ctl tools).
-3. **The Cluster** — pending. Covers the network-facing surface (gRPC, client,
+1. **The Ledger** — `§1..§16`. The in-memory engine: structures, threads,
+   queues, indexes, and the sequence in which records flow through the
+   pipeline.
+2. **The Storage** — `§17..§25`. The on-disk file format: segment file
+   layout, WAL record byte layout, sidecar files, snapshot file format,
+   function binary storage, on-disk index file format, durable cluster
+   state (term and vote logs), and ctl tools.
+3. **The Cluster** — `§26..§39`. The network-facing surface (gRPC, client,
    proto) and Raft replication.
 
-Anything described here is the in-memory ledger: structures, threads, queues,
-indexes, the sequence in which records flow through the pipeline. The on-disk
-*shape* of those records and files is in Stage 2; the *mechanism* by which the
-ledger reads and writes them is here.
+Stage 1 specifies the *mechanism* by which the ledger reads and writes
+records; Stage 2 specifies the on-disk *shape* of those records; Stage 3
+specifies how independent ledgers replicate to one another over a network.
 
 ---
 
@@ -1436,3 +1438,1399 @@ is what makes this true on the read side as well: the Snapshotter
 never sees a transaction that is not yet on disk, so a transaction that
 was visible to a reader before the crash is by definition committed
 and is replayed on restart.
+
+---
+
+# Stage 2 — The Storage
+
+The previous sections describe the in-memory engine. This stage describes
+the on-disk shape: how records are laid out byte by byte, how files are
+named, how the writer and reader cooperate to keep the disk consistent
+across a crash, and what the `ctl` tooling can read and write.
+
+---
+
+## §17 Storage layout and segment lifecycle
+
+### §17.1 The data directory is a flat namespace
+
+A ledger owns one data directory. Every file belonging to that ledger
+lives directly in the directory; the only subdirectory is `functions/`
+(§21.1). The names are `wal.bin`, `wal_NNNNNN.bin`, `wal_NNNNNN.crc`,
+`wal_NNNNNN.seal`, `wal_index_NNNNNN.bin`, `account_index_NNNNNN.bin`,
+`snapshot_NNNNNN.bin`, `snapshot_NNNNNN.crc`,
+`function_snapshot_NNNNNN.bin`, `function_snapshot_NNNNNN.crc`,
+`term.log`, `vote.log`, and `wal.stop`. The flat layout means recovery
+can enumerate every artifact in one syscall and partition the results
+purely by name parse.
+
+### §17.2 Segment file naming
+
+The active WAL segment is always `wal.bin`. Sealed segments are
+`wal_NNNNNN.bin` where `NNNNNN` is the segment id zero-padded to six
+decimal digits. The pad width is a hard limit; segment ids beyond
+999_999 are unsupported by the on-disk naming. At the default
+`transaction_count_per_segment = 10_000_000` (§15.5) that bound is
+~10^13 transactions per ledger, comfortably beyond any expected scale.
+Index, snapshot, sidecar, and seal-marker files reuse the same
+six-digit segment id so a single text match identifies every artifact
+for a given segment.
+
+### §17.3 Three lifecycle states
+
+A segment is in exactly one of three states: **Active** — it is
+`wal.bin`, the writer is appending records to it, no `SegmentSealed`
+record has been written; **Closed** — it has been renamed to
+`wal_NNNNNN.bin` and a `SegmentSealed` record has been written and
+fsynced, but the seal marker and CRC sidecar are not yet present;
+**Sealed** — the per-segment seal procedure (§11.3) has computed the
+file CRC, written the `.crc` sidecar, and written the empty `.seal`
+marker. Cold-tier index lookups (§22) require the Sealed state;
+recovery (§12.2) re-seals any Closed-but-not-Sealed segment it finds.
+
+### §17.4 Rotation is rename-then-open
+
+When the WAL Writer crosses the rotation threshold (§7.6), it appends
+the `SegmentSealed` record to `wal.bin`, performs a synchronous
+`fdatasync`, then renames `wal.bin` to `wal_NNNNNN.bin` and opens a
+fresh `wal.bin` for the next segment. The rename is atomic on every
+supported filesystem. A reader that opened `wal.bin` before the rename
+retains its handle to the now-renamed inode; a reader that opens after
+the rename gets the new file. This is the foundation of the inode-based
+rotation detection used by replication (§23.3).
+
+### §17.5 The `wal.stop` clean-shutdown marker
+
+A clean `Ledger::shutdown` writes an empty `wal.stop` file before
+exiting. On startup, recovery uses the marker to decide what to trust:
+both `wal.stop` and `wal.bin` present means the previous shutdown was
+clean and the active segment is fully trustworthy; only `wal.bin`
+present means the process exited without flushing and the active
+segment must be tail-trimmed (§23.4). The marker is removed at the
+start of every `Ledger::start` so a crashed restart cannot mistake a
+stale marker for clean state.
+
+### §17.6 Inode rotation detection
+
+Both the leader-side replication tailer (§23.3) and any external reader
+of the active segment detect rotation by inode comparison: at open time
+they stash the inode of `wal.bin`; on every read after EOF they compare
+the current on-disk inode with the stashed one. A mismatch means the
+active segment was renamed and the reader must advance to the next
+segment. The pattern works because the rename in §17.4 produces a new
+inode for the new `wal.bin`; the old inode lives on as long as anyone
+holds a handle to it. [ADR-0006, ADR-0013]
+
+---
+
+## §18 WAL record byte layout
+
+### §18.1 The 40-byte invariant
+
+Every WAL record is exactly 40 bytes. This is the same invariant stated
+in §1.6 from the in-memory side; this section states the byte-level
+consequences. The first byte is the record's `entry_type` discriminant;
+the remaining 39 bytes are the record's payload. All multi-byte fields
+are little-endian. Records are dense in the file: there is no
+inter-record padding, no length prefix, no framing layer. A reader can
+scan a segment by stepping 40 bytes at a time and dispatching on
+byte 0.
+
+### §18.2 Zero-copy serialization
+
+The in-memory layout matches the on-disk layout exactly. Records are
+defined as `#[repr(C)]` plain-old-data structs with explicit `_pad`
+fields filling unused bytes; the bytes that go to disk are obtained by
+casting the struct reference to a byte slice via `bytemuck::bytes_of`.
+There is no per-field encode step, no allocator pressure, no
+conversion between in-memory and on-disk representation. The same
+pattern is used on the read side: a 40-byte slice is cast back to the
+appropriate struct once the discriminant has been examined.
+
+### §18.3 `TxMetadata` (`entry_type = 0`)
+
+| Bytes | Field | Purpose |
+|---|---|---|
+| `[0]` | `entry_type = 0` (u8) | discriminant |
+| `[1]` | `entry_count` (u8) | number of `TxEntry` records that follow |
+| `[2]` | `link_count` (u8) | number of `TxLink` records after the entries |
+| `[3]` | `fail_reason` (u8) | success = 0; see §1.12 |
+| `[4..8]` | `crc32c` (u32) | covers this record (with this field zeroed) plus all entries plus all links |
+| `[8..16]` | `tx_id` (u64) |  |
+| `[16..24]` | `timestamp` (u64) |  |
+| `[24..32]` | `user_ref` (u64) | dedup key (§5) |
+| `[32..40]` | `tag` (8 bytes) | execution-engine identification (§6.14) |
+
+The `crc32c` field's position inside its own coverage is what forces
+the zero-while-computing convention: any reader that wants to verify
+the CRC must zero those four bytes in a working copy before
+recomputing. The `u8` widths of `entry_count` and `link_count` are
+hard caps of 255 entries and 255 links per transaction (§1.8).
+
+### §18.4 `TxEntry` (`entry_type = 1`)
+
+| Bytes | Field |
+|---|---|
+| `[0]` | `entry_type = 1` (u8) |
+| `[1]` | `kind` (u8) — `Credit = 0` or `Debit = 1` |
+| `[2..8]` | `_pad0` (6 bytes) |
+| `[8..16]` | `tx_id` (u64) |
+| `[16..24]` | `account_id` (u64) |
+| `[24..32]` | `amount` (u64) |
+| `[32..40]` | `computed_balance` (i64, signed) |
+
+`computed_balance` is signed because the WASM path can drive a balance
+negative (§4.9); the built-in operations cannot. The `tx_id` field is
+duplicated on every entry so a reader that joins on a tx boundary
+(account-history walks, §10.3) does not need to look back at the
+owning `TxMetadata`.
+
+### §18.5 `SegmentHeader` (`entry_type = 2`)
+
+| Bytes | Field |
+|---|---|
+| `[0]` | `entry_type = 2` (u8) |
+| `[1]` | `version` (u8) — `WAL_VERSION = 1` |
+| `[2..4]` | `_pad0` (2 bytes) |
+| `[4..8]` | `magic` (u32) — `WAL_MAGIC = 0x524F4441` (`"RODA"` in ASCII) |
+| `[8..12]` | `segment_id` (u32) — must equal the suffix in the file name |
+| `[12..40]` | `_pad1`, `_pad2` (28 bytes) |
+
+`SegmentHeader` is the first record of every segment file. The `magic`
+field is the cheapest sanity check on any read: a wrong magic means
+the file is not a roda WAL. The `version` byte exists for forward
+evolution; a reader that does not know how to interpret a version
+refuses the file rather than risk silent miscompute.
+
+### §18.6 `SegmentSealed` (`entry_type = 3`)
+
+| Bytes | Field |
+|---|---|
+| `[0]` | `entry_type = 3` (u8) |
+| `[1..4]` | `_pad0` (3 bytes) |
+| `[4..8]` | `segment_id` (u32) |
+| `[8..16]` | `last_tx_id` (u64) — last committed `tx_id` in this segment |
+| `[16..24]` | `record_count` (u64) — total records including this one and the header |
+| `[24..40]` | `_pad1` (16 bytes) |
+
+`SegmentSealed` is written only by rotation (§7.6) and is followed by
+a synchronous `fdatasync`. Its presence at the tail is the definitive
+signal that a segment file is complete; cold-boot recovery uses
+`record_count` and `last_tx_id` as cross-checks against the bytes it
+walked.
+
+### §18.7 `TxLink` (`entry_type = 4`)
+
+| Bytes | Field |
+|---|---|
+| `[0]` | `entry_type = 4` (u8) |
+| `[1]` | `link_kind` (u8) — `Duplicate = 0`, `Reversal = 1` |
+| `[2..8]` | `_pad` (6 bytes) |
+| `[8..16]` | `tx_id` (u64) — the transaction that *owns* this link |
+| `[16..24]` | `to_tx_id` (u64) — the transaction this link points at |
+| `[24..40]` | `_pad2` (16 bytes) |
+
+A link record always follows the `TxMetadata` of its owning
+transaction and is included in the metadata's CRC32C coverage (§18.3).
+A torn write that lands somewhere inside a multi-record transaction is
+detected by the metadata CRC failing — the reader does not need a
+per-record CRC to spot the corruption.
+
+### §18.8 `FunctionRegistered` (`entry_type = 5`)
+
+| Bytes | Field |
+|---|---|
+| `[0]` | `entry_type = 5` (u8) |
+| `[1]` | `_pad0` (1 byte) |
+| `[2..4]` | `version` (u16) — per-name monotonic, `1..=65535` |
+| `[4..8]` | `crc32c` (u32) — CRC32C of the WASM binary; `0` ⇒ unregister |
+| `[8..40]` | `name` (32 bytes) — ASCII snake_case, null-padded |
+
+`FunctionRegistered` carries no `tx_id` and is not part of any
+transaction's CRC envelope (§1.11). The `crc32c == 0` convention
+preserves the audit trail for unregistration without introducing a
+separate record kind. The 32-byte `name` width is a hard limit at
+registration time (§6.15). [ADR-0001, ADR-0014]
+
+---
+
+## §19 Sidecar files
+
+### §19.1 The CRC sidecar
+
+Every Sealed segment has a paired `wal_NNNNNN.crc` file of exactly
+16 bytes:
+
+| Bytes | Field |
+|---|---|
+| `[0..4]` | `crc32c` (u32) — CRC32C of the entire segment binary |
+| `[4..12]` | `file_size` (u64) — size in bytes of the segment file at seal time |
+| `[12..16]` | `magic` (u32) — `WAL_MAGIC = 0x524F4441` |
+
+The sidecar is written by the per-segment seal procedure (§11.3,
+§25.5) after the segment file itself has been closed. The `file_size`
+field catches truncation that does not change the CRC of the surviving
+prefix; the `magic` field disambiguates a `.crc` against any unrelated
+16-byte file that might end up in the directory.
+
+### §19.2 The `.seal` marker
+
+Alongside the `.crc` sidecar, Seal writes an empty `wal_NNNNNN.seal`
+file. Presence of the marker is what distinguishes a Sealed segment
+from a Closed-but-not-yet-sealed one: a crash between `SegmentSealed`
+writing and the seal procedure leaves a Closed segment that recovery
+(§12.2) re-seals on the next startup. The marker file carries no
+content; only its existence matters. An empty marker file is cheaper
+than a flag inside the sidecar because its presence can be detected by
+a stat call alone.
+
+### §19.3 The `wal.stop` clean-shutdown marker
+
+`wal.stop` is the symmetric marker for the active segment: present iff
+the last `Ledger::shutdown` call completed cleanly (§17.5). It is the
+one file in the directory whose *absence* is informative. Recovery
+uses its absence to decide whether the active segment needs
+tail-trimming (§23.4) versus full-trust load.
+
+### §19.4 Missing sidecars are tolerated
+
+A Sealed segment that is missing its `.crc` sidecar is loaded with a
+warning, not a failure. The rationale: the sidecar is a redundant
+check; the segment's own per-record CRCs (§18.3) and `SegmentSealed`
+cross-check (§18.6) are still authoritative. Missing sidecars are most
+commonly produced by a crash after the segment was renamed but before
+Seal ran, or by external tools that copied a segment without copying
+its sidecar. Neither case warrants a refusal to start. [ADR-0006]
+
+---
+
+## §20 Snapshot files
+
+### §20.1 Naming and pairing
+
+Every snapshot is a pair: `snapshot_NNNNNN.bin` plus
+`snapshot_NNNNNN.crc`. The function snapshot equivalent uses
+`function_snapshot_NNNNNN.bin` plus `function_snapshot_NNNNNN.crc`.
+The six-digit suffix is the segment id of the segment whose sealing
+triggered the snapshot (§11.5); the snapshot reflects the state
+through the end of that segment. A pair is the unit of trust: a
+snapshot whose `.crc` is missing is not loaded, even if the `.bin`
+parses cleanly.
+
+### §20.2 Balance snapshot header
+
+Each `snapshot_NNNNNN.bin` begins with a 36-byte header followed by
+an LZ4-compressed body:
+
+| Bytes | Field |
+|---|---|
+| `[0..4]` | `magic` (u32) — `SNAPSHOT_MAGIC = 0x534E4150` (`"SNAP"`) |
+| `[4]` | `version` (u8) — `SNAPSHOT_VERSION = 1` |
+| `[5..9]` | `segment_id` (u32) |
+| `[9..17]` | `last_tx_id` (u64) — the highest `tx_id` reflected in the snapshot |
+| `[17..25]` | `account_count` (u64) — number of `(account_id, balance)` pairs in the body |
+| `[25]` | `compressed` (u8) — `1` = LZ4, `0` reserved |
+| `[26..32]` | `_pad` (6 bytes) |
+| `[32..36]` | `data_crc32c` (u32) — CRC32C of the *uncompressed* body |
+
+Two CRCs cover the file: this `data_crc32c` validates the records
+themselves independent of the compression layer; the sidecar CRC
+(§20.5) validates the written file as a whole.
+
+### §20.3 Balance snapshot body
+
+The body is LZ4-compressed bytes prefixed by a 4-byte little-endian
+uncompressed-size word. Decompressed, the body is a flat array of
+`account_count` records, each 16 bytes:
+`[account_id:8 LE][balance:8 LE]`, sorted by `account_id`. Sorting is
+for determinism — the same set of balances always produces the same
+bytes — which makes the file reproducible across restarts and amenable
+to offline diffing. Only non-zero balances are emitted; account ids
+that have never been touched are omitted.
+
+### §20.4 Snapshot atomic write
+
+Snapshots are written atomically with the `.tmp` rename pattern: write
+the body to `snapshot_NNNNNN.bin.tmp`, `fsync` it, write the `.crc` to
+`snapshot_NNNNNN.crc.tmp`, `fsync` it, then rename both to their final
+names. If the process crashes between any two steps the partial work
+is identifiable by the `.tmp` suffix and is discarded on the next
+startup. The two renames are independent — a snapshot is not
+considered loaded until *both* finals exist (§20.1) — so the order of
+the two renames does not matter for correctness.
+
+### §20.5 The snapshot CRC sidecar
+
+`snapshot_NNNNNN.crc` is the same 16-byte format as the WAL CRC
+sidecar (§19.1) but with a different magic
+(`SNAPSHOT_MAGIC = 0x534E4150`). The fields cover the entire
+`snapshot_NNNNNN.bin` file as written, so a truncation or bit-flip
+after the rename is detected on the next load.
+
+### §20.6 Function snapshot
+
+`function_snapshot_NNNNNN.bin` mirrors the balance snapshot's shape: a
+header (`FUNCTION_SNAPSHOT_MAGIC = 0x46554E43` — `"FUNC"`), an
+LZ4-compressed body, a paired `.crc` sidecar. The body is a
+sorted-by-name sequence of `(name, version, crc32c)` triples — the
+registry's complete state at the time of the snapshot, including names
+whose latest record is an unregister (`crc32c == 0`). Recording
+unregisters in the snapshot is what lets recovery jump straight to the
+latest snapshot boundary instead of replaying from segment 1 (§12.3).
+
+### §20.7 Empty function snapshots are still written
+
+Even when the registry is empty, the function snapshot is emitted at
+every snapshot boundary. The reason is symmetry with the balance
+snapshot: recovery always loads the *paired* snapshot for a given
+segment id, and the absence of a function snapshot would otherwise
+require a special "function snapshot may legitimately be missing" code
+path. An empty file is cheaper than a special case. [ADR-0014]
+
+---
+
+## §21 Function binary storage
+
+### §21.1 The `functions/` subdirectory
+
+WASM binaries live in `{data_dir}/functions/`. This is the only
+subdirectory of the data directory; it is created on first
+registration. Each binary is a file named `{name}_v{N}.wasm` where
+`name` is the ASCII snake_case identifier from the
+`FunctionRegistered` record (§18.8) and `N` is the per-name monotonic
+version starting at `1`. The directory is the secondary signal of the
+registry's history; the WAL is authoritative (§1.11).
+
+### §21.2 Atomic write on registration
+
+`RegisterFunction` writes the binary to `{name}_v{N}.wasm.tmp`,
+fsyncs, then renames to the final `{name}_v{N}.wasm`. The rename is
+atomic on every supported filesystem; readers therefore never observe
+a partial file. Only after the rename is committed does the
+registration emit its `FunctionRegistered` WAL record (§6.16); the
+disk-then-WAL order means a crash at any point leaves either no record
+of the registration, or both the file and the WAL record in their
+final states.
+
+### §21.3 Unregister produces a 0-byte file
+
+Unregistration writes a 0-byte `{name}_v{N}.wasm` (where `N` is the
+*next* version after the last registered one) and emits a
+`FunctionRegistered` record with `crc32c == 0` (§18.8). The 0-byte
+file is the on-disk audit trail; the WAL record is the authoritative
+signal. Past versions of the binary are preserved; the on-disk history
+of a function is therefore the directory listing of `{name}_v*.wasm`
+files in version order. [ADR-0014]
+
+---
+
+## §22 On-disk indexes
+
+### §22.1 Per-segment, written at seal
+
+Each Sealed segment has a paired transaction index
+(`wal_index_NNNNNN.bin`) and account index
+(`account_index_NNNNNN.bin`), both built once at seal time (§11.3)
+and never modified afterwards. The hot tier (§9) covers the active
+window; the on-disk indexes cover everything older. A query that
+misses in the hot tier (§10.4) consults the on-disk indexes for the
+segment that contains the requested `tx_id` or account history. The
+boundary between hot and cold is not bytes-on-disk — it is *eviction
+in the hot tier*.
+
+### §22.2 Transaction index format
+
+`wal_index_NNNNNN.bin` is a flat sorted array prefixed by a count:
+
+```
+[record_count: u64 LE]
+[ tx_id: u64 LE | byte_offset: u64 LE ] × record_count
+```
+
+Records are in WAL order — i.e., naturally sorted by `tx_id`. The
+`byte_offset` field points to the start of the transaction's
+`TxMetadata` record inside the segment file. A cold-tier
+`GetTransaction` binary-searches the index on `tx_id`, then issues a
+positional read at the resulting offset to fetch the metadata plus
+its dependent entries and links.
+
+### §22.3 Account index format
+
+`account_index_NNNNNN.bin` is the same shape but sorted differently:
+
+```
+[record_count: u64 LE]
+[ account_id: u64 LE | tx_id: u64 LE ] × record_count
+```
+
+Records are sorted lexicographically by `(account_id, tx_id)`. A
+cold-tier `GetAccountHistory` partition-points on `account_id` to
+find the range, then iterates forward in `tx_id` order until either
+the lower bound is hit or the limit is reached. Iteration order is
+ascending in `tx_id`; the caller reverses if it wants newest-first.
+
+### §22.4 Why flat sorted arrays
+
+The format has no per-record framing, no inline pointers, no tree
+metadata. The cost of binary search is `O(log N)` with predictable
+cache behaviour; the cost of construction is one `sort_unstable` over
+the segment's records. The trade-off compared to a B-tree or hash
+index is that updates require a full rewrite — but indexes are
+written exactly once per segment and never updated, so the trade-off
+favours the simpler format. [ADR-0008]
+
+---
+
+## §23 WAL-tail reader and runtime truncation
+
+### §23.1 `WalTailer` is a stateful cursor
+
+The leader-side replication path (§31) reads raw WAL bytes via a
+stateful cursor that holds an open file handle and a byte position
+across calls. Reads use positional I/O (`pread`), so concurrent reads
+do not interfere with the writer's append position. The cursor
+amortises the cost of opening the file: once seeded, every subsequent
+call pays only for the new bytes since the previous call's position.
+
+### §23.2 Whole-record reads only
+
+The tailer always returns a multiple of 40 bytes (§18.1). When the
+underlying file ends mid-record — a torn write or a write still in
+progress — the tailer rounds the byte count down and stops at the
+last full record boundary. The partial bytes are not lost; the next
+call resumes from the same position and re-reads them along with
+whatever new bytes have arrived. The replication path therefore never
+sees a partial record on the wire.
+
+### §23.3 Inode-based rotation detection
+
+When the tailer opens `wal.bin`, it stashes the inode of the file. On
+EOF, it compares the stashed inode against the inode currently bound
+to the path: a mismatch means rotation happened (§17.4) and the
+tailer advances to the next segment file (`wal_NNNNNN.bin` if the
+rotation has fully completed, the new `wal.bin` once the next segment
+starts taking writes). The detection is cheap — one `stat` call per
+EOF — and avoids any coordination with the writer.
+
+### §23.4 Tail-trim on cold-boot recovery
+
+On startup, recovery (§12) inspects the active segment for a torn
+tail. The procedure: walk the segment record by record, validating
+each metadata's CRC against its dependent entries and links; on the
+first metadata whose CRC fails or that runs off the end of the file,
+truncate the file to the byte position just before that metadata.
+This is the *one* tolerated case of corruption (§12.7); a torn middle
+is fatal. The torn-tail trim is performed via `set_len` followed by an
+`fsync_data`, so the post-recovery file matches what is on disk.
+
+### §23.5 Runtime truncation classifies segments by watermark
+
+Divergence-driven runtime truncation (§33) classifies each segment by
+its range of `tx_id`s relative to the recovery watermark. A segment
+whose last `tx_id` is at or below the watermark is kept untouched. A
+segment whose first `tx_id` is strictly above the watermark is removed
+entirely — `wal_NNNNNN.bin`, the `.crc` and `.seal` sidecars, the
+transaction and account indexes, the balance snapshot and its sidecar,
+the function snapshot and its sidecar — every artifact for that
+segment id. A segment that straddles the watermark is byte-truncated
+at the first `TxMetadata` whose `tx_id` exceeds the watermark; the
+surviving prefix is treated as Closed-but-not-yet-Sealed and resealed
+on the next start.
+
+### §23.6 Sealed segments are immutable
+
+A Sealed segment is never modified in place. The straddle case
+(§23.5) can only land in the active segment or in a segment that was
+Closed but not yet Sealed at the moment recovery began. The watermark
+is gated at the storage layer to prevent landing inside a Sealed
+segment; the higher layer (§33) is responsible for choosing a
+watermark that respects this. A request to truncate a Sealed segment
+is a programming error and panics rather than corrupt the on-disk
+audit trail. [ADR-0006, ADR-0016 §9, §10]
+
+---
+
+## §24 Term and vote logs
+
+### §24.1 Two files, one purpose each
+
+Cluster Raft state is persisted as two append-only files in the data
+directory: `term.log` and `vote.log`. They are storage-layer artifacts
+because their durability rules and on-disk format are storage's
+responsibility, even though their semantic meaning belongs to the
+cluster (§28). Keeping them as separate files means the hot path that
+queries the current term (§36.4) does not pay the cost of pollution
+from a vote-grant write.
+
+### §24.2 40-byte records, magic per file
+
+Both records are exactly 40 bytes — the same width as a WAL record
+(§18.1) — so the same offline tooling can inspect them. A
+`TermRecord` is `(term: u64, start_tx_id: u64, magic: u32 = "TERM",
+crc32c: u32)` in its first 24 bytes, with the remaining 16 bytes
+reserved zero-pad. A `VoteRecord` is `(term: u64, voted_for: u64,
+magic: u32 = "VOTE", crc32c: u32)` in the same first 24 bytes, also
+with 16 bytes of pad. The CRC covers bytes `[0..20]` only; it does
+not include the `crc32c` field itself.
+
+### §24.3 Append, then `fdatasync`, then publish
+
+The writer takes a per-file mutex, appends the record, calls
+`sync_data`, and only then publishes the corresponding atomic value
+(`current_term`, `voted_for`). Readers observe the atomic with
+`Acquire` ordering. The discipline enforces the same "atomic value
+observed ⇒ record on disk" rule that the WAL stage enforces for its
+own commit index (§7.5). A crash between append and publish is
+harmless: the next restart's scan re-derives the atomic from the last
+record on disk.
+
+### §24.4 Crash-tolerant scan
+
+Both files are read by walking from the head and parsing one 40-byte
+record at a time. The reader stops cleanly on EOF or on the first
+record whose magic mismatches or whose CRC fails — it does not throw.
+A torn write to either file is therefore tolerated: the surviving
+prefix is the authoritative state. The append path's `sync_data`
+ordering means a record observed by the scanner was on disk before
+the writer published its atomic value; no committed term or vote is
+ever lost to a crash.
+
+### §24.5 No truncation, no rotation
+
+The two logs grow without bound. In practice the term log adds one
+record per election and the vote log adds one record per granted
+vote; both are negligible in steady state. There is no rotation, no
+compaction, no truncation. A future bound (e.g. truncating the term
+log to records covering only the active window) is not part of the
+current design.
+
+---
+
+## §25 ctl tools
+
+### §25.1 The `roda_ctl` binary
+
+`roda_ctl` is the offline tooling for inspecting and reconstructing
+WAL segments. It is *not* a control plane: it does not connect to a
+running ledger, does not synchronise with the running writer, and does
+not modify any in-memory state. It operates purely on files in the
+data directory and assumes no other process holds a write handle to
+the artifacts it touches. Four subcommands exist: `unpack`, `pack`,
+`verify`, and `seal`.
+
+### §25.2 `unpack`
+
+`roda_ctl unpack SEGMENT [--out FILE] [--ignore_crc]` reads a WAL
+segment binary and emits one JSON object per record to standard
+output (or `--out FILE`). The JSON shape is one-to-one with the
+record's fields; CRC errors are surfaced as a `"crc_error": true`
+field on the offending record rather than aborting the dump, unless
+`--ignore_crc` is used to skip the check entirely. `unpack` is the
+diagnostic tool of record: any question about what is in a segment is
+answered by piping its output to `jq`.
+
+### §25.3 `pack`
+
+`roda_ctl pack INPUT [--out FILE] [--no_validate]` is the inverse of
+`unpack`: it parses NDJSON from `INPUT` (or stdin) and writes a
+binary segment to `--out` (or stdout). It re-encodes each record
+using the zero-copy serialization (§18.2) and recomputes the CRC32C
+of every `TxMetadata` from its dependent entries and links. By
+default it validates structural invariants: the first record is
+`SegmentHeader`, the last is `SegmentSealed`, segment ids match, and
+the `record_count` in `SegmentSealed` equals the actual record count.
+`--no_validate` disables the structural checks for cases where a
+deliberately partial or malformed segment is needed (typically for
+testing recovery).
+
+### §25.4 `verify`
+
+`roda_ctl verify DIR [--segment ID | --range FROM..TO]` runs an
+integrity audit over a data directory or a subset of its segments.
+Per segment it checks: the file-level CRC against the `.crc` sidecar;
+the magic byte and version of the `SegmentHeader`; the per-transaction
+CRC; the cumulative `computed_balance` chain (no unexplained jumps);
+declared `entry_count` and `link_count` match the actual record
+counts. Across segments it checks that sealed segments form a
+contiguous `tx_id` chain with no gaps and no overlaps. The output is
+a structured report; a non-zero exit code signals at least one
+failure.
+
+### §25.5 `seal`
+
+`roda_ctl seal SEGMENT [--force]` finalises a Closed segment to
+Sealed state by computing the file-level CRC32C, writing the
+`wal_NNNNNN.crc` sidecar, and writing the empty `wal_NNNNNN.seal`
+marker. It refuses to operate on Active or already-Sealed segments
+unless `--force` is given. The operation is idempotent under
+`--force`: the sidecar and marker are simply rewritten. `seal` exists
+primarily for recovery scenarios where the running ledger crashed
+after a rotation but before its Seal thread (§11) had a chance to
+finish. [ADR-0007]
+
+---
+
+# Stage 3 — The Cluster
+
+The previous stages describe a single-node ledger and its on-disk
+artifacts. This stage describes the network layer that wraps the
+ledger to provide replication and high availability. The cluster
+module owns both gRPC services — the client-facing Ledger service and
+the peer-facing Node service — and the Raft state machine that drives
+leader election and log replication. The Ledger itself remains
+unchanged except for a small, narrow contract surface (§26.2).
+
+---
+
+## §26 The cluster layer
+
+### §26.1 Single node is a cluster with zero peers
+
+There is one binary and one configuration shape for both single-node
+and multi-node deployments. A "single node" is a cluster whose peer
+list contains only itself; a multi-node cluster has additional peers.
+There is no separate single-node binary, no feature flag for gRPC,
+and no distinct configuration path. The simplification is deliberate:
+every observable behaviour is exercised by the same code path that
+runs in production, and operational tooling does not need to branch
+by mode. [ADR-0015 decisions 1, 2]
+
+### §26.2 The minimal Ledger contract
+
+The cluster module never reaches into the Ledger's internals. It uses
+exactly four entry points beyond the standard query and submit
+surface:
+
+- `append_wal_entries(Vec<WalEntry>)` — the follower-side write path
+  that bypasses the Transactor and feeds pre-validated bytes directly
+  to the WAL stage.
+- `wal_tailer()` — produces a stateful raw-WAL byte cursor (§23.1)
+  used by the leader to ship bytes to followers.
+- An `on_commit` hook fired when the local commit index advances,
+  used by the leader to feed its own slot of the quorum tracker
+  (§30.4).
+- `start_with_recovery_until(watermark)` — an alternative to `start()`
+  invoked only by the runtime divergence path (§33).
+
+Nothing else changes inside the Ledger. A standalone Ledger ignores
+all four. [ADR-0015, ADR-0016 §10]
+
+### §26.3 Two gRPC surfaces
+
+The cluster runs two distinct gRPC services on two distinct ports.
+The **Ledger service** (`proto/ledger.proto`) is the client-facing
+API: submit, query, status, wait. The **Node service**
+(`proto/node.proto`) is the peer-facing API: append entries, request
+vote, ping, install snapshot. The two services are entirely separate;
+a client never speaks the Node service and a peer never speaks the
+Ledger service. Both servers are spawned by the supervisor and survive
+every role transition (§38.2) — only their *posture* (writable vs
+read-only) changes when the node's role transitions.
+
+### §26.4 Naming follows role, not transport
+
+Within the cluster module, types are named by their role (`Leader`,
+`Follower`, `LedgerHandler`, `NodeHandler`, `Server`,
+`NodeServerRuntime`) rather than by their transport. gRPC is an
+implementation detail; the same role surface could in principle be
+served by another transport without renaming the role types.
+[ADR-0015 decision 6]
+
+---
+
+## §27 Roles and the runtime state machine
+
+### §27.1 Four roles encoded in one atomic
+
+A node is in exactly one of four roles at any time: `Initializing`
+(post-boot or post-teardown, awaiting a signal), `Candidate` (running
+an election round), `Leader` (writable), or `Follower` (read-only,
+receiving `AppendEntries`). The role is encoded as a `u8` inside a
+single atomic; reads use `Acquire`, writes use `Release`. The atomic
+is shared by every gRPC handler so the writability check on every
+submit RPC is one cache-line read.
+
+### §27.2 The supervisor is the sole writer
+
+The role supervisor is the only entity that mutates the role atomic.
+Handlers, replication tasks, and ledger threads all read the atomic
+freely but never write it. The single-writer rule means a transitioning
+role cannot leave handlers observing a half-applied state: the
+supervisor publishes the new role only after the old role's tasks
+have been torn down and the new role's tasks have been brought up.
+
+### §27.3 Drop-and-rebuild on every transition
+
+Role-specific state — peer replication tasks, the Quorum tracker,
+the gRPC handler's posture — lives inside a `LeaderHandles` or
+`FollowerHandles` struct. A transition drops the outgoing struct
+(which joins or aborts every owned task) before constructing the new
+one. There is no "modify role in place" path; a node that goes
+Leader → Follower → Leader has fully re-instantiated its peer tasks,
+fresh quorum slots, and a freshly-bound writable handler each time.
+The discipline is what eliminates stale-state bugs during failover.
+
+### §27.4 What survives a transition
+
+Three pieces of state are deliberately carried across a role
+boundary: the `Arc<Ledger>` (so the node's data does not have to be
+recovered on every transition), the `Arc<Term>` (so the durable term
+log keeps a single owner), and the `Arc<Vote>` (same reason for vote
+durability). Every other piece of state is owned by a `Handles`
+struct and dies with it. The one exception to even the Ledger
+surviving a transition is divergence (§33), in which case the Arc is
+dropped and rebuilt via `start_with_recovery_until`.
+
+### §27.5 `Initializing` is the post-boot and post-teardown state
+
+`Initializing` is the role a node is in immediately after the
+supervisor starts (before the first election timer fires) and
+immediately after any `Handles` is dropped (before the next role's
+bring-up). The Node gRPC server is already running so the node can
+participate in elections and receive `AppendEntries`, but neither the
+writable client handler nor any peer-replication task is up. The
+client-facing handler in this state behaves like a follower's
+read-only handler: queries succeed; submits return
+`FAILED_PRECONDITION`. [ADR-0016 §2, §3]
+
+---
+
+## §28 Term and vote durability
+
+### §28.1 `term.log` and `vote.log` separate the hot from the cold
+
+The two durable Raft state files (§24) are kept distinct precisely
+because their access patterns are different. `term.log` is on the
+`GetStatus` hot path: every status query reads the current term. It
+grows by one record per term boundary, which is rare in steady state.
+`vote.log` is purely cold: it is written by the `RequestVote` handler
+when a vote is granted, and it is read only at boot to seed the
+in-memory `(current_term, voted_for)` pair. Mixing them in one log
+would force the hot path to scan past vote records.
+
+### §28.2 Append-then-publish ordering
+
+A term bump goes: take the term mutex, append the `TermRecord`,
+`sync_data`, publish the new term to the in-memory atomic with
+`Release`, drop the mutex. A vote grant goes: take the vote mutex,
+append the `VoteRecord`, `sync_data`, publish `voted_for` with
+`Release`, drop the mutex. A reader that observes either atomic via
+`Acquire` is therefore guaranteed the on-disk record exists. This is
+the same discipline used for the WAL's own commit index (§7.5) and is
+what makes "committed term" meaningful across a crash.
+
+### §28.3 Monotonic term
+
+Both `Term::observe(term, start_tx_id)` and `Vote::observe_term(term)`
+reject regressions: a request with a term smaller than the current
+term is a no-op. Term values are monotonic across the entire cluster's
+lifetime; `observe` is the path by which a follower or candidate
+adopts a higher term seen on an incoming RPC. A peer that receives a
+higher term clears its `voted_for` (since `voted_for` is per-term)
+before publishing the new term.
+
+### §28.4 The term hot ring
+
+In-memory, `Term` keeps a bounded ring (capacity 10_000) of recent
+records to serve `GetStatus`-style queries without disk I/O. A query
+for a `tx_id` whose covering term is in the ring returns directly; a
+miss falls through to a mutex-locked disk scan. The ring is sized so
+that under normal failover frequencies every term boundary in the
+recent past is in memory; clusters with extreme term churn fall back
+to the cold path more often but still see correct answers.
+[ADR-0016 §4, §11]
+
+---
+
+## §29 Election protocol
+
+### §29.1 Randomised election timer
+
+Every node not in `Leader` role runs an election timer with a
+randomised deadline in `[election_timer_min_ms,
+election_timer_max_ms]` (default 150–300 ms). The deadline is
+re-randomised on every reset. Reset triggers: any valid
+`AppendEntries` from a current leader (empty heartbeat included), and
+the granting of a `RequestVote`. Without a reset, the timer fires and
+the node transitions to `Candidate`. The randomisation defeats split
+votes: two nodes that timed out at exactly the same instant would
+collide otherwise.
+
+### §29.2 Candidate round
+
+A candidate round consists of: durably bumping the term via
+`Term::new_term(last_commit_id)`, durably self-voting via
+`Vote::vote(new_term, self_id)`, fanning out `RequestVote` to every
+other peer in parallel, and tallying responses. The outcome is one of
+three values: **Won** — at least majority granted, transition to
+`Leader`; **HigherTermSeen** — any peer reported a term higher than
+ours, transition back to `Initializing` after observing the new term;
+**Lost** — the deadline expired with neither outcome, transition back
+to `Initializing` and re-arm the timer with a new randomised
+deadline.
+
+### §29.3 Majority is `(node_count / 2) + 1`
+
+Majority counts the candidate itself: a 5-node cluster needs 3 votes
+(of which 1 is the self-vote, so 2 peer grants suffice). A single-node
+cluster trivially wins by self-vote with no RPCs sent. The arithmetic
+matches `Quorum`'s majority calculation (§30.1) but is computed
+independently — the election's vote count is not the running quorum.
+
+### §29.4 `RequestVote` grant rule
+
+`RequestVote` grants iff *all three* hold (Raft §5.4.1):
+
+1. `request.term ≥ current_term`.
+2. `voted_for` is `None`, or `voted_for == request.candidate_id`
+   (within this term).
+3. The candidate's log is at least as up-to-date as ours:
+   `(request.last_term, request.last_tx_id) ≥ (our_last_term,
+   our_last_tx_id)` lexicographically.
+
+A granted vote fsyncs `vote.log` *before* the RPC reply is sent
+(§28.2). The third clause is what enforces leader completeness: a
+candidate whose log lacks a quorum-committed transaction cannot win.
+
+### §29.5 Pre-vote round
+
+A candidate first runs a *pre-vote* round before bumping its term: it
+asks peers whether they would grant a vote under the third clause of
+§29.4 (log up-to-date check) without persisting `voted_for` or
+bumping its own term. Only if pre-vote succeeds does the candidate
+proceed to the real round. Pre-vote prevents a partitioned node from
+forcing the rest of the cluster to step down on every reconnect —
+without it, a node coming back online would unconditionally bump its
+term high enough to depose the current leader.
+
+### §29.6 Step-down on higher term
+
+Any RPC in any direction (request or response, `RequestVote` or
+`AppendEntries` or even a `Ping`) that carries a term higher than the
+node's current term triggers an immediate step-down: `Term::observe`
+durably records the new term, `voted_for` is cleared, and the node
+transitions to `Initializing`. A node in `Leader` role drops its
+`LeaderHandles` (which drains all peer tasks); a node in `Follower`
+or `Candidate` drops the equivalent. The step-down is the universal
+correctness anchor — no Raft node ever continues operating in an old
+term once it has seen a higher one. [ADR-0016 §5, §6, §13]
+
+---
+
+## §30 Quorum tracker
+
+### §30.1 One slot per node
+
+`Quorum` is an array of `AtomicU64`s, one slot per node in the
+cluster. By convention slot 0 is the leader itself; slots `1..` are
+the peers in configuration order. The majority size —
+`(node_count / 2) + 1` — is computed at construction and never
+changes. A separate atomic caches the current majority-committed
+index for lock-free reads.
+
+### §30.2 `advance` publishes via `fetch_max`
+
+`advance(slot, index)` writes the slot's atomic with `Release`,
+snapshots all slots with `Relaxed`, sorts the snapshot descending,
+takes the `(majority - 1)`-th element (the highest index acknowledged
+by a majority), and publishes it via `fetch_max(Release)` on the
+cached majority atomic. The `fetch_max` ensures the published majority
+never regresses, even when concurrent `advance` calls from different
+slots interleave. This is the lock-free property that lets every peer
+task call `advance` without coordination.
+
+### §30.3 Lock-free reads via `get`
+
+`Quorum::get()` is one `Acquire` load of the cached majority atomic.
+There is no allocation, no fast-path lock, no per-call computation.
+Client wait paths (§34.1) call `get()` repeatedly while polling for a
+target index; the cost per poll is one cache-line load.
+
+### §30.4 The leader's slot is fed by the on-commit hook
+
+On `Leader` bring-up, the leader registers an `on_commit` callback
+with the Ledger. The callback fires every time the local commit index
+advances and calls `advance(self_slot, ledger.last_commit_id())`.
+Without this callback the leader's own progress would be invisible to
+the quorum calculation and the cached majority would be stuck at the
+slowest peer. The hook is the reason the leader counts toward its own
+quorum.
+
+### §30.5 `reset_peers` zeros peer slots on bring-up
+
+When a leader is freshly elected, the prior leader's match-index
+state may still be reflected in the slots; carrying it forward could
+let a stale peer slot inflate the new leader's perceived majority.
+`reset_peers(leader_slot)` is called as part of `Leader` bring-up and
+zeros every slot except the leader's own. The next `advance` call
+from each peer task republishes from a clean baseline.
+[ADR-0015 decisions 3, 5; ADR-0016 §3]
+
+---
+
+## §31 Leader replication tasks
+
+### §31.1 One task per peer
+
+A `Leader` spawns one `tokio` task per peer (`PeerReplication`). The
+leader owns these tasks directly — there is no per-peer-supervisor
+indirection — and they all share the leader's `Arc<Quorum>`,
+`Arc<AtomicBool> running` shutdown flag, and a transition channel for
+out-of-band signals. Spawning is part of `Leader::run_role_tasks`;
+joining is part of `LeaderHandles::drop`.
+
+### §31.2 Each task's private state
+
+Each peer task owns: a `WalTailer` cursor seeded from the leader's
+ledger (§23.1); a tonic Node-service client connected to the peer;
+the peer's slot index in `Quorum`; and two watermarks — `from_tx_id`
+(Raft's `nextIndex`, the next `tx_id` to ship) and `peer_last_tx`
+(Raft's `matchIndex` snapshot, the highest `tx_id` the peer
+acknowledged). Nothing else is shared between peer tasks.
+
+### §31.3 The replication loop
+
+Each iteration: call `tailer.tail(from_tx_id, &mut buf)`; if it
+returns zero bytes, send an empty `AppendEntries` heartbeat carrying
+only `leader_commit_tx_id` and sleep for `replication_poll_ms`; if it
+returns bytes, call the ship-until-accepted path which retries on
+transport failures and observes higher-term replies. On a successful
+non-empty reply the task advances `from_tx_id` past the shipped
+batch's last `tx_id`, updates `peer_last_tx`, and calls
+`quorum.advance(slot, peer_last_tx)`.
+
+### §31.4 Lagged single-phase replication
+
+A successful `AppendEntries` returns the follower's *current*
+fsynced `last_commit_id` — *not* a fresh fsync of the shipped batch.
+The follower queues the bytes and replies immediately; its WAL stage
+fsyncs on its own schedule (§7.7) and the next RPC's reply reflects
+the result. Replies are therefore one batch stale relative to the
+shipped data, which is harmless for quorum tracking because the gap
+closes on the next reply. The model avoids blocking the network RPC
+on disk latency. [ADR-0015]
+
+### §31.5 Idle heartbeats close the staleness gap
+
+Without idle heartbeats, the leader's last knowledge of a peer's
+commit progress would be the reply to the previous shipment — itself
+one batch stale. After the writer goes idle, the peer's true commit
+watermark would never be observed. Sending an empty `AppendEntries`
+every `replication_poll_ms` fixes this: the reply carries the peer's
+now-fsynced `last_commit_id`, which advances the peer's quorum slot.
+Transport errors on heartbeats are intentionally swallowed — the
+next interval retries; a heartbeat is purely observational, not a
+durability event.
+
+### §31.6 Step-down on higher-term reply
+
+A peer reply whose `term` is higher than the leader's current term
+triggers an immediate step-down: the peer task posts a step-down
+transition to the supervisor and returns. The supervisor drains all
+peer tasks (drops `LeaderHandles`), observes the higher term, clears
+`voted_for`, and re-enters `Initializing`. The write side is also
+drained: any in-flight client submit returns the error generated by
+the dropping handler. [ADR-0015, ADR-0016 §3]
+
+---
+
+## §32 Per-peer replication and consistency
+
+### §32.1 Raft naming map
+
+The Roda cluster module uses Raft's terminology where possible:
+`from_tx_id` is `nextIndex`; `peer_last_tx` and the `Quorum` peer
+slot together correspond to `matchIndex`. The `tx_id` stream is the
+Raft log; the term boundary records in `term.log` (§28) supply the
+term for any historical `tx_id`. This mapping is documented so a
+reader who knows Raft can navigate the implementation without
+re-deriving the correspondence.
+
+### §32.2 `prev_tx_id` and `prev_term` consistency check
+
+Every `AppendEntries` request carries `prev_tx_id` (the `tx_id`
+immediately before the batch) and `prev_term` (the term of that
+`tx_id`). The follower validates: it has `prev_tx_id` durably on
+disk, and the term covering `prev_tx_id` matches `prev_term`. If the
+follower's log is shorter, the reply carries `REJECT_PREV_MISMATCH`
+with the follower's own `last_commit_id`. If the follower's log has
+the `tx_id` but with a different term, the reply also carries
+`REJECT_PREV_MISMATCH` and divergence handling kicks in (§33).
+
+### §32.3 The first RPC
+
+For the first `AppendEntries` against an empty follower (or a
+fully-replicated follower starting a fresh batch from `tx_id = 0`),
+both `prev_tx_id` and `prev_term` are zero. The follower treats
+`(0, 0)` as "no precondition" and accepts. Subsequent RPCs use the
+actual preceding `tx_id` and its covering term.
+
+### §32.4 Reject reasons are explicit
+
+`AppendEntriesResponse` carries an enum reject reason rather than a
+bare bool. The four currently emitted reasons are: `TERM_STALE`
+(request's term is below the follower's current term),
+`PREV_MISMATCH` (consistency check failed — see §33), `CRC_FAILED`
+(the bytes did not parse), `WAL_APPEND_FAILED` (the follower's WAL
+stage rejected the queued bytes). The leader uses the reject reason
+to decide whether to step down (`TERM_STALE`), trigger a divergence
+path on the follower side (`PREV_MISMATCH`), or log and continue.
+
+### §32.5 Batch sizing is exact
+
+WAL records are exactly 40 bytes (§18.1), so the leader's per-RPC
+byte cap is always a clean multiple of 40 — there is no padding, no
+partial record at the end of a batch. The configured
+`append_entries_max_bytes` is rounded down to the nearest multiple of
+40 at startup.
+
+### §32.6 gRPC message-size override
+
+Tonic's default decoding/encoding limit of 4 MiB would otherwise
+reject batches sized at exactly `append_entries_max_bytes`. The Node
+server and client both raise `max_decoding_message_size` and
+`max_encoding_message_size` to `append_entries_max_bytes × 2 + 4 KiB`
+to cover both the WAL byte payload and protobuf framing overhead with
+margin. [ADR-0015, ADR-0016 §8]
+
+---
+
+## §33 Log divergence and runtime ledger reseed
+
+### §33.1 The live WAL is append-only *while running*
+
+Truncation of the WAL is permitted, but only via a Ledger restart.
+The running Ledger never modifies records that have already been
+written. This rule preserves the in-memory pipeline's invariants —
+the Snapshotter (§8) and the indexes (§9) assume a monotonically
+growing WAL and would not survive in-place truncation. The runtime
+divergence path (§33.3) achieves truncation by *restarting the
+Ledger*, which lets the Recover path do the truncation safely against
+a quiescent disk.
+
+### §33.2 Divergence detection on the follower
+
+When `AppendEntries` arrives with a `prev_tx_id` that the follower
+has on disk but with a `prev_term` that disagrees with the follower's
+own term covering that `tx_id`, the follower has diverged from the
+new leader's history. The follower stashes `leader_commit_tx_id` from
+the request as the *recovery watermark* and replies
+`REJECT_PREV_MISMATCH`. The supervisor's divergence watcher reads the
+stashed watermark and triggers the reseed.
+
+### §33.3 Reseed sequence
+
+The supervisor: drops the current `FollowerHandles` (so all tasks
+holding the `Arc<Ledger>` are gone); calls a `LedgerSlot::replace`
+with a freshly-built `Ledger::start_with_recovery_until(watermark)`,
+which gives the slot a new `Arc<Ledger>` and returns the old one for
+asynchronous drop on a background task; brings up a fresh
+`FollowerHandles` over the new Ledger. The next `AppendEntries` from
+the leader either resumes cleanly (`prev_tx_id ≤ watermark`) or
+triggers a normal catch-up backfill from the leader.
+
+### §33.4 `start_with_recovery_until` semantics
+
+`start_with_recovery_until(watermark)` is the alternative entry point
+to `Ledger::start`. It walks the WAL and replays snapshots up to and
+including `watermark`, physically truncates any WAL content above the
+watermark (§23.5), and skips any snapshot whose covered-up-to-tx
+exceeds the watermark — recovery falls back to an earlier snapshot
+or to genesis. Cold boot (first start of a process) always uses plain
+`start()`; `start_with_recovery_until` is strictly a runtime response
+to divergence and is never invoked at boot.
+
+### §33.5 Balances rewind for free
+
+Because balances are a derived state of the WAL (§1.2), rewinding the
+WAL rewinds balances as a side-effect of `Recover` re-walking the
+truncated log. There is no undo log, no in-place rollback of applied
+entries, no staged balance layer. The simplification is what makes
+divergence recovery tractable: the Ledger's recovery path already
+knows how to reconstruct balances from a WAL prefix.
+
+### §33.6 `LedgerSlot` is the indirection that lets handlers survive
+
+A reseed swaps the Ledger out from under the gRPC handlers without
+restarting the gRPC servers. The mechanism is `LedgerSlot`: an atomic
+swap of `Arc<Ledger>`. Every handler reads the current Arc on every
+call (`slot.ledger()`) and never retains it across operations. The
+swap is lock-free; the old Arc's strong count drops to zero on a
+background task that joins the old Ledger's pipeline threads
+synchronously, which never blocks a gRPC request because gRPC handlers
+have already released their reference. The supervisor is the sole
+writer of the slot. [ADR-0016 §9, §10]
+
+---
+
+## §34 Cluster commit and the `cluster_commit` wait level
+
+### §34.1 A fifth wait level
+
+Stage 1 introduces four wait levels (§14.1). The cluster adds a
+fifth: `cluster_commit` blocks the submitter until
+`quorum.get() ≥ tx_id`. The handler driving the wait is the same
+shared wait strategy (§13.2) used for the in-process levels; the only
+difference is which atomic the predicate reads.
+
+### §34.2 The leader feeds its own slot
+
+The leader's slot in `Quorum` is advanced by the on-commit hook
+(§30.4); each peer task advances its peer's slot on every successful
+`AppendEntries`. Both contributions are required for the majority to
+move forward — without the leader's own contribution the cached
+majority would be stuck at the slowest peer's progress.
+
+### §34.3 Local commit is independent of quorum
+
+The leader's *own* `commit_index` (§2.5) advances from its local WAL
+stage as soon as the local `fdatasync` returns, independent of any
+peer's progress. Only the client's wait choice determines the
+guarantee: a client that picks `wal` sees the local commit; a client
+that picks `cluster_commit` waits for quorum. The two indexes coexist
+in the same pipeline; nothing about cluster mode slows down the local
+commit path. [ADR-0015 decision 5]
+
+### §34.4 Followers do not durably track cluster commit
+
+`leader_commit_tx_id` arrives on every `AppendEntries` (including
+heartbeats) but the follower does not persist it. Its only consumer
+on the follower side is divergence handling (§33.2), where it is
+captured as the recovery watermark. A follower's view of "cluster
+commit" is not authoritative — only the leader's `Quorum::get()` is.
+Reads from a follower that need cluster-commit semantics are out of
+scope for this implementation.
+
+---
+
+## §35 gRPC: Node service
+
+### §35.1 Service-level invariant
+
+The Node service (`proto/node.proto`) is the peer-facing API. Every
+handler in the service except `Ping` shares a single per-node
+`tokio::sync::Mutex` so that updates to `(current_term, voted_for,
+log)` appear atomic to peers. Tonic dispatches RPCs in parallel by
+default; without the mutex, two concurrent `RequestVote` handlers
+could race on `vote.log` and grant the same term to two candidates.
+[ADR-0016 §7]
+
+### §35.2 `AppendEntries`
+
+Request fields: `leader_id`, `term`, `prev_tx_id`, `prev_term`,
+`from_tx_id`, `to_tx_id`, `wal_bytes`, `leader_commit_tx_id`.
+Response fields: `term`, `success` (bool), `last_tx_id` (the
+follower's *current* fsynced commit id, see §31.4), `reject_reason`.
+An empty `wal_bytes` is a valid heartbeat: the follower runs the
+consistency check and returns its commit id without queueing any
+records.
+
+### §35.3 `RequestVote`
+
+Request fields: `term`, `candidate_id`, `last_tx_id`, `last_term`.
+Response fields: `term`, `vote_granted`. The handler implements the
+grant rule of §29.4 verbatim and persists the vote via `Vote::vote`
+before replying. A grant that requires a term observation also
+durably bumps the term via `Vote::observe_term`.
+
+### §35.4 `Ping`
+
+Request fields: `from_node_id`, `nonce`. Response fields: `node_id`,
+`term`, `last_tx_id`, `role`, `nonce`. The handler reads only atomics
+— no WAL, no vote log — and bypasses the per-node mutex. Its purpose
+is operational: health checks, RTT measurement, and leader discovery
+without the cost of the full Raft handler stack.
+
+### §35.5 `InstallSnapshot`
+
+Request and response fields are modelled after Raft's
+`InstallSnapshot` and exist in the proto to lock in the wire format.
+The handler is scaffolded but not fully implemented; followers that
+fall too far behind a leader's retention window will need this RPC to
+catch up via a snapshot rather than via WAL backfill. The protocol is
+in place; the handler currently returns `UNIMPLEMENTED`.
+
+---
+
+## §36 gRPC: Ledger service
+
+### §36.1 Submit family
+
+`SubmitOperation`, `SubmitAndWait`, `SubmitBatch`,
+`SubmitBatchAndWait`. All four are gated on `role.is_leader()`; a
+non-leader returns `FAILED_PRECONDITION` with the leader's id (the
+node's best-known leader hint) carried in response metadata. Clients
+hitting a non-leader can therefore redirect without a separate lookup
+RPC. The wait variants accept any of the five wait levels (§14, §34)
+and block until the threshold is crossed.
+
+### §36.2 Query family
+
+`GetTransaction`, `GetTransactionStatus`, `GetTransactionStatuses`,
+`GetAccountHistory`, `GetBalance`, `GetBalances`. `GetBalance` and
+`GetBalances` are direct atomic reads against the read-side balance
+cache and never touch the snapshot FIFO (§10.6); the rest enqueue
+queries on the Snapshotter FIFO (§8.4). Reads are served on every
+role including `Initializing` and `Follower`; only the freshness
+signal (`last_tx_id`) tells the caller how stale the answer is.
+
+### §36.3 `GetPipelineIndex`
+
+Returns the five progress indexes — `compute`, `commit`, `snapshot`,
+`term`, `cluster_commit` — in one call. Used by the `load_cluster`
+benchmark and external monitoring to track replication lag and
+pipeline depth. Cheap: every field is one atomic load.
+
+### §36.4 `WaitForTransaction`
+
+Request fields: `tx_id`, `wait_level`, optional `term` fence.
+Response field: `outcome` enum with `REACHED`, `NOT_FOUND`,
+`TERM_MISMATCH`. The optional `term` fence tells the server "I expect
+to be talking to term N"; if the server's current term differs, the
+response carries `TERM_MISMATCH` along with the actual term and
+`term_start_tx_id` so the client can decide whether to redirect or
+re-query.
+
+### §36.5 Function registry RPCs
+
+`RegisterFunction`, `UnregisterFunction`, `ListFunctions`. Writes are
+gated on `role.is_leader()`; on a leader they go through the
+Transactor like any other operation (§6.16, §6.17). `ListFunctions`
+reads the live registry and can be served on any role.
+
+### §36.6 Read-only mode on followers and `Initializing`
+
+A follower's client handler is constructed in read-only mode; every
+`submit_*` and `register_function` returns `FAILED_PRECONDITION`
+unconditionally, regardless of leader-hint availability. The
+`Initializing` role uses the same read-only handler. This is what
+prevents a partitioned former leader from accepting writes that would
+later have to be discarded. [ADR-0004, ADR-0015]
+
+---
+
+## §37 Client library
+
+### §37.1 `LedgerClient` is a thin tonic wrapper
+
+The client library is one type, `LedgerClient`, holding a tonic
+`Channel` (cloneable; tonic pools internally). Construction is
+`LedgerClient::connect(addr).await`. The library does not maintain
+its own connection pool, retry policy, or leader-discovery cache —
+applications wrap calls themselves and use response metadata (term,
+leader hint) when steering.
+
+### §37.2 One async method per RPC
+
+Every gRPC RPC has a corresponding `async fn` on `LedgerClient` that
+takes the natural Rust types as parameters and returns a Rust-side
+response type (`SubmitResult`, `Balance`, `Transaction`,
+`PipelineIndex`, `WaitOutcome`, `FunctionInfo`, …). The wrapper
+hides protobuf message construction; callers never touch generated
+types. The methods take `&self` so a single `LedgerClient` can be
+cloned and shared across many concurrent callers — the underlying
+tonic `Channel` handles multiplexing.
+
+### §37.3 No built-in failover
+
+A `LedgerClient` is bound to one address. Cluster-aware applications
+construct one client per node, make the call against the suspected
+leader, and on a `FAILED_PRECONDITION` with leader hint redirect to
+the indicated peer. Implementing leader-hint following inside the
+client library is deliberately deferred: the hint is on every error
+metadata, but the application owns the policy (try once and fail vs.
+retry on the hinted node vs. consult an external service).
+
+---
+
+## §38 Cluster startup, supervisor, shutdown
+
+### §38.1 `ClusterNode::new` constructs the Ledger and the Term log
+
+`ClusterNode::new(config)` constructs the in-process Ledger via
+`Ledger::start()` — the cold-boot path, never the divergence path —
+opens `Term`, durably bumps the term once on every restart so that
+any in-flight election is forced to start from a higher term than was
+observed pre-crash, and wraps the Ledger in `LedgerSlot` for later
+indirection (§33.6).
+
+### §38.2 Supervisor boot
+
+The role supervisor builds the long-lived shared resources: `Quorum`
+(sized to `peers + 1`), the cooperative `running: Arc<AtomicBool>`,
+and the transition channel. It then spawns the client-facing gRPC
+server, the peer-facing gRPC server, the divergence watcher, and the
+role driver loop. The two gRPC servers are bound for the entire
+lifetime of the process; they never restart on a role transition.
+
+### §38.3 Initial role
+
+A single-node cluster (`peers.len() == 1` and the only entry is
+`self`) is brought up with `initial_role = Leader` so the node is
+immediately writable without waiting for an election timer. A
+multi-node cluster starts in `Initializing` and waits for the first
+election timer to expire before becoming a candidate.
+
+### §38.4 The role-driver loop
+
+The driver awaits the appropriate signal per role: an election-timer
+expiry while in `Initializing` or `Follower`; the candidate round's
+outcome while in `Candidate`; a transition-channel message while in
+`Leader`. Each transition drops the previous role's `Handles` (which
+joins or aborts every owned task) before constructing the next role's
+`Handles`. The driver itself owns no role-specific state; it is purely
+the coordinator that decides which role to bring up next.
+
+### §38.5 Shutdown ordering
+
+Shutdown flips `running` to `false`, sends a `Shutdown` transition
+message (which wakes the role driver if it is parked), and aborts
+every spawned task in order — the role driver first, the divergence
+watcher, the peer-facing server, the client-facing server. Peer
+replication tasks observe `running` at the top of their loop and exit
+cleanly; the gRPC servers run their tonic shutdown protocol before
+the abort takes effect.
+
+---
+
+## §39 Standalone, single-node, and testing modes
+
+### §39.1 Standalone (no `[cluster]` config block)
+
+When the configuration has no `[cluster]` section, `ClusterNode` does
+not invoke the supervisor at all. It constructs a single client-facing
+`Server` task with a hardcoded `Role::Leader` posture, no `RoleFlag`,
+no Node gRPC server, no `Term`, no `Vote`, no `Quorum`, no peer tasks.
+The deployment is identical in observable behaviour to a single-node
+cluster but pays none of the supervisor's coordination cost. This is
+the configuration `roda` ships with by default.
+
+### §39.2 Single-node cluster (`peers.len() == 1`)
+
+A cluster whose configuration lists exactly one peer (itself) runs
+the full supervisor infrastructure: a `RoleFlag`, a `Term`, a `Vote`,
+a single-slot `Quorum`. The node boots as `Leader` (§38.3) and the
+replication loop has zero peers to fan out to; every `on_commit` hook
+firing immediately advances the cluster watermark since there is no
+one to wait for. This mode exercises the cluster code path against a
+trivial cluster shape and is the one used by most cluster integration
+tests.
+
+### §39.3 Multi-node cluster
+
+A cluster with two or more peers runs the full Raft state machine: a
+node boots as `Initializing`, awaits the election timer, transitions
+through `Candidate` to either `Leader` or back to `Initializing`,
+runs `Leader` with peer replication tasks until it sees a higher term
+or loses its majority, etc. This is the production deployment shape.
+
+### §39.4 `ClusterTestingControl`
+
+`ClusterTestingControl` is the in-process test harness for composing
+N-node clusters in a single process: distinct ports on localhost,
+temporary data directories per node, helpers to inject network
+partitions, drop messages, kill nodes mid-flight, and wait for
+specific cluster-wide states. It is not a production code path; it
+exists to give the test suite, the `load_cluster` benchmark, and
+manual debugging a uniform way to construct and tear down clusters
+without spawning processes.
