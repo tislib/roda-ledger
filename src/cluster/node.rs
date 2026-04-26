@@ -15,9 +15,7 @@
 use crate::cluster::config::Config;
 use crate::cluster::server::Server;
 use crate::cluster::supervisor::{RoleSupervisor, SupervisorHandles};
-use crate::cluster::{
-    ClusterCommitIndex, LedgerSlot, Quorum, RoleFlag, Term, role_flag::Role,
-};
+use crate::cluster::{ClusterCommitIndex, LedgerSlot, Quorum, RoleFlag, Term, role_flag::Role};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
@@ -137,6 +135,24 @@ impl Handles {
         match self {
             Handles::Standalone(h) => h.abort(),
             Handles::Cluster(h) => h.abort(),
+        }
+    }
+
+    /// Abort every spawned task and await their join handles so the
+    /// runtime drives teardown to completion before returning.
+    /// `JoinError::cancelled` from `abort()` is treated as success.
+    pub async fn shutdown(self) {
+        self.abort();
+        match self {
+            Handles::Standalone(h) => {
+                let _ = h.client_handle.await;
+            }
+            Handles::Cluster(h) => {
+                let _ = h.client_handle.await;
+                let _ = h.node_handle.await;
+                let _ = h.watcher_handle.await;
+                let _ = h.driver_handle.await;
+            }
         }
     }
 

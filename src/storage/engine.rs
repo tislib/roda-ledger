@@ -176,10 +176,21 @@ impl Storage {
         // broken-invariant input, the data dir is left exactly as we
         // found it.
         enum Action {
-            DeleteActive { active_id: u32 },
-            TruncateActive { active_id: u32, offset: usize },
-            DeleteClosed { seg_id: u32 },
-            TruncateClosed { idx: usize, seg_id: u32, offset: usize },
+            DeleteActive {
+                active_id: u32,
+            },
+            TruncateActive {
+                active_id: u32,
+                offset: usize,
+            },
+            DeleteClosed {
+                seg_id: u32,
+            },
+            TruncateClosed {
+                idx: usize,
+                seg_id: u32,
+                offset: usize,
+            },
         }
 
         let mut closed_segs = self.list_all_segments()?;
@@ -204,22 +215,21 @@ impl Storage {
         let mut continue_after_active = true;
 
         // Closure-style "classify one segment" used twice.
-        let classify =
-            |seg: &mut Segment| -> Result<(u64, u64), std::io::Error> {
-                seg.load().map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "truncate_wal_above: failed to load segment {}: {}",
-                            seg.id(),
-                            e
-                        ),
-                    )
-                })?;
-                let last_tx = seg.last_tx_id_in_wal_data()?;
-                let first_tx = seg.first_tx_id_in_wal_data()?;
-                Ok((first_tx, last_tx))
-            };
+        let classify = |seg: &mut Segment| -> Result<(u64, u64), std::io::Error> {
+            seg.load().map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "truncate_wal_above: failed to load segment {}: {}",
+                        seg.id(),
+                        e
+                    ),
+                )
+            })?;
+            let last_tx = seg.last_tx_id_in_wal_data()?;
+            let first_tx = seg.first_tx_id_in_wal_data()?;
+            Ok((first_tx, last_tx))
+        };
 
         if let Some(active) = active.as_mut() {
             let active_id = active.id();
@@ -274,7 +284,11 @@ impl Storage {
                              (see seal_watermark / ADR-0016 §10); reaching this state \
                              indicates a broken cluster invariant.",
                             seg_id,
-                            if is_fully_past { "deletion" } else { "byte truncation" },
+                            if is_fully_past {
+                                "deletion"
+                            } else {
+                                "byte truncation"
+                            },
                             watermark,
                             first_tx,
                             last_tx
@@ -338,7 +352,11 @@ impl Storage {
                     );
                     Segment::delete_all_files_for_segment(&data_dir, seg_id)?;
                 }
-                Action::TruncateClosed { idx, seg_id, offset } => {
+                Action::TruncateClosed {
+                    idx,
+                    seg_id,
+                    offset,
+                } => {
                     let seg = &mut closed_segs[idx];
                     info!(
                         "truncate_wal_above: truncating segment {} from {} to {} bytes (watermark={})",

@@ -90,7 +90,10 @@ impl ElectionTimer {
     /// The currently-scheduled deadline. Observability only — Stage
     /// 4 transitions consume this through `await_expiry`.
     pub fn deadline(&self) -> Instant {
-        self.state.lock().expect("election timer mutex poisoned").deadline
+        self.state
+            .lock()
+            .expect("election timer mutex poisoned")
+            .deadline
     }
 
     /// Resolve when the deadline elapses. Cancellation-safe: drop

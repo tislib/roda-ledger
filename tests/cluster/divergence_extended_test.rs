@@ -268,7 +268,7 @@ async fn supervisor_reseeds_on_divergence() {
     assert_eq!(b1, 50);
     assert_eq!(b2, 0);
 
-    ctl.stop_node(0).expect("stop");
+    ctl.stop_node(0).await.expect("stop");
 }
 
 /// Reseed re-registers the `on_commit` hook on the new ledger so the
@@ -343,7 +343,7 @@ async fn reseed_re_registers_on_commit_hook() {
     let idx = client.get_pipeline_index().await.unwrap();
     assert_eq!(idx.commit, 10);
 
-    ctl.stop_node(0).expect("stop");
+    ctl.stop_node(0).await.expect("stop");
 }
 
 /// gRPC servers stay up across reseed: the same client keeps working.
@@ -412,5 +412,5 @@ async fn grpc_servers_survive_reseed_swap() {
     .await
     .expect("reseed visible to held client");
 
-    ctl.stop_node(0).expect("stop");
+    ctl.stop_node(0).await.expect("stop");
 }

@@ -164,7 +164,7 @@ async fn supervisor_reseeds_on_divergence_detected_via_node_grpc() {
     assert_eq!(b1, 50, "account 1 prefix preserved");
     assert_eq!(b2, 0, "account 2 deposits truncated");
 
-    ctl.stop_node(0).expect("stop");
+    ctl.stop_node(0).await.expect("stop");
     // `ctl` Drop removes the cluster's root temp folder.
 }
 

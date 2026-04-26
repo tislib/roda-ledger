@@ -470,11 +470,11 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::RegisterFunctionResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        match self
-            .ledger_slot
-            .ledger()
-            .register_function(&req.name, &req.binary, req.override_existing)
-        {
+        match self.ledger_slot.ledger().register_function(
+            &req.name,
+            &req.binary,
+            req.override_existing,
+        ) {
             Ok((version, crc32c)) => Ok(Response::new(proto::RegisterFunctionResponse {
                 version: version as u32,
                 crc32c,
@@ -541,9 +541,15 @@ impl LedgerHandler {
 
         loop {
             let reached = match level {
-                proto::WaitLevel::Computed => self.ledger_slot.ledger().last_compute_id() >= transaction_id,
-                proto::WaitLevel::Committed => self.ledger_slot.ledger().last_commit_id() >= transaction_id,
-                proto::WaitLevel::Snapshot => self.ledger_slot.ledger().last_snapshot_id() >= transaction_id,
+                proto::WaitLevel::Computed => {
+                    self.ledger_slot.ledger().last_compute_id() >= transaction_id
+                }
+                proto::WaitLevel::Committed => {
+                    self.ledger_slot.ledger().last_commit_id() >= transaction_id
+                }
+                proto::WaitLevel::Snapshot => {
+                    self.ledger_slot.ledger().last_snapshot_id() >= transaction_id
+                }
                 proto::WaitLevel::ClusterCommit => {
                     // Require all three watermarks to have passed the tx.
                     // `cluster_commit_index` reflects the leader's view of

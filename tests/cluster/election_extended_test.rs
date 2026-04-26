@@ -46,8 +46,7 @@ async fn three_nodes_elect_a_unique_leader() {
     while Instant::now() < deadline {
         let mut leader_terms: Vec<u64> = Vec::new();
         for i in 0..ctl.len() {
-            if let Some((nproto::NodeRole::Leader, term, _)) =
-                ping(ctl.node_port(i).unwrap()).await
+            if let Some((nproto::NodeRole::Leader, term, _)) = ping(ctl.node_port(i).unwrap()).await
             {
                 leader_terms.push(term);
             }
@@ -79,8 +78,7 @@ async fn failover_elects_different_leader_with_higher_term() {
     let leader_port = ctl.node_port(leader_idx).unwrap();
     let (_, term_pre, _) = ping(leader_port).await.expect("pre-kill ping");
 
-    ctl.stop_node(leader_idx).expect("stop leader");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(leader_idx).await.expect("stop leader");
 
     let new_leader_idx = ctl
         .wait_for_leader(Duration::from_secs(10))
@@ -239,13 +237,9 @@ async fn request_vote_refuses_stale_log() {
         amount: 1,
         user_ref: 0,
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while ledger.last_commit_id() < tx_id {
-        if Instant::now() > deadline {
-            panic!("commit timeout");
-        }
-        sleep(Duration::from_millis(2)).await;
-    }
+    ctl.wait_for_commit(&ledger, tx_id, Duration::from_secs(5))
+        .await
+        .expect("commit");
     assert!(ledger.last_commit_id() >= 1);
 
     let handler = ctl.node_handler(0, 2).expect("handler");
@@ -291,13 +285,9 @@ async fn request_vote_higher_term_durably_observed() {
         amount: 1,
         user_ref: 0,
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while ledger.last_commit_id() < tx_id {
-        if Instant::now() > deadline {
-            panic!("commit timeout");
-        }
-        sleep(Duration::from_millis(2)).await;
-    }
+    ctl.wait_for_commit(&ledger, tx_id, Duration::from_secs(5))
+        .await
+        .expect("commit");
 
     let handler = ctl.node_handler(0, 2).expect("handler");
     use roda_ledger::cluster::proto::node::node_server::Node;
@@ -341,8 +331,7 @@ async fn term_monotonic_across_restarts() {
     let (_, term_initial, _) = ping(port_init).await.unwrap();
 
     // Cycle the leader: stop, restart on the same dir.
-    ctl.stop_node(leader_idx).expect("stop");
-    sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(leader_idx).await.expect("stop");
     ctl.start_node(leader_idx).await.expect("restart");
 
     let new_idx = ctl.wait_for_leader(Duration::from_secs(15)).await.unwrap();
@@ -355,8 +344,7 @@ async fn term_monotonic_across_restarts() {
     );
 
     // Cycle whichever node is leading now.
-    ctl.stop_node(new_idx).expect("stop");
-    sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(new_idx).await.expect("stop");
     ctl.start_node(new_idx).await.expect("restart");
 
     let new_idx2 = ctl.wait_for_leader(Duration::from_secs(15)).await.unwrap();

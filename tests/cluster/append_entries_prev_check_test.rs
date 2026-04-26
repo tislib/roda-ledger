@@ -11,9 +11,7 @@
 
 use roda_ledger::cluster::proto::node as proto;
 use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{
-    ClusterTestingConfig, ClusterTestingControl, NodeHandler, Role, Term,
-};
+use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, NodeHandler, Role, Term};
 use roda_ledger::ledger::Ledger;
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
@@ -27,18 +25,15 @@ use tonic::Request;
 /// Follower, returning `(ctl, ledger, term, handler)`. The handler
 /// claims `node_id == 2` to match the historical setup (it's the
 /// follower receiving from leader id 1).
-async fn setup() -> (
-    ClusterTestingControl,
-    Arc<Ledger>,
-    Arc<Term>,
-    NodeHandler,
-) {
+async fn setup() -> (ClusterTestingControl, Arc<Ledger>, Arc<Term>, NodeHandler) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Follower))
         .await
         .expect("bare start");
     let ledger = ctl.ledger(0).expect("ledger");
     let term = ctl.term(0).expect("term");
-    let handler = ctl.node_handler(0, /* claimed_node_id */ 2).expect("node_handler");
+    let handler = ctl
+        .node_handler(0, /* claimed_node_id */ 2)
+        .expect("node_handler");
     (ctl, ledger, term, handler)
 }
 
@@ -239,7 +234,9 @@ async fn leader_role_rejects_append_entries() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Leader))
         .await
         .expect("bare start");
-    let handler = ctl.node_handler(0, /* claimed_node_id */ 1).expect("handler");
+    let handler = ctl
+        .node_handler(0, /* claimed_node_id */ 1)
+        .expect("handler");
 
     let resp = handler
         .append_entries(Request::new(make_request(1, 0, 0, 0)))

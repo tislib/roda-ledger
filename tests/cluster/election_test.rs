@@ -79,8 +79,7 @@ async fn three_nodes_elect_a_unique_leader_from_cold_boot() {
                 leader_terms.push(term);
             }
         }
-        let unique_terms: std::collections::HashSet<u64> =
-            leader_terms.iter().copied().collect();
+        let unique_terms: std::collections::HashSet<u64> = leader_terms.iter().copied().collect();
         if leader_terms.len() > 1 && unique_terms.len() == 1 {
             panic!(
                 "two leaders in the same term {}: {} observed",
@@ -93,10 +92,7 @@ async fn three_nodes_elect_a_unique_leader_from_cold_boot() {
 
     // ── Failover: kill the leader, expect a new one ────────────────────
     let killed_node_id = leader_node_id;
-    ctl.stop_node(leader_idx).expect("stop leader");
-
-    // Wait briefly so the abort actually drops the bind listener.
-    sleep(Duration::from_millis(100)).await;
+    ctl.stop_node(leader_idx).await.expect("stop leader");
 
     let new_leader_idx = ctl
         .wait_for_leader(Duration::from_millis(5 * 300))
@@ -113,5 +109,5 @@ async fn three_nodes_elect_a_unique_leader_from_cold_boot() {
     );
 
     // ── Shutdown ────────────────────────────────────────────────────────
-    ctl.stop_all();
+    ctl.stop_all().await;
 }

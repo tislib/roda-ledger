@@ -124,7 +124,7 @@ async fn leader_replicates_to_follower() {
         .balance;
     assert_eq!(leader_bal + sys, 0);
 
-    ctl.stop_all();
+    ctl.stop_all().await;
 }
 
 /// Idle heartbeats keep `Quorum::get()` advancing after the writer
@@ -155,17 +155,22 @@ async fn idle_heartbeats_close_stale_by_one_gap() {
     let supervisor = ctl.handles(leader_idx).unwrap();
     let quorum = supervisor.quorum().expect("quorum");
     let last_commit = ctl.ledger(leader_idx).unwrap().last_commit_id();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while quorum.get() < last_commit {
-        if Instant::now() > deadline {
-            panic!(
-                "Quorum::get()={} did not catch leader's last_commit_id={} via heartbeats",
-                quorum.get(),
-                last_commit
-            );
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
+    ctl.wait_for(
+        Duration::from_secs(2),
+        "quorum catches up via heartbeats",
+        || {
+            let q = quorum.clone();
+            async move { q.get() >= last_commit }
+        },
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "Quorum::get()={} did not catch leader's last_commit_id={} via heartbeats",
+            quorum.get(),
+            last_commit
+        )
+    });
     assert!(quorum.get() >= last_commit);
 }
 
@@ -374,16 +379,21 @@ async fn follower_reads_reflect_lagging_state() {
     assert!(r.tx_id > 0);
 
     let follower_client = ctl.follower_client().await.expect("follower");
-    // Follower must eventually report commit ≥ tx_id and a non-zero balance.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let idx = follower_client.get_pipeline_index().await.unwrap();
-        if idx.commit >= r.tx_id {
-            break;
-        }
-        if Instant::now() > deadline {
-            panic!("follower commit never caught up");
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
+    // Follower must eventually report commit ≥ tx_id.
+    ctl.wait_for(
+        Duration::from_secs(10),
+        "follower commit catches up",
+        || {
+            let fc = follower_client.clone();
+            let target = r.tx_id;
+            async move {
+                fc.get_pipeline_index()
+                    .await
+                    .map(|idx| idx.commit >= target)
+                    .unwrap_or(false)
+            }
+        },
+    )
+    .await
+    .expect("follower commit");
 }

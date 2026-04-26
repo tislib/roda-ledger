@@ -493,10 +493,7 @@ impl LedgerContext {
     /// to leader would start from stale state and silently double-apply
     /// user retries (`dedup` gap) or mis-validate ops (`balances` gap).
     #[inline]
-    pub fn push_replicated_entries(
-        &self,
-        entries: Vec<WalEntry>,
-    ) -> Result<(), Vec<WalEntry>> {
+    pub fn push_replicated_entries(&self, entries: Vec<WalEntry>) -> Result<(), Vec<WalEntry>> {
         match self
             .pipeline
             .sequencer_to_transactor

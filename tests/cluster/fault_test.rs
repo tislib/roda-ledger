@@ -5,7 +5,6 @@
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
-use tokio::time::sleep;
 
 const ACCOUNT: u64 = 1;
 const AMOUNT: u64 = 100;
@@ -34,8 +33,7 @@ async fn kill_leader_no_committed_tx_lost() {
     let bal_pre = leader_client.get_balance(ACCOUNT).await.unwrap().balance;
     drop(leader_client);
 
-    ctl.stop_node(leader_idx).expect("stop");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(leader_idx).await.expect("stop");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     let new_client = ctl.leader_client().await.unwrap();
@@ -62,8 +60,7 @@ async fn kill_follower_leader_continues() {
         .await
         .unwrap();
 
-    ctl.stop_node(follower_idx).expect("stop follower");
-    sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(follower_idx).await.expect("stop follower");
 
     // Quorum still 2/3 reachable. ClusterCommit must succeed.
     let r = leader_client
@@ -94,11 +91,10 @@ async fn kill_two_of_three_blocks_cluster_commit() {
         if i == leader_idx {
             continue;
         }
-        ctl.stop_node(i).expect("stop");
+        ctl.stop_node(i).await.expect("stop");
         stopped += 1;
     }
     assert_eq!(stopped, 2);
-    sleep(Duration::from_millis(200)).await;
 
     // ClusterCommit blocks (and the test's overall budget guards against hang).
     let result = leader_client
@@ -121,13 +117,12 @@ async fn kill_two_of_five_cluster_continues() {
         if i == leader_idx {
             continue;
         }
-        ctl.stop_node(i).expect("stop");
+        ctl.stop_node(i).await.expect("stop");
         stopped += 1;
         if stopped == 2 {
             break;
         }
     }
-    sleep(Duration::from_millis(300)).await;
 
     let leader_client = ctl.leader_client().await.unwrap();
     let r = leader_client
@@ -150,13 +145,12 @@ async fn kill_three_of_five_blocks_cluster_commit() {
         if i == leader_idx {
             continue;
         }
-        ctl.stop_node(i).expect("stop");
+        ctl.stop_node(i).await.expect("stop");
         stopped += 1;
         if stopped == 3 {
             break;
         }
     }
-    sleep(Duration::from_millis(300)).await;
 
     let leader_client = ctl.leader_client().await.unwrap();
     let result = leader_client
@@ -187,9 +181,8 @@ async fn full_restart_preserves_committed_data() {
     drop(leader_client);
 
     for i in 0..ctl.len() {
-        ctl.stop_node(i).expect("stop");
+        ctl.stop_node(i).await.expect("stop");
     }
-    sleep(Duration::from_millis(300)).await;
     for i in 0..ctl.len() {
         ctl.start_node(i).await.expect("start");
     }
@@ -225,8 +218,7 @@ async fn repeated_leader_churn_preserves_commits() {
         // Kill current leader.
         let li = ctl.leader_index().await.unwrap();
         drop(leader_client);
-        ctl.stop_node(li).expect("stop");
-        sleep(Duration::from_millis(150)).await;
+        ctl.stop_node(li).await.expect("stop");
         ctl.start_node(li).await.expect("restart");
         let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
@@ -260,15 +252,15 @@ async fn killed_leader_rejoins_as_follower() {
     }
     drop(leader_client);
 
-    ctl.stop_node(leader_idx).expect("stop");
-    sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(leader_idx).await.expect("stop");
     let new_idx = ctl.wait_for_leader(Duration::from_secs(15)).await.unwrap();
     let new_node_id = ctl.node_id(new_idx).unwrap();
 
     // Restart the old leader — it should rejoin as follower; the new
     // leader's heartbeat lands on it within a few election windows.
-    ctl.start_node(leader_idx).await.expect("restart old leader");
-    sleep(Duration::from_millis(800)).await;
+    ctl.start_node(leader_idx)
+        .await
+        .expect("restart old leader");
 
     // The cluster still has a single leader (could be either of the
     // alive nodes — if the rejoined node had a higher pre-failover
@@ -323,7 +315,7 @@ async fn slow_follower_does_not_block_majority() {
 
     // Stop one follower, drive writes (only 2/3 alive — still majority),
     // then restart.
-    ctl.stop_node(follower_idx).expect("stop");
+    ctl.stop_node(follower_idx).await.expect("stop");
     for ur in 1..=20u64 {
         let r = leader_client
             .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
@@ -332,7 +324,6 @@ async fn slow_follower_does_not_block_majority() {
         assert_eq!(r.fail_reason, 0);
     }
     ctl.start_node(follower_idx).await.expect("restart");
-    sleep(Duration::from_millis(500)).await;
 
     // Catch-up.
     let lagged_client = ctl.client(follower_idx).await.expect("client");

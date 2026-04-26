@@ -296,10 +296,7 @@ impl Config {
     /// Returns `0` when standalone (no cluster identity).
     #[inline]
     pub fn node_id(&self) -> u64 {
-        self.cluster
-            .as_ref()
-            .map(|c| c.node.node_id)
-            .unwrap_or(0)
+        self.cluster.as_ref().map(|c| c.node.node_id).unwrap_or(0)
     }
 
     /// Iterator over peers excluding self. Empty when standalone or

@@ -487,13 +487,9 @@ impl Node for NodeHandler {
         // have a log at least as up-to-date as ours: their
         // `(last_term, last_tx_id)` must be ≥ ours by lex order.
         let our_last_tx_id = core.ledger.ledger().last_commit_id();
-        let our_last_term = core
-            .term
-            .last_record()
-            .map(|r| r.term)
-            .unwrap_or(0);
-        let candidate_more_up_to_date = (req.last_term, req.last_tx_id)
-            >= (our_last_term, our_last_tx_id);
+        let our_last_term = core.term.last_record().map(|r| r.term).unwrap_or(0);
+        let candidate_more_up_to_date =
+            (req.last_term, req.last_tx_id) >= (our_last_term, our_last_tx_id);
         if !candidate_more_up_to_date {
             return Ok(Response::new(proto::RequestVoteResponse {
                 term: core.term.get_current_term(),

@@ -119,8 +119,7 @@ impl PeerReplication {
     /// `false` is sufficient cause to drain.
     #[inline]
     fn alive(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
-            && self.supervisor_running.load(Ordering::Relaxed)
+        self.running.load(Ordering::Relaxed) && self.supervisor_running.load(Ordering::Relaxed)
     }
 
     /// If the peer's response carries a strictly-higher term, push a
@@ -135,11 +134,9 @@ impl PeerReplication {
                 "replication: peer {} responded with term {} > our {}; signalling step-down",
                 self.peer.peer_id, peer_term, self.params.term
             );
-            let _ = self
-                .transition_tx
-                .try_send(Transition::StepDownHigherTerm {
-                    observed: peer_term,
-                });
+            let _ = self.transition_tx.try_send(Transition::StepDownHigherTerm {
+                observed: peer_term,
+            });
             return true;
         }
         false
@@ -161,10 +158,7 @@ impl PeerReplication {
             match connect(&self.peer.host, self.params.rpc_message_size_limit).await {
                 Ok(c) => break c,
                 Err(e) => {
-                    warn!(
-                        "replication: connect to {} failed: {}",
-                        self.peer.host, e
-                    );
+                    warn!("replication: connect to {} failed: {}", self.peer.host, e);
                     sleep(Duration::from_millis(200)).await;
                 }
             }

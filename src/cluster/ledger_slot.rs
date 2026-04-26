@@ -55,7 +55,6 @@ impl LedgerSlot {
 mod tests {
     use super::*;
     use crate::config::LedgerConfig;
-    use std::time::Duration;
 
     fn build_started_ledger() -> Arc<Ledger> {
         let mut cfg = LedgerConfig::temp();
@@ -84,6 +83,5 @@ mod tests {
         let after = slot.ledger();
         assert!(Arc::ptr_eq(&after, &new_ledger));
         drop(old);
-        std::thread::sleep(Duration::from_millis(10));
     }
 }

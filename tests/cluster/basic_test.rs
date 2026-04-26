@@ -61,8 +61,7 @@ async fn cluster_leader_replicates_to_follower() {
     let account = 7u64;
     let amount = 100u64;
     let total_tx = 200u64;
-    let deposits: Vec<(u64, u64, u64)> =
-        (0..total_tx).map(|_| (account, amount, 0u64)).collect();
+    let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|_| (account, amount, 0u64)).collect();
     let results = leader_client
         .deposit_batch_and_wait(&deposits, WaitLevel::Committed)
         .await
@@ -124,5 +123,5 @@ async fn cluster_leader_replicates_to_follower() {
     assert_eq!(leader_account_balance + leader_system_balance, 0);
 
     // ── Shutdown ────────────────────────────────────────────────────────
-    ctl.stop_all();
+    ctl.stop_all().await;
 }

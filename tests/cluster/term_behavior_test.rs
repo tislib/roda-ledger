@@ -33,12 +33,7 @@ use tonic::Request;
 /// Build a single-slot Bare-mode harness with role pinned to Leader
 /// (writable RPCs proceed) and return `(ctl, ledger, term,
 /// handler)`. The harness owns lifetime of the data dir.
-async fn setup() -> (
-    ClusterTestingControl,
-    Arc<Ledger>,
-    Arc<Term>,
-    LedgerHandler,
-) {
+async fn setup() -> (ClusterTestingControl, Arc<Ledger>, Arc<Term>, LedgerHandler) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Leader))
         .await
         .expect("bare start");

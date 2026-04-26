@@ -22,21 +22,20 @@ async fn supervisor_abort_releases_all_ports() {
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
     let cport = ctl.client_port(0).unwrap();
     let nport = ctl.node_port(0).unwrap();
-    ctl.stop_node(0).expect("stop");
+    ctl.stop_node(0).await.expect("stop");
 
-    // Both ports must release.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let c = std::net::TcpListener::bind(("127.0.0.1", cport)).is_ok();
-        let n = std::net::TcpListener::bind(("127.0.0.1", nport)).is_ok();
-        if c && n {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("ports {} / {} not released", cport, nport);
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    // `stop_node` awaits join handles + port release; both ports must
+    // be immediately bindable.
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", cport)).is_ok(),
+        "client port {} still bound after stop_node returned",
+        cport
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", nport)).is_ok(),
+        "node port {} still bound after stop_node returned",
+        nport
+    );
 }
 
 /// `Drop` of a harness with a temp data dir removes it.
@@ -49,7 +48,10 @@ async fn harness_drop_removes_owned_temp_dir() {
             .expect("start");
         let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
         temp_root_path = ctl.root_data_dir().to_path_buf();
-        assert!(temp_root_path.exists(), "harness should have created the dir");
+        assert!(
+            temp_root_path.exists(),
+            "harness should have created the dir"
+        );
     }
     sleep(Duration::from_millis(100)).await;
     assert!(
@@ -101,8 +103,7 @@ async fn cluster_node_restart_preserves_state() {
     assert_eq!(r.fail_reason, 0);
     drop(client);
 
-    ctl.stop_node(0).expect("stop");
-    sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(0).await.expect("stop");
     ctl.start_node(0).await.expect("restart");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
@@ -123,18 +124,15 @@ async fn peer_tasks_drain_on_supervisor_abort() {
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     let nport = ctl.node_port(leader_idx).unwrap();
-    ctl.stop_node(leader_idx).expect("stop");
+    ctl.stop_node(leader_idx).await.expect("stop");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if std::net::TcpListener::bind(("127.0.0.1", nport)).is_ok() {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("leader's Node port {} not released", nport);
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    // `stop_node` awaits the supervisor's join handles + the OS port
+    // release before returning, so binding must succeed immediately.
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", nport)).is_ok(),
+        "leader's Node port {} still bound after stop_node returned",
+        nport
+    );
 }
 
 /// Standalone harness drop releases its single port.

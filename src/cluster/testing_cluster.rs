@@ -55,20 +55,37 @@ use tokio::time::sleep;
 pub enum ClusterTestingError {
     Build(std::io::Error),
     Run(String),
-    NoLeader { timeout: Duration },
-    TwoLeaders { ids: Vec<u64> },
+    NoLeader {
+        timeout: Duration,
+    },
+    TwoLeaders {
+        ids: Vec<u64>,
+    },
     TcpBindTimeout(String),
     Connect(tonic::transport::Error),
-    OutOfRange { which: &'static str, idx: usize, len: usize },
-    NotStarted { idx: usize },
+    OutOfRange {
+        which: &'static str,
+        idx: usize,
+        len: usize,
+    },
+    NotStarted {
+        idx: usize,
+    },
     NoFollower,
     /// [`ClusterTestingControl::wait_for`] timed out without the
     /// predicate ever returning `true`.
-    WaitTimeout { label: String, timeout: Duration },
+    WaitTimeout {
+        label: String,
+        timeout: Duration,
+    },
     /// Operation is only valid for [`ClusterTestingMode::Bare`].
-    BareModeOnly { op: &'static str },
+    BareModeOnly {
+        op: &'static str,
+    },
     /// Operation is not valid for [`ClusterTestingMode::Bare`].
-    NotInBareMode { op: &'static str },
+    NotInBareMode {
+        op: &'static str,
+    },
 }
 
 impl std::fmt::Display for ClusterTestingError {
@@ -273,9 +290,7 @@ impl ClusterTestingControl {
     /// Build a harness from a config. Unless
     /// [`ClusterTestingConfig::autostart`] is `false`, every slot's
     /// components / servers are brought up before returning.
-    pub async fn start(
-        config: ClusterTestingConfig,
-    ) -> Result<Self, ClusterTestingError> {
+    pub async fn start(config: ClusterTestingConfig) -> Result<Self, ClusterTestingError> {
         // 1) Resolve root data dir.
         let (root_data_dir, harness_owns_root_dir) = match config.data_dir_root {
             Some(p) => (p, false),
@@ -403,9 +418,11 @@ impl ClusterTestingControl {
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     /// Bring slot `i` up. In Cluster/Standalone modes this builds
-    /// (`ClusterNode::new`) and runs (`ClusterNode::run`) the node.
-    /// In Bare mode it constructs `Ledger`/`Term`/`Vote`/`RoleFlag`/
-    /// `LedgerSlot`/`ClusterCommitIndex`. Idempotent.
+    /// (`ClusterNode::new`), runs (`ClusterNode::run`) the node, and
+    /// waits for the gRPC servers to bind so the slot is immediately
+    /// usable on return. In Bare mode it constructs `Ledger`/`Term`/
+    /// `Vote`/`RoleFlag`/`LedgerSlot`/`ClusterCommitIndex`.
+    /// Idempotent.
     pub async fn start_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
         match self.mode {
             ClusterTestingMode::Bare { role } => {
@@ -414,21 +431,37 @@ impl ClusterTestingControl {
             _ => {
                 self.build_node(i)?;
                 self.run_node(i).await?;
+                self.wait_for_bind(i, Duration::from_secs(5)).await?;
             }
         }
         Ok(())
     }
 
-    /// Aborts node `i`'s spawned tasks (Cluster/Standalone) and
-    /// drops every owned component for that slot. Safe to call on
-    /// already-stopped slots.
-    pub fn stop_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
-        let slot = self.slot_mut(i)?;
-        if let Some(h) = slot.handles.take() {
-            h.abort();
+    /// Aborts node `i`'s spawned tasks (Cluster/Standalone), awaits
+    /// their join handles so the runtime drives teardown to
+    /// completion, and waits for the OS to release the bound ports
+    /// before returning. Safe to call on already-stopped slots.
+    pub async fn stop_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
+        let (handles_opt, addr) = {
+            let slot = self.slot_mut(i)?;
+            let h = slot.handles.take();
+            slot.node = None;
+            slot.bare = None;
+            (h, slot.addr.clone())
+        };
+
+        if let Some(h) = handles_opt {
+            // Bound the join in case a task hangs — we'd rather
+            // surface a clear error than wedge the test harness.
+            let _ = tokio::time::timeout(Duration::from_secs(5), h.shutdown()).await;
+            if addr.client_port != 0 {
+                wait_for_tcp_release(addr.client_port, Duration::from_secs(5)).await?;
+            }
+            if addr.node_port != 0 {
+                wait_for_tcp_release(addr.node_port, Duration::from_secs(5)).await?;
+            }
         }
-        slot.node = None;
-        slot.bare = None;
+
         if let Ok(mut g) = self.cached_leader_idx.try_lock() {
             *g = None;
         }
@@ -442,9 +475,9 @@ impl ClusterTestingControl {
         Ok(())
     }
 
-    pub fn stop_all(&mut self) {
+    pub async fn stop_all(&mut self) {
         for i in 0..self.slots.len() {
-            let _ = self.stop_node(i);
+            let _ = self.stop_node(i).await;
         }
     }
 
@@ -462,8 +495,7 @@ impl ClusterTestingControl {
         if slot.node.is_some() {
             return Ok(());
         }
-        let node =
-            ClusterNode::new(slot.config.clone()).map_err(ClusterTestingError::Build)?;
+        let node = ClusterNode::new(slot.config.clone()).map_err(ClusterTestingError::Build)?;
         slot.node = Some(node);
         Ok(())
     }
@@ -589,10 +621,7 @@ impl ClusterTestingControl {
 
     /// Live `Arc<LedgerSlot>` (the swap point used by divergence
     /// reseed). Works in all modes.
-    pub fn ledger_slot(
-        &self,
-        i: usize,
-    ) -> Result<Arc<LedgerSlot>, ClusterTestingError> {
+    pub fn ledger_slot(&self, i: usize) -> Result<Arc<LedgerSlot>, ClusterTestingError> {
         let slot = self.slot(i)?;
         if let Some(b) = &slot.bare {
             return Ok(b.ledger_slot.clone());
@@ -690,10 +719,7 @@ impl ClusterTestingControl {
     /// Block until exactly one Leader is observed (or `timeout`
     /// elapses). In single-node modes (Standalone / Bare) returns
     /// slot 0 immediately without polling.
-    pub async fn wait_for_leader(
-        &self,
-        timeout: Duration,
-    ) -> Result<usize, ClusterTestingError> {
+    pub async fn wait_for_leader(&self, timeout: Duration) -> Result<usize, ClusterTestingError> {
         if matches!(
             self.mode,
             ClusterTestingMode::Standalone | ClusterTestingMode::Bare { .. }
@@ -712,8 +738,7 @@ impl ClusterTestingControl {
                 if slot.handles.is_none() {
                     continue;
                 }
-                if let Some(nproto::NodeRole::Leader) = ping_role(slot.addr.node_port).await
-                {
+                if let Some(nproto::NodeRole::Leader) = ping_role(slot.addr.node_port).await {
                     leaders.push(i);
                 }
             }
@@ -823,6 +848,21 @@ impl ClusterTestingControl {
         }
     }
 
+    /// Wait for `ledger.last_commit_id()` to reach `tx_id`. Polls at
+    /// 10ms via [`Self::wait_for`]. Replaces the duplicated
+    /// `wait_committed` helpers that used to live in each test file.
+    pub async fn wait_for_commit(
+        &self,
+        ledger: &Ledger,
+        tx_id: u64,
+        timeout: Duration,
+    ) -> Result<(), ClusterTestingError> {
+        self.wait_for(timeout, &format!("commit ≥ {tx_id}"), || async {
+            ledger.last_commit_id() >= tx_id
+        })
+        .await
+    }
+
     /// Wait for slot `i`'s gRPC servers to bind. Useful after a
     /// manual [`run_node`] call (`autostart = false` flow).
     pub async fn wait_for_bind(
@@ -835,9 +875,7 @@ impl ClusterTestingControl {
             return Err(ClusterTestingError::NotStarted { idx: i });
         }
         wait_for_tcp(format!("127.0.0.1:{}", slot.addr.client_port), timeout).await?;
-        if !matches!(self.mode, ClusterTestingMode::Standalone)
-            && slot.addr.node_port != 0
-        {
+        if !matches!(self.mode, ClusterTestingMode::Standalone) && slot.addr.node_port != 0 {
             wait_for_tcp(format!("127.0.0.1:{}", slot.addr.node_port), timeout).await?;
         }
         Ok(())
@@ -845,18 +883,13 @@ impl ClusterTestingControl {
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    async fn wait_for_all_tcp(
-        &self,
-        timeout: Duration,
-    ) -> Result<(), ClusterTestingError> {
+    async fn wait_for_all_tcp(&self, timeout: Duration) -> Result<(), ClusterTestingError> {
         for slot in &self.slots {
             if slot.handles.is_none() {
                 continue;
             }
             wait_for_tcp(format!("127.0.0.1:{}", slot.addr.client_port), timeout).await?;
-            if !matches!(self.mode, ClusterTestingMode::Standalone)
-                && slot.addr.node_port != 0
-            {
+            if !matches!(self.mode, ClusterTestingMode::Standalone) && slot.addr.node_port != 0 {
                 wait_for_tcp(format!("127.0.0.1:{}", slot.addr.node_port), timeout).await?;
             }
         }
@@ -869,13 +902,11 @@ impl ClusterTestingControl {
 
     fn slot(&self, i: usize) -> Result<&NodeSlot, ClusterTestingError> {
         let len = self.slots.len();
-        self.slots
-            .get(i)
-            .ok_or(ClusterTestingError::OutOfRange {
-                which: "node",
-                idx: i,
-                len,
-            })
+        self.slots.get(i).ok_or(ClusterTestingError::OutOfRange {
+            which: "node",
+            idx: i,
+            len,
+        })
     }
 
     fn slot_mut(&mut self, i: usize) -> Result<&mut NodeSlot, ClusterTestingError> {
@@ -896,7 +927,9 @@ impl ClusterTestingControl {
             });
         }
         let slot = self.slot(i)?;
-        slot.bare.as_ref().ok_or(ClusterTestingError::NotStarted { idx: i })
+        slot.bare
+            .as_ref()
+            .ok_or(ClusterTestingError::NotStarted { idx: i })
     }
 }
 
@@ -943,6 +976,24 @@ async fn wait_for_tcp(addr: String, timeout: Duration) -> Result<(), ClusterTest
     let deadline = Instant::now() + timeout;
     loop {
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ClusterTestingError::TcpBindTimeout(addr));
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Polls `TcpListener::bind` on `127.0.0.1:port` until success or
+/// `timeout` — used by `stop_node` to confirm the OS has released a
+/// port that the now-aborted server task held. No event source for
+/// this; the kernel is the authority.
+async fn wait_for_tcp_release(port: u16, timeout: Duration) -> Result<(), ClusterTestingError> {
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {

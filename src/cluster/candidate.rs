@@ -195,4 +195,3 @@ async fn request_vote_one(
         Err(_) => RoundReply::TransportError,
     }
 }
-

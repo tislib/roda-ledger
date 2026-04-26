@@ -3,8 +3,6 @@
 use roda_ledger::client::LedgerClient;
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
-use std::time::Duration;
-use tokio::time::sleep;
 
 /// Spin up a standalone cluster and connect a high-level client to
 /// it. Returns the harness (so the caller can keep it alive for the
@@ -269,10 +267,8 @@ async fn test_deposit_restart_withdraw() {
     assert_eq!(client.get_balance(1).await.unwrap().balance, 1000);
 
     // -- Stop server, then restart on the same port + data dir --
-    ctl.stop_node(0).expect("stop");
-    sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(0).await.expect("stop");
     ctl.start_node(0).await.expect("restart");
-    sleep(Duration::from_millis(100)).await;
 
     // -- Use the SAME client (no reconnect logic exercised yet) --
     let result = client

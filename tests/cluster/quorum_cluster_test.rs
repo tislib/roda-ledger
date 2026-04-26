@@ -5,7 +5,6 @@
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
 
 const ACCOUNT: u64 = 1;
 const AMOUNT: u64 = 100;
@@ -88,19 +87,25 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
     assert!(pre >= 10);
 
     let follower_idx = ctl.first_follower_index().await.expect("follower");
-    ctl.stop_node(follower_idx).expect("stop");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(follower_idx).await.expect("stop");
     ctl.start_node(follower_idx).await.expect("restart");
-    sleep(Duration::from_millis(300)).await;
+    // Wait for the restarted follower to rejoin replication (its slot
+    // in `Quorum` repopulates from the leader's heartbeats).
+    ctl.wait_for(
+        Duration::from_secs(5),
+        "follower's quorum slot repopulates",
+        || {
+            let q = q.clone();
+            let target = pre;
+            async move { q.get() >= target }
+        },
+    )
+    .await
+    .expect("follower rejoined");
 
     // Q::get() must not regress.
     let post = q.get();
-    assert!(
-        post >= pre,
-        "Quorum::get() regressed: {} -> {}",
-        pre,
-        post
-    );
+    assert!(post >= pre, "Quorum::get() regressed: {} -> {}", pre, post);
 }
 
 /// After a Leader transition, the new leader's own slot in `Quorum` is
@@ -124,8 +129,7 @@ async fn new_leader_self_slot_repopulated_after_transition() {
     drop(leader_client);
 
     // Kill leader → new election.
-    ctl.stop_node(leader_idx).expect("stop");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(leader_idx).await.expect("stop");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     // First write under new leader must reach ClusterCommit.

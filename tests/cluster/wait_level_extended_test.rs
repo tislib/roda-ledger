@@ -20,12 +20,7 @@ use tonic::Request;
 const ACCOUNT: u64 = 1;
 const AMOUNT: u64 = 100;
 
-async fn setup_bare_leader() -> (
-    ClusterTestingControl,
-    Arc<Ledger>,
-    Arc<Term>,
-    LedgerHandler,
-) {
+async fn setup_bare_leader() -> (ClusterTestingControl, Arc<Ledger>, Arc<Term>, LedgerHandler) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Leader))
         .await
         .expect("bare start");
@@ -130,9 +125,8 @@ async fn wait_level_cluster_commit_blocks_without_quorum() {
         if i == leader_idx {
             continue;
         }
-        ctl.stop_node(i).expect("stop");
+        ctl.stop_node(i).await.expect("stop");
     }
-    sleep(Duration::from_millis(200)).await;
 
     let result = leader_client
         .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)

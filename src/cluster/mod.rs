@@ -20,8 +20,8 @@ pub mod cluster_commit;
 pub mod config;
 pub mod election_timer;
 pub mod leader;
-pub mod ledger_slot;
 pub mod ledger_handler;
+pub mod ledger_slot;
 pub mod mapping;
 pub mod node;
 pub mod node_handler;
@@ -36,10 +36,10 @@ pub mod vote;
 
 pub use crate::storage::{TermRecord, VoteRecord};
 pub use cluster_commit::ClusterCommitIndex;
-pub use election_timer::{ElectionTimer, ElectionTimerConfig};
 pub use config::{
     ClusterNodeSection, ClusterSection, Config, ConfigError, PeerConfig, ServerSection,
 };
+pub use election_timer::{ElectionTimer, ElectionTimerConfig};
 pub use leader::{Leader, LeaderHandles};
 pub use ledger_handler::LedgerHandler;
 pub use ledger_slot::LedgerSlot;

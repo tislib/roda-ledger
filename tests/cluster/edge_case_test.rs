@@ -357,17 +357,13 @@ async fn supervisor_abort_releases_ports() {
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
     let port = ctl.client_port(0).unwrap();
-    ctl.stop_node(0).expect("stop");
+    ctl.stop_node(0).await.expect("stop");
 
-    // Wait for OS to release the port.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("port {} not released after stop", port);
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    // `stop_node` awaits the supervisor's join handles + the OS port
+    // release before returning, so binding must succeed immediately.
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "port {} still bound after stop_node returned",
+        port
+    );
 }

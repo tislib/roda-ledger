@@ -195,12 +195,9 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
     assert_eq!(r.fail_reason, 0);
 
     // Stop the follower. Quorum (2 of 2) is now unreachable.
-    let follower_idx = ctl
-        .first_follower_index()
-        .await
-        .expect("follower exists");
+    let follower_idx = ctl.first_follower_index().await.expect("follower exists");
     let follower_node_port = ctl.node_port(follower_idx).unwrap();
-    ctl.stop_node(follower_idx).expect("stop follower");
+    ctl.stop_node(follower_idx).await.expect("stop follower");
     // `JoinHandle::abort` is asynchronous; the tonic server task may
     // still be answering AppendEntries for a brief window. Block until
     // the port actually releases — that's the cleanest signal that the
@@ -217,7 +214,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
         result
     );
 
-    ctl.stop_all();
+    ctl.stop_all().await;
 }
 
 async fn wait_port_free(port: u16, timeout: Duration) {
@@ -244,8 +241,9 @@ async fn three_node_cluster_tolerates_one_failure() {
     let leader_client = ctl.leader_client().await.expect("client");
 
     let follower_idx = ctl.first_follower_index().await.expect("follower");
-    ctl.stop_node(follower_idx).expect("stop one follower");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    ctl.stop_node(follower_idx)
+        .await
+        .expect("stop one follower");
 
     // 2/3 alive — majority intact, ClusterCommit must still succeed.
     let r = leader_client
@@ -254,7 +252,7 @@ async fn three_node_cluster_tolerates_one_failure() {
         .expect("ClusterCommit with one follower down");
     assert_eq!(r.fail_reason, 0);
 
-    ctl.stop_all();
+    ctl.stop_all().await;
 }
 
 /// 5-node cluster tolerates exactly two failures (majority = 3).
@@ -274,13 +272,12 @@ async fn five_node_cluster_tolerates_two_failures() {
         if i == leader_idx {
             continue;
         }
-        ctl.stop_node(i).expect("stop follower");
+        ctl.stop_node(i).await.expect("stop follower");
         stopped += 1;
         if stopped == 2 {
             break;
         }
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let r = leader_client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
@@ -288,7 +285,7 @@ async fn five_node_cluster_tolerates_two_failures() {
         .expect("ClusterCommit with 2 of 5 down");
     assert_eq!(r.fail_reason, 0);
 
-    ctl.stop_all();
+    ctl.stop_all().await;
 }
 
 /// In a clustered config with phantom peers, the per-node config files

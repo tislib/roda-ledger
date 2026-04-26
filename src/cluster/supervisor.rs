@@ -151,9 +151,7 @@ impl RoleSupervisor {
         })
     }
 
-    pub async fn run(
-        &self,
-    ) -> Result<SupervisorHandles, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run(&self) -> Result<SupervisorHandles, Box<dyn std::error::Error + Send + Sync>> {
         let cluster = self
             .config
             .cluster
@@ -285,15 +283,8 @@ impl RoleSupervisor {
                         "supervisor: divergence detected (watermark={}); reseeding ledger",
                         watermark
                     );
-                    if let Err(e) = reseed(
-                        &config,
-                        &ledger_slot,
-                        &role,
-                        &quorum,
-                        self_slot,
-                        watermark,
-                    )
-                    .await
+                    if let Err(e) =
+                        reseed(&config, &ledger_slot, &role, &quorum, self_slot, watermark).await
                     {
                         error!("supervisor: reseed failed: {}", e);
                     } else {
@@ -362,9 +353,8 @@ impl RoleSupervisor {
                         // round-trip on healthy networks, short
                         // enough that a partitioned candidate spins
                         // back to Initializing quickly.
-                        let round_deadline = Duration::from_millis(
-                            ElectionTimerConfig::default().max_ms,
-                        );
+                        let round_deadline =
+                            Duration::from_millis(ElectionTimerConfig::default().max_ms);
                         let live_ledger = ledger_slot.ledger();
                         match run_election_round(
                             &config,
@@ -384,8 +374,8 @@ impl RoleSupervisor {
                                 role.set(Role::Leader);
                             }
                             Ok(ElectionOutcome::HigherTermSeen { observed_term }) => {
-                                if let Err(e) =
-                                    term.observe(observed_term, ledger_slot.ledger().last_commit_id())
+                                if let Err(e) = term
+                                    .observe(observed_term, ledger_slot.ledger().last_commit_id())
                                 {
                                     warn!(
                                         "supervisor: term.observe({}) on step-down failed: {}",
@@ -421,10 +411,7 @@ impl RoleSupervisor {
 fn handle_transition(ev: Option<Transition>, role: &Arc<RoleFlag>, _term: &Arc<Term>) {
     match ev {
         Some(Transition::StepDownHigherTerm { observed }) => {
-            warn!(
-                "supervisor: step down observed term={}",
-                observed
-            );
+            warn!("supervisor: step down observed term={}", observed);
             role.set(Role::Initializing);
         }
         Some(Transition::DivergenceDetected { watermark }) => {
@@ -470,11 +457,7 @@ async fn run_leader_role(
         quorum.clone(),
     );
     let leader_handles = match leader
-        .run_role_tasks(
-            leader_alive.clone(),
-            running.clone(),
-            transition_tx.clone(),
-        )
+        .run_role_tasks(leader_alive.clone(), running.clone(), transition_tx.clone())
         .await
     {
         Ok(h) => h,
@@ -553,15 +536,14 @@ async fn reseed(
     role.set(Role::Initializing);
 
     let ledger_cfg = config.ledger.clone();
-    let new_ledger: Arc<Ledger> = tokio::task::spawn_blocking(
-        move || -> Result<Arc<Ledger>, std::io::Error> {
+    let new_ledger: Arc<Ledger> =
+        tokio::task::spawn_blocking(move || -> Result<Arc<Ledger>, std::io::Error> {
             let mut ledger = Ledger::new(ledger_cfg);
             ledger.start_with_recovery_until(watermark)?;
             Ok(Arc::new(ledger))
-        },
-    )
-    .await
-    .map_err(|e| std::io::Error::other(format!("reseed: spawn_blocking panicked: {}", e)))??;
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("reseed: spawn_blocking panicked: {}", e)))??;
 
     // Re-register the on-commit hook on the *new* ledger so the
     // supervisor's permanent quorum keeps observing commit

@@ -6,12 +6,9 @@ use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::proto::node as nproto;
 use roda_ledger::cluster::proto::node::node_client::NodeClient;
 use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{
-    ClusterTestingConfig, ClusterTestingControl, NodeHandler, Role,
-};
+use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, NodeHandler, Role};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
 use tonic::Request;
 
 const ACCOUNT: u64 = 1;
@@ -86,8 +83,7 @@ async fn leader_steps_down_on_higher_term() {
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     let leader_node_id = ctl.node_id(leader_idx).unwrap();
 
-    ctl.stop_node(leader_idx).expect("stop leader");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(leader_idx).await.expect("stop leader");
 
     let new_leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     assert_ne!(ctl.node_id(new_leader_idx).unwrap(), leader_node_id);
@@ -111,8 +107,7 @@ async fn new_leader_quorum_slots_reset_correctly() {
         .unwrap();
     drop(leader_client);
 
-    ctl.stop_node(leader_idx).expect("stop");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(leader_idx).await.expect("stop");
     let _new_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     let new_client = ctl.leader_client().await.unwrap();
@@ -138,7 +133,7 @@ async fn aborted_leader_does_not_zombie_heartbeat() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    ctl.stop_node(leader_idx).expect("stop leader");
+    ctl.stop_node(leader_idx).await.expect("stop leader");
 
     // Election timer max is 300 ms; new leader should appear within ~5×.
     let started = Instant::now();

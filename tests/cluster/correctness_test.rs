@@ -8,7 +8,6 @@ use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
 use std::time::Duration;
-use tokio::time::sleep;
 
 const ACCOUNT_A: u64 = 11;
 const ACCOUNT_B: u64 = 22;
@@ -27,19 +26,15 @@ async fn deposit_via_current_leader(
     wait: WaitLevel,
 ) -> SubmitResult {
     for attempt in 0..10 {
-        let client: LedgerClient = ctl
-            .leader_client()
-            .await
-            .expect("a leader must exist");
+        let client: LedgerClient = ctl.leader_client().await.expect("a leader must exist");
         match client
             .deposit_and_wait(account, amount, user_ref, wait)
             .await
         {
             Ok(r) => return r,
             Err(e) if e.code() == tonic::Code::FailedPrecondition => {
-                // The cached leader stepped down. Wait briefly so a
-                // new leader can stabilise, then re-resolve and retry.
-                sleep(Duration::from_millis(150)).await;
+                // The cached leader stepped down. `wait_for_leader`
+                // polls until a new leader stabilises.
                 let _ = ctl.wait_for_leader(Duration::from_secs(10)).await;
                 if attempt == 9 {
                     panic!(
@@ -82,8 +77,7 @@ async fn balances_converge_across_nodes_after_churn() {
         if round < 2 {
             let li = ctl.leader_index().await.unwrap();
             drop(client);
-            ctl.stop_node(li).expect("stop");
-            sleep(Duration::from_millis(150)).await;
+            ctl.stop_node(li).await.expect("stop");
             ctl.start_node(li).await.expect("restart");
             let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
         }
@@ -93,11 +87,7 @@ async fn balances_converge_across_nodes_after_churn() {
     let leader_client = ctl.leader_client().await.unwrap();
     let target_a = leader_client.get_balance(ACCOUNT_A).await.unwrap().balance;
     let target_b = leader_client.get_balance(ACCOUNT_B).await.unwrap().balance;
-    let target_commit = leader_client
-        .get_pipeline_index()
-        .await
-        .unwrap()
-        .commit;
+    let target_commit = leader_client.get_pipeline_index().await.unwrap().commit;
 
     for i in 0..ctl.len() {
         let c = ctl.client(i).await.expect("client");
@@ -114,8 +104,18 @@ async fn balances_converge_across_nodes_after_churn() {
         .expect("convergence");
         let a = c.get_balance(ACCOUNT_A).await.unwrap().balance;
         let b = c.get_balance(ACCOUNT_B).await.unwrap().balance;
-        assert_eq!(a, target_a, "node {} disagrees on A", ctl.node_id(i).unwrap());
-        assert_eq!(b, target_b, "node {} disagrees on B", ctl.node_id(i).unwrap());
+        assert_eq!(
+            a,
+            target_a,
+            "node {} disagrees on A",
+            ctl.node_id(i).unwrap()
+        );
+        assert_eq!(
+            b,
+            target_b,
+            "node {} disagrees on B",
+            ctl.node_id(i).unwrap()
+        );
         let sys = c.get_balance(SYSTEM_ACCOUNT_ID).await.unwrap().balance;
         assert_eq!(a + b + sys, 0, "zero-sum violated on node {}", i);
     }
@@ -186,8 +186,7 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
     drop(leader_client);
 
     // Kill any single node and observe survivors.
-    ctl.stop_node(0).expect("stop");
-    sleep(Duration::from_millis(150)).await;
+    ctl.stop_node(0).await.expect("stop");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     let new_client = ctl.leader_client().await.unwrap();
