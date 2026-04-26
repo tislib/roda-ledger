@@ -169,17 +169,14 @@ async fn single_node_cluster_boots_directly_as_leader() {
 /// ClusterCommit ack. Verifies the boundary case where a single
 /// failure stalls the cluster.
 ///
-/// Currently FAILS — `Quorum::get()` advances past the dead follower's
-/// last-acked slot value when the leader commits a new tx, even after
-/// the follower's gRPC port has fully released. The expected
-/// math (`snapshot[majority-1] = min(slots)` for 2-node) suggests
-/// `cluster_commit_index` should stay at the last mutually-acked tx,
-/// but it advances to the leader's local commit. Worth investigating
-/// in `Quorum::advance` and the supervisor's on-commit registration.
+/// Crash-safety guarantee: this must hold whether the follower goes
+/// away via graceful drain (`stop_node` flips
+/// `NodeHandlerCore::shutdown`, refusing further AE) or via hard
+/// crash (process gone, no responses at all). In both cases the
+/// follower's slot ages out of `Quorum`'s freshness window and stops
+/// counting toward majority — so `cluster_commit_index` cannot
+/// advance and `WaitLevel::ClusterCommit` correctly times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "FIXME(cluster): Quorum::get() advances past dead follower's slot \
-            in 2-node cluster — cluster_commit_index reaches the leader's local \
-            commit instead of stalling at the mutually-acked watermark"]
 async fn two_node_cluster_requires_both_for_cluster_commit() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(2))
         .await

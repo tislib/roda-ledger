@@ -89,10 +89,27 @@ pub struct SupervisorHandles {
     /// transitions; exposed for observability (`load_cluster`,
     /// tests) and the future quorum-gated commit path.
     pub quorum: Arc<Quorum>,
+    /// Shared NodeHandler state. `abort` flips its `shutdown` latch so
+    /// any in-flight or subsequent gRPC handler refuses immediately —
+    /// this is the in-process stand-in for "the process is gone" and
+    /// is what makes the dying-follower's slot in the leader's
+    /// `Quorum` actually stop refreshing on soft-abort. (Hard crashes
+    /// don't need this — they kill all handler tasks instantly.)
+    pub node_core: Arc<crate::cluster::NodeHandlerCore>,
 }
 
 impl SupervisorHandles {
     pub fn abort(&self) {
+        // Flip the gRPC-handler shutdown latch FIRST. After this
+        // store, every handler invocation on this node returns
+        // `Status::unavailable` — including any that the leader's
+        // `PeerReplication` is about to fire and any that arrive on
+        // already-accepted connections after the listener task is
+        // aborted. This is what severs the dying-follower's ability
+        // to keep its slot fresh in the leader's Quorum.
+        self.node_core
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         self.running
             .store(false, std::sync::atomic::Ordering::Release);
         // A polite shutdown nudge for the driver loop in case it's
@@ -247,6 +264,7 @@ impl RoleSupervisor {
             running,
             transition_tx,
             quorum,
+            node_core,
         })
     }
 

@@ -3,6 +3,7 @@
 
 #![cfg(feature = "cluster")]
 
+use roda_ledger::client::{LedgerClient, SubmitResult};
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
@@ -12,6 +13,46 @@ use tokio::time::sleep;
 const ACCOUNT_A: u64 = 11;
 const ACCOUNT_B: u64 = 22;
 const AMOUNT: u64 = 100;
+
+/// Submit a deposit, retrying with a freshly-resolved leader if the
+/// current leader_client stepped down between resolution and submit
+/// (cold-boot election can briefly hand leadership to one node before
+/// a higher-term winner takes over). Bounds the retry count so a
+/// genuinely-broken cluster surfaces.
+async fn deposit_via_current_leader(
+    ctl: &ClusterTestingControl,
+    account: u64,
+    amount: u64,
+    user_ref: u64,
+    wait: WaitLevel,
+) -> SubmitResult {
+    for attempt in 0..10 {
+        let client: LedgerClient = ctl
+            .leader_client()
+            .await
+            .expect("a leader must exist");
+        match client
+            .deposit_and_wait(account, amount, user_ref, wait)
+            .await
+        {
+            Ok(r) => return r,
+            Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+                // The cached leader stepped down. Wait briefly so a
+                // new leader can stabilise, then re-resolve and retry.
+                sleep(Duration::from_millis(150)).await;
+                let _ = ctl.wait_for_leader(Duration::from_secs(10)).await;
+                if attempt == 9 {
+                    panic!(
+                        "deposit kept hitting FailedPrecondition across 10 \
+                         leader-resolution retries; the cluster is unstable"
+                    );
+                }
+            }
+            Err(e) => panic!("deposit failed with {:?}", e),
+        }
+    }
+    unreachable!()
+}
 
 /// After leader churn under continuous writes, all surviving nodes
 /// converge on the same balances for every account.
@@ -168,13 +209,12 @@ async fn wal_is_byte_exact_across_replicas() {
     .await
     .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.unwrap();
 
+    // Use the leader-resolving helper so cold-boot election churn —
+    // the cached leader briefly stepping down between observation and
+    // submit — doesn't fail the test spuriously.
     for ur in 1..=20u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT_A, AMOUNT, ur, WaitLevel::ClusterCommit)
-            .await
-            .unwrap();
+        deposit_via_current_leader(&ctl, ACCOUNT_A, AMOUNT, ur, WaitLevel::ClusterCommit).await;
     }
 
     let leader_idx = ctl.leader_index().await.unwrap();

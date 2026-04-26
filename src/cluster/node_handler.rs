@@ -23,7 +23,7 @@ use crate::cluster::{ClusterCommitIndex, LedgerSlot, RoleFlag, Term, Vote};
 use crate::wal_tail::decode_records;
 use spdlog::warn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
@@ -81,6 +81,24 @@ pub struct NodeHandlerCore {
     /// `None` only in unit tests that construct a `NodeHandlerCore`
     /// outside a real supervisor.
     pub election_timer: Option<Arc<ElectionTimer>>,
+    /// Shutdown latch — when set, every gRPC handler returns
+    /// `Status::unavailable` immediately, *before* touching any state
+    /// and *before* refreshing any quorum slot on the caller's side.
+    ///
+    /// This is the in-process equivalent of "the process is gone".
+    /// Tonic's `JoinHandle::abort` cancels the listen task but cannot
+    /// stop already-spawned per-RPC handler tasks; without this latch,
+    /// the dying follower's in-flight handlers complete normally,
+    /// returning fresh `last_tx_id` values that the leader's
+    /// `PeerReplication` advances into Quorum — which is the exact
+    /// behaviour a hard crash would NOT exhibit.
+    ///
+    /// The supervisor's shutdown path flips this latch *before*
+    /// aborting handles, so any handler that hasn't yet entered its
+    /// state-touching body refuses; in-flight handlers that already
+    /// passed the check finish naturally (they see consistent state)
+    /// but no new ones start.
+    pub shutdown: AtomicBool,
 }
 
 impl NodeHandlerCore {
@@ -102,7 +120,22 @@ impl NodeHandlerCore {
             node_mutex: AsyncMutex::new(()),
             last_divergence_watermark: AtomicU64::new(0),
             election_timer: None,
+            shutdown: AtomicBool::new(false),
         }
+    }
+
+    /// Flip the shutdown latch. After this returns, every subsequent
+    /// gRPC handler invocation on the corresponding `NodeHandler`
+    /// returns `Status::unavailable` without touching state. Idempotent.
+    #[inline]
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Check the shutdown latch. Inlined into every handler's first line.
+    #[inline]
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     /// Builder-style override used by the supervisor to inject the
@@ -255,6 +288,12 @@ impl Node for NodeHandler {
     ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
         let core = &self.core;
 
+        // Shutdown latch — refuse before touching state. See
+        // `NodeHandlerCore::shutdown` doc-comment for why this exists.
+        if core.is_shutdown() {
+            return Err(Status::unavailable("node shutting down"));
+        }
+
         // ADR-0016 §7: serialise every mutating Node-service handler.
         // Held for the entire body so `(currentTerm, votedFor, log)`
         // observations and writes appear atomic to peers.
@@ -363,6 +402,9 @@ impl Node for NodeHandler {
         request: Request<proto::PingRequest>,
     ) -> Result<Response<proto::PingResponse>, Status> {
         let core = &self.core;
+        if core.is_shutdown() {
+            return Err(Status::unavailable("node shutting down"));
+        }
         let req = request.into_inner();
         Ok(Response::new(proto::PingResponse {
             node_id: core.node_id,
@@ -377,6 +419,9 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
+        if self.core.is_shutdown() {
+            return Err(Status::unavailable("node shutting down"));
+        }
         // ADR-0016 §6 — Raft §5.4.1 verbatim. The per-node mutex
         // serialises this against `AppendEntries` so a candidate
         // and an arriving leader cannot race against the same
@@ -495,6 +540,9 @@ impl Node for NodeHandler {
         &self,
         _request: Request<proto::InstallSnapshotRequest>,
     ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
+        if self.core.is_shutdown() {
+            return Err(Status::unavailable("node shutting down"));
+        }
         let _guard = self.core.node_mutex.lock().await;
         Err(Status::unimplemented("InstallSnapshot deferred to ADR-016"))
     }

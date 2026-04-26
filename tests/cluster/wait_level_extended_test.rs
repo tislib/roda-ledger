@@ -111,13 +111,7 @@ async fn wait_level_cluster_commit_requires_full_advance() {
 
 /// `WaitLevel::ClusterCommit` blocks (and eventually times out) when no
 /// quorum is reachable.
-///
-/// Currently FAILS — same root cause as
-/// `config_test::two_node_cluster_requires_both_for_cluster_commit`:
-/// `Quorum::get()` advances past the dead followers' last-acked
-/// values, so the wait succeeds even without quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "FIXME(cluster): see two_node_cluster_requires_both_for_cluster_commit"]
 async fn wait_level_cluster_commit_blocks_without_quorum() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await

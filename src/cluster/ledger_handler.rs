@@ -537,7 +537,7 @@ impl LedgerHandler {
         level: proto::WaitLevel,
     ) -> std::io::Result<()> {
         let start_time = std::time::Instant::now();
-        let timeout = Duration::from_secs(20);
+        let timeout = Duration::from_secs(2);
 
         loop {
             let reached = match level {

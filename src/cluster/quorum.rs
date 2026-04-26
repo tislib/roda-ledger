@@ -1,15 +1,27 @@
 //! Lock-free majority-commit tracker.
 //!
 //! One `AtomicU64` per cluster node (leader + every peer) plus a cached
-//! `majority_index`. Slot 0 is conventionally the leader itself —
-//! advanced via `Ledger::on_commit` so the leader's own commit progress
-//! counts toward the majority (Raft-style, N/2+1 out of N including self).
-//! Slots 1..=peer_count are the peers, advanced by each
-//! `PeerReplication` task on every successful `AppendEntries`.
+//! `majority_index`. Each `Quorum::advance(node_index, idx)` publishes
+//! the most recent `match_index` for that node and recomputes the
+//! `majority - 1`-th value of the descending sort — exactly Raft's
+//! `commitIndex = sort_desc(matchIndex)[majority - 1]`.
 //!
-//! Readers (observability, future quorum-gated commit in ADR-016) call
-//! `get()`. No locks, no allocation after construction, no backwards
-//! movement of `majority_index`.
+//! **Acks are forever (Raft).** Once a node has reported `match_index = K`,
+//! that report stays in the slot. The data IS on that node's disk; future
+//! `advance` calls only ever raise the slot via `fetch_max`-equivalent
+//! semantics (callers always pass monotonically non-decreasing indices).
+//! `majority_index` itself is updated via `fetch_max(Release)` so the
+//! published value never regresses even under concurrent advances.
+//!
+//! Liveness (whether a peer is still reachable) is NOT tracked here.
+//! Refusing to count a dead peer's ack would violate the Raft invariant
+//! that a confirmed write is durable. The right place to handle a dead
+//! peer is at the gRPC handler boundary on the dying node — see
+//! `NodeHandlerCore::shutdown`. Once that latch is set, the dying node's
+//! handlers refuse, no `last_tx_id` flows back, and Quorum simply never
+//! observes a higher `match_index` for that slot. The slot's existing
+//! value remains correct: it reflects what the peer durably had at the
+//! moment it last responded.
 
 use crate::cluster::cluster_commit::ClusterCommitIndex;
 use std::sync::Arc;
@@ -88,7 +100,7 @@ impl Quorum {
     ///
     /// - Writes `match_index[node_index]` with `Release`.
     /// - Snapshots every slot's value into a thread-local buffer with
-    ///   `Relaxed`, sorts descending, takes the `majority - 1` element.
+    ///   `Acquire`, sorts descending, takes the `majority - 1` element.
     /// - Publishes the result via `majority_index.fetch_max(..., Release)`
     ///   so the visible value never regresses.
     pub fn advance(&self, node_index: u32, index: u64) {
@@ -108,7 +120,7 @@ impl Quorum {
         }
         let mut snapshot: Vec<u64> = Vec::with_capacity(n);
         for a in &self.match_index {
-            snapshot.push(a.load(Ordering::Relaxed));
+            snapshot.push(a.load(Ordering::Acquire));
         }
         // Sort descending so snapshot[majority - 1] is the largest index
         // acked by at least `majority` nodes.

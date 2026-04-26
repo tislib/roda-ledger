@@ -75,13 +75,7 @@ async fn kill_follower_leader_continues() {
 
 /// Kill TWO of three nodes → surviving node cannot reach quorum;
 /// ClusterCommit waits time out.
-///
-/// Currently FAILS — same root cause as
-/// `config_test::two_node_cluster_requires_both_for_cluster_commit`:
-/// Quorum::get() advances past the dead followers' last-acked slot
-/// values when the leader commits a new tx locally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "FIXME(cluster): see two_node_cluster_requires_both_for_cluster_commit"]
 async fn kill_two_of_three_blocks_cluster_commit() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -144,11 +138,7 @@ async fn kill_two_of_five_cluster_continues() {
 }
 
 /// Kill THREE of five nodes → no quorum. ClusterCommit blocks.
-///
-/// Currently FAILS — same root cause as
-/// `config_test::two_node_cluster_requires_both_for_cluster_commit`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "FIXME(cluster): see two_node_cluster_requires_both_for_cluster_commit"]
 async fn kill_three_of_five_blocks_cluster_commit() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(5))
         .await
