@@ -280,6 +280,7 @@ async fn cold_lookup_path_via_term_storage_also_detects_divergence() {
                 start_tx_id: 0,
             })
             .unwrap();
+        storage.sync().unwrap();
     }
 
     // Now bring the bare components up — Term::open_in_dir will see

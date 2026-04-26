@@ -33,7 +33,7 @@ pub struct Term {
     ring: RwLock<TermRing>,
     /// Writer serialisation. Ordering:
     ///     1. take `writer`,
-    ///     2. `storage.append` (fdatasync),
+    ///     2. `storage.append` + `storage.sync` (fdatasync),
     ///     3. ring write-lock + push,
     ///     4. atomic store.
     writer: Mutex<TermStorage>,
@@ -190,6 +190,7 @@ impl Term {
             start_tx_id,
         };
         writer.append(rec)?;
+        writer.sync()?;
         {
             let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
             ring.push(rec);
@@ -227,6 +228,7 @@ impl Term {
 
         let rec = TermRecord { term, start_tx_id };
         writer.append(rec)?;
+        writer.sync()?;
         {
             let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
             ring.push(rec);
@@ -348,7 +350,9 @@ mod tests {
         let dir = td.path().to_string_lossy().into_owned();
 
         // Write RING_CAP + 50 records via the low-level TermStorage so
-        // the in-memory ring will drop the first 50 on load.
+        // the in-memory ring will drop the first 50 on load. One sync
+        // after the loop is enough — the test only cares that records
+        // are durable before the reopen below.
         {
             let mut storage = TermStorage::open(&dir).unwrap();
             let total = RING_CAP as u64 + 50;
@@ -360,6 +364,7 @@ mod tests {
                     })
                     .unwrap();
             }
+            storage.sync().unwrap();
         }
 
         let term = Term::open_in_dir(&dir).unwrap();

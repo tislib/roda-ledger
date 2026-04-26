@@ -4,7 +4,9 @@
 //! out to mirror `term.log` (and the WAL record size) so tooling can
 //! scan all three with the same cadence. Callers (typically
 //! `cluster::Vote`) handle the in-memory semantics — this file is just
-//! "open, scan, append+fsync".
+//! "open, scan, append, sync". `append` and `sync` are deliberately
+//! separate so test seeds can batch a single fdatasync after a bulk
+//! write while production paths call `sync` after every record.
 //!
 //! Each record captures the durable Raft state required by §5.4.1:
 //! the `term` for which the vote applies, and the `voted_for` node id
@@ -41,7 +43,8 @@ pub struct VoteRecord {
 }
 
 /// File-backed vote log. Holds an append-open `File` and the file path.
-/// All writes are `fdatasync`-guarded; every read is a positional scan.
+/// Writers `append` records and call `sync` to fdatasync; every read
+/// is a positional scan.
 pub struct VoteStorage {
     file: File,
     path: PathBuf,
@@ -98,14 +101,22 @@ impl VoteStorage {
         Ok(latest)
     }
 
-    /// Append `rec` and `fdatasync`. Caller must serialise concurrent
-    /// appenders externally (the cluster layer uses a mutex).
+    /// Append `rec` to the file (no fdatasync — call `sync` for
+    /// durability). Caller must serialise concurrent appenders
+    /// externally (the cluster layer uses a mutex).
     pub fn append(&mut self, rec: VoteRecord) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         let bytes = encode_record(rec);
         self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
         Ok(())
+    }
+
+    /// `fdatasync` previously appended records. Production callers
+    /// invoke this after every `append` to guarantee durability before
+    /// returning to the client; bulk seeds in tests call it once after
+    /// the loop.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.file.sync_data()
     }
 }
 
@@ -185,6 +196,7 @@ mod tests {
                 voted_for: 7,
             })
             .unwrap();
+        storage.sync().unwrap();
 
         let mut collected = Vec::new();
         storage.scan(|r| collected.push(r)).unwrap();
@@ -224,6 +236,7 @@ mod tests {
                 voted_for: 0,
             })
             .unwrap();
+        storage.sync().unwrap();
         assert_eq!(
             storage.last_record().unwrap(),
             Some(VoteRecord {
@@ -245,6 +258,7 @@ mod tests {
                     voted_for: 11,
                 })
                 .unwrap();
+            storage.sync().unwrap();
         }
         let mut storage = VoteStorage::open(&dir).unwrap();
         assert_eq!(
@@ -268,6 +282,7 @@ mod tests {
                     voted_for: 4,
                 })
                 .unwrap();
+            storage.sync().unwrap();
         }
         // Append garbage bytes directly to simulate a torn write.
         let path = td.path().join("vote.log");

@@ -43,7 +43,7 @@ pub struct Vote {
     voted_for: AtomicU64,
     /// Writer serialisation. Ordering:
     ///     1. take `writer`,
-    ///     2. `storage.append` (fdatasync),
+    ///     2. `storage.append` + `storage.sync` (fdatasync),
     ///     3. atomic stores.
     writer: Mutex<VoteStorage>,
 }
@@ -138,6 +138,7 @@ impl Vote {
             voted_for: candidate_id,
         };
         writer.append(rec)?;
+        writer.sync()?;
         self.voted_for.store(candidate_id, Ordering::Release);
         self.current_term.store(term, Ordering::Release);
         info!(
@@ -178,6 +179,7 @@ impl Vote {
 
         let rec = VoteRecord { term, voted_for: 0 };
         writer.append(rec)?;
+        writer.sync()?;
         self.voted_for.store(0, Ordering::Release);
         self.current_term.store(term, Ordering::Release);
         info!(
