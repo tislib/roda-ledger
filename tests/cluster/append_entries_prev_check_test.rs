@@ -11,45 +11,35 @@
 
 use roda_ledger::cluster::proto::node as proto;
 use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{LedgerSlot, NodeHandler, NodeHandlerCore, Role, RoleFlag, Term, Vote};
-use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::cluster::{
+    ClusterTestingConfig, ClusterTestingControl, NodeHandler, Role, Term,
+};
+use roda_ledger::ledger::Ledger;
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tonic::Request;
 
 // ── harness ────────────────────────────────────────────────────────────────
 
-/// Build a started `Ledger`, a parallel `Term` over the same data
-/// dir, and a follower-role `NodeHandler` wrapping both.
-fn setup() -> (TempDir, Arc<Ledger>, Arc<Term>, NodeHandler) {
-    let td = TempDir::new().unwrap();
-    let data_dir = td.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    let mut cfg = LedgerConfig::temp();
-    cfg.storage.data_dir = data_dir.to_string_lossy().into_owned();
-    cfg.storage.temporary = false; // TempDir owns cleanup
-
-    let mut ledger = Ledger::new(cfg);
-    ledger.start().unwrap();
-    let ledger = Arc::new(ledger);
-
-    let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let role = Arc::new(RoleFlag::new(Role::Follower));
-    let core = Arc::new(NodeHandlerCore::new(
-        Arc::new(LedgerSlot::new(ledger.clone())),
-        /* node_id */ 2,
-        term.clone(),
-        vote,
-        role,
-        /* cluster_commit_index */ None,
-    ));
-    let handler = NodeHandler::new(core);
-    (td, ledger, term, handler)
+/// Build a single-slot Bare-mode harness with role pinned to
+/// Follower, returning `(ctl, ledger, term, handler)`. The handler
+/// claims `node_id == 2` to match the historical setup (it's the
+/// follower receiving from leader id 1).
+async fn setup() -> (
+    ClusterTestingControl,
+    Arc<Ledger>,
+    Arc<Term>,
+    NodeHandler,
+) {
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Follower))
+        .await
+        .expect("bare start");
+    let ledger = ctl.ledger(0).expect("ledger");
+    let term = ctl.term(0).expect("term");
+    let handler = ctl.node_handler(0, /* claimed_node_id */ 2).expect("node_handler");
+    (ctl, ledger, term, handler)
 }
 
 async fn wait_committed(ledger: &Ledger, tx_id: u64) {
@@ -90,7 +80,7 @@ async fn prev_tx_id_zero_is_accepted_unconditionally() {
     // First-RPC sentinel: leader signals "I have no prior tx" via
     // `prev_tx_id == 0`. The follower must accept regardless of its
     // own log content.
-    let (_td, ledger, _term, handler) = setup();
+    let (_ctl, ledger, _term, handler) = setup().await;
     // Even with some local history, prev=(0,0) bypasses the check.
     let tx = ledger.submit(Operation::Deposit {
         account: 1,
@@ -115,7 +105,7 @@ async fn prev_tx_id_zero_is_accepted_unconditionally() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prev_log_match_with_correct_term_is_accepted() {
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
 
     // Open term 1 covering tx 1+, then commit tx 1 and tx 2.
     term.new_term(1).unwrap();
@@ -148,7 +138,7 @@ async fn prev_log_match_with_correct_term_is_accepted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prev_tx_id_beyond_our_last_commit_is_rejected_as_gap() {
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
     term.new_term(1).unwrap();
     let tx1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -180,7 +170,7 @@ async fn prev_term_mismatch_at_existing_tx_id_triggers_divergence() {
     // Our tx 1 was written under term 1. Leader claims it should be
     // term 2 — the classic Raft divergence case (different leader
     // wrote different content under a different term at this tx id).
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
     term.new_term(1).unwrap();
     let tx1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -221,7 +211,7 @@ async fn prev_term_mismatch_at_existing_tx_id_triggers_divergence() {
 async fn divergence_watermark_updates_to_latest_leader_commit() {
     // Two divergence rejects in a row should leave the most recent
     // leader_commit_tx_id stashed (we don't queue them).
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
     term.new_term(1).unwrap();
     let tx1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -244,29 +234,12 @@ async fn divergence_watermark_updates_to_latest_leader_commit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leader_role_rejects_append_entries() {
-    // Reusing the regular setup to have a Ledger and a Term, then
-    // building a leader-role NodeHandler over them.
-    let td = TempDir::new().unwrap();
-    let data_dir = td.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let mut cfg = LedgerConfig::temp();
-    cfg.storage.data_dir = data_dir.to_string_lossy().into_owned();
-    cfg.storage.temporary = false;
-    let mut ledger = Ledger::new(cfg);
-    ledger.start().unwrap();
-    let ledger = Arc::new(ledger);
-    let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let role = Arc::new(RoleFlag::new(Role::Leader));
-    let core = Arc::new(NodeHandlerCore::new(
-        Arc::new(LedgerSlot::new(ledger.clone())),
-        1,
-        term.clone(),
-        vote,
-        role,
-        None,
-    ));
-    let handler = NodeHandler::new(core);
+    // Same setup, just with a Leader-role harness so the handler
+    // returns NotFollower without touching the log.
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Leader))
+        .await
+        .expect("bare start");
+    let handler = ctl.node_handler(0, /* claimed_node_id */ 1).expect("handler");
 
     let resp = handler
         .append_entries(Request::new(make_request(1, 0, 0, 0)))
@@ -285,12 +258,19 @@ async fn leader_role_rejects_append_entries() {
 async fn cold_lookup_path_via_term_storage_also_detects_divergence() {
     // Pre-seed the term log directly via storage so the Term hot ring
     // sees `term=1 @ start_tx_id=0` from a fresh boot — exercises the
-    // get_term_at_tx hot path. (The cold path is exercised by
-    // term_behavior_test::cold_lookup_resolves_tx_older_than_ring;
-    // here we just verify the prev-check is wired through the same
-    // lookup.)
-    let td = TempDir::new().unwrap();
-    let data_dir = td.path().join("data");
+    // get_term_at_tx hot path.
+    //
+    // Use `autostart: false` so the harness allocates a data dir but
+    // does NOT open `Ledger`/`Term`/`Vote` yet — we get to write a
+    // `TermRecord` to disk before the in-memory hot ring is populated.
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        autostart: false,
+        ..ClusterTestingConfig::bare(Role::Follower)
+    })
+    .await
+    .expect("bare start");
+
+    let data_dir = ctl.data_dir(0).unwrap().to_path_buf();
     std::fs::create_dir_all(&data_dir).unwrap();
     {
         let mut storage = TermStorage::open(&data_dir.to_string_lossy()).unwrap();
@@ -302,24 +282,11 @@ async fn cold_lookup_path_via_term_storage_also_detects_divergence() {
             .unwrap();
     }
 
-    let mut cfg = LedgerConfig::temp();
-    cfg.storage.data_dir = data_dir.to_string_lossy().into_owned();
-    cfg.storage.temporary = false;
-    let mut ledger = Ledger::new(cfg);
-    ledger.start().unwrap();
-    let ledger = Arc::new(ledger);
-    let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let vote = Arc::new(Vote::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let role = Arc::new(RoleFlag::new(Role::Follower));
-    let core = Arc::new(NodeHandlerCore::new(
-        Arc::new(LedgerSlot::new(ledger.clone())),
-        2,
-        term.clone(),
-        vote,
-        role,
-        None,
-    ));
-    let handler = NodeHandler::new(core);
+    // Now bring the bare components up — Term::open_in_dir will see
+    // the pre-seeded record on its first scan.
+    ctl.start_node(0).await.expect("start_node");
+    let ledger = ctl.ledger(0).expect("ledger");
+    let handler = ctl.node_handler(0, 2).expect("handler");
 
     let tx1 = ledger.submit(Operation::Deposit {
         account: 1,

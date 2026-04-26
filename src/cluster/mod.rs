@@ -31,6 +31,7 @@ pub mod role_flag;
 pub mod server;
 pub mod supervisor;
 pub mod term;
+pub mod testing_cluster;
 pub mod vote;
 
 pub use crate::storage::{TermRecord, VoteRecord};
@@ -50,6 +51,9 @@ pub use role_flag::{Role, RoleFlag};
 pub use server::{NodeServerRuntime, Server};
 pub use supervisor::{RoleSupervisor, SupervisorHandles};
 pub use term::Term;
+pub use testing_cluster::{
+    ClusterTestingConfig, ClusterTestingControl, ClusterTestingError, ClusterTestingMode,
+};
 pub use vote::Vote;
 
 /// Generated protobuf types for both gRPC services owned by the cluster:
