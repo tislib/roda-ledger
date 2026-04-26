@@ -1,6 +1,7 @@
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_server::Ledger;
-use crate::cluster::{ClusterCommitIndex, LedgerSlot, RoleFlag, Term};
+use crate::cluster::raft::{RoleFlag, Term};
+use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::Operation;
 use spdlog::warn;

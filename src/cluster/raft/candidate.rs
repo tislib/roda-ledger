@@ -17,10 +17,10 @@
 //!      bounded election deadline; supervisor will spin Initializing
 //!      again with a fresh randomised election timeout.
 
+use super::peer_replication::connect;
+use super::{Term, Vote};
 use crate::cluster::config::{Config, PeerConfig};
-use crate::cluster::peer_replication::connect;
 use crate::cluster::proto::node as proto;
-use crate::cluster::{Term, Vote};
 use crate::ledger::Ledger;
 use spdlog::{info, warn};
 use std::sync::Arc;

@@ -7,7 +7,7 @@
 //! - `peer_last_tx` is the high-water mark the follower has acked (stamped
 //!   onto every AppendEntries as `prev_tx_id` for Raft-style ordering).
 
-use crate::cluster::Quorum;
+use super::Quorum;
 use crate::cluster::config::PeerConfig;
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_client::NodeClient;

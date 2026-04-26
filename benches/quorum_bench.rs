@@ -1,4 +1,4 @@
-//! Benchmarks for `cluster::Quorum` — the lock-free majority-commit tracker.
+//! Benchmarks for `cluster::raft::Quorum` — the lock-free majority-commit tracker.
 //!
 //! The hot paths are:
 //! - `advance(node_index, idx)` — fired on every successful `AppendEntries`
@@ -10,7 +10,7 @@
 //! Cluster sizes swept: 1 (single-node), 3, 5, 7, 9 — realistic Raft sizes.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::cluster::Quorum;
+use roda_ledger::cluster::raft::Quorum;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

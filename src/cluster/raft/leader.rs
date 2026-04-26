@@ -13,10 +13,11 @@
 //! `Quorum` so tests + the load harness can read the cluster-wide
 //! majority watermark.
 
+use super::peer_replication::{PeerReplication, ReplicationParams};
+use super::{Quorum, Term};
+use crate::cluster::LedgerSlot;
 use crate::cluster::config::Config;
-use crate::cluster::peer_replication::{PeerReplication, ReplicationParams};
 use crate::cluster::supervisor::TransitionTx;
-use crate::cluster::{LedgerSlot, Quorum, Term};
 use spdlog::info;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

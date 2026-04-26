@@ -15,7 +15,7 @@
 //!    - In `Initializing` / `Follower`, awaits the election timer.
 //!      Expiry → transition to `Candidate`.
 //!    - In `Candidate`, runs one election round
-//!      ([`crate::cluster::candidate::run_election_round`]).
+//!      ([`crate::cluster::raft::run_election_round`]).
 //!      `Won` → `Leader`. `HigherTermSeen` → `Initializing` (and
 //!      `Term::observe` is performed inside the round).
 //!      `Lost` → loop back to `Initializing` (re-arms timer).
@@ -32,14 +32,14 @@
 //! observes a higher term, every divergence-detected reseed,
 //! pushes a [`Transition`] enum value.
 
-use crate::cluster::candidate::{ElectionOutcome, run_election_round};
 use crate::cluster::config::Config;
-use crate::cluster::election_timer::{ElectionTimer, ElectionTimerConfig};
-use crate::cluster::leader::Leader;
 use crate::cluster::node_handler::NodeHandlerCore;
-use crate::cluster::role_flag::Role;
+use crate::cluster::raft::{
+    ElectionOutcome, ElectionTimer, ElectionTimerConfig, Leader, Quorum, Role, RoleFlag, Term,
+    Vote, run_election_round,
+};
 use crate::cluster::server::{NodeServerRuntime, Server};
-use crate::cluster::{LedgerSlot, NodeHandler, Quorum, RoleFlag, Term, Vote};
+use crate::cluster::{LedgerSlot, NodeHandler};
 use crate::ledger::Ledger;
 use spdlog::{error, info, warn};
 use std::sync::Arc;

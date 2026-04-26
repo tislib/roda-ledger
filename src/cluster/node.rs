@@ -13,9 +13,10 @@
 //! longer own gRPC servers — only their role-task sub-trees.
 
 use crate::cluster::config::Config;
+use crate::cluster::raft::{Quorum, Role, RoleFlag, Term};
 use crate::cluster::server::Server;
 use crate::cluster::supervisor::{RoleSupervisor, SupervisorHandles};
-use crate::cluster::{ClusterCommitIndex, LedgerSlot, Quorum, RoleFlag, Term, role_flag::Role};
+use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;

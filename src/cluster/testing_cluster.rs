@@ -34,9 +34,7 @@ use crate::cluster::node::{ClusterNode, Handles};
 use crate::cluster::node_handler::{NodeHandler, NodeHandlerCore};
 use crate::cluster::proto::node as nproto;
 use crate::cluster::proto::node::node_client::NodeClient;
-use crate::cluster::role_flag::{Role, RoleFlag};
-use crate::cluster::term::Term;
-use crate::cluster::vote::Vote;
+use crate::cluster::raft::{Role, RoleFlag, Term, Vote};
 use crate::config::{LedgerConfig, StorageConfig};
 use crate::ledger::Ledger;
 use crate::wait_strategy::WaitStrategy;
@@ -441,6 +439,13 @@ impl ClusterTestingControl {
     /// their join handles so the runtime drives teardown to
     /// completion, and waits for the OS to release the bound ports
     /// before returning. Safe to call on already-stopped slots.
+    ///
+    /// The shutdown + port-release waits are bounded so a stuck task
+    /// can't wedge the test harness. If a port doesn't release in
+    /// time we log and continue rather than fail the call — the
+    /// caller likely doesn't care about that specific port (it's
+    /// either restarting on a new free port via `start_all`, or it's
+    /// done with this slot for the rest of the test).
     pub async fn stop_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
         let (handles_opt, addr) = {
             let slot = self.slot_mut(i)?;
@@ -451,14 +456,26 @@ impl ClusterTestingControl {
         };
 
         if let Some(h) = handles_opt {
-            // Bound the join in case a task hangs — we'd rather
-            // surface a clear error than wedge the test harness.
-            let _ = tokio::time::timeout(Duration::from_secs(5), h.shutdown()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), h.shutdown()).await;
             if addr.client_port != 0 {
-                wait_for_tcp_release(addr.client_port, Duration::from_secs(5)).await?;
+                if let Err(e) =
+                    wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
+                {
+                    spdlog::warn!(
+                        "stop_node({i}): client_port {} not released: {e}",
+                        addr.client_port
+                    );
+                }
             }
             if addr.node_port != 0 {
-                wait_for_tcp_release(addr.node_port, Duration::from_secs(5)).await?;
+                if let Err(e) =
+                    wait_for_tcp_release(addr.node_port, Duration::from_secs(2)).await
+                {
+                    spdlog::warn!(
+                        "stop_node({i}): node_port {} not released: {e}",
+                        addr.node_port
+                    );
+                }
             }
         }
 

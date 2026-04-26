@@ -15,11 +15,10 @@
 //!   behind `Arc`. Sharing the core via `Arc` already gives every
 //!   call site the same lock instance.
 
-use crate::cluster::election_timer::ElectionTimer;
 use crate::cluster::proto::node as proto;
 use crate::cluster::proto::node::node_server::Node;
-use crate::cluster::role_flag::Role;
-use crate::cluster::{ClusterCommitIndex, LedgerSlot, RoleFlag, Term, Vote};
+use crate::cluster::raft::{ElectionTimer, Role, RoleFlag, Term, Vote};
+use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use crate::wal_tail::decode_records;
 use spdlog::warn;
 use std::sync::Arc;
