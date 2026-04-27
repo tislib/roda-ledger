@@ -249,7 +249,7 @@ async fn supervisor_reseeds_on_divergence() {
         .into_inner();
     assert!(!resp.success);
 
-    let client = ctl.client(0).await.expect("client");
+    let client = ctl.client().node(0).clone();
     ctl.wait_for(Duration::from_secs(10), "reseed lands at watermark", || {
         let c = client.clone();
         async move {
@@ -322,7 +322,7 @@ async fn reseed_re_registers_on_commit_hook() {
         })
         .await;
 
-    let client = ctl.client(0).await.expect("client");
+    let client = ctl.client().node(0).clone();
     ctl.wait_for(Duration::from_secs(10), "reseed lands", || {
         let c = client.clone();
         async move {
@@ -376,7 +376,7 @@ async fn grpc_servers_survive_reseed_swap() {
     ctl.run_node(0).await.expect("run");
     ctl.wait_for_bind(0, Duration::from_secs(5)).await.unwrap();
 
-    let client_held = ctl.client(0).await.expect("client");
+    let client_held = ctl.client().node(0).clone();
     let pre_idx = client_held.get_pipeline_index().await.unwrap();
     assert_eq!(pre_idx.commit, 10);
 

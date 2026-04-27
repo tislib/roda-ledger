@@ -21,6 +21,7 @@
 //! deadline; otherwise it returns.
 
 use rand::Rng;
+use spdlog::debug;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -80,11 +81,18 @@ impl ElectionTimer {
     /// `await_expiry` so it re-checks against the new deadline.
     pub fn reset(&self) {
         let new_deadline = Self::roll_deadline(&self.cfg);
+        let in_ms = new_deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis();
         {
             let mut s = self.state.lock().expect("election timer mutex poisoned");
             s.deadline = new_deadline;
         }
         self.notify.notify_waiters();
+        debug!(
+            "election_timer: reset — next expiry in {}ms (window {}..{}ms)",
+            in_ms, self.cfg.min_ms, self.cfg.max_ms
+        );
     }
 
     /// The currently-scheduled deadline. Observability only — Stage
@@ -100,13 +108,21 @@ impl ElectionTimer {
     /// the future to abandon the wait. Mid-await `reset()` causes
     /// us to re-arm against the new deadline.
     pub async fn await_expiry(&self) {
+        let started = Instant::now();
+        let mut iterations = 0u32;
         loop {
             let deadline = self.deadline();
             let now = Instant::now();
             if now >= deadline {
+                debug!(
+                    "election_timer: expired after {}ms (iterations={})",
+                    started.elapsed().as_millis(),
+                    iterations
+                );
                 return;
             }
             let sleep_for = deadline - now;
+            iterations += 1;
             tokio::select! {
                 _ = tokio::time::sleep(sleep_for) => {
                     // Timer slept the full window — but a reset()
@@ -114,6 +130,10 @@ impl ElectionTimer {
                 }
                 _ = self.notify.notified() => {
                     // Deadline was bumped; re-read and try again.
+                    debug!(
+                        "election_timer: await_expiry re-armed after reset (iteration {})",
+                        iterations
+                    );
                 }
             }
         }

@@ -11,7 +11,7 @@ async fn setup() -> (ClusterTestingControl, NodeClient) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::standalone())
         .await
         .expect("standalone start");
-    let client = ctl.client(0).await.expect("client connect");
+    let client = ctl.client().node(0).clone();
     (ctl, client)
 }
 
@@ -258,7 +258,7 @@ async fn test_deposit_restart_withdraw() {
     .expect("standalone start");
 
     // -- Create client and deposit --
-    let client = ctl.client(0).await.unwrap();
+    let client = ctl.client().node(0).clone();
     let result = client
         .deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot)
         .await

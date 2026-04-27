@@ -78,8 +78,8 @@ async fn leader_replicates_to_follower() {
     .expect("start");
 
     let _leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.expect("leader client");
-    let follower_client = ctl.follower_client().await.expect("follower client");
+    let leader_client = ctl.client().leader().clone();
+    let follower_client = ctl.client().next_follower().await.expect("follower index");
 
     // Follower rejects writes.
     let err = follower_client
@@ -140,7 +140,7 @@ async fn idle_heartbeats_close_stale_by_one_gap() {
     .expect("start");
 
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.expect("client");
+    let leader_client = ctl.client().leader().clone();
 
     // Submit a few txs.
     for ur in 1..=10u64 {
@@ -349,7 +349,7 @@ async fn single_node_cluster_commit_index_advances() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client(0).await.expect("client");
+    let client = ctl.client().node(0).clone();
 
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
@@ -370,7 +370,7 @@ async fn follower_reads_reflect_lagging_state() {
     .expect("start");
 
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.expect("client");
+    let leader_client = ctl.client().leader().clone();
 
     let r = leader_client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
@@ -378,7 +378,7 @@ async fn follower_reads_reflect_lagging_state() {
         .expect("deposit");
     assert!(r.tx_id > 0);
 
-    let follower_client = ctl.follower_client().await.expect("follower");
+    let follower_client = ctl.client().next_follower().await.expect("follower idx");
     // Follower must eventually report commit ≥ tx_id.
     ctl.wait_for(
         Duration::from_secs(10),

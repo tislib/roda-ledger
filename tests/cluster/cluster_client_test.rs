@@ -100,7 +100,7 @@ async fn cluster_client_routes_writes_to_leader_and_reads_round_robin() {
 /// facade without needing a separate connect call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_client_exposes_leader_and_per_node_clients() {
-    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(2))
         .await
         .expect("start");
     let _ = ctl

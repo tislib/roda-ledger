@@ -13,10 +13,10 @@
 
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
+use crate::tools::backoff::{Backoff, BackoffPolicy};
 use spdlog::warn;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::time::sleep;
 use tonic::transport::Channel;
 
 /// Result type for client operations.
@@ -28,12 +28,14 @@ pub type Result<T> = std::result::Result<T, tonic::Status>;
 
 /// Retry policy for [`NodeClient`] and `ClusterClient` RPCs. Every
 /// public method runs through a retry loop that retries on any
-/// `tonic::Status` error using exponential backoff.
+/// `tonic::Status` error using exponential backoff. Internally each
+/// loop drives a [`crate::tools::backoff::Backoff`] built from
+/// [`Self::backoff_policy`] — the same primitive the cluster's
+/// peer-replication loop uses.
 ///
-/// The defaults — 10 retries, 100 ms base backoff — give backoffs of
-/// 100, 200, 400, 800, 1600 ms (then capped further out) and a worst-
-/// case total wait of a few seconds. This is tuned wide enough to
-/// absorb the kinds of cluster-side transient failures that show up
+/// The defaults — 10 retries, 100 ms base backoff, 1.6 s cap — give
+/// the schedule 100, 200, 400, 800, 1600, 1600, … ms. Tuned wide
+/// enough to absorb the cluster-side transient failures that show up
 /// under concurrent test load: a node restarting, an election in
 /// flight, a freshly-promoted leader whose snapshot hasn't caught
 /// up yet, or a few rotations through the peer list while the
@@ -44,11 +46,12 @@ pub struct RetryConfig {
     /// the default of 10, an operation makes up to 11 total attempts
     /// before bubbling the last error up to the caller.
     pub max_retry_count: u32,
-    /// Base backoff in milliseconds. Backoff before retry N
-    /// (1-indexed) is `base_backoff_ms * 2^(N-1)`. To keep waits
-    /// bounded the shift saturates at 2^16 internally so even a
-    /// pathologically high `max_retry_count` cannot overflow.
+    /// Base backoff in milliseconds — delay before the first retry.
+    /// Subsequent retries double up to [`Self::max_backoff_ms`].
     pub base_backoff_ms: u64,
+    /// Cap on any single backoff. Defaults to 1600 ms so high retry
+    /// counts can't wait minutes between attempts.
+    pub max_backoff_ms: u64,
 }
 
 impl Default for RetryConfig {
@@ -56,18 +59,20 @@ impl Default for RetryConfig {
         Self {
             max_retry_count: 10,
             base_backoff_ms: 100,
+            max_backoff_ms: 1_600,
         }
     }
 }
 
-/// Compute the backoff for retry `attempt` (0-indexed) under
-/// `base_ms`. Doubles per attempt up to a 16× ceiling so a high
-/// `max_retry_count` cannot blow up into multi-minute waits — at
-/// `base_ms = 100` the shift saturates at 1600 ms.
-pub(crate) fn backoff_for(base_ms: u64, attempt: u32) -> u64 {
-    const MAX_SHIFT: u32 = 4;
-    let shift = attempt.min(MAX_SHIFT);
-    base_ms.saturating_mul(1u64 << shift)
+impl RetryConfig {
+    /// Build a [`BackoffPolicy`] matching this config — used by the
+    /// retry loops in `NodeClient` and `ClusterClient`.
+    pub fn backoff_policy(&self) -> BackoffPolicy {
+        BackoffPolicy::exponential(
+            Duration::from_millis(self.base_backoff_ms),
+            Duration::from_millis(self.max_backoff_ms),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +92,10 @@ pub struct PipelineIndex {
     pub compute: u64,
     pub commit: u64,
     pub snapshot: u64,
+    /// True iff the responding node is currently the cluster leader.
+    /// Cluster-aware clients use this to discover the leader without
+    /// having to attempt a write.
+    pub is_leader: bool,
 }
 
 /// Balance for a single account.
@@ -210,6 +219,7 @@ impl NodeClient {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let max = self.retry.max_retry_count;
+        let mut backoff = Backoff::new(self.retry.backoff_policy());
         for attempt in 0..=max {
             match op().await {
                 Ok(v) => return Ok(v),
@@ -225,7 +235,7 @@ impl NodeClient {
                         return Err(e);
                     }
                     let retry_num = attempt + 1;
-                    let backoff_ms = backoff_for(self.retry.base_backoff_ms, attempt);
+                    let next = backoff.peek_delay();
                     warn!(
                         "client::{}: error '{}' (code={:?}) — retrying ({}/{}) after {}ms",
                         op_name,
@@ -233,9 +243,9 @@ impl NodeClient {
                         e.code(),
                         retry_num,
                         max,
-                        backoff_ms
+                        next.as_millis()
                     );
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff.wait().await;
                 }
             }
         }
@@ -262,7 +272,7 @@ impl NodeClient {
                 .into_inner();
             Ok(resp.transaction_id)
         })
-            .await
+        .await
     }
 
     /// Submit a withdrawal (fire-and-forget). Returns the transaction ID.
@@ -283,7 +293,7 @@ impl NodeClient {
                 .into_inner();
             Ok(resp.transaction_id)
         })
-            .await
+        .await
     }
 
     /// Submit a transfer (fire-and-forget). Returns the transaction ID.
@@ -305,7 +315,7 @@ impl NodeClient {
                 .into_inner();
             Ok(resp.transaction_id)
         })
-            .await
+        .await
     }
 
     // -- Submit and wait ----------------------------------------------------
@@ -338,7 +348,7 @@ impl NodeClient {
                 fail_reason: resp.fail_reason,
             })
         })
-            .await
+        .await
     }
 
     /// Submit a withdrawal and wait.
@@ -369,7 +379,7 @@ impl NodeClient {
                 fail_reason: resp.fail_reason,
             })
         })
-            .await
+        .await
     }
 
     /// Submit a transfer and wait.
@@ -402,7 +412,7 @@ impl NodeClient {
                 fail_reason: resp.fail_reason,
             })
         })
-            .await
+        .await
     }
 
     // -- Batch operations ---------------------------------------------------
@@ -435,7 +445,7 @@ impl NodeClient {
 
             Ok(resp.results.iter().map(|r| r.transaction_id).collect())
         })
-            .await
+        .await
     }
 
     /// Submit a batch of deposit operations and wait for the given level.
@@ -479,7 +489,7 @@ impl NodeClient {
                 })
                 .collect())
         })
-            .await
+        .await
     }
 
     /// Submit a batch of transfer operations and wait for the given level.
@@ -524,7 +534,7 @@ impl NodeClient {
                 })
                 .collect())
         })
-            .await
+        .await
     }
 
     // -- Balance queries ----------------------------------------------------
@@ -542,7 +552,7 @@ impl NodeClient {
                 last_snapshot_tx_id: resp.last_snapshot_tx_id,
             })
         })
-            .await
+        .await
     }
 
     /// Get balances for multiple accounts. Returns balances in the same order.
@@ -557,7 +567,7 @@ impl NodeClient {
                 .into_inner();
             Ok(resp.balances)
         })
-            .await
+        .await
     }
 
     // -- Transaction status -------------------------------------------------
@@ -575,7 +585,7 @@ impl NodeClient {
                 .into_inner();
             Ok((resp.status, resp.fail_reason))
         })
-            .await
+        .await
     }
 
     /// Get statuses for multiple transactions. Returns `(status, fail_reason)` pairs.
@@ -597,7 +607,7 @@ impl NodeClient {
                 .map(|r| (r.status, r.fail_reason))
                 .collect())
         })
-            .await
+        .await
     }
 
     // -- Pipeline index -----------------------------------------------------
@@ -614,9 +624,10 @@ impl NodeClient {
                 compute: resp.compute_index,
                 commit: resp.commit_index,
                 snapshot: resp.snapshot_index,
+                is_leader: resp.is_leader,
             })
         })
-            .await
+        .await
     }
 
     // -- Transaction queries ------------------------------------------------
@@ -651,7 +662,7 @@ impl NodeClient {
                     .collect(),
             })
         })
-            .await
+        .await
     }
 
     /// Get account history (newest first) with pagination.
@@ -685,7 +696,7 @@ impl NodeClient {
                 next_tx_id: resp.next_tx_id,
             })
         })
-            .await
+        .await
     }
 
     // -- WASM function registry ---------------------------------------------
@@ -711,7 +722,7 @@ impl NodeClient {
                 .into_inner();
             Ok((resp.version as u16, resp.crc32c))
         })
-            .await
+        .await
     }
 
     /// Unregister a WASM function by name. Returns the version stamped on
@@ -727,7 +738,7 @@ impl NodeClient {
                 .into_inner();
             Ok(resp.version as u16)
         })
-            .await
+        .await
     }
 
     /// List every currently-loaded function.
@@ -748,7 +759,7 @@ impl NodeClient {
                 })
                 .collect())
         })
-            .await
+        .await
     }
 
     /// Submit an `Operation::Function` with 8 positional `i64` params
@@ -780,6 +791,6 @@ impl NodeClient {
                 fail_reason: resp.fail_reason,
             })
         })
-            .await
+        .await
     }
 }

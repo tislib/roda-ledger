@@ -135,7 +135,7 @@ async fn supervisor_reseeds_on_divergence_detected_via_node_grpc() {
     //
     // The cluster is in Initializing post-reseed, so reads work
     // (`get_pipeline_index` doesn't go through the writable gate).
-    let client = ctl.client(0).await.expect("client");
+    let client = ctl.client().node(0).clone();
     ctl.wait_for(
         Duration::from_secs(10),
         "supervisor reseed to land at watermark",

@@ -18,7 +18,7 @@ async fn leader_counts_itself_in_quorum() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client(0).await.expect("client");
+    let client = ctl.client().node(0).clone();
 
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
@@ -43,7 +43,7 @@ async fn cluster_commit_index_advances_under_replication() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.expect("client");
+    let leader_client = ctl.client().leader().clone();
 
     for ur in 1..=5u64 {
         leader_client
@@ -74,7 +74,7 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
     .expect("start");
 
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.expect("client");
+    let leader_client = ctl.client().leader().clone();
 
     for ur in 1..=10u64 {
         leader_client
@@ -117,7 +117,7 @@ async fn new_leader_self_slot_repopulated_after_transition() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.expect("client");
+    let leader_client = ctl.client().leader().clone();
 
     // Land some writes.
     for ur in 1..=5u64 {
@@ -133,7 +133,7 @@ async fn new_leader_self_slot_repopulated_after_transition() {
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     // First write under new leader must reach ClusterCommit.
-    let new_client = ctl.leader_client().await.expect("new client");
+    let new_client = ctl.client().leader().clone();
     let started = Instant::now();
     let r = new_client
         .deposit_and_wait(ACCOUNT, AMOUNT, 6, WaitLevel::ClusterCommit)

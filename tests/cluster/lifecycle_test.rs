@@ -95,7 +95,7 @@ async fn cluster_node_restart_preserves_state() {
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
-    let client = ctl.client(0).await.unwrap();
+    let client = ctl.client().node(0).clone();
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
@@ -107,7 +107,7 @@ async fn cluster_node_restart_preserves_state() {
     ctl.start_node(0).await.expect("restart");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
-    let new_client = ctl.client(0).await.unwrap();
+    let new_client = ctl.client().node(0).clone();
     let bal = new_client.get_balance(ACCOUNT).await.unwrap().balance;
     assert_eq!(bal, AMOUNT as i64);
 }

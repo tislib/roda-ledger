@@ -23,7 +23,7 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
-use crate::client::NodeClient;
+use crate::client::ClusterClient;
 use crate::cluster::cluster_commit::ClusterCommitIndex;
 use crate::cluster::config::{
     ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection,
@@ -183,9 +183,9 @@ impl Default for ClusterTestingConfig {
             label: "cluster".to_string(),
             replication_poll_ms: 5,
             append_entries_max_bytes: 256 * 1024,
-            transaction_count_per_segment: 10_000_000,
+            transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,
-            ledger_log_level: Level::Info,
+            ledger_log_level: Level::Debug,
             autostart: true,
             data_dir_root: None,
         }
@@ -282,6 +282,13 @@ pub struct ClusterTestingControl {
     #[allow(dead_code)]
     phantom_peers: Vec<PhantomPeer>,
     cached_leader_idx: Arc<Mutex<Option<usize>>>,
+    /// The cluster-aware [`ClusterClient`] for tests. Built once in
+    /// [`Self::start`] (when autostart=true and the mode has servers)
+    /// against every node's client port. `None` in Bare mode and in
+    /// `autostart = false` flows where no servers have bound yet.
+    /// All test code that needs to talk to the cluster goes through
+    /// [`Self::client`].
+    cluster_client: Option<ClusterClient>,
 }
 
 impl ClusterTestingControl {
@@ -400,17 +407,50 @@ impl ClusterTestingControl {
             slots,
             phantom_peers,
             cached_leader_idx: Arc::new(Mutex::new(None)),
+            cluster_client: None,
         };
 
         // 5) Optionally start every slot. Standalone/Cluster also
-        //    waits for gRPC binds.
+        //    waits for gRPC binds and then opens a ClusterClient
+        //    against every running node so tests can route through a
+        //    single `client()` accessor instead of resolving leader
+        //    vs follower channels by hand.
         if config.autostart {
             ctl.start_all().await?;
             if !matches!(ctl.mode, ClusterTestingMode::Bare { .. }) {
                 ctl.wait_for_all_tcp(Duration::from_secs(5)).await?;
+                ctl.rebuild_cluster_client().await?;
             }
         }
         Ok(ctl)
+    }
+
+    /// (Re)build the embedded [`ClusterClient`] from every currently
+    /// started slot's client URL. Called automatically inside
+    /// [`Self::start`] for autostart flows; tests that bring nodes up
+    /// manually (`autostart = false`) should call this once after the
+    /// first round of `start_node` so [`Self::client`] becomes usable.
+    pub async fn rebuild_cluster_client(&mut self) -> Result<(), ClusterTestingError> {
+        if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
+            // Bare mode has no client gRPC; nothing to connect.
+            self.cluster_client = None;
+            return Ok(());
+        }
+        let urls: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|s| s.handles.is_some() && s.addr.client_port != 0)
+            .map(|s| format!("http://127.0.0.1:{}", s.addr.client_port))
+            .collect();
+        if urls.is_empty() {
+            self.cluster_client = None;
+            return Ok(());
+        }
+        let cc = ClusterClient::connect(&urls)
+            .await
+            .map_err(ClusterTestingError::Connect)?;
+        self.cluster_client = Some(cc);
+        Ok(())
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────
@@ -430,6 +470,11 @@ impl ClusterTestingControl {
                 self.build_node(i)?;
                 self.run_node(i).await?;
                 self.wait_for_bind(i, Duration::from_secs(5)).await?;
+                // Refresh the embedded cluster client now that this
+                // slot is bound — covers the `autostart = false` flow
+                // where tests bring nodes up manually and expect
+                // `ctl.client()` to "just work" right after.
+                self.rebuild_cluster_client().await?;
             }
         }
         Ok(())
@@ -458,8 +503,7 @@ impl ClusterTestingControl {
         if let Some(h) = handles_opt {
             let _ = tokio::time::timeout(Duration::from_secs(2), h.shutdown()).await;
             if addr.client_port != 0 {
-                if let Err(e) =
-                    wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
+                if let Err(e) = wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
                 {
                     spdlog::warn!(
                         "stop_node({i}): client_port {} not released: {e}",
@@ -468,9 +512,7 @@ impl ClusterTestingControl {
                 }
             }
             if addr.node_port != 0 {
-                if let Err(e) =
-                    wait_for_tcp_release(addr.node_port, Duration::from_secs(2)).await
-                {
+                if let Err(e) = wait_for_tcp_release(addr.node_port, Duration::from_secs(2)).await {
                     spdlog::warn!(
                         "stop_node({i}): node_port {} not released: {e}",
                         addr.node_port
@@ -718,17 +760,24 @@ impl ClusterTestingControl {
             .ok_or(ClusterTestingError::NotStarted { idx: i })
     }
 
-    /// Open a fresh high-level [`NodeClient`] against node `i`'s
-    /// client port. Each call returns a new channel — gRPC channels
-    /// are cheap. Errors in Bare mode (no servers).
-    pub async fn client(&self, i: usize) -> Result<NodeClient, ClusterTestingError> {
-        if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
-            return Err(ClusterTestingError::NotInBareMode { op: "client" });
-        }
-        let port = self.client_port(i)?;
-        NodeClient::connect_url(&format!("http://127.0.0.1:{}", port))
-            .await
-            .map_err(ClusterTestingError::Connect)
+    /// The cluster-aware [`ClusterClient`] for this harness.
+    ///
+    /// Tests get every cluster operation through this accessor:
+    /// - leader-routed writes via `ctl.client().deposit(…)` or
+    ///   `ctl.client().leader().deposit_and_wait(…)`.
+    /// - per-node access via `ctl.client().node(i)`.
+    /// - read-style RPCs via `ctl.client().get_balance(…)` (round-
+    ///   robin across all nodes).
+    ///
+    /// Panics if the harness is in Bare mode (no client gRPC) or
+    /// `start()` was called with `autostart = false` and the caller
+    /// has not yet invoked [`Self::rebuild_cluster_client`].
+    pub fn client(&self) -> &ClusterClient {
+        self.cluster_client.as_ref().expect(
+            "ClusterTestingControl::client() called before the cluster client was built — \
+             use autostart=true (the default) or call rebuild_cluster_client() after \
+             starting nodes manually",
+        )
     }
 
     // ── Leader resolution ────────────────────────────────────────────────
@@ -796,11 +845,6 @@ impl ClusterTestingControl {
         self.node_id(i)
     }
 
-    pub async fn leader_client(&self) -> Result<NodeClient, ClusterTestingError> {
-        let i = self.leader_index().await?;
-        self.client(i).await
-    }
-
     pub async fn leader_ledger(&self) -> Result<Arc<Ledger>, ClusterTestingError> {
         let i = self.leader_index().await?;
         self.ledger(i)
@@ -816,22 +860,17 @@ impl ClusterTestingControl {
             .ok_or(ClusterTestingError::NoFollower)
     }
 
-    pub async fn follower_client(&self) -> Result<NodeClient, ClusterTestingError> {
-        let i = self.first_follower_index().await?;
-        self.client(i).await
-    }
-
     // ── Polling helpers ──────────────────────────────────────────────────
 
     /// Poll `predicate` every 10 ms until it returns `true` or
     /// `timeout` elapses. The predicate is an async closure so it
     /// can drive client RPCs on each iteration.
     ///
-    /// Tip: if the predicate captures a `LedgerClient`, clone it
-    /// inside the closure so each iteration owns its own handle:
+    /// Tip: if the predicate captures a client, clone it inside the
+    /// closure so each iteration owns its own handle:
     ///
     /// ```ignore
-    /// let lc = ctl.leader_client().await?;
+    /// let lc = ctl.client().leader().clone();
     /// ctl.wait_for(timeout, "leader commit", || {
     ///     let lc = lc.clone();
     ///     async move {
@@ -900,7 +939,7 @@ impl ClusterTestingControl {
     /// Wait for slot `i`'s gRPC servers to bind. Useful after a
     /// manual [`run_node`] call (`autostart = false` flow).
     pub async fn wait_for_bind(
-        &self,
+        &mut self,
         i: usize,
         timeout: Duration,
     ) -> Result<(), ClusterTestingError> {
@@ -912,6 +951,12 @@ impl ClusterTestingControl {
         if !matches!(self.mode, ClusterTestingMode::Standalone) && slot.addr.node_port != 0 {
             wait_for_tcp(format!("127.0.0.1:{}", slot.addr.node_port), timeout).await?;
         }
+        // The slot is now bound — refresh the embedded cluster client
+        // so `client()` reflects the new node. Covers both the
+        // `start()`-internal autostart loop and the
+        // `autostart = false` flow where tests bring nodes up
+        // manually via `build_node` + `run_node` + `wait_for_bind`.
+        self.rebuild_cluster_client().await?;
         Ok(())
     }
 

@@ -14,7 +14,8 @@ use crate::cluster::proto::node::node_client::NodeClient;
 use crate::cluster::supervisor::{Transition, TransitionTx};
 use crate::ledger::Ledger;
 use crate::storage::WalTailer;
-use spdlog::{info, warn};
+use crate::tools::backoff::{Backoff, BackoffPolicy};
+use spdlog::{debug, info, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -147,24 +148,53 @@ impl PeerReplication {
     /// failures in place.
     pub async fn run(mut self) {
         info!(
-            "replication: starting peer-task for node_id={} ({})",
-            self.peer.peer_id, self.peer.host
+            "replication: starting peer-task for node_id={} ({}) — term={}, poll_interval={:?}",
+            self.peer.peer_id, self.peer.host, self.params.term, self.params.poll_interval
         );
 
+        // Connect retry: start at 200 ms and double up to 3.2 s. A
+        // peer that takes a few seconds to bind (cluster cold start,
+        // node restart) settles on the first or second retry; a
+        // permanently-down peer doesn't drown the log in tight-loop
+        // warns.
+        let connect_policy =
+            BackoffPolicy::exponential(Duration::from_millis(200), Duration::from_millis(3_200));
+        let mut connect_backoff = Backoff::new(connect_policy);
         let mut client = loop {
             if !self.alive() {
+                debug!(
+                    "replication: peer-task for node_id={} aborted before connect (running flag cleared)",
+                    self.peer.peer_id
+                );
                 return;
             }
+            let attempt_no = connect_backoff.attempt() + 1;
             match connect(&self.peer.host, self.params.rpc_message_size_limit).await {
-                Ok(c) => break c,
+                Ok(c) => {
+                    debug!(
+                        "replication: connected to peer node_id={} ({}) after {} attempt(s)",
+                        self.peer.peer_id, self.peer.host, attempt_no
+                    );
+                    break c;
+                }
                 Err(e) => {
-                    warn!("replication: connect to {} failed: {}", self.peer.host, e);
-                    sleep(Duration::from_millis(200)).await;
+                    let next = connect_backoff.peek_delay();
+                    warn!(
+                        "replication: connect to peer node_id={} ({}) failed (attempt {}): {} — retrying in {}ms",
+                        self.peer.peer_id,
+                        self.peer.host,
+                        attempt_no,
+                        e,
+                        next.as_millis()
+                    );
+                    connect_backoff.wait().await;
                 }
             }
         };
 
         let mut buf = vec![0u8; self.params.max_bytes_per_rpc];
+        let mut heartbeats_sent = 0u64;
+        let mut shipments_sent = 0u64;
 
         while self.alive() {
             let n = self.tailer.tail(self.from_tx_id, &mut buf) as usize;
@@ -176,17 +206,34 @@ impl PeerReplication {
                 // the value the follower returned on the previous
                 // non-empty RPC — which is always one batch stale, since
                 // `append_wal_entries` queues-then-returns on the follower.
+                heartbeats_sent += 1;
+                debug!(
+                    "replication: heartbeat #{} to peer node_id={} (peer_last_tx={}, leader_commit={})",
+                    heartbeats_sent,
+                    self.peer.peer_id,
+                    self.peer_last_tx,
+                    self.majority.get()
+                );
                 if !self.send_heartbeat(&mut client).await {
                     // step-down observed on the heartbeat — exit
                     // cleanly so the supervisor can drain us.
+                    info!(
+                        "replication: peer-task for node_id={} stepping down after higher-term heartbeat response",
+                        self.peer.peer_id
+                    );
                     return;
                 }
                 sleep(self.params.poll_interval).await;
                 continue;
             }
 
+            shipments_sent += 1;
             let shipment_last_tx = tx_id_of_last_record(&buf[..n])
                 .expect("tailer returned non-empty bytes with no tx-bearing record");
+            debug!(
+                "replication: shipment #{} to peer node_id={} ({} bytes, tx_id={}..={})",
+                shipments_sent, self.peer.peer_id, n, self.from_tx_id, shipment_last_tx
+            );
             let bytes = buf[..n].to_vec();
 
             if !self
@@ -198,8 +245,8 @@ impl PeerReplication {
         }
 
         info!(
-            "replication: peer-task for node_id={} stopped",
-            self.peer.peer_id
+            "replication: peer-task for node_id={} stopped — sent {} shipments, {} heartbeats",
+            self.peer.peer_id, shipments_sent, heartbeats_sent
         );
     }
 
@@ -211,10 +258,24 @@ impl PeerReplication {
         bytes: Vec<u8>,
         shipment_last_tx: u64,
     ) -> bool {
+        // Exponential backoff for the retry loop — start at 50 ms,
+        // double up to 3.2 s. Without the cap, a peer that's
+        // permanently shutting down (Unavailable on every RPC) would
+        // produce ~20 warns/sec; with it, the rate degrades to
+        // roughly one warn per 3 s.
+        let mut backoff = Backoff::new(BackoffPolicy::exponential(
+            Duration::from_millis(50),
+            Duration::from_millis(3_200),
+        ));
         loop {
             if !self.alive() {
+                debug!(
+                    "replication: ship_until_accepted aborted for peer node_id={} (running flag cleared)",
+                    self.peer.peer_id
+                );
                 return false;
             }
+            let attempt_no = backoff.attempt() + 1;
             let req = proto::AppendEntriesRequest {
                 leader_id: self.params.leader_id,
                 term: self.params.term,
@@ -237,6 +298,14 @@ impl PeerReplication {
                         return false;
                     }
                     if r.success {
+                        debug!(
+                            "replication: peer node_id={} accepted shipment tx_id={}..={} (peer_last_tx now {}) on attempt {}",
+                            self.peer.peer_id,
+                            self.from_tx_id,
+                            shipment_last_tx,
+                            r.last_tx_id,
+                            attempt_no
+                        );
                         self.peer_last_tx = shipment_last_tx;
                         self.from_tx_id = shipment_last_tx + 1;
                         // Publish this peer's latest commit watermark and
@@ -246,24 +315,42 @@ impl PeerReplication {
                         self.majority.advance(self.peer_index, r.last_tx_id);
                         return true;
                     }
+                    let next = backoff.peek_delay();
                     warn!(
-                        "replication: peer {} rejected append (reason={}, last_tx_id={})",
-                        self.peer.peer_id, r.reject_reason, r.last_tx_id
+                        "replication: peer node_id={} rejected append on attempt {} (reason={}, peer last_tx_id={}) — retrying in {}ms",
+                        self.peer.peer_id,
+                        attempt_no,
+                        r.reject_reason,
+                        r.last_tx_id,
+                        next.as_millis()
                     );
-                    sleep(Duration::from_millis(50)).await;
+                    backoff.wait().await;
                 }
                 Err(e) => {
+                    let next = backoff.peek_delay();
                     warn!(
-                        "replication: AppendEntries to peer {} failed (code={:?}): {}",
+                        "replication: AppendEntries to peer node_id={} failed on attempt {} (code={:?}): {} — reconnecting + retrying in {}ms",
                         self.peer.peer_id,
+                        attempt_no,
                         e.code(),
-                        e.message()
+                        e.message(),
+                        next.as_millis()
                     );
-                    sleep(Duration::from_millis(50)).await;
-                    if let Ok(c) =
-                        connect(&self.peer.host, self.params.rpc_message_size_limit).await
-                    {
-                        *client = c;
+                    backoff.wait().await;
+                    match connect(&self.peer.host, self.params.rpc_message_size_limit).await {
+                        Ok(c) => {
+                            debug!(
+                                "replication: reconnected to peer node_id={} after RPC failure",
+                                self.peer.peer_id
+                            );
+                            *client = c;
+                        }
+                        Err(reconnect_err) => {
+                            debug!(
+                                "replication: reconnect to peer node_id={} failed: {} — keeping stale channel for now",
+                                self.peer.peer_id, reconnect_err
+                            );
+                        }
                     }
                 }
             }

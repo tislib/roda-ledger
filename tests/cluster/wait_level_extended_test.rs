@@ -48,7 +48,7 @@ async fn wait_level_computed_on_cluster() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client(0).await.unwrap();
+    let client = ctl.client().node(0).clone();
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::Computed)
         .await
@@ -63,7 +63,7 @@ async fn wait_level_committed_on_cluster() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client(0).await.unwrap();
+    let client = ctl.client().node(0).clone();
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::Committed)
         .await
@@ -77,7 +77,7 @@ async fn wait_level_snapshot_on_cluster() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client(0).await.unwrap();
+    let client = ctl.client().node(0).clone();
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::Snapshot)
         .await
@@ -96,7 +96,7 @@ async fn wait_level_cluster_commit_requires_full_advance() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let client = ctl.leader_client().await.unwrap();
+    let client = ctl.client().leader().clone();
     let r = client
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
@@ -112,7 +112,7 @@ async fn wait_level_cluster_commit_blocks_without_quorum() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.unwrap();
+    let leader_client = ctl.client().leader().clone();
 
     // Ack one tx.
     leader_client
@@ -280,7 +280,7 @@ async fn submit_on_follower_returns_failed_precondition() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let follower_client = ctl.follower_client().await.expect("follower");
+    let follower_client = ctl.client().next_follower().await.expect("follower idx");
     let err = follower_client
         .deposit(ACCOUNT, AMOUNT, 0)
         .await

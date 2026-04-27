@@ -17,14 +17,13 @@
 
 use crate::client::node_client::{
     AccountHistory, Balance, FunctionInfo, NodeClient, PipelineIndex, Result, RetryConfig,
-    SubmitResult, Transaction, backoff_for,
+    SubmitResult, Transaction,
 };
 use crate::cluster::proto::ledger as proto;
+use crate::tools::backoff::Backoff;
 use spdlog::warn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::time::sleep;
 use tonic::Code;
 
 /// Metadata key used by the server to hint at the current leader's
@@ -52,15 +51,17 @@ pub struct ClusterClient {
     nodes: Arc<Vec<NodeClient>>,
     leader: ClusterLeaderClient,
     next_read: Arc<AtomicUsize>,
+    /// Independent rotation cursor for [`Self::next_follower`] so
+    /// follower picks aren't entangled with the round-robin used by
+    /// the read facades.
+    next_follower: Arc<AtomicUsize>,
     retry: RetryConfig,
 }
 
 impl ClusterClient {
     /// Connect to every node in `urls` (e.g. `http://127.0.0.1:50051`)
     /// using the default [`RetryConfig`]. Panics on empty input.
-    pub async fn connect(
-        urls: &[String],
-    ) -> std::result::Result<Self, tonic::transport::Error> {
+    pub async fn connect(urls: &[String]) -> std::result::Result<Self, tonic::transport::Error> {
         Self::connect_with_retry(urls, RetryConfig::default()).await
     }
 
@@ -81,6 +82,7 @@ impl ClusterClient {
         let inner_retry = RetryConfig {
             max_retry_count: 0,
             base_backoff_ms: retry.base_backoff_ms,
+            max_backoff_ms: retry.max_backoff_ms,
         };
         let mut nodes = Vec::with_capacity(urls.len());
         for url in urls {
@@ -109,6 +111,7 @@ impl ClusterClient {
             nodes,
             leader,
             next_read: Arc::new(AtomicUsize::new(0)),
+            next_follower: Arc::new(AtomicUsize::new(0)),
             retry,
         }
     }
@@ -126,6 +129,53 @@ impl ClusterClient {
     /// Number of nodes the client is connected to.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Pick the next live follower in round-robin order — any node
+    /// whose `get_pipeline_index` responds AND whose `is_leader`
+    /// flag is `false`. Returns `None` for single-node clusters and
+    /// for clusters where no follower is reachable.
+    ///
+    /// Probes every candidate in round-robin order: queries
+    /// `get_pipeline_index` and reads the server-reported `is_leader`
+    /// flag. The first non-leader that responds is returned and the
+    /// cluster's cached leader index is updated as a side effect, so
+    /// follow-up writes via `leader()` skip the rotation+retry dance.
+    /// Tests that previously did `let i = ctl.first_follower_index().await?;
+    /// ctl.client().node(i)` should prefer this.
+    pub async fn next_follower(&self) -> Option<NodeClient> {
+        let n = self.nodes.len();
+        if n <= 1 {
+            return None;
+        }
+
+        // Walk every node index in round-robin order. Probe via
+        // `get_pipeline_index` (always succeeds on a healthy node)
+        // and use the server-reported `is_leader` flag to decide.
+        // Update the leader cache opportunistically when we find a
+        // leader so subsequent writes don't have to discover it.
+        let mut follower: Option<NodeClient> = None;
+        for _ in 0..n {
+            let pick = self.next_follower.fetch_add(1, Ordering::Relaxed) % n;
+            match self.nodes[pick].get_pipeline_index().await {
+                Ok(idx) => {
+                    if idx.is_leader {
+                        let _ = self.leader.set_current_leader_index(pick);
+                    } else if follower.is_none() {
+                        follower = Some(self.nodes[pick].clone());
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        follower
+    }
+
+    /// Index of whichever node the leader client currently considers
+    /// the leader. Used by tests that need to log or compare against
+    /// the live leader without going through the gRPC `Ping` probe.
+    pub fn current_leader_index(&self) -> usize {
+        self.leader.current_leader_index()
     }
 
     /// Read-only view of the active retry policy.
@@ -148,6 +198,7 @@ impl ClusterClient {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let max = self.retry.max_retry_count;
+        let mut backoff = Backoff::new(self.retry.backoff_policy());
         for attempt in 0..=max {
             let idx = self.pick_read_node();
             let client = self.nodes[idx].clone();
@@ -166,7 +217,7 @@ impl ClusterClient {
                         return Err(e);
                     }
                     let retry_num = attempt + 1;
-                    let backoff_ms = backoff_for(self.retry.base_backoff_ms, attempt);
+                    let next = backoff.peek_delay();
                     warn!(
                         "cluster::{}: error '{}' (code={:?}) on node[{}] — retrying ({}/{}) on next node after {}ms",
                         op_name,
@@ -175,9 +226,9 @@ impl ClusterClient {
                         idx,
                         retry_num,
                         max,
-                        backoff_ms
+                        next.as_millis()
                     );
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff.wait().await;
                 }
             }
         }
@@ -397,6 +448,15 @@ impl ClusterLeaderClient {
         self.current_leader.load(Ordering::Acquire) % self.nodes.len()
     }
 
+    /// Override the cached leader index. Used by sibling probes (e.g.
+    /// [`ClusterClient::next_follower`]) that learn a node's role
+    /// out-of-band and want to spare subsequent writes from having
+    /// to rediscover via "not a leader" rejections.
+    pub fn set_current_leader_index(&self, idx: usize) {
+        self.current_leader
+            .store(idx % self.nodes.len(), Ordering::Release);
+    }
+
     /// Read-only view of the active retry policy.
     pub fn retry_config(&self) -> &RetryConfig {
         &self.retry
@@ -414,6 +474,7 @@ impl ClusterLeaderClient {
     {
         let max = self.retry.max_retry_count;
         let n_nodes = self.nodes.len();
+        let mut backoff = Backoff::new(self.retry.backoff_policy());
         for attempt in 0..=max {
             let idx = self.current_leader.load(Ordering::Acquire) % n_nodes;
             let client = self.nodes[idx].clone();
@@ -432,7 +493,7 @@ impl ClusterLeaderClient {
                         return Err(e);
                     }
                     let retry_num = attempt + 1;
-                    let backoff_ms = backoff_for(self.retry.base_backoff_ms, attempt);
+                    let next = backoff.peek_delay();
 
                     // Rotate the cached leader index whenever the
                     // current node looks unable to serve the write —
@@ -464,7 +525,7 @@ impl ClusterLeaderClient {
                             next_idx,
                             retry_num,
                             max,
-                            backoff_ms
+                            next.as_millis()
                         );
                     } else {
                         warn!(
@@ -475,10 +536,10 @@ impl ClusterLeaderClient {
                             idx,
                             retry_num,
                             max,
-                            backoff_ms
+                            next.as_millis()
                         );
                     }
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff.wait().await;
                 }
             }
         }
@@ -615,10 +676,7 @@ impl ClusterLeaderClient {
         self.with_leader_retry("register_function", move |c| {
             let name = name.clone();
             let binary = binary.clone();
-            async move {
-                c.register_function(&name, &binary, override_existing)
-                    .await
-            }
+            async move { c.register_function(&name, &binary, override_existing).await }
         })
         .await
     }
@@ -700,7 +758,7 @@ impl ClusterLeaderClient {
         self.with_leader_retry("list_functions", move |c| async move {
             c.list_functions().await
         })
-            .await
+        .await
     }
 }
 

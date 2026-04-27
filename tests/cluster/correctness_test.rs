@@ -3,7 +3,7 @@
 
 #![cfg(feature = "cluster")]
 
-use roda_ledger::client::{NodeClient, SubmitResult};
+use roda_ledger::client::{ClusterLeaderClient, SubmitResult};
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
@@ -26,7 +26,7 @@ async fn deposit_via_current_leader(
     wait: WaitLevel,
 ) -> SubmitResult {
     for attempt in 0..10 {
-        let client: NodeClient = ctl.leader_client().await.expect("a leader must exist");
+        let client: ClusterLeaderClient = ctl.client().leader().clone();
         match client
             .deposit_and_wait(account, amount, user_ref, wait)
             .await
@@ -60,7 +60,7 @@ async fn balances_converge_across_nodes_after_churn() {
 
     let mut user_ref: u64 = 1;
     for round in 0..3 {
-        let client = ctl.leader_client().await.unwrap();
+        let client = ctl.client().leader().clone();
         for _ in 0..10 {
             client
                 .deposit_and_wait(ACCOUNT_A, AMOUNT, user_ref, WaitLevel::ClusterCommit)
@@ -84,13 +84,13 @@ async fn balances_converge_across_nodes_after_churn() {
     }
 
     // Final convergence: every node sees the same A and B balance.
-    let leader_client = ctl.leader_client().await.unwrap();
+    let leader_client = ctl.client().leader().clone();
     let target_a = leader_client.get_balance(ACCOUNT_A).await.unwrap().balance;
     let target_b = leader_client.get_balance(ACCOUNT_B).await.unwrap().balance;
     let target_commit = leader_client.get_pipeline_index().await.unwrap().commit;
 
     for i in 0..ctl.len() {
-        let c = ctl.client(i).await.expect("client");
+        let c = ctl.client().node(i).clone();
         ctl.wait_for(Duration::from_secs(30), "node commit catches up", || {
             let c = c.clone();
             async move {
@@ -130,7 +130,7 @@ async fn zero_sum_holds_on_every_node_after_load() {
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
-    let leader_client = ctl.leader_client().await.unwrap();
+    let leader_client = ctl.client().leader().clone();
     // Bootstrap account A.
     leader_client
         .deposit_and_wait(ACCOUNT_A, 10_000, 0, WaitLevel::ClusterCommit)
@@ -146,7 +146,7 @@ async fn zero_sum_holds_on_every_node_after_load() {
     let target_commit = leader_client.get_pipeline_index().await.unwrap().commit;
 
     for i in 0..ctl.len() {
-        let c = ctl.client(i).await.expect("client");
+        let c = ctl.client().node(i).clone();
         ctl.wait_for(Duration::from_secs(30), "node catches up", || {
             let c = c.clone();
             async move {
@@ -173,7 +173,7 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.unwrap();
+    let leader_client = ctl.client().leader().clone();
 
     let mut acked = Vec::new();
     for ur in 1..=10u64 {
@@ -189,7 +189,7 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
     ctl.stop_node(0).await.expect("stop");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
-    let new_client = ctl.leader_client().await.unwrap();
+    let new_client = ctl.client().leader().clone();
     for tx_id in &acked {
         let (status, _) = new_client.get_transaction_status(*tx_id).await.unwrap();
         assert!(status >= 2, "tx {} lost after single-node failure", tx_id);
@@ -224,7 +224,7 @@ async fn wal_is_byte_exact_across_replicas() {
         if i == leader_idx {
             continue;
         }
-        let c = ctl.client(i).await.unwrap();
+        let c = ctl.client().node(i).clone();
         ctl.wait_for(Duration::from_secs(30), "follower catches up", || {
             let c = c.clone();
             async move {

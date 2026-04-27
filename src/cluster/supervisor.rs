@@ -41,7 +41,7 @@ use crate::cluster::raft::{
 use crate::cluster::server::{NodeServerRuntime, Server};
 use crate::cluster::{LedgerSlot, NodeHandler};
 use crate::ledger::Ledger;
-use spdlog::{error, info, warn};
+use spdlog::{debug, error, info, warn};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -276,26 +276,37 @@ impl RoleSupervisor {
         let config = self.config.clone();
         let ledger_slot = self.ledger_slot.clone();
         let role = self.role.clone();
+        let self_id = self.config.node_id();
         tokio::spawn(async move {
+            debug!(
+                "supervisor[node_id={}]: divergence watcher started (poll interval {:?})",
+                self_id,
+                Self::WATCHER_INTERVAL
+            );
             while running.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(watermark) = node_core.take_divergence_watermark() {
                     info!(
-                        "supervisor: divergence detected (watermark={}); reseeding ledger",
-                        watermark
+                        "supervisor[node_id={}]: divergence detected (watermark={}); reseeding ledger",
+                        self_id, watermark
                     );
                     if let Err(e) =
                         reseed(&config, &ledger_slot, &role, &quorum, self_slot, watermark).await
                     {
-                        error!("supervisor: reseed failed: {}", e);
+                        error!("supervisor[node_id={}]: reseed failed: {}", self_id, e);
                     } else {
                         info!(
-                            "supervisor: reseed complete (last_commit_id now={})",
+                            "supervisor[node_id={}]: reseed complete (last_commit_id now={})",
+                            self_id,
                             ledger_slot.ledger().last_commit_id()
                         );
                     }
                 }
                 tokio::time::sleep(Self::WATCHER_INTERVAL).await;
             }
+            debug!(
+                "supervisor[node_id={}]: divergence watcher exiting (running flag cleared)",
+                self_id
+            );
         })
     }
 
@@ -314,11 +325,25 @@ impl RoleSupervisor {
         let role = self.role.clone();
 
         tokio::spawn(async move {
+            let self_id = config.node_id();
+            let mut iter = 0u64;
             loop {
                 if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                    debug!(
+                        "supervisor[node_id={}]: role driver exiting after {} iterations (running flag cleared)",
+                        self_id, iter
+                    );
                     return;
                 }
+                iter += 1;
                 let current = role.get();
+                debug!(
+                    "supervisor[node_id={}]: role driver iter={} state={:?} term={}",
+                    self_id,
+                    iter,
+                    current,
+                    term.get_current_term()
+                );
                 match current {
                     Role::Leader => {
                         run_leader_role(
@@ -336,12 +361,24 @@ impl RoleSupervisor {
                     Role::Initializing | Role::Follower => {
                         // Wait for either the election timer to
                         // expire OR a transition signal to arrive.
+                        debug!(
+                            "supervisor[node_id={}]: arming election timer in {:?} state",
+                            self_id, current
+                        );
                         timer.reset();
                         tokio::select! {
                             _ = timer.await_expiry() => {
+                                debug!(
+                                    "supervisor[node_id={}]: election timer expired in {:?} — promoting to Candidate",
+                                    self_id, current
+                                );
                                 role.set(Role::Candidate);
                             }
                             ev = transition_rx.recv() => {
+                                debug!(
+                                    "supervisor[node_id={}]: transition signal received in {:?}: {:?}",
+                                    self_id, current, ev
+                                );
                                 handle_transition(ev, &role, &term);
                             }
                         }
@@ -478,10 +515,16 @@ async fn run_leader_role(
     // or the process is shutting down.
     let mut step_down_observed: Option<u64> = None;
     while running.load(std::sync::atomic::Ordering::Relaxed) {
+        debug!(
+            "supervisor[node_id={}]: leader awaiting transition signal (term={})",
+            config.node_id(),
+            term.get_current_term()
+        );
         match transition_rx.recv().await {
             Some(Transition::StepDownHigherTerm { observed }) => {
                 warn!(
-                    "supervisor: leader stepping down (observed term {})",
+                    "supervisor[node_id={}]: leader stepping down (observed term {})",
+                    config.node_id(),
                     observed
                 );
                 step_down_observed = Some(observed);
@@ -492,18 +535,36 @@ async fn run_leader_role(
                 // divergence under ADR-0016 §9; ignore on the
                 // leader. (If we ever see it, fall through to
                 // step-down to be safe.)
-                warn!("supervisor: leader observed unexpected divergence; stepping down");
+                warn!(
+                    "supervisor[node_id={}]: leader observed unexpected divergence; stepping down",
+                    config.node_id()
+                );
                 break;
             }
-            Some(Transition::Shutdown) | None => break,
+            Some(Transition::Shutdown) | None => {
+                debug!(
+                    "supervisor[node_id={}]: leader received shutdown signal — exiting role",
+                    config.node_id()
+                );
+                break;
+            }
         }
     }
 
     // Cooperative drain: tell every peer task to exit, then await.
+    debug!(
+        "supervisor[node_id={}]: draining {} peer-replication tasks",
+        config.node_id(),
+        leader_handles.peer_handles.len()
+    );
     leader_alive.store(false, std::sync::atomic::Ordering::Release);
     for h in leader_handles.peer_handles {
         let _ = h.await;
     }
+    debug!(
+        "supervisor[node_id={}]: peer-replication tasks drained",
+        config.node_id()
+    );
 
     // After draining peers, persist the higher term we just
     // observed (if any). The matching `vote.observe_term` lives on

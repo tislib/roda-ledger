@@ -4,7 +4,7 @@ use crate::cluster::raft::{RoleFlag, Term};
 use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::Operation;
-use spdlog::warn;
+use spdlog::{debug, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
@@ -365,6 +365,7 @@ impl Ledger for LedgerHandler {
             snapshot_index: self.ledger_slot.ledger().last_snapshot_id(),
             term: self.current_term(),
             cluster_commit_index: self.cluster_commit_index.get(),
+            is_leader: self.role.is_leader(),
         }))
     }
 
@@ -539,37 +540,78 @@ impl LedgerHandler {
     ) -> std::io::Result<()> {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(2);
+        let mut iter = 0u32;
+        debug!(
+            "wait_for_transaction_level: tx_id={} level={:?} timeout={:?} starting",
+            transaction_id, level, timeout
+        );
 
         loop {
+            iter += 1;
+            let ledger = self.ledger_slot.ledger();
+            let compute = ledger.last_compute_id();
+            let commit = ledger.last_commit_id();
+            let snapshot = ledger.last_snapshot_id();
+            let cluster_commit = self.cluster_commit_index.get();
             let reached = match level {
-                proto::WaitLevel::Computed => {
-                    self.ledger_slot.ledger().last_compute_id() >= transaction_id
-                }
-                proto::WaitLevel::Committed => {
-                    self.ledger_slot.ledger().last_commit_id() >= transaction_id
-                }
-                proto::WaitLevel::Snapshot => {
-                    self.ledger_slot.ledger().last_snapshot_id() >= transaction_id
-                }
+                proto::WaitLevel::Computed => compute >= transaction_id,
+                proto::WaitLevel::Committed => commit >= transaction_id,
+                proto::WaitLevel::Snapshot => snapshot >= transaction_id,
                 proto::WaitLevel::ClusterCommit => {
                     // Require all three watermarks to have passed the tx.
                     // `cluster_commit_index` reflects the leader's view of
                     // quorum replication; the local `commit_index` and
                     // `snapshot_index` ensure the tx is also durably
                     // stored and queryable on this node.
-                    self.ledger_slot.ledger().last_snapshot_id() >= transaction_id
-                        && self.ledger_slot.ledger().last_commit_id() >= transaction_id
-                        && self.cluster_commit_index.get() >= transaction_id
+                    snapshot >= transaction_id
+                        && commit >= transaction_id
+                        && cluster_commit >= transaction_id
                 }
             };
 
             if reached {
+                debug!(
+                    "wait_for_transaction_level: tx_id={} level={:?} reached after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
+                    transaction_id,
+                    level,
+                    start_time.elapsed().as_millis(),
+                    iter,
+                    compute,
+                    commit,
+                    snapshot,
+                    cluster_commit
+                );
                 return Ok(());
+            }
+
+            // Periodic progress log so multi-second waits aren't silent.
+            if iter.is_multiple_of(10_000) {
+                debug!(
+                    "wait_for_transaction_level: tx_id={} level={:?} still waiting after {}ms — compute={} commit={} snapshot={} cluster_commit={}",
+                    transaction_id,
+                    level,
+                    start_time.elapsed().as_millis(),
+                    compute,
+                    commit,
+                    snapshot,
+                    cluster_commit
+                );
             }
 
             yield_now().await;
 
             if start_time.elapsed() >= timeout {
+                warn!(
+                    "wait_for_transaction_level: tx_id={} level={:?} TIMED OUT after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
+                    transaction_id,
+                    level,
+                    start_time.elapsed().as_millis(),
+                    iter,
+                    compute,
+                    commit,
+                    snapshot,
+                    cluster_commit
+                );
                 return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
             }
         }

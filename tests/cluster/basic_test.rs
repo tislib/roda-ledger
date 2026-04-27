@@ -41,8 +41,8 @@ async fn cluster_leader_replicates_to_follower() {
         ctl.node_id(leader_idx).unwrap()
     );
 
-    let leader_client = ctl.leader_client().await.expect("leader client");
-    let follower_client = ctl.follower_client().await.expect("follower client");
+    let leader_client = ctl.client().leader().clone();
+    let follower_client = ctl.client().next_follower().await.expect("follower index");
 
     // ── Follower rejects writes ─────────────────────────────────────────
     let write_err = follower_client
