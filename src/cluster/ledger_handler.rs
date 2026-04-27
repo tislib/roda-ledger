@@ -4,7 +4,7 @@ use crate::cluster::raft::{RoleFlag, Term};
 use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use crate::transaction::Operation;
-use spdlog::{debug, warn};
+use spdlog::{debug, trace, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
@@ -541,7 +541,7 @@ impl LedgerHandler {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(2);
         let mut iter = 0u32;
-        debug!(
+        trace!(
             "wait_for_transaction_level: tx_id={} level={:?} timeout={:?} starting",
             transaction_id, level, timeout
         );
@@ -570,7 +570,7 @@ impl LedgerHandler {
             };
 
             if reached {
-                debug!(
+                trace!(
                     "wait_for_transaction_level: tx_id={} level={:?} reached after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
                     transaction_id,
                     level,
@@ -586,7 +586,7 @@ impl LedgerHandler {
 
             // Periodic progress log so multi-second waits aren't silent.
             if iter.is_multiple_of(10_000) {
-                debug!(
+                trace!(
                     "wait_for_transaction_level: tx_id={} level={:?} still waiting after {}ms — compute={} commit={} snapshot={} cluster_commit={}",
                     transaction_id,
                     level,

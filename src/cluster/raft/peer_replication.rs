@@ -15,7 +15,7 @@ use crate::cluster::supervisor::{Transition, TransitionTx};
 use crate::ledger::Ledger;
 use crate::storage::WalTailer;
 use crate::tools::backoff::{Backoff, BackoffPolicy};
-use spdlog::{debug, info, warn};
+use spdlog::{debug, info, trace, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -75,6 +75,12 @@ pub struct PeerReplication {
     /// preventing re-election.
     supervisor_running: Arc<AtomicBool>,
     tailer: WalTailer,
+    /// DIAG-flake-replication: kept so the periodic "still tailing 0 bytes"
+    /// diagnostic can read `last_commit_id`, `last_segment_id`, and the
+    /// active wal file length on the same `Ledger` instance the tailer
+    /// was bound to. Pointer comparison (`storage_ptr`) lets us detect
+    /// a ledger swap (reseed) — see H1 in the diagnose plan.
+    ledger_for_diag: Arc<Ledger>,
     from_tx_id: u64,
     peer_last_tx: u64,
     /// Shared majority-commit tracker owned by `Leader`. The
@@ -108,6 +114,7 @@ impl PeerReplication {
             running,
             supervisor_running,
             tailer,
+            ledger_for_diag: ledger,
             from_tx_id: 1,
             peer_last_tx: 0,
             majority,
@@ -196,6 +203,23 @@ impl PeerReplication {
         let mut heartbeats_sent = 0u64;
         let mut shipments_sent = 0u64;
 
+        // DIAG-flake-replication: snapshot the leader's view of its own
+        // ledger at peer-task launch. Pair this with the periodic
+        // "still tailing 0 bytes" print to see whether the writer is
+        // making progress while the tailer reads nothing.
+        let diag_storage_ptr_at_start = self.ledger_for_diag.storage_ptr();
+        info!(
+            "DIAG-flake-replication: peer-task starting node_id={} from_tx_id={} \
+             ledger.last_commit_id={} storage.last_segment_id={} \
+             active_wal_file_len={:?} storage_ptr={:#x}",
+            self.peer.peer_id,
+            self.from_tx_id,
+            self.ledger_for_diag.last_commit_id(),
+            self.ledger_for_diag.last_segment_id(),
+            self.ledger_for_diag.active_wal_file_len(),
+            diag_storage_ptr_at_start,
+        );
+
         while self.alive() {
             let n = self.tailer.tail(self.from_tx_id, &mut buf) as usize;
             if n == 0 {
@@ -207,13 +231,38 @@ impl PeerReplication {
                 // non-empty RPC — which is always one batch stale, since
                 // `append_wal_entries` queues-then-returns on the follower.
                 heartbeats_sent += 1;
-                debug!(
+                trace!(
                     "replication: heartbeat #{} to peer node_id={} (peer_last_tx={}, leader_commit={})",
                     heartbeats_sent,
                     self.peer.peer_id,
                     self.peer_last_tx,
                     self.majority.get()
                 );
+                // DIAG-flake-replication: every 250 idle heartbeats
+                // (~1 second at the test's 2 ms poll), dump enough
+                // state to tell whether (a) the leader's pipeline is
+                // still committing locally, (b) the WAL on disk is
+                // growing, and (c) the storage Arc has been swapped
+                // out from under us by a reseed. Cheap — runs at most
+                // once per second per peer.
+                if heartbeats_sent.is_multiple_of(250) && shipments_sent == 0 {
+                    let cur_storage_ptr = self.ledger_for_diag.storage_ptr();
+                    info!(
+                        "DIAG-flake-replication: still tailing 0 bytes node_id={} \
+                         from_tx_id={} heartbeats_sent={} \
+                         ledger.last_commit_id={} storage.last_segment_id={} \
+                         active_wal_file_len={:?} storage_ptr={:#x} \
+                         storage_ptr_changed_since_start={}",
+                        self.peer.peer_id,
+                        self.from_tx_id,
+                        heartbeats_sent,
+                        self.ledger_for_diag.last_commit_id(),
+                        self.ledger_for_diag.last_segment_id(),
+                        self.ledger_for_diag.active_wal_file_len(),
+                        cur_storage_ptr,
+                        cur_storage_ptr != diag_storage_ptr_at_start,
+                    );
+                }
                 if !self.send_heartbeat(&mut client).await {
                     // step-down observed on the heartbeat — exit
                     // cleanly so the supervisor can drain us.

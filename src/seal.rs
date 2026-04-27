@@ -129,15 +129,11 @@ impl Seal {
 
 impl SealRunner {
     fn run(&mut self, ctx: SealContext) {
-        loop {
+        while ctx.is_running() {
             // A long time nothing happened.
             if let Err(e) = self.seal_pending_segments(&ctx) {
                 error!("Seal: failed to seal pending segments: {}", e);
                 sleep(Duration::from_secs(1));
-            }
-            // Check before sleep to ensure that the last seal is done before shutting down
-            if !ctx.is_running() {
-                break;
             }
             sleep(self.seal_check_internal);
         }
@@ -151,6 +147,9 @@ impl SealRunner {
 
         let mut pending = self.storage.list_all_segments()?;
         for segment in pending.iter_mut() {
+            if !ctx.is_running() {
+                break;
+            }
             if segment.status() == SEALED {
                 continue;
             }

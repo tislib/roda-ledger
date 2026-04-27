@@ -329,6 +329,29 @@ impl Ledger {
         self.storage.wal_tailer()
     }
 
+    /// DIAG-flake-replication: storage's current active-segment id.
+    /// Diagnostic accessor added while investigating an intermittent
+    /// replication stall in `cluster_leader_replicates_to_follower`.
+    pub fn last_segment_id(&self) -> u32 {
+        self.storage.last_segment_id()
+    }
+
+    /// DIAG-flake-replication: on-disk size of the active `wal.bin`,
+    /// or `None` if it doesn't exist. Used by the peer-task's periodic
+    /// "still tailing 0 bytes" diagnostic to distinguish "writes never
+    /// landed" from "writes landed but the tailer can't see them".
+    pub fn active_wal_file_len(&self) -> Option<u64> {
+        self.storage.active_wal_file_len()
+    }
+
+    /// DIAG-flake-replication: pointer-identity of the storage Arc.
+    /// Lets the peer-task detect a ledger swap (reseed) — if the
+    /// recorded pointer changes between two reads, the underlying
+    /// `Storage`/WAL has been replaced out from under us.
+    pub fn storage_ptr(&self) -> usize {
+        Arc::as_ptr(&self.storage) as usize
+    }
+
     pub fn wait_for_transaction(&self, transaction_id: u64) {
         self.wait_for_transaction_until(transaction_id, Duration::from_secs(100));
     }
@@ -417,7 +440,7 @@ impl Ledger {
         if !self.config.disable_seal {
             self.handles
                 .push(self.seal.start(self.pipeline.seal_context()).map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
+                    io::Error::new(e.kind(), format!("failed to start seal: {}", e))
                 })?);
         }
 

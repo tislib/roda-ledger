@@ -63,7 +63,7 @@ async fn cluster_leader_replicates_to_follower() {
     let total_tx = 200u64;
     let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|_| (account, amount, 0u64)).collect();
     let results = leader_client
-        .deposit_batch_and_wait(&deposits, WaitLevel::Committed)
+        .deposit_batch_and_wait(&deposits, WaitLevel::ClusterCommit)
         .await
         .expect("leader batch deposit");
     assert_eq!(results.len(), total_tx as usize);

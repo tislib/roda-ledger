@@ -21,7 +21,7 @@
 //! deadline; otherwise it returns.
 
 use rand::Rng;
-use spdlog::debug;
+use spdlog::{debug, trace};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -89,7 +89,7 @@ impl ElectionTimer {
             s.deadline = new_deadline;
         }
         self.notify.notify_waiters();
-        debug!(
+        trace!(
             "election_timer: reset — next expiry in {}ms (window {}..{}ms)",
             in_ms, self.cfg.min_ms, self.cfg.max_ms
         );
@@ -130,7 +130,7 @@ impl ElectionTimer {
                 }
                 _ = self.notify.notified() => {
                     // Deadline was bumped; re-read and try again.
-                    debug!(
+                    trace!(
                         "election_timer: await_expiry re-armed after reset (iteration {})",
                         iterations
                     );

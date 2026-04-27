@@ -185,7 +185,7 @@ impl Default for ClusterTestingConfig {
             append_entries_max_bytes: 256 * 1024,
             transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,
-            ledger_log_level: Level::Debug,
+            ledger_log_level: Level::Trace,
             autostart: true,
             data_dir_root: None,
         }

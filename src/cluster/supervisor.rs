@@ -594,6 +594,19 @@ async fn reseed(
     watermark: u64,
 ) -> Result<(), std::io::Error> {
     let prior_role = role.get();
+    // DIAG-flake-replication: log every reseed entry. If a reseed
+    // fires between leader bring-up and the test's deposits on the
+    // hanging iteration, peer-tasks spawned for the old ledger will
+    // tail an orphaned `Storage` forever (H1 in the diagnose plan).
+    info!(
+        "DIAG-flake-replication: reseed BEGIN node_id={} watermark={} prior_role={:?} \
+         pre_storage_ptr={:#x} pre_last_commit_id={}",
+        config.node_id(),
+        watermark,
+        prior_role,
+        ledger_slot.ledger().storage_ptr(),
+        ledger_slot.ledger().last_commit_id(),
+    );
     role.set(Role::Initializing);
 
     let ledger_cfg = config.ledger.clone();
@@ -612,6 +625,9 @@ async fn reseed(
     // when its `Arc` refcount hits zero.
     register_on_commit_hook(&new_ledger, quorum, self_slot);
 
+    let new_storage_ptr_for_diag = new_ledger.storage_ptr();
+    let new_last_commit_for_diag = new_ledger.last_commit_id();
+
     let _old = ledger_slot.replace(new_ledger);
 
     if matches!(prior_role, Role::Leader) {
@@ -622,6 +638,16 @@ async fn reseed(
             prior_role
         );
     }
+    // DIAG-flake-replication: log post-swap state so a subsequent
+    // peer-task startup print can be matched against the new storage
+    // ptr / last_commit_id.
+    info!(
+        "DIAG-flake-replication: reseed END node_id={} new_storage_ptr={:#x} \
+         new_last_commit_id={}",
+        config.node_id(),
+        new_storage_ptr_for_diag,
+        new_last_commit_for_diag,
+    );
     Ok(())
 }
 

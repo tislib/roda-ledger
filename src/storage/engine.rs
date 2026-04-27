@@ -115,6 +115,15 @@ impl Storage {
         WalTailer::new(self.clone())
     }
 
+    /// DIAG-flake-replication: on-disk size of the active `wal.bin`,
+    /// or `None` if it doesn't exist. Used by the peer-task's periodic
+    /// "still tailing 0 bytes" diagnostic to distinguish "writes never
+    /// landed" from "writes landed but the tailer can't see them".
+    pub fn active_wal_file_len(&self) -> Option<u64> {
+        let path = active_wal_path(Path::new(&self.config.data_dir));
+        std::fs::metadata(&path).ok().map(|m| m.len())
+    }
+
     /// Physically remove every WAL byte (and dependent snapshot file)
     /// whose `tx_id > watermark`. Boot-time mechanism behind
     /// [`crate::ledger::Ledger::start_with_recovery_until`] (ADR-0016 §9).
