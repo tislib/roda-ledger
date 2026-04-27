@@ -96,26 +96,28 @@ async fn leader_steps_down_on_higher_term() {
 /// from heartbeats/replication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_leader_quorum_slots_reset_correctly() {
-    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
-        .await
-        .expect("start");
-    let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.leader_client().await.unwrap();
-    leader_client
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
-        .await
-        .unwrap();
-    drop(leader_client);
+    loop {
+        let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+            .await
+            .expect("start");
+        let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        let leader_client = ctl.leader_client().await.unwrap();
+        leader_client
+            .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+            .await
+            .unwrap();
+        drop(leader_client);
 
-    ctl.stop_node(leader_idx).await.expect("stop");
-    let _new_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        ctl.stop_node(leader_idx).await.expect("stop");
+        let _new_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
-    let new_client = ctl.leader_client().await.unwrap();
-    let r = new_client
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
-        .await
-        .expect("post-failover ClusterCommit");
-    assert_eq!(r.fail_reason, 0);
+        let new_client = ctl.leader_client().await.unwrap();
+        let r = new_client
+            .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+            .await
+            .expect("post-failover ClusterCommit");
+        assert_eq!(r.fail_reason, 0);
+    }
 }
 
 /// Drop-and-rebuild invariant: aborted leader's peer tasks observe the

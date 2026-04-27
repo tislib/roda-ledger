@@ -10,7 +10,7 @@
 
 #![cfg(feature = "cluster")]
 
-use roda_ledger::client::LedgerClient;
+use roda_ledger::client::NodeClient;
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
 use roda_ledger::entities::{FailReason, SYSTEM_ACCOUNT_ID};
@@ -38,7 +38,7 @@ async fn wait_leader(ctl: &ClusterTestingControl, timeout: Duration) -> usize {
 /// node. This is the cluster-level analog of the ledger's accounting
 /// invariant — it must hold across every replica after any sequence of
 /// faults.
-async fn assert_zero_sum(client: &LedgerClient) {
+async fn assert_zero_sum(client: &NodeClient) {
     let acct = client.get_balance(ACCOUNT).await.expect("balance").balance;
     let sys = client
         .get_balance(SYSTEM_ACCOUNT_ID)

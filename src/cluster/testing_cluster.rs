@@ -23,7 +23,7 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
-use crate::client::LedgerClient;
+use crate::client::NodeClient;
 use crate::cluster::cluster_commit::ClusterCommitIndex;
 use crate::cluster::config::{
     ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection,
@@ -33,7 +33,7 @@ use crate::cluster::ledger_slot::LedgerSlot;
 use crate::cluster::node::{ClusterNode, Handles};
 use crate::cluster::node_handler::{NodeHandler, NodeHandlerCore};
 use crate::cluster::proto::node as nproto;
-use crate::cluster::proto::node::node_client::NodeClient;
+use crate::cluster::proto::node::node_client::NodeClient as ProtoNodeClient;
 use crate::cluster::raft::{Role, RoleFlag, Term, Vote};
 use crate::config::{LedgerConfig, StorageConfig};
 use crate::ledger::Ledger;
@@ -185,7 +185,7 @@ impl Default for ClusterTestingConfig {
             append_entries_max_bytes: 256 * 1024,
             transaction_count_per_segment: 10_000_000,
             snapshot_frequency: 2,
-            ledger_log_level: Level::Critical,
+            ledger_log_level: Level::Info,
             autostart: true,
             data_dir_root: None,
         }
@@ -718,15 +718,15 @@ impl ClusterTestingControl {
             .ok_or(ClusterTestingError::NotStarted { idx: i })
     }
 
-    /// Open a fresh high-level [`LedgerClient`] against node `i`'s
+    /// Open a fresh high-level [`NodeClient`] against node `i`'s
     /// client port. Each call returns a new channel — gRPC channels
     /// are cheap. Errors in Bare mode (no servers).
-    pub async fn client(&self, i: usize) -> Result<LedgerClient, ClusterTestingError> {
+    pub async fn client(&self, i: usize) -> Result<NodeClient, ClusterTestingError> {
         if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
             return Err(ClusterTestingError::NotInBareMode { op: "client" });
         }
         let port = self.client_port(i)?;
-        LedgerClient::connect_url(&format!("http://127.0.0.1:{}", port))
+        NodeClient::connect_url(&format!("http://127.0.0.1:{}", port))
             .await
             .map_err(ClusterTestingError::Connect)
     }
@@ -796,7 +796,7 @@ impl ClusterTestingControl {
         self.node_id(i)
     }
 
-    pub async fn leader_client(&self) -> Result<LedgerClient, ClusterTestingError> {
+    pub async fn leader_client(&self) -> Result<NodeClient, ClusterTestingError> {
         let i = self.leader_index().await?;
         self.client(i).await
     }
@@ -816,7 +816,7 @@ impl ClusterTestingControl {
             .ok_or(ClusterTestingError::NoFollower)
     }
 
-    pub async fn follower_client(&self) -> Result<LedgerClient, ClusterTestingError> {
+    pub async fn follower_client(&self) -> Result<NodeClient, ClusterTestingError> {
         let i = self.first_follower_index().await?;
         self.client(i).await
     }
@@ -876,6 +876,23 @@ impl ClusterTestingControl {
     ) -> Result<(), ClusterTestingError> {
         self.wait_for(timeout, &format!("commit ≥ {tx_id}"), || async {
             ledger.last_commit_id() >= tx_id
+        })
+        .await
+    }
+
+    /// Wait for `ledger.last_snapshot_id()` to reach `tx_id`. Mirrors
+    /// [`Self::wait_for_commit`] but waits on the snapshot stage —
+    /// the one that actually publishes balance changes that
+    /// `get_balance` reads. Use whenever a test reads a balance after
+    /// a write that targeted a level below `WaitLevel::Snapshot`.
+    pub async fn wait_for_snapshot_id(
+        &self,
+        ledger: &Ledger,
+        tx_id: u64,
+        timeout: Duration,
+    ) -> Result<(), ClusterTestingError> {
+        self.wait_for(timeout, &format!("snapshot ≥ {tx_id}"), || async {
+            ledger.last_snapshot_id() >= tx_id
         })
         .await
     }
@@ -1021,7 +1038,7 @@ async fn wait_for_tcp_release(port: u16, timeout: Duration) -> Result<(), Cluste
 }
 
 async fn ping_role(node_port: u16) -> Option<nproto::NodeRole> {
-    let mut client = NodeClient::connect(format!("http://127.0.0.1:{}", node_port))
+    let mut client = ProtoNodeClient::connect(format!("http://127.0.0.1:{}", node_port))
         .await
         .ok()?;
     let resp = client

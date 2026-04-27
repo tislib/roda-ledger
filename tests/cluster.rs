@@ -13,6 +13,7 @@ mod cluster {
     pub mod append_entries_prev_check_test;
     pub mod basic_test;
     pub mod client_test;
+    pub mod cluster_client_test;
     pub mod config_test;
     pub mod correctness_test;
     pub mod divergence_extended_test;

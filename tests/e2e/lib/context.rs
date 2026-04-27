@@ -8,7 +8,7 @@ use crate::e2e::lib::backend::E2EBackend;
 use crate::e2e::lib::backend_inline::InlineNode;
 use crate::e2e::lib::backend_process::ProcessNode;
 use crate::e2e::lib::profile::Profile;
-use roda_ledger::client::{FunctionInfo, LedgerClient, SubmitResult};
+use roda_ledger::client::{FunctionInfo, NodeClient, SubmitResult};
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use std::net::SocketAddr;
 use tokio::time::{Duration, sleep};
@@ -73,7 +73,7 @@ impl E2EContext {
 
     // -- Node access (private) ----------------------------------------------
 
-    fn client(&self, node: usize) -> &LedgerClient {
+    fn client(&self, node: usize) -> &NodeClient {
         match &self.nodes[node] {
             NodeHandle::Inline(n) => n.client(),
             NodeHandle::Process(n) => n.client(),
@@ -289,7 +289,7 @@ impl E2EContext {
                             }
                             let jitter_ms = (batch_idx as u64 * 7 + 13) % 500;
                             sleep(Duration::from_millis(2000 + jitter_ms)).await;
-                            if let Ok(new_client) = LedgerClient::connect(addr).await {
+                            if let Ok(new_client) = NodeClient::connect(addr).await {
                                 current_client = new_client;
                             }
                         }

@@ -3,7 +3,7 @@
 
 #![cfg(feature = "cluster")]
 
-use roda_ledger::client::{LedgerClient, SubmitResult};
+use roda_ledger::client::{NodeClient, SubmitResult};
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
@@ -26,7 +26,7 @@ async fn deposit_via_current_leader(
     wait: WaitLevel,
 ) -> SubmitResult {
     for attempt in 0..10 {
-        let client: LedgerClient = ctl.leader_client().await.expect("a leader must exist");
+        let client: NodeClient = ctl.leader_client().await.expect("a leader must exist");
         match client
             .deposit_and_wait(account, amount, user_ref, wait)
             .await

@@ -1,13 +1,13 @@
 #![cfg(feature = "cluster")]
 
-use roda_ledger::client::LedgerClient;
+use roda_ledger::client::NodeClient;
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 
 /// Spin up a standalone cluster and connect a high-level client to
 /// it. Returns the harness (so the caller can keep it alive for the
 /// duration of the test) and a connected client.
-async fn setup() -> (ClusterTestingControl, LedgerClient) {
+async fn setup() -> (ClusterTestingControl, NodeClient) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::standalone())
         .await
         .expect("standalone start");
