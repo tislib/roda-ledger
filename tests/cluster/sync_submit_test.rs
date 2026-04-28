@@ -4,7 +4,7 @@ mod tests {
     use roda_ledger::cluster::proto::ledger::{
         Deposit, SubmitAndWaitRequest, SubmitBatchAndWaitRequest, Transfer, WaitLevel, Withdrawal,
     };
-    use roda_ledger::cluster::{ClusterCommitIndex, Server, Term};
+    use roda_ledger::cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use roda_ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
     use std::net::SocketAddr;
@@ -228,11 +228,28 @@ mod tests {
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
-            let server = Server::new(server_ledger, addr, term, cci);
+            let server = Server::new(
+                std::sync::Arc::new(roda_ledger::cluster::LedgerSlot::new(server_ledger)),
+                addr,
+                std::sync::Arc::new(RoleFlag::new(Role::Leader)),
+                term,
+                cci,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            );
             server.run().await.unwrap();
         });
 
-        sleep(Duration::from_millis(100)).await;
+        // Wait for the server to actually bind by polling TCP connect.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("grpc server did not bind {} within 5s", addr);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
 
         (ledger, addr)
     }

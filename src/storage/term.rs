@@ -3,7 +3,10 @@
 //! `TermStorage` owns `{data_dir}/term.log`: fixed 40-byte records laid
 //! out to mirror the WAL record size so tooling can scan both with the
 //! same cadence. Callers (typically `cluster::Term`) handle the
-//! in-memory semantics — this file is just "open, scan, append+fsync".
+//! in-memory semantics — this file is just "open, scan, append, sync".
+//! `append` and `sync` are deliberately separate so test seeds can
+//! batch a single fdatasync after a bulk write while production paths
+//! call `sync` after every record.
 //!
 //! Record layout:
 //!
@@ -32,7 +35,8 @@ pub struct TermRecord {
 }
 
 /// File-backed term log. Holds an append-open `File` and the file path.
-/// All writes are `fdatasync`-guarded; every read is a positional scan.
+/// Writers `append` records and call `sync` to fdatasync; every read
+/// is a positional scan.
 pub struct TermStorage {
     file: File,
     path: PathBuf,
@@ -95,14 +99,22 @@ impl TermStorage {
         Ok(best)
     }
 
-    /// Append `rec` and `fdatasync`. Caller must serialise concurrent
-    /// appenders externally (the cluster layer uses a mutex).
+    /// Append `rec` to the file (no fdatasync — call `sync` for
+    /// durability). Caller must serialise concurrent appenders
+    /// externally (the cluster layer uses a mutex).
     pub fn append(&mut self, rec: TermRecord) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         let bytes = encode_record(rec);
         self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
         Ok(())
+    }
+
+    /// `fdatasync` previously appended records. Production callers
+    /// invoke this after every `append` to guarantee durability before
+    /// returning to the client; bulk seeds in tests call it once after
+    /// the loop.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.file.sync_data()
     }
 }
 
@@ -176,6 +188,7 @@ mod tests {
                 start_tx_id: 100,
             })
             .unwrap();
+        storage.sync().unwrap();
 
         let mut collected = Vec::new();
         storage.scan(|r| collected.push(r)).unwrap();
@@ -215,6 +228,7 @@ mod tests {
                 start_tx_id: 200,
             })
             .unwrap();
+        storage.sync().unwrap();
 
         assert_eq!(
             storage.cold_lookup(5).unwrap(),
@@ -248,6 +262,7 @@ mod tests {
                 start_tx_id: 0,
             })
             .unwrap();
+        storage.sync().unwrap();
         // Append garbage bytes directly to simulate a torn write.
         let path = td.path().join("term.log");
         let mut raw = OpenOptions::new().append(true).open(&path).unwrap();

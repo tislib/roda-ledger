@@ -11,6 +11,7 @@ mod sequencer;
 pub mod snapshot;
 pub mod storage;
 pub mod testing;
+pub mod tools;
 pub mod transaction;
 pub mod transactor;
 pub mod wait_strategy;

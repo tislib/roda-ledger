@@ -54,13 +54,40 @@ impl Seal {
         }
     }
 
-    /// Pre-seal a segment during recovery. Returns the sealed segment id so the
-    /// caller can publish it to the pipeline's seal index.
-    pub fn recover_pre_seal(&mut self, segment: &mut Segment) -> std::io::Result<u32> {
+    /// Pre-seal a segment during recovery. Returns the sealed
+    /// segment id so the caller can publish it to the pipeline's
+    /// seal index.
+    ///
+    /// At recovery time, [`crate::storage::Storage::truncate_wal_above`]
+    /// has already enforced the watermark on disk: any tx above it has
+    /// been physically removed. The segments visible at this point are
+    /// CLOSED, will never be appended to, and are expected to be safe
+    /// to seal. So if `process_seal`'s gate *fires* here — meaning a
+    /// segment's last `tx_id` is still above `seal_watermark` after
+    /// truncation supposedly ran — the cluster invariant has been
+    /// broken. We surface that as an error rather than silently
+    /// leaving an unsealable CLOSED segment behind.
+    pub fn recover_pre_seal(
+        &mut self,
+        segment: &mut Segment,
+        seal_watermark: u64,
+    ) -> std::io::Result<u32> {
         if let Some(mut runner) = self.runner.take() {
-            let id = runner.process_seal(segment)?;
+            let result = runner.process_seal(segment, seal_watermark);
             self.runner = Some(runner);
-            Ok(id)
+            match result? {
+                Some(id) => Ok(id),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "recover_pre_seal: segment {} has last_tx > seal_watermark={} \
+                         after truncate_wal_above ran. The on-disk watermark invariant \
+                         is broken (ADR-0016 §10).",
+                        segment.id(),
+                        seal_watermark,
+                    ),
+                )),
+            }
         } else {
             Err(std::io::Error::other("Seal already started"))
         }
@@ -102,38 +129,82 @@ impl Seal {
 
 impl SealRunner {
     fn run(&mut self, ctx: SealContext) {
-        loop {
+        while ctx.is_running() {
             // A long time nothing happened.
             if let Err(e) = self.seal_pending_segments(&ctx) {
                 error!("Seal: failed to seal pending segments: {}", e);
                 sleep(Duration::from_secs(1));
-            }
-            // Check before sleep to ensure that the last seal is done before shutting down
-            if !ctx.is_running() {
-                break;
             }
             sleep(self.seal_check_internal);
         }
     }
 
     fn seal_pending_segments(&mut self, ctx: &SealContext) -> std::io::Result<()> {
+        // Snapshot the cluster gate once per pass — it advances
+        // monotonically, so re-reading inside the loop would not
+        // change the decision for an already-rejected segment.
+        let seal_watermark = ctx.seal_watermark();
+
         let mut pending = self.storage.list_all_segments()?;
         for segment in pending.iter_mut() {
+            if !ctx.is_running() {
+                break;
+            }
             if segment.status() == SEALED {
                 continue;
             }
-            let id = self.process_seal(segment)?;
-            ctx.set_processed_index(id);
+            match self.process_seal(segment, seal_watermark)? {
+                Some(id) => ctx.set_processed_index(id),
+                None => {
+                    // Cluster gate blocked this segment. Later
+                    // segments have strictly higher tx_ids, so they're
+                    // blocked too — abandon the pass.
+                    break;
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Seal `segment` and update the runner's balance buffer. Returns the
-    /// sealed segment id; the caller is responsible for publishing it to the
-    /// pipeline (either through `SealContext` or directly during recovery).
-    pub fn process_seal(&mut self, segment: &mut Segment) -> std::io::Result<u32> {
+    /// Seal `segment` and update the runner's balance buffer.
+    ///
+    /// Returns `Some(id)` when the segment was actually sealed; the
+    /// caller is responsible for publishing `id` to the pipeline
+    /// (either via `SealContext` or directly during recovery).
+    ///
+    /// Returns `None` when the cluster seal-watermark gate
+    /// (ADR-0016 §10) blocked the seal because `segment_last_tx >
+    /// seal_watermark`. In that case the segment stays CLOSED (no
+    /// `.crc` / `.seal` written) and balances are unchanged. The
+    /// caller must NOT advance the seal index.
+    ///
+    /// The segment is loaded exactly once at the start of this method;
+    /// the gate check then reads the last tx_id directly from the
+    /// loaded WAL via `Segment::last_tx_id_in_wal_data` — no second
+    /// load, no full forward scan.
+    pub fn process_seal(
+        &mut self,
+        segment: &mut Segment,
+        seal_watermark: u64,
+    ) -> std::io::Result<Option<u32>> {
         segment.load()?;
+
+        // ADR-0016 §10 cluster gate. The default `u64::MAX` (standalone
+        // Ledger users, plain `start()`) short-circuits this check.
+        if seal_watermark != u64::MAX {
+            let last_tx = segment.last_tx_id_in_wal_data()?;
+            if last_tx > seal_watermark {
+                debug!(
+                    "Seal: skipping segment {} (last_tx={} > seal_watermark={})",
+                    segment.id(),
+                    last_tx,
+                    seal_watermark
+                );
+                return Ok(None);
+            }
+        }
+
         segment.seal()?;
 
         // Build on-disk transaction and account index files (ADR-008).
@@ -234,6 +305,6 @@ impl SealRunner {
             );
         }
 
-        Ok(segment.id())
+        Ok(Some(segment.id()))
     }
 }

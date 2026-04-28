@@ -361,6 +361,12 @@ message GetPipelineIndexResponse {
   // advertised by the most recent AppendEntries from the leader, clamped to
   // the follower's last_commit_id. 0 in single-node mode.
   uint64 cluster_commit_index = 5;
+
+  // is_leader: true iff the responding node is currently the cluster
+  // leader (its `RoleFlag` reads as `Leader`). Used by cluster-aware
+  // clients to discover which node serves writes without having to
+  // attempt one. Always true in single-node Standalone mode.
+  bool is_leader = 6;
 }
 
 // ---- Transaction query (ADR-008) ----

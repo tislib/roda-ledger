@@ -5,7 +5,7 @@
 //! easiest debugging, but cannot test crash recovery or process isolation.
 
 use crate::e2e::lib::profile::Profile;
-use roda_ledger::client::LedgerClient;
+use roda_ledger::client::NodeClient;
 use roda_ledger::cluster::{ClusterCommitIndex, Server, Term};
 use roda_ledger::ledger::Ledger;
 use std::net::SocketAddr;
@@ -21,7 +21,7 @@ pub struct InlineNode {
     /// The spawned tokio task running `Server::run()`.
     server_task: JoinHandle<()>,
     /// gRPC client connected to this node.
-    client: LedgerClient,
+    client: NodeClient,
     /// Listen address (for diagnostics / logging).
     pub addr: SocketAddr,
 }
@@ -53,7 +53,7 @@ impl InlineNode {
 
         sleep(Duration::from_millis(100)).await;
 
-        let client = LedgerClient::connect(addr)
+        let client = NodeClient::connect(addr)
             .await
             .expect("failed to connect to inline node");
 
@@ -66,7 +66,7 @@ impl InlineNode {
     }
 
     /// Get a reference to the client.
-    pub fn client(&self) -> &LedgerClient {
+    pub fn client(&self) -> &NodeClient {
         &self.client
     }
 }

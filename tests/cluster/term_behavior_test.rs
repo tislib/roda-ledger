@@ -17,8 +17,10 @@
 
 use roda_ledger::cluster::proto::ledger as proto;
 use roda_ledger::cluster::proto::ledger::ledger_server::Ledger as LedgerSvc;
-use roda_ledger::cluster::{ClusterCommitIndex, LedgerHandler, Term};
-use roda_ledger::ledger::{Ledger, LedgerConfig};
+use roda_ledger::cluster::{
+    ClusterTestingConfig, ClusterTestingControl, LedgerHandler, Role, Term,
+};
+use roda_ledger::ledger::Ledger;
 use roda_ledger::storage::{TermRecord, TermStorage};
 use roda_ledger::transaction::Operation;
 use std::sync::Arc;
@@ -28,26 +30,17 @@ use tonic::Request;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/// Build a started `Ledger` + a fresh `Term` log under the same temp dir.
-/// Returns the handler plus the shared `Arc<Term>` so tests can inspect /
-/// mutate the term state.
-fn setup() -> (TempDir, Arc<Ledger>, Arc<Term>, LedgerHandler) {
-    let td = TempDir::new().unwrap();
-    let data_dir = td.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    let mut cfg = LedgerConfig::temp();
-    cfg.storage.data_dir = data_dir.to_string_lossy().into_owned();
-    cfg.storage.temporary = false; // TempDir owns cleanup
-
-    let mut ledger = Ledger::new(cfg);
-    ledger.start().unwrap();
-    let ledger = Arc::new(ledger);
-
-    let term = Arc::new(Term::open_in_dir(&data_dir.to_string_lossy()).unwrap());
-    let cci = ClusterCommitIndex::from_ledger(&ledger);
-    let handler = LedgerHandler::new(ledger.clone(), term.clone(), cci);
-    (td, ledger, term, handler)
+/// Build a single-slot Bare-mode harness with role pinned to Leader
+/// (writable RPCs proceed) and return `(ctl, ledger, term,
+/// handler)`. The harness owns lifetime of the data dir.
+async fn setup() -> (ClusterTestingControl, Arc<Ledger>, Arc<Term>, LedgerHandler) {
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Leader))
+        .await
+        .expect("bare start");
+    let ledger = ctl.ledger(0).expect("ledger");
+    let term = ctl.term(0).expect("term");
+    let handler = ctl.ledger_handler(0).expect("ledger_handler");
+    (ctl, ledger, term, handler)
 }
 
 async fn wait_committed(ledger: &Ledger, tx_id: u64) {
@@ -64,7 +57,7 @@ async fn wait_committed(ledger: &Ledger, tx_id: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ledger_get_transaction_status_returns_not_found_for_never_sequenced() {
-    let (_td, ledger, _term, _handler) = setup();
+    let (_ctl, ledger, _term, _handler) = setup().await;
 
     use roda_ledger::transaction::TransactionStatus as LStatus;
     // tx_id 0 is never assigned by the sequencer.
@@ -104,7 +97,7 @@ async fn ledger_get_transaction_status_returns_not_found_for_never_sequenced() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_status_rpc_returns_tx_not_found_for_unknown_tx() {
-    let (_td, _ledger, _term, handler) = setup();
+    let (_ctl, _ledger, _term, handler) = setup().await;
 
     let resp = handler
         .get_transaction_status(Request::new(proto::GetStatusRequest {
@@ -124,7 +117,7 @@ async fn get_status_rpc_returns_tx_not_found_for_unknown_tx() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_status_rpc_returns_tx_not_found_on_term_mismatch_with_actual_term() {
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
 
     // Open term 1 @ tx=0, submit a tx that lands in term 1, then open
     // term 2 @ tx=2 so term 1 has a known start+end.
@@ -158,7 +151,7 @@ async fn get_status_rpc_returns_tx_not_found_on_term_mismatch_with_actual_term()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_status_rpc_matches_caller_term_when_correct() {
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
 
     term.new_term(0).unwrap();
     let tx1 = ledger.submit(Operation::Deposit {
@@ -191,7 +184,7 @@ async fn get_status_rpc_matches_caller_term_when_correct() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_rpc_returns_not_found_for_unknown_tx_immediately() {
-    let (_td, _ledger, _term, handler) = setup();
+    let (_ctl, _ledger, _term, handler) = setup().await;
 
     // Use a long timeout on the caller side to prove the handler did
     // NOT block — if the wait loop ran at all, the test would stall.
@@ -217,7 +210,7 @@ async fn wait_rpc_returns_not_found_for_unknown_tx_immediately() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_rpc_returns_term_mismatch_with_actual_term() {
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
 
     term.new_term(0).unwrap();
     let tx1 = ledger.submit(Operation::Deposit {
@@ -247,7 +240,7 @@ async fn wait_rpc_returns_term_mismatch_with_actual_term() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_rpc_reached_carries_actual_term() {
-    let (_td, ledger, term, handler) = setup();
+    let (_ctl, ledger, term, handler) = setup().await;
 
     term.new_term(0).unwrap();
     let tx1 = ledger.submit(Operation::Deposit {
@@ -276,6 +269,9 @@ async fn wait_rpc_reached_carries_actual_term() {
 
 #[test]
 fn term_storage_recovers_current_after_reopen() {
+    // Pure storage-layer test — no Ledger / handler involvement,
+    // so it stays on `tempfile::TempDir` rather than going through
+    // the harness.
     let td = TempDir::new().unwrap();
     let dir = td.path().to_string_lossy().into_owned();
 

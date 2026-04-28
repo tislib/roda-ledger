@@ -17,29 +17,40 @@
 
 pub mod cluster_commit;
 pub mod config;
-pub mod follower;
-pub mod leader;
 pub mod ledger_handler;
+pub mod ledger_slot;
+pub(crate) mod lifecycle;
 pub mod mapping;
 pub mod node;
 pub mod node_handler;
-pub mod peer_replication;
-pub mod quorum;
+pub mod raft;
 pub mod server;
-pub mod term;
+pub mod supervisor;
+pub mod testing_cluster;
 
-pub use crate::storage::TermRecord;
+pub use crate::storage::{TermRecord, VoteRecord};
 pub use cluster_commit::ClusterCommitIndex;
-pub use config::{Config, ConfigError, Mode, NodeServerSection, PeerConfig, ServerSection};
-pub use follower::{Follower, FollowerHandles};
-pub use leader::{Leader, LeaderHandles};
+pub use config::{
+    ClusterNodeSection, ClusterSection, Config, ConfigError, PeerConfig, ServerSection,
+};
 pub use ledger_handler::LedgerHandler;
+pub use ledger_slot::LedgerSlot;
 pub use node::{ClusterNode, Handles};
-pub use node_handler::NodeHandler;
-pub use peer_replication::{PeerReplication, ReplicationParams};
-pub use quorum::Quorum;
+pub use node_handler::{NodeHandler, NodeHandlerCore};
 pub use server::{NodeServerRuntime, Server};
-pub use term::Term;
+pub use supervisor::{RoleSupervisor, SupervisorHandles};
+pub use testing_cluster::{
+    ClusterTestingConfig, ClusterTestingControl, ClusterTestingError, ClusterTestingMode,
+};
+
+// Backwards-compat re-exports of the `raft::` public surface. New code
+// should prefer the canonical path `crate::cluster::raft::{Term, Vote, …}`;
+// these aliases exist so external test/bench callers and downstream
+// consumers don't need to be updated alongside the internal split.
+pub use raft::{
+    ElectionOutcome, ElectionTimer, ElectionTimerConfig, Leader, LeaderHandles, PeerReplication,
+    Quorum, ReplicationParams, Role, RoleFlag, Term, Vote,
+};
 
 /// Generated protobuf types for both gRPC services owned by the cluster:
 ///

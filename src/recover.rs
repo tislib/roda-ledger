@@ -360,8 +360,31 @@ impl<'r> Recover<'r> {
         false
     }
 
-    pub fn recover(&mut self) -> Result<(), std::io::Error> {
-        info!("Starting recovery...");
+    /// Watermark-bounded recovery. The unbounded path is recovered by
+    /// passing `watermark = u64::MAX` (what `Ledger::start` does);
+    /// `Ledger::start_with_recovery_until` (ADR-0016 §9) passes a
+    /// finite watermark. Replays snapshot + WAL up to and including
+    /// `watermark` only; records whose `tx_id > watermark` are visited
+    /// but not applied.
+    ///
+    /// Snapshot selection picks the latest sealed snapshot whose
+    /// `last_tx_id <= watermark`, falling back to genesis (no
+    /// snapshot) when none qualify. Pipeline indices are clamped to
+    /// `min(replayed_last_tx, watermark)`.
+    ///
+    /// The watermark applies only to **transactional** records
+    /// (`Metadata`, `Entry`, `Link`). `FunctionRegistered` records are
+    /// applied or skipped based on whether the most recently observed
+    /// `Metadata` had `tx_id > watermark` — i.e. function registrations
+    /// that occurred *after* the last accepted transaction are dropped
+    /// alongside the diverged tail.
+    ///
+    /// Caller (`Ledger::start_with_recovery_until`) is expected to have
+    /// already invoked `Storage::truncate_wal_above(watermark)`. Even
+    /// without that, `recover_until` is correct on its own — it simply
+    /// won't physically reclaim the disk space of the rejected tail.
+    pub fn recover_until(&mut self, watermark: u64) -> Result<(), std::io::Error> {
+        info!("Starting recovery (watermark={})...", watermark);
 
         // locate segments
         self.segments = self.storage.list_all_segments().map_err(|e| {
@@ -371,13 +394,15 @@ impl<'r> Recover<'r> {
             )
         })?;
 
-        // find the latest snapshot
-        let latest_snapshot_segment_id = self.locate_latest_snapshot_segment_id().map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to locate latest snapshot segment: {}", e),
-            )
-        })?;
+        // find the latest snapshot whose covered_up_to_tx ≤ watermark
+        let latest_snapshot_segment_id = self
+            .locate_latest_snapshot_segment_id_for_watermark(watermark)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to locate latest snapshot segment: {}", e),
+                )
+            })?;
         let mut last_tx_id = 0;
         let mut recover_balances = HashMap::new();
 
@@ -431,7 +456,15 @@ impl<'r> Recover<'r> {
 
             // process the segments after snapshot
             if segment.status() != SEALED {
-                let sealed_id = self.seal.recover_pre_seal(segment).map_err(|e| {
+                // Pass the seal-watermark through so `recover_pre_seal`
+                // can sanity-check it: if a closed segment's last tx
+                // is somehow still above the watermark at recovery
+                // time, truncation failed to remove the diverged tail
+                // and we must abort rather than seal unsafe content
+                // (ADR-0016 §10). On healthy data this is always a
+                // pass-through.
+                let sw = self.pipeline.get_seal_watermark();
+                let sealed_id = self.seal.recover_pre_seal(segment, sw).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
                         format!(
@@ -452,6 +485,13 @@ impl<'r> Recover<'r> {
             })?;
 
             let mut segment_recover_tx_id = 0u64;
+            // `skipping_tx` becomes true once we observe a `Metadata`
+            // with `tx_id > watermark`. Subsequent `Entry`/`Link`
+            // records belong to that rejected transaction and must be
+            // dropped. `FunctionRegistered` records are also dropped
+            // once we are past the last accepted transaction — they
+            // occurred temporally after a rejected tx (ADR-0016 §9).
+            let mut skipping_tx = false;
             // Borrow the fields we need through local refs so the closure
             // captures them by shared ref (WASM side) and mutable ref
             // (snapshot side) without double-borrowing `self`.
@@ -462,18 +502,32 @@ impl<'r> Recover<'r> {
             segment
                 .visit_wal_records(|record| match record {
                     WalEntry::Metadata(metadata) => {
+                        if metadata.tx_id > watermark {
+                            skipping_tx = true;
+                            return;
+                        }
+                        skipping_tx = false;
                         last_tx_id = metadata.tx_id;
                         segment_recover_tx_id = metadata.tx_id;
                         snapshot.recover_index_tx_metadata(metadata);
                     }
                     WalEntry::Entry(entry) => {
+                        if skipping_tx {
+                            return;
+                        }
                         recover_balances.insert(entry.account_id, entry.computed_balance);
                         snapshot.recover_index_tx_entry(entry);
                     }
                     WalEntry::Link(link) => {
+                        if skipping_tx {
+                            return;
+                        }
                         snapshot.recover_index_tx_link(segment_recover_tx_id, link);
                     }
                     WalEntry::FunctionRegistered(f) => {
+                        if skipping_tx {
+                            return;
+                        }
                         if function_apply_err.is_none()
                             && let Err(e) = apply_function_registered(storage, wasm_runtime, f)
                         {
@@ -502,6 +556,8 @@ impl<'r> Recover<'r> {
             std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
         })?;
         let mut current_recover_tx_id = 0u64;
+        // Same skipping discipline as the sealed-segment loop above.
+        let mut skipping_tx = false;
         let storage = self.storage;
         let wasm_runtime = self.wasm_runtime.as_ref();
         let snapshot = &mut self.snapshot;
@@ -510,6 +566,11 @@ impl<'r> Recover<'r> {
         active_segment
             .visit_wal_records(|record| match record {
                 WalEntry::Metadata(metadata) => {
+                    if metadata.tx_id > watermark {
+                        skipping_tx = true;
+                        return;
+                    }
+                    skipping_tx = false;
                     last_tx_id = metadata.tx_id;
                     current_recover_tx_id = metadata.tx_id;
                     snapshot.recover_index_tx_metadata(metadata);
@@ -524,13 +585,22 @@ impl<'r> Recover<'r> {
                     }
                 }
                 WalEntry::Entry(entry) => {
+                    if skipping_tx {
+                        return;
+                    }
                     recover_balances.insert(entry.account_id, entry.computed_balance);
                     snapshot.recover_index_tx_entry(entry);
                 }
                 WalEntry::Link(link) => {
+                    if skipping_tx {
+                        return;
+                    }
                     snapshot.recover_index_tx_link(current_recover_tx_id, link);
                 }
                 WalEntry::FunctionRegistered(f) => {
+                    if skipping_tx {
+                        return;
+                    }
                     if function_apply_err.is_none()
                         && let Err(e) = apply_function_registered(storage, wasm_runtime, f)
                     {
@@ -552,13 +622,20 @@ impl<'r> Recover<'r> {
         self.transactor.recover_balances(&recover_balances);
         self.snapshot.recover_balances(&recover_balances);
 
-        // Restore last tx ids in the pipeline indexes.
-        self.pipeline.set_compute_index(last_tx_id);
-        self.pipeline.set_snapshot_index(last_tx_id);
-        self.pipeline.set_commit_index(last_tx_id);
-        self.pipeline.set_sequencer_next_id(last_tx_id + 1);
+        // Clamp pipeline indices to min(replayed, watermark). When the
+        // watermark is u64::MAX (the unbounded default used by `recover`),
+        // this is a no-op.
+        let effective_last = last_tx_id.min(watermark);
+        self.pipeline.set_compute_index(effective_last);
+        self.pipeline.set_snapshot_index(effective_last);
+        self.pipeline.set_commit_index(effective_last);
+        self.pipeline
+            .set_sequencer_next_id(effective_last.saturating_add(1));
 
-        info!("Recovery completed successfully.");
+        info!(
+            "Recovery completed successfully (last_tx_id={}, watermark={}).",
+            effective_last, watermark
+        );
 
         Ok(())
     }
@@ -573,6 +650,40 @@ impl<'r> Recover<'r> {
         }
 
         Ok(last_snapshot_segment_id)
+    }
+
+    /// Watermark-aware variant of `locate_latest_snapshot_segment_id`
+    /// (ADR-0016 §10). Returns the highest `segment.id()` with a
+    /// snapshot whose `SnapshotData::last_tx_id <= watermark`. Falls
+    /// back to `0` (no snapshot, replay from genesis) when none qualify.
+    ///
+    /// `watermark == u64::MAX` reduces to the unbounded selector and
+    /// preserves the original `recover()` behaviour.
+    fn locate_latest_snapshot_segment_id_for_watermark(
+        &self,
+        watermark: u64,
+    ) -> Result<u32, std::io::Error> {
+        if watermark == u64::MAX {
+            return self.locate_latest_snapshot_segment_id();
+        }
+        let mut best: u32 = 0;
+        for segment in self.segments.iter() {
+            if !segment.has_snapshot() {
+                continue;
+            }
+            // load_snapshot is cheap (small file); errors are tolerated
+            // — a corrupt snapshot just gets skipped, falling back to
+            // an earlier one or genesis.
+            match segment.load_snapshot() {
+                Ok(Some(data)) if data.last_tx_id <= watermark => {
+                    if segment.id() >= best {
+                        best = segment.id();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(best)
     }
 
     /// Load the most recent function snapshot (if any) and install its

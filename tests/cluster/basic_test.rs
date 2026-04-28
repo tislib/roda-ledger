@@ -7,128 +7,49 @@
 
 #![cfg(feature = "cluster")]
 
-use lproto::submit_operation_request::Operation;
-use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
-use roda_ledger::cluster::proto::ledger::{self as lproto, Deposit, SubmitOperationRequest};
-use roda_ledger::cluster::{self, ClusterNode, PeerConfig, ServerSection};
-use roda_ledger::config::{LedgerConfig, StorageConfig};
+use roda_ledger::cluster::proto::ledger::WaitLevel;
+use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
-use roda_ledger::wait_strategy::WaitStrategy;
-use spdlog::Level;
-use std::net::TcpListener;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use std::time::Duration;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
-fn tmp_dir(name: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut d = std::env::current_dir().unwrap();
-    d.push(format!("temp_cluster_{}_{}", name, nanos));
-    d.to_string_lossy().into_owned()
-}
-
-fn ledger_cfg(data_dir: &str, tx_per_seg: u64) -> LedgerConfig {
-    LedgerConfig {
-        storage: StorageConfig {
-            data_dir: data_dir.to_string(),
-            temporary: true,
-            transaction_count_per_segment: tx_per_seg,
-            snapshot_frequency: 2,
-        },
-        wait_strategy: WaitStrategy::Balanced,
-        log_level: Level::Critical,
-        seal_check_internal: Duration::from_millis(10),
-        ..LedgerConfig::default()
-    }
-}
-
+// Stage 4: with the Candidate loop landed, multi-node clusters
+// elect a leader from cold boot — no static role is assigned. The
+// follower no longer rejects writes deterministically (whichever
+// node loses the election becomes the follower), so this test
+// drives writes against the elected leader, identified via the
+// `Ping` RPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_leader_replicates_to_follower() {
-    let leader_client_port = free_port();
-    let leader_node_port = free_port();
-    let follower_client_port = free_port();
-    let follower_node_port = free_port();
-
-    let leader_cfg = cluster::Config {
-        mode: cluster::Mode::Leader,
-        node_id: 1,
-        term: 1,
-        peers: vec![PeerConfig {
-            id: 2,
-            node_addr: format!("http://127.0.0.1:{}", follower_node_port),
-        }],
-        server: ServerSection {
-            host: "127.0.0.1".to_string(),
-            port: leader_client_port,
-            ..Default::default()
-        },
-        node: roda_ledger::cluster::config::NodeServerSection {
-            host: "127.0.0.1".to_string(),
-            port: leader_node_port,
-        },
-        ledger: ledger_cfg(&tmp_dir("leader"), 10_000_000),
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        label: "basic".to_string(),
         replication_poll_ms: 2,
         append_entries_max_bytes: 256 * 1024,
-    };
+        transaction_count_per_segment: 20_000,
+        snapshot_frequency: 2,
+        ..ClusterTestingConfig::cluster(2)
+    })
+    .await
+    .expect("start");
 
-    let follower_cfg = cluster::Config {
-        mode: cluster::Mode::Follower,
-        node_id: 2,
-        term: 1,
-        peers: Vec::new(),
-        server: ServerSection {
-            host: "127.0.0.1".to_string(),
-            port: follower_client_port,
-            ..Default::default()
-        },
-        node: roda_ledger::cluster::config::NodeServerSection {
-            host: "127.0.0.1".to_string(),
-            port: follower_node_port,
-        },
-        ledger: ledger_cfg(&tmp_dir("follower"), 20_000),
-        replication_poll_ms: 2,
-        append_entries_max_bytes: 256 * 1024,
-    };
+    // ── Wait for an election to settle on a unique Leader ───────────────
+    let leader_idx = ctl
+        .wait_for_leader(Duration::from_secs(5))
+        .await
+        .expect("leader");
+    eprintln!(
+        "election settled: node_id={} is leader",
+        ctl.node_id(leader_idx).unwrap()
+    );
 
-    // Follower first so its node port is listening when the leader's replication
-    // task attempts to connect.
-    let follower = ClusterNode::new(follower_cfg).expect("follower ledger");
-    let follower_handles = follower.run().await.expect("follower run");
-
-    let leader = ClusterNode::new(leader_cfg).expect("leader ledger");
-    let leader_handles = leader.run().await.expect("leader run");
-
-    // Wait for both gRPC servers to be bound.
-    wait_for_tcp(format!("127.0.0.1:{}", leader_client_port)).await;
-    wait_for_tcp(format!("127.0.0.1:{}", follower_client_port)).await;
-    wait_for_tcp(format!("127.0.0.1:{}", follower_node_port)).await;
-
-    // ── Connect clients to both Ledger servers ───────────────────────────
-    let mut leader_client =
-        LedgerClient::connect(format!("http://127.0.0.1:{}", leader_client_port))
-            .await
-            .expect("leader client connect");
-    let mut follower_client =
-        LedgerClient::connect(format!("http://127.0.0.1:{}", follower_client_port))
-            .await
-            .expect("follower client connect");
-
-    // ── Follower rejects writes ─────────────────────────────────────────
-    let write_err = follower_client
-        .submit_operation(SubmitOperationRequest {
-            operation: Some(Operation::Deposit(Deposit {
-                account: 1,
-                amount: 10,
-                user_ref: 0,
-            })),
-        })
+    // ── Follower rejects writes (negative-path uses raw escape hatch) ──
+    let follower_idx = ctl
+        .first_follower_index()
+        .await
+        .expect("follower index");
+    let write_err = ctl
+        .raw_client_for_slot(follower_idx)
+        .expect("raw follower client")
+        .deposit(1, 10, 0)
         .await
         .expect_err("follower must reject writes");
     assert_eq!(
@@ -137,89 +58,32 @@ async fn cluster_leader_replicates_to_follower() {
         "follower should return FAILED_PRECONDITION on submit"
     );
 
-    // ── Drive writes on the leader ──────────────────────────────────────
+    // ── Drive writes on the leader (bumps last_tx_id internally) ────────
     let account = 7u64;
     let amount = 100u64;
     let total_tx = 200u64;
-
-    for _ in 0..total_tx {
-        leader_client
-            .submit_operation(SubmitOperationRequest {
-                operation: Some(Operation::Deposit(Deposit {
-                    account,
-                    amount,
-                    user_ref: 0,
-                })),
-            })
-            .await
-            .expect("leader submit");
+    let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|_| (account, amount, 0u64)).collect();
+    let results = ctl
+        .deposit_batch_and_wait(&deposits, WaitLevel::ClusterCommit)
+        .await
+        .expect("leader batch deposit");
+    assert_eq!(results.len(), total_tx as usize);
+    for r in &results {
+        assert_eq!(r.fail_reason, 0, "leader deposit must succeed");
     }
 
-    // ── Wait for follower to catch up ────────────────────────────────────
-    let leader_ledger = leader.ledger();
-    let follower_ledger = follower.ledger();
-
-    // Leader commit first.
-    wait_for(Duration::from_secs(30), "leader commit_index", || {
-        leader_ledger.last_commit_id() >= total_tx
-    })
-    .await;
-
-    // Follower replication lag → commit.
-    wait_for(Duration::from_secs(60), "follower commit_index", || {
-        follower_ledger.last_commit_id() >= leader_ledger.last_commit_id()
-    })
-    .await;
-
-    wait_for(Duration::from_secs(60), "follower snapshot_index", || {
-        follower_ledger.last_snapshot_id() >= leader_ledger.last_snapshot_id()
-    })
-    .await;
-
-    // ── Verification: balances match ─────────────────────────────────────
-    assert_eq!(
-        leader_ledger.get_balance(account),
-        follower_ledger.get_balance(account),
-        "user account balance must match between leader and follower"
-    );
-    assert_eq!(
-        leader_ledger.get_balance(SYSTEM_ACCOUNT_ID),
-        follower_ledger.get_balance(SYSTEM_ACCOUNT_ID),
-        "system account balance must match"
-    );
+    // ── Verification: leader and follower converge on the same balance ──
+    // `require_balance{,_on}` blocks each node's snapshot watermark
+    // until it has caught up to last_tx_id, then asserts.
     let expected_abs = (total_tx * amount) as i64;
-    assert_eq!(leader_ledger.get_balance(account).abs(), expected_abs);
-    assert_eq!(
-        leader_ledger.get_balance(account) + leader_ledger.get_balance(SYSTEM_ACCOUNT_ID),
-        0
-    );
+    ctl.require_balance(account, expected_abs).await;
+    ctl.require_balance_on(follower_idx, account, expected_abs)
+        .await;
+    ctl.require_balance(SYSTEM_ACCOUNT_ID, -expected_abs).await;
+    ctl.require_balance_on(follower_idx, SYSTEM_ACCOUNT_ID, -expected_abs)
+        .await;
+    ctl.require_zero_sum(&[account, SYSTEM_ACCOUNT_ID]).await;
 
     // ── Shutdown ────────────────────────────────────────────────────────
-    leader_handles.abort();
-    follower_handles.abort();
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-async fn wait_for_tcp(addr: String) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("tcp {} never bound", addr);
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn wait_for<F: FnMut() -> bool>(timeout: Duration, label: &str, mut f: F) {
-    let deadline = Instant::now() + timeout;
-    while !f() {
-        if Instant::now() >= deadline {
-            panic!("timeout waiting for: {label}");
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
+    ctl.stop_all().await;
 }

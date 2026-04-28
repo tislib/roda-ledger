@@ -33,7 +33,7 @@ pub struct Term {
     ring: RwLock<TermRing>,
     /// Writer serialisation. Ordering:
     ///     1. take `writer`,
-    ///     2. `storage.append` (fdatasync),
+    ///     2. `storage.append` + `storage.sync` (fdatasync),
     ///     3. ring write-lock + push,
     ///     4. atomic store.
     writer: Mutex<TermStorage>,
@@ -190,6 +190,7 @@ impl Term {
             start_tx_id,
         };
         writer.append(rec)?;
+        writer.sync()?;
         {
             let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
             ring.push(rec);
@@ -202,6 +203,52 @@ impl Term {
             writer.path().display()
         );
         Ok(next)
+    }
+
+    /// Candidate-on-Won path: durably commit a term boundary at a
+    /// **specific** expected term. Unlike [`Self::new_term`], which
+    /// always increments, this fails fast if `current` advanced
+    /// concurrently (e.g. a `request_vote` / `AppendEntries` handler
+    /// observed a higher term while the election round was in flight).
+    ///
+    /// - `Ok(true)`  — wrote `(expected, start_tx_id)` durably.
+    /// - `Ok(false)` — `current >= expected`; treat as step-down. No
+    ///                  record was written.
+    /// - `Err(_)`    — `current + 1 < expected` (caller logic error;
+    ///                  must `observe` to catch up first), or I/O.
+    pub fn commit_term(&self, expected: u64, start_tx_id: u64) -> io::Result<bool> {
+        let mut writer = self.writer.lock().expect("term: writer mutex poisoned");
+        let current = self.current.load(Ordering::Acquire);
+        if current >= expected {
+            return Ok(false);
+        }
+        if current + 1 != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "term: commit_term current={} expected={} (caller must observe first)",
+                    current, expected
+                ),
+            ));
+        }
+        let rec = TermRecord {
+            term: expected,
+            start_tx_id,
+        };
+        writer.append(rec)?;
+        writer.sync()?;
+        {
+            let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
+            ring.push(rec);
+        }
+        self.current.store(expected, Ordering::Release);
+        info!(
+            "term: committed term {} at start_tx_id={} ({})",
+            expected,
+            start_tx_id,
+            writer.path().display()
+        );
+        Ok(true)
     }
 
     /// Follower path: record `term` observed from an incoming
@@ -227,6 +274,7 @@ impl Term {
 
         let rec = TermRecord { term, start_tx_id };
         writer.append(rec)?;
+        writer.sync()?;
         {
             let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
             ring.push(rec);
@@ -318,6 +366,54 @@ mod tests {
     }
 
     #[test]
+    fn commit_term_writes_at_expected_when_current_plus_one() {
+        let (_td, term) = open_in_tmp();
+        assert_eq!(term.get_current_term(), 0);
+        assert_eq!(term.commit_term(1, 42).unwrap(), true);
+        assert_eq!(term.get_current_term(), 1);
+        assert_eq!(
+            term.last_record(),
+            Some(TermRecord {
+                term: 1,
+                start_tx_id: 42,
+            })
+        );
+        // Chained commit at next term still works.
+        assert_eq!(term.commit_term(2, 99).unwrap(), true);
+        assert_eq!(term.get_current_term(), 2);
+    }
+
+    #[test]
+    fn commit_term_returns_false_when_already_advanced() {
+        let (_td, term) = open_in_tmp();
+        // Simulate a concurrent observer that raced ahead to term 5.
+        term.observe(5, 100).unwrap();
+        assert_eq!(term.commit_term(3, 50).unwrap(), false);
+        // No new record written; current stays at 5.
+        assert_eq!(term.get_current_term(), 5);
+        assert_eq!(
+            term.last_record(),
+            Some(TermRecord {
+                term: 5,
+                start_tx_id: 100,
+            })
+        );
+        // Equal-to-current also returns false (would not advance).
+        assert_eq!(term.commit_term(5, 200).unwrap(), false);
+        assert_eq!(term.get_current_term(), 5);
+    }
+
+    #[test]
+    fn commit_term_errors_on_lag() {
+        let (_td, term) = open_in_tmp();
+        // current=0, expected=5 — caller is too far ahead; must observe first.
+        let err = term.commit_term(5, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(term.get_current_term(), 0);
+        assert_eq!(term.last_record(), None);
+    }
+
+    #[test]
     fn reopen_recovers_current_and_ring() {
         let td = TempDir::new().unwrap();
         let dir = td.path().to_string_lossy().into_owned();
@@ -348,7 +444,9 @@ mod tests {
         let dir = td.path().to_string_lossy().into_owned();
 
         // Write RING_CAP + 50 records via the low-level TermStorage so
-        // the in-memory ring will drop the first 50 on load.
+        // the in-memory ring will drop the first 50 on load. One sync
+        // after the loop is enough — the test only cares that records
+        // are durable before the reopen below.
         {
             let mut storage = TermStorage::open(&dir).unwrap();
             let total = RING_CAP as u64 + 50;
@@ -360,6 +458,7 @@ mod tests {
                     })
                     .unwrap();
             }
+            storage.sync().unwrap();
         }
 
         let term = Term::open_in_dir(&dir).unwrap();
