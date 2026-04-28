@@ -445,20 +445,14 @@ impl RoleSupervisor {
                                 role.set(Role::Leader);
                             }
                             Ok(ElectionOutcome::HigherTermSeen { observed_term }) => {
-                                if let Err(e) = term
-                                    .observe(observed_term, ledger_slot.ledger().last_commit_id())
-                                {
-                                    warn!(
-                                        "supervisor: term.observe({}) on step-down failed: {}",
-                                        observed_term, e
-                                    );
-                                }
-                                if let Err(e) = vote.observe_term(observed_term) {
-                                    warn!(
-                                        "supervisor: vote.observe_term({}) on step-down failed: {}",
-                                        observed_term, e
-                                    );
-                                }
+                                // The candidate has already durably
+                                // observed `observed_term` on both
+                                // `term` and `vote` before returning.
+                                info!(
+                                    "supervisor: node_id={} stepping down on higher term {}",
+                                    config.node_id(),
+                                    observed_term
+                                );
                                 role.set(Role::Initializing);
                             }
                             Ok(ElectionOutcome::Lost) => {

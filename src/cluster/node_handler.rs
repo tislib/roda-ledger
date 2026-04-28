@@ -439,7 +439,15 @@ impl Node for NodeHandler {
             }));
         }
 
-        // 2. Higher-term observation: durably advance our term and
+        // 2. Snapshot our log's last-entry coordinates **before** any
+        // higher-term observation. The Raft §5.4.1 up-to-date check
+        // compares the candidate's last log entry against ours, and
+        // "ours" must reflect the committed log — not a record we
+        // are about to write because of *this* RequestVote.
+        let our_last_tx_id = core.ledger.ledger().last_commit_id();
+        let our_last_term = core.term.last_record().map(|r| r.term).unwrap_or(0);
+
+        // 3. Higher-term observation: durably advance our term and
         // clear `voted_for` so we can grant in this new term. Both
         // the term log (`Term::observe`) and the vote log
         // (`Vote::observe_term`) are fdatasync'd before we proceed.
@@ -469,7 +477,7 @@ impl Node for NodeHandler {
             }
         }
 
-        // 3. Already-voted check. If we voted for someone else in
+        // 4. Already-voted check. If we voted for someone else in
         // this term, reject. If we voted for *this* candidate
         // (idempotent retry), the vote-grant path below will
         // observe that and return success.
@@ -482,11 +490,10 @@ impl Node for NodeHandler {
             }));
         }
 
-        // 4. Up-to-date-log check (Raft §5.4.1). The candidate must
+        // 5. Up-to-date-log check (Raft §5.4.1). The candidate must
         // have a log at least as up-to-date as ours: their
-        // `(last_term, last_tx_id)` must be ≥ ours by lex order.
-        let our_last_tx_id = core.ledger.ledger().last_commit_id();
-        let our_last_term = core.term.last_record().map(|r| r.term).unwrap_or(0);
+        // `(last_term, last_tx_id)` must be ≥ ours by lex order. Uses
+        // the snapshot from step 2.
         let candidate_more_up_to_date =
             (req.last_term, req.last_tx_id) >= (our_last_term, our_last_tx_id);
         if !candidate_more_up_to_date {
@@ -496,7 +503,7 @@ impl Node for NodeHandler {
             }));
         }
 
-        // 5. Grant — durably persist the vote *before* we reply.
+        // 6. Grant — durably persist the vote *before* we reply.
         // On a clean grant the same call re-applies on retry
         // (idempotent for the same `candidate_id`).
         match core.vote.vote(req.term, req.candidate_id) {

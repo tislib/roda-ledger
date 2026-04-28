@@ -4,18 +4,23 @@
 //! timer expires while the node is in `Initializing` (or `Follower`,
 //! once that role is reachable post-Stage 4 step-down). One round:
 //!
-//! 1. Bump our durable term: `term.new_term(start_tx)`.
-//! 2. Persist self-vote: `vote.vote(new_term, self_id)`.
+//! 1. Compute `new_term` in memory (no `term.log` write yet).
+//! 2. Persist the term claim via `vote.vote(new_term, self_id)` —
+//!    Raft §5.2: a candidate's claim to a new term is recorded by
+//!    voting for itself.
 //! 3. Fan out `RequestVote` to every other peer in parallel.
 //! 4. Tally responses against the cluster-wide majority. Three
 //!    outcomes:
-//!    - **Won** — strict majority granted; promote to Leader.
+//!    - **Won** — strict majority granted; commit the durable term
+//!      boundary via `term.commit_term(new_term, start_tx)` and
+//!      promote to Leader.
 //!    - **HigherTermSeen(term)** — any peer reported a term above
-//!      our new term; step down to Initializing and observe the
-//!      new term.
+//!      ours; observe it locally (`term.observe` + `vote.observe_term`)
+//!      and step down to Initializing.
 //!    - **Lost** — neither won nor saw a higher term within a
 //!      bounded election deadline; supervisor will spin Initializing
-//!      again with a fresh randomised election timeout.
+//!      again with a fresh randomised election timeout. The term
+//!      log is **not** mutated by a lost round.
 
 use super::peer_replication::connect;
 use super::{Term, Vote};
@@ -60,49 +65,58 @@ pub async fn run_election_round(
         .expect("run_election_round requires a clustered config");
     let self_id = config.node_id();
 
-    // 1. Bump our durable term. `start_tx_id` is the first tx_id we
-    // would write if we won — Raft §5.2 says elections claim a
-    // fresh term, and our `Term::new_term` records the boundary
-    // tx_id that the new term covers.
-    let start_tx = ledger.last_commit_id();
-    let new_term = term.new_term(start_tx)?;
-    info!(
-        "candidate: node_id={} bumped to term {} at start_tx_id={}",
-        self_id, new_term, start_tx
-    );
+    // 1. Compute `new_term` in memory only. Use max-of-(term, vote)
+    // because `vote.current_term` may legitimately lead `term.current`
+    // after an asymmetric step-down (e.g. supervisor's `term.observe`
+    // succeeded but `vote.observe_term` failed in a previous round, or
+    // vice versa). We do **not** touch `term.log` here — that record
+    // is only legitimate if we actually win this round. Lost rounds
+    // must not pollute the durable term-boundary log.
+    let new_term = term
+        .get_current_term()
+        .max(vote.get_current_term())
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("candidate: u64 term overflow"))?;
 
-    // 2. Durable self-vote. `vote.vote` fdatasyncs `vote.log`
-    // before returning. Granting our own vote here is one of the
-    // votes counted toward the majority below.
-    let self_vote_granted = vote.vote(new_term, self_id)?;
-    if !self_vote_granted {
-        // We had voted for someone else in this term already. This
-        // shouldn't happen on a fresh term-bump (we just minted
-        // `new_term`) but guard against weird `Vote` interactions.
+    // 2. Persist the term claim via the vote log — Raft §5.2.
+    // `vote.vote` refuses (`Ok(false)`) if a concurrent observer
+    // already pushed `vote.current_term` past `new_term`, in which
+    // case we abandon this round.
+    if !vote.vote(new_term, self_id)? {
         warn!(
             "candidate: node_id={} could not self-vote in term {}; aborting round",
             self_id, new_term
         );
         return Ok(ElectionOutcome::Lost);
     }
+    info!(
+        "candidate: node_id={} claimed term {}",
+        self_id, new_term
+    );
 
     let majority = cluster.peers.len() / 2 + 1;
     let mut granted_count: usize = 1; // self
-    let mut highest_observed_term = new_term;
 
-    // Fast path: single-node cluster (zero other peers) —
-    // self-vote is already a majority of 1.
+    // Fast path: single-node cluster — self-vote is already a
+    // majority of 1.
     let other_peers: Vec<PeerConfig> = config.other_peers().cloned().collect();
     if other_peers.is_empty() {
-        return Ok(ElectionOutcome::Won {
-            elected_term: new_term,
-        });
+        return commit_won(term, ledger, vote, new_term);
     }
 
     // 3. Fan out RequestVote in parallel.
     let our_last_tx_id = ledger.last_commit_id();
-    let our_last_term = term.last_record().map(|r| r.term).unwrap_or(new_term);
-    let rpc_max_bytes = cluster.append_entries_max_bytes * 2 + 4 * 1024;
+    // Match the follower's default at `node_handler.rs::request_vote`
+    // (the §5.4.1 up-to-date check). An empty term log means term 0.
+    let our_last_term = term.last_record().map(|r| r.term).unwrap_or(0);
+    // RequestVote is four u64s on the wire. A small fixed cap is
+    // appropriate; sizing off `append_entries_max_bytes` would be
+    // misleading.
+    let rpc_max_bytes = 64 * 1024;
+    // Per-RPC timeout: a single stuck connect should not burn the
+    // whole round. Half the round deadline leaves headroom for the
+    // collect loop to drain.
+    let per_rpc_deadline = round_deadline / 2;
 
     let mut tasks: JoinSet<RoundReply> = JoinSet::new();
     for peer in other_peers {
@@ -112,11 +126,18 @@ pub async fn run_election_round(
             last_tx_id: our_last_tx_id,
             last_term: our_last_term,
         };
-        tasks.spawn(async move { request_vote_one(peer, req, rpc_max_bytes).await });
+        tasks.spawn(async move {
+            tokio::time::timeout(per_rpc_deadline, request_vote_one(peer, req, rpc_max_bytes))
+                .await
+                .unwrap_or(RoundReply::TransportError)
+        });
     }
 
     // 4. Collect with an overall deadline. We stop early on
-    // majority-won OR higher-term-seen.
+    // majority-won OR higher-term-seen. We deliberately do not
+    // return `ElectionOutcome` from inside the async block — that
+    // would force `term`/`vote`/`ledger` to be moved in. Use a
+    // primitive `RoundResult` and dispatch after the await.
     let collect = async {
         while let Some(joined) = tasks.join_next().await {
             let reply = match joined {
@@ -128,28 +149,27 @@ pub async fn run_election_round(
             };
             match reply {
                 RoundReply::Granted { peer_term } => {
-                    if peer_term > highest_observed_term {
-                        // Edge case: a peer granted under a higher
-                        // term than ours? Treat as step-down signal.
-                        return ElectionOutcome::HigherTermSeen {
-                            observed_term: peer_term,
-                        };
+                    // A peer granting while reporting a higher term
+                    // is protocol-violating: a grant means "I voted
+                    // for you in your term", so the peer's term must
+                    // not exceed ours. Treat as no-vote noise rather
+                    // than letting one misbehaving peer torpedo a
+                    // healthy election.
+                    if peer_term > new_term {
+                        warn!(
+                            "candidate: peer granted with term {} > {} — ignoring as protocol violation",
+                            peer_term, new_term
+                        );
+                        continue;
                     }
                     granted_count += 1;
                     if granted_count >= majority {
-                        return ElectionOutcome::Won {
-                            elected_term: new_term,
-                        };
+                        return RoundResult::Won;
                     }
                 }
                 RoundReply::Refused { peer_term } => {
-                    if peer_term > highest_observed_term {
-                        highest_observed_term = peer_term;
-                    }
                     if peer_term > new_term {
-                        return ElectionOutcome::HigherTermSeen {
-                            observed_term: peer_term,
-                        };
+                        return RoundResult::HigherTerm(peer_term);
                     }
                 }
                 RoundReply::TransportError => {
@@ -157,14 +177,86 @@ pub async fn run_election_round(
                 }
             }
         }
-        // All RPCs returned but we didn't reach majority.
-        ElectionOutcome::Lost
+        RoundResult::Lost
     };
 
-    match tokio::time::timeout(round_deadline, collect).await {
-        Ok(outcome) => Ok(outcome),
-        Err(_) => Ok(ElectionOutcome::Lost),
+    let result = match tokio::time::timeout(round_deadline, collect).await {
+        Ok(r) => r,
+        Err(_) => RoundResult::Lost,
+    };
+
+    match result {
+        RoundResult::Won => commit_won(term, ledger, vote, new_term),
+        RoundResult::HigherTerm(observed) => {
+            // Candidate observes the higher term itself before
+            // returning, so the supervisor can simply set Role and
+            // step down. Both calls are durable + idempotent.
+            if let Err(e) = term.observe(observed, ledger.last_commit_id()) {
+                warn!(
+                    "candidate: term.observe({}) on step-down failed: {}",
+                    observed, e
+                );
+            }
+            if let Err(e) = vote.observe_term(observed) {
+                warn!(
+                    "candidate: vote.observe_term({}) on step-down failed: {}",
+                    observed, e
+                );
+            }
+            Ok(ElectionOutcome::HigherTermSeen {
+                observed_term: observed,
+            })
+        }
+        RoundResult::Lost => Ok(ElectionOutcome::Lost),
     }
+}
+
+/// Won-branch tail: durably commit the term boundary at `new_term`.
+/// Handles two edge cases:
+/// - `term.current` lags `vote.current_term` (asymmetric step-down in
+///   a prior round): catch up via `term.observe(new_term - 1, _)`.
+/// - A concurrent `request_vote` / `AppendEntries` handler observed a
+///   higher term while our election was in flight (`commit_term`
+///   returns `Ok(false)`): align the vote layer and report
+///   `HigherTermSeen`.
+fn commit_won(
+    term: &Arc<Term>,
+    ledger: &Arc<Ledger>,
+    vote: &Arc<Vote>,
+    new_term: u64,
+) -> std::io::Result<ElectionOutcome> {
+    let start_tx = ledger.last_commit_id();
+    let cur = term.get_current_term();
+    if cur + 1 < new_term {
+        term.observe(new_term - 1, start_tx)?;
+    }
+    match term.commit_term(new_term, start_tx)? {
+        true => Ok(ElectionOutcome::Won {
+            elected_term: new_term,
+        }),
+        false => {
+            let observed = term.get_current_term();
+            if observed > vote.get_current_term()
+                && let Err(e) = vote.observe_term(observed)
+            {
+                warn!(
+                    "candidate: vote.observe_term({}) on race step-down failed: {}",
+                    observed, e
+                );
+            }
+            Ok(ElectionOutcome::HigherTermSeen {
+                observed_term: observed,
+            })
+        }
+    }
+}
+
+/// Internal collect-loop result. Kept primitive so the inner async
+/// block doesn't capture `term`/`vote`/`ledger`.
+enum RoundResult {
+    Won,
+    HigherTerm(u64),
+    Lost,
 }
 
 #[derive(Debug)]
