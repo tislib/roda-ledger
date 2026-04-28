@@ -285,10 +285,11 @@ async fn main() {
     println!("  ╚══════════════════════════════════════════════╝");
     println!();
 
-    leader_handles.abort();
-    for h in follower_handles {
-        h.abort();
-    }
+    // RAII teardown: dropping the handles bindings cooperatively
+    // awaits every spawned task (`SupervisorHandles::Drop` /
+    // `StandaloneHandles::Drop` handle the cascade).
+    drop(leader_handles);
+    drop(follower_handles);
 }
 
 /// Blocking write loop. Reads the shared `Quorum` (published by the

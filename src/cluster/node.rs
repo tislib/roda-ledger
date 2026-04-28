@@ -11,8 +11,13 @@
 //! Stage 3b: the cluster path always goes through the supervisor.
 //! Per-role bring-ups (`Leader`, future `Follower`/`Candidate`) no
 //! longer own gRPC servers — only their role-task sub-trees.
+//!
+//! Lifecycle is RAII: dropping a `Handles` (or `StandaloneHandles` /
+//! `SupervisorHandles`) is the shutdown. There is no separate
+//! `shutdown()` / `abort()` API.
 
 use crate::cluster::config::Config;
+use crate::cluster::lifecycle::drain_in_drop;
 use crate::cluster::raft::{Quorum, Role, RoleFlag, Term};
 use crate::cluster::server::Server;
 use crate::cluster::supervisor::{RoleSupervisor, SupervisorHandles};
@@ -20,7 +25,8 @@ use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use crate::ledger::Ledger;
 use spdlog::{error, info};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 pub struct ClusterNode {
@@ -84,12 +90,15 @@ impl ClusterNode {
             let client_addr = self.config.server.socket_addr()?;
             let role = Arc::new(RoleFlag::new(Role::Leader));
             let cluster_commit_index = ClusterCommitIndex::new();
+            let client_running = Arc::new(AtomicBool::new(true));
+            let client_shutdown = Arc::new(Notify::new());
             let server = Server::new(
                 self.ledger_slot.clone(),
                 client_addr,
                 role,
                 self.term.clone(),
                 cluster_commit_index,
+                client_shutdown.clone(),
             );
             let client_handle = tokio::spawn(async move {
                 if let Err(e) = server.run().await {
@@ -97,7 +106,11 @@ impl ClusterNode {
                 }
             });
             info!("standalone: client-facing Ledger gRPC up");
-            return Ok(Handles::Standalone(StandaloneHandles { client_handle }));
+            return Ok(Handles::Standalone(StandaloneHandles {
+                client_handle: Some(client_handle),
+                client_running,
+                client_shutdown,
+            }));
         }
 
         // Clustered: hand off to the supervisor, which owns the
@@ -113,6 +126,10 @@ impl ClusterNode {
 }
 
 /// Unified handles view across standalone / clustered bring-ups.
+///
+/// Lifecycle is RAII: dropping the value triggers cooperative shutdown
+/// of every spawned task this bring-up owns. There is no separate
+/// `shutdown()` method.
 pub enum Handles {
     Standalone(StandaloneHandles),
     Cluster(SupervisorHandles),
@@ -121,42 +138,28 @@ pub enum Handles {
 /// Handles produced by a successful standalone bring-up. Single
 /// gRPC server, nothing else.
 pub struct StandaloneHandles {
-    pub client_handle: JoinHandle<()>,
+    pub client_handle: Option<JoinHandle<()>>,
+    /// Cooperative shutdown flag for the standalone gRPC server.
+    /// Currently unused by the server itself (it has no long-running
+    /// loop beyond `serve_with_shutdown`), but exists so the
+    /// `LedgerHandler` and any future async fan-out can observe
+    /// process shutdown alongside the cluster path.
+    pub client_running: Arc<AtomicBool>,
+    /// Cooperative shutdown trigger for the client-facing Ledger
+    /// gRPC server.
+    pub client_shutdown: Arc<Notify>,
 }
 
-impl StandaloneHandles {
-    pub fn abort(&self) {
-        self.client_handle.abort();
+impl Drop for StandaloneHandles {
+    fn drop(&mut self) {
+        self.client_running.store(false, Ordering::Release);
+        self.client_shutdown.notify_waiters();
+        let client = self.client_handle.take();
+        drain_in_drop("standalone", [client]);
     }
 }
 
 impl Handles {
-    /// Abort every spawned task owned by this bring-up.
-    pub fn abort(&self) {
-        match self {
-            Handles::Standalone(h) => h.abort(),
-            Handles::Cluster(h) => h.abort(),
-        }
-    }
-
-    /// Abort every spawned task and await their join handles so the
-    /// runtime drives teardown to completion before returning.
-    /// `JoinError::cancelled` from `abort()` is treated as success.
-    pub async fn shutdown(self) {
-        self.abort();
-        match self {
-            Handles::Standalone(h) => {
-                let _ = h.client_handle.await;
-            }
-            Handles::Cluster(h) => {
-                let _ = h.client_handle.await;
-                let _ = h.node_handle.await;
-                let _ = h.watcher_handle.await;
-                let _ = h.driver_handle.await;
-            }
-        }
-    }
-
     /// Shared quorum tracker (clustered only). The supervisor owns
     /// the `Arc<Quorum>` for the process lifetime; reading
     /// `quorum.get()` returns the cluster-wide majority watermark
@@ -184,20 +187,9 @@ impl Handles {
         }
     }
 
-    /// Client-facing Ledger gRPC server handle (always present).
-    pub fn client_handle(&self) -> &JoinHandle<()> {
-        match self {
-            Handles::Standalone(h) => &h.client_handle,
-            Handles::Cluster(h) => &h.client_handle,
-        }
-    }
-
-    /// Peer-facing Node gRPC server handle. `None` in standalone
-    /// mode (no Node service runs).
-    pub fn node_handle(&self) -> Option<&JoinHandle<()>> {
-        match self {
-            Handles::Standalone(_) => None,
-            Handles::Cluster(h) => Some(&h.node_handle),
-        }
+    /// Whether the peer-facing Node gRPC server task is present.
+    /// `false` in standalone mode (no Node service runs).
+    pub fn has_node_handle(&self) -> bool {
+        matches!(self, Handles::Cluster(_))
     }
 }

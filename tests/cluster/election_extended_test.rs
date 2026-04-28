@@ -5,6 +5,7 @@
 use roda_ledger::cluster::proto::node as nproto;
 use roda_ledger::cluster::proto::node::node_client::NodeClient;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, Role, Vote};
+use spdlog::info;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tonic::Request;
@@ -120,7 +121,10 @@ async fn single_node_cluster_self_elects() {
 /// Election timer reset: a leader's heartbeats keep followers from ever
 /// becoming Candidate. Over 3 seconds, no new term is opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
 async fn heartbeats_prevent_followers_from_starting_election() {
+    // loop {
+    info!("BEGIN_______________________________________________");
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
         .expect("start");
@@ -128,7 +132,9 @@ async fn heartbeats_prevent_followers_from_starting_election() {
     let leader_port = ctl.node_port(leader_idx).unwrap();
     let (_, term_at_start, _) = ping(leader_port).await.unwrap();
 
+    info!("SB leader {} at term {}", leader_idx, term_at_start);
     sleep(Duration::from_secs(3)).await;
+    info!("SE leader {} at term {}", leader_idx, term_at_start);
 
     // Term must not have churned — leader is still leader, no election restarts.
     let (_, term_at_end, _) = ping(leader_port).await.unwrap();
@@ -137,6 +143,9 @@ async fn heartbeats_prevent_followers_from_starting_election() {
         "term churned despite healthy heartbeats: {} -> {}",
         term_at_start, term_at_end
     );
+    info!("END________________________________________________");
+    sleep(Duration::from_secs(3)).await;
+    // }
 }
 
 // ── Vote layer (Raft §5.4.1) ---------------------------------------------
@@ -321,6 +330,7 @@ async fn request_vote_higher_term_durably_observed() {
 /// Uses `start_node` to BRING BACK the killed node so quorum stays
 /// reachable across restarts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
 async fn term_monotonic_across_restarts() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await

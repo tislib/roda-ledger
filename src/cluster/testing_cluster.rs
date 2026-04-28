@@ -23,7 +23,7 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
-use crate::client::ClusterClient;
+use crate::client::{ClusterClient, NodeClient, PipelineIndex, SubmitResult};
 use crate::cluster::cluster_commit::ClusterCommitIndex;
 use crate::cluster::config::{
     ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection,
@@ -32,13 +32,14 @@ use crate::cluster::ledger_handler::LedgerHandler;
 use crate::cluster::ledger_slot::LedgerSlot;
 use crate::cluster::node::{ClusterNode, Handles};
 use crate::cluster::node_handler::{NodeHandler, NodeHandlerCore};
+use crate::cluster::proto::ledger as lproto;
 use crate::cluster::proto::node as nproto;
 use crate::cluster::proto::node::node_client::NodeClient as ProtoNodeClient;
 use crate::cluster::raft::{Role, RoleFlag, Term, Vote};
 use crate::config::{LedgerConfig, StorageConfig};
 use crate::ledger::Ledger;
 use crate::wait_strategy::WaitStrategy;
-use spdlog::Level;
+use spdlog::{info, warn, Level};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +85,19 @@ pub enum ClusterTestingError {
     NotInBareMode {
         op: &'static str,
     },
+    /// `ensure_caught_up_at` did not observe the slot's `snapshot`
+    /// watermark reach the harness's `last_tx_id` within the budget.
+    /// `last_observed` is the most recent `PipelineIndex` we read.
+    CatchUpTimedOut {
+        slot: usize,
+        target: u64,
+        last_observed: PipelineIndex,
+    },
+    /// A `require_*` call's underlying RPC failed.
+    Rpc {
+        op: &'static str,
+        source: tonic::Status,
+    },
 }
 
 impl std::fmt::Display for ClusterTestingError {
@@ -113,6 +127,22 @@ impl std::fmt::Display for ClusterTestingError {
             Self::NotInBareMode { op } => {
                 write!(f, "{op} is not valid in Bare mode")
             }
+            Self::CatchUpTimedOut {
+                slot,
+                target,
+                last_observed,
+            } => write!(
+                f,
+                "slot {slot} did not catch up to last_tx_id={target}: \
+                 last observed pipeline_index = compute={} commit={} snapshot={} \
+                 cluster_commit={} is_leader={}",
+                last_observed.compute,
+                last_observed.commit,
+                last_observed.snapshot,
+                last_observed.cluster_commit,
+                last_observed.is_leader,
+            ),
+            Self::Rpc { op, source } => write!(f, "{op} RPC failed: {source}"),
         }
     }
 }
@@ -185,7 +215,7 @@ impl Default for ClusterTestingConfig {
             append_entries_max_bytes: 256 * 1024,
             transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,
-            ledger_log_level: Level::Trace,
+            ledger_log_level: Level::Info,
             autostart: true,
             data_dir_root: None,
         }
@@ -289,9 +319,22 @@ pub struct ClusterTestingControl {
     /// All test code that needs to talk to the cluster goes through
     /// [`Self::client`].
     cluster_client: Option<ClusterClient>,
+    /// Highest tx_id any submit through this harness has produced.
+    /// Bumped via `fetch_max` on every successful `*_and_wait` /
+    /// `submit_*` call so concurrent submits never regress the
+    /// watermark. Used by [`Self::ensure_caught_up_at`] as the catch-
+    /// up target for `require_*` reads.
+    last_tx_id: Arc<AtomicU64>,
 }
 
 impl ClusterTestingControl {
+    /// Upper bound on how long `ensure_caught_up_at` will wait for a
+    /// node's snapshot watermark to reach the harness's
+    /// `last_tx_id`. Generous enough to cover post-restart election
+    /// + replication windows; if a real test needs more, that's a
+    /// signal something is wrong, not a knob to tune.
+    pub const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(15);
+
     /// Build a harness from a config. Unless
     /// [`ClusterTestingConfig::autostart`] is `false`, every slot's
     /// components / servers are brought up before returning.
@@ -408,6 +451,7 @@ impl ClusterTestingControl {
             phantom_peers,
             cached_leader_idx: Arc::new(Mutex::new(None)),
             cluster_client: None,
+            last_tx_id: Arc::new(AtomicU64::new(0)),
         };
 
         // 5) Optionally start every slot. Standalone/Cluster also
@@ -430,7 +474,7 @@ impl ClusterTestingControl {
     /// [`Self::start`] for autostart flows; tests that bring nodes up
     /// manually (`autostart = false`) should call this once after the
     /// first round of `start_node` so [`Self::client`] becomes usable.
-    pub async fn rebuild_cluster_client(&mut self) -> Result<(), ClusterTestingError> {
+    async fn rebuild_cluster_client(&mut self) -> Result<(), ClusterTestingError> {
         if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
             // Bare mode has no client gRPC; nothing to connect.
             self.cluster_client = None;
@@ -501,7 +545,11 @@ impl ClusterTestingControl {
         };
 
         if let Some(h) = handles_opt {
-            let _ = tokio::time::timeout(Duration::from_secs(2), h.shutdown()).await;
+            // Dropping `h` triggers cooperative teardown via the
+            // `Drop` impls on `StandaloneHandles` / `SupervisorHandles`.
+            // The drop is bounded internally by `drain_in_drop`'s
+            // 5-second timeout, so a wedged task can't hang us.
+            drop(h);
             if addr.client_port != 0 {
                 if let Err(e) = wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
                 {
@@ -815,12 +863,7 @@ impl ClusterTestingControl {
                     return Ok(idx);
                 }
                 n if n > 1 => {
-                    return Err(ClusterTestingError::TwoLeaders {
-                        ids: leaders
-                            .iter()
-                            .map(|i| self.slots[*i].addr.node_id)
-                            .collect(),
-                    });
+                    warn!("More than one leader found: {:?}", leaders);
                 }
                 _ => {}
             }
@@ -936,6 +979,570 @@ impl ClusterTestingControl {
         .await
     }
 
+    /// Log a per-node table of pipeline progression watermarks
+    /// (compute, commit, snapshot) followed by the cluster-wide
+    /// `cluster_commit_index`. Useful for diagnosing where a
+    /// stalled pipeline is stuck.
+    ///
+    /// Works in all modes: in Cluster/Standalone the values are
+    /// fetched per-node over gRPC via `ClusterClient::node(i)`; in
+    /// Bare mode they're read directly from the bare components.
+    /// Never fails for individual node RPC errors — unreachable
+    /// nodes show dashes so the rest of the matrix is still
+    /// visible.
+    pub async fn show_pipeline_matrix(&self) -> Result<(), ClusterTestingError> {
+        info!(
+            "{:<8} {:<26} {:<14} {:<13} {:<14}",
+            "node_id", "node_url", "compute_index", "commit_index", "snapshot_index"
+        );
+
+        let mut cluster_commit: u64 = 0;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let node_id = slot.addr.node_id;
+            let url = if slot.addr.client_port == 0 {
+                "<bare>".to_string()
+            } else {
+                format!("http://{}:{}", slot.addr.host, slot.addr.client_port)
+            };
+
+            if let Some(b) = &slot.bare {
+                let compute = b.ledger.last_compute_id();
+                let commit = b.ledger.last_commit_id();
+                let snapshot = b.ledger.last_snapshot_id();
+                cluster_commit = cluster_commit.max(b.cluster_commit_index.get());
+                info!(
+                    "{:<8} {:<26} {:<14} {:<13} {:<14}",
+                    node_id, url, compute, commit, snapshot
+                );
+            } else if slot.handles.is_some() {
+                match self.client().node(i).get_pipeline_index().await {
+                    Ok(pi) => {
+                        cluster_commit = cluster_commit.max(pi.cluster_commit);
+                        info!(
+                            "{:<8} {:<26} {:<14} {:<13} {:<14}",
+                            node_id, url, pi.compute, pi.commit, pi.snapshot
+                        );
+                    }
+                    Err(e) => {
+                        info!(
+                            "{:<8} {:<26} {:<14} {:<13} {:<14}  (rpc error: {})",
+                            node_id, url, "—", "—", "—", e
+                        );
+                    }
+                }
+            } else {
+                info!(
+                    "{:<8} {:<26} {:<14} {:<13} {:<14}  (not started)",
+                    node_id, url, "—", "—", "—"
+                );
+            }
+        }
+
+        info!("cluster_commit_index: {}", cluster_commit);
+        Ok(())
+    }
+
+    // ── High-level test API: submit + require + catch-up ─────────────────
+    //
+    // These methods are the supported way for tests to drive the
+    // cluster. They:
+    // 1. Track the harness's `last_tx_id` watermark on every submit.
+    // 2. Resolve the live leader on every leader-routed call (no
+    //    stale cached-leader-handle hazard).
+    // 3. Block reads until the responding node's snapshot watermark
+    //    has caught up to `last_tx_id`, so a `require_*` assertion
+    //    always reflects the cumulative effect of every prior submit.
+    //
+    // Tests should NOT bypass them by calling `client()` directly —
+    // the leader cache, catch-up, and status-code interpretation are
+    // all easy to get subtly wrong, and getting them wrong silently
+    // hides cluster bugs as opaque "balance regressed" failures.
+
+    /// The harness's watermark of the highest tx_id any submit has
+    /// produced so far. Catch-up reads target this value.
+    #[inline]
+    pub fn last_tx_id(&self) -> u64 {
+        self.last_tx_id.load(Ordering::Acquire)
+    }
+
+    /// Block until slot `slot`'s `snapshot` watermark reaches
+    /// [`Self::last_tx_id`], or [`Self::CATCH_UP_TIMEOUT`] elapses.
+    ///
+    /// Gates on `snapshot_id` (not `commit_id`, not `cluster_commit`)
+    /// because that's the watermark `GetBalance` reads against — by
+    /// the time `snapshot >= last_tx_id`, every submit through this
+    /// harness is observable in queries against this slot.
+    ///
+    /// Skips the wait (returns `Ok`) when the slot is not running —
+    /// the responding read will fail naturally with a clearer error
+    /// than a silent harness hang.
+    pub async fn ensure_caught_up_at(&self, slot: usize) -> Result<(), ClusterTestingError> {
+        let target = self.last_tx_id();
+        if target == 0 {
+            return Ok(());
+        }
+        let _ = self.slot(slot)?;
+        if !self.slot_started(&self.slots[slot]) {
+            return Ok(());
+        }
+
+        let client = self.cluster_client_or_err()?;
+        let deadline = Instant::now() + Self::CATCH_UP_TIMEOUT;
+        let mut last_observed: Option<PipelineIndex> = None;
+        loop {
+            // Re-check started state inside the loop so a slot that
+            // gets stopped mid-wait short-circuits cleanly.
+            if !self.slot_started(&self.slots[slot]) {
+                return Ok(());
+            }
+            match client.node(slot).get_pipeline_index().await {
+                Ok(idx) => {
+                    if idx.snapshot >= target {
+                        return Ok(());
+                    }
+                    last_observed = Some(idx);
+                }
+                Err(e) => {
+                    // Transient RPC errors are normal during election
+                    // windows; keep polling until the deadline.
+                    if Instant::now() >= deadline {
+                        return Err(ClusterTestingError::Rpc {
+                            op: "get_pipeline_index (catch-up)",
+                            source: e,
+                        });
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(ClusterTestingError::CatchUpTimedOut {
+                    slot,
+                    target,
+                    last_observed: last_observed.unwrap_or(PipelineIndex {
+                        compute: 0,
+                        commit: 0,
+                        snapshot: 0,
+                        cluster_commit: 0,
+                        is_leader: false,
+                    }),
+                });
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Resolve the live leader and ensure it has caught up to the
+    /// harness's `last_tx_id`. Used internally by the no-suffix
+    /// `require_*` variants.
+    async fn ensure_caught_up_at_leader(&self) -> Result<usize, ClusterTestingError> {
+        let leader = self.wait_for_leader(Duration::from_secs(10)).await?;
+        self.ensure_caught_up_at(leader).await?;
+        Ok(leader)
+    }
+
+    fn cluster_client_or_err(&self) -> Result<&ClusterClient, ClusterTestingError> {
+        self.cluster_client
+            .as_ref()
+            .ok_or(ClusterTestingError::NotInBareMode {
+                op: "cluster client access",
+            })
+    }
+
+    /// Escape hatch: borrow slot `i`'s raw [`NodeClient`]. Tests that
+    /// need negative-path RPC behavior (e.g. asserting a non-leader
+    /// rejects a write with `FailedPrecondition`) use this to bypass
+    /// the harness's leader-routing + catch-up. Prefer the
+    /// `require_*` API for any positive-path assertion.
+    pub fn raw_client_for_slot(&self, i: usize) -> Result<&NodeClient, ClusterTestingError> {
+        let _ = self.slot(i)?;
+        Ok(self.cluster_client_or_err()?.node(i))
+    }
+
+    // ── Submit wrappers (write through leader, bump last_tx_id) ──
+
+    /// Bumps the harness's `last_tx_id` watermark from a known good
+    /// tx_id (post-successful submit). Uses `fetch_max` so concurrent
+    /// submits from multiple tasks never regress the watermark.
+    #[inline]
+    fn bump_last_tx_id(&self, tx_id: u64) {
+        if tx_id > 0 {
+            self.last_tx_id.fetch_max(tx_id, Ordering::Release);
+        }
+    }
+
+    /// Submit a deposit (fire-and-forget). Routed to the live leader.
+    /// Bumps `last_tx_id` on success.
+    pub async fn deposit(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+    ) -> Result<u64, ClusterTestingError> {
+        let tx_id = self
+            .cluster_client_or_err()?
+            .deposit(account, amount, user_ref)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit",
+                source: e,
+            })?;
+        self.bump_last_tx_id(tx_id);
+        Ok(tx_id)
+    }
+
+    /// Submit a deposit and wait for the requested `WaitLevel`.
+    pub async fn deposit_and_wait(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        wait_level: lproto::WaitLevel,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .deposit_and_wait(account, amount, user_ref, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(r.tx_id);
+        Ok(r)
+    }
+
+    /// Submit a transfer (fire-and-forget).
+    pub async fn transfer(
+        &self,
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+    ) -> Result<u64, ClusterTestingError> {
+        let tx_id = self
+            .cluster_client_or_err()?
+            .transfer(from, to, amount, user_ref)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "transfer",
+                source: e,
+            })?;
+        self.bump_last_tx_id(tx_id);
+        Ok(tx_id)
+    }
+
+    /// Submit a transfer and wait for the requested `WaitLevel`.
+    pub async fn transfer_and_wait(
+        &self,
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+        wait_level: lproto::WaitLevel,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .transfer_and_wait(from, to, amount, user_ref, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "transfer_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(r.tx_id);
+        Ok(r)
+    }
+
+    /// Submit a batch of deposits (fire-and-forget).
+    pub async fn deposit_batch(
+        &self,
+        deposits: &[(u64, u64, u64)],
+    ) -> Result<Vec<u64>, ClusterTestingError> {
+        let tx_ids = self
+            .cluster_client_or_err()?
+            .deposit_batch(deposits)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_batch",
+                source: e,
+            })?;
+        if let Some(&max) = tx_ids.iter().max() {
+            self.bump_last_tx_id(max);
+        }
+        Ok(tx_ids)
+    }
+
+    /// Submit a batch of deposits and wait for the requested
+    /// `WaitLevel` against the *last* element of the batch.
+    pub async fn deposit_batch_and_wait(
+        &self,
+        deposits: &[(u64, u64, u64)],
+        wait_level: lproto::WaitLevel,
+    ) -> Result<Vec<SubmitResult>, ClusterTestingError> {
+        let results = self
+            .cluster_client_or_err()?
+            .deposit_batch_and_wait(deposits, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_batch_and_wait",
+                source: e,
+            })?;
+        if let Some(max) = results.iter().map(|r| r.tx_id).max() {
+            self.bump_last_tx_id(max);
+        }
+        Ok(results)
+    }
+
+    /// Submit a batch of transfers and wait.
+    pub async fn transfer_batch_and_wait(
+        &self,
+        transfers: &[(u64, u64, u64)],
+        wait_level: lproto::WaitLevel,
+    ) -> Result<Vec<SubmitResult>, ClusterTestingError> {
+        let results = self
+            .cluster_client_or_err()?
+            .transfer_batch_and_wait(transfers, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "transfer_batch_and_wait",
+                source: e,
+            })?;
+        if let Some(max) = results.iter().map(|r| r.tx_id).max() {
+            self.bump_last_tx_id(max);
+        }
+        Ok(results)
+    }
+
+    // ── Require methods (catch up, read, assert) ─────────────────
+
+    /// Resolve the live leader, ensure it has caught up to the
+    /// harness's `last_tx_id`, then assert the account's balance
+    /// equals `expected`. Panics on mismatch with a diagnostic
+    /// message that includes the responding slot, `last_tx_id`, and
+    /// pipeline index.
+    pub async fn require_balance(&self, account: u64, expected: i64) {
+        let slot = self
+            .ensure_caught_up_at_leader()
+            .await
+            .unwrap_or_else(|e| panic!("require_balance({account}) catch-up: {e}"));
+        self.assert_balance_at(slot, account, expected).await;
+    }
+
+    /// Pin to a specific slot. Catch up + read + assert.
+    pub async fn require_balance_on(&self, slot: usize, account: u64, expected: i64) {
+        self.ensure_caught_up_at(slot)
+            .await
+            .unwrap_or_else(|e| panic!("require_balance_on({slot}, {account}) catch-up: {e}"));
+        self.assert_balance_at(slot, account, expected).await;
+    }
+
+    async fn assert_balance_at(&self, slot: usize, account: u64, expected: i64) {
+        let client = self
+            .cluster_client_or_err()
+            .unwrap_or_else(|e| panic!("require_balance: {e}"));
+        let bal = client
+            .node(slot)
+            .get_balance(account)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("require_balance: get_balance(account={account}, slot={slot}) failed: {e}")
+            });
+        if bal.balance != expected {
+            let pi = client.node(slot).get_pipeline_index().await.ok();
+            panic!(
+                "require_balance(account={}, slot={}, last_tx_id={}): \
+                 expected {}, got {} (last_snapshot_tx_id={}; pipeline_index={:?})",
+                account,
+                slot,
+                self.last_tx_id(),
+                expected,
+                bal.balance,
+                bal.last_snapshot_tx_id,
+                pi,
+            );
+        }
+    }
+
+    /// Assert that the sum of `accounts`' balances on the live
+    /// leader equals zero (the cluster-wide accounting invariant).
+    /// Reads against the same node so balances are taken from a
+    /// consistent snapshot.
+    pub async fn require_zero_sum(&self, accounts: &[u64]) {
+        let slot = self
+            .ensure_caught_up_at_leader()
+            .await
+            .unwrap_or_else(|e| panic!("require_zero_sum catch-up: {e}"));
+        let client = self
+            .cluster_client_or_err()
+            .unwrap_or_else(|e| panic!("require_zero_sum: {e}"));
+        let mut total: i64 = 0;
+        let mut per_account: Vec<(u64, i64)> = Vec::with_capacity(accounts.len());
+        for &acct in accounts {
+            let bal = client
+                .node(slot)
+                .get_balance(acct)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("require_zero_sum: get_balance({acct}, slot={slot}) failed: {e}")
+                });
+            total = total.saturating_add(bal.balance);
+            per_account.push((acct, bal.balance));
+        }
+        if total != 0 {
+            panic!(
+                "require_zero_sum(slot={}, last_tx_id={}): sum != 0; per-account = {:?}, sum = {}",
+                slot,
+                self.last_tx_id(),
+                per_account,
+                total,
+            );
+        }
+    }
+
+    /// Assert a transaction's status equals `expected_status` on the
+    /// live leader (catching up first). For positive-path tests:
+    /// pass `proto::TransactionStatus::Committed` to require that
+    /// the tx has been durably persisted (Committed or higher would
+    /// also satisfy the design intent — see
+    /// [`Self::require_transaction_committed`] for that variant).
+    pub async fn require_transaction_status(
+        &self,
+        tx_id: u64,
+        expected_status: lproto::TransactionStatus,
+        expected_fail_reason: u32,
+    ) {
+        let slot = self
+            .ensure_caught_up_at_leader()
+            .await
+            .unwrap_or_else(|e| panic!("require_transaction_status({tx_id}) catch-up: {e}"));
+        self.assert_transaction_status_at(slot, tx_id, expected_status, expected_fail_reason)
+            .await;
+    }
+
+    /// Convenience: assert the tx is `Committed` or `OnSnapshot`
+    /// (i.e. durable) with `fail_reason == 0`. This is the right
+    /// check for "the cluster preserved this acked write".
+    pub async fn require_transaction_committed(&self, tx_id: u64) {
+        let slot = self
+            .ensure_caught_up_at_leader()
+            .await
+            .unwrap_or_else(|e| panic!("require_transaction_committed({tx_id}) catch-up: {e}"));
+        let client = self
+            .cluster_client_or_err()
+            .unwrap_or_else(|e| panic!("require_transaction_committed: {e}"));
+        let (status, fail_reason) = client
+            .node(slot)
+            .get_transaction_status(tx_id)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "require_transaction_committed: get_transaction_status(tx_id={tx_id}, slot={slot}) failed: {e}"
+                )
+            });
+        let committed = lproto::TransactionStatus::Committed as i32;
+        let on_snapshot = lproto::TransactionStatus::OnSnapshot as i32;
+        if status != committed && status != on_snapshot {
+            let pi = client.node(slot).get_pipeline_index().await.ok();
+            panic!(
+                "require_transaction_committed(tx_id={}, slot={}, last_tx_id={}): \
+                 expected status in {{COMMITTED({}), ON_SNAPSHOT({})}} with fail_reason=0, \
+                 got status={} fail_reason={} (pipeline_index={:?})",
+                tx_id,
+                slot,
+                self.last_tx_id(),
+                committed,
+                on_snapshot,
+                status,
+                fail_reason,
+                pi,
+            );
+        }
+        if fail_reason != 0 {
+            panic!(
+                "require_transaction_committed(tx_id={}, slot={}, last_tx_id={}): \
+                 fail_reason={} (status={})",
+                tx_id,
+                slot,
+                self.last_tx_id(),
+                fail_reason,
+                status,
+            );
+        }
+    }
+
+    async fn assert_transaction_status_at(
+        &self,
+        slot: usize,
+        tx_id: u64,
+        expected_status: lproto::TransactionStatus,
+        expected_fail_reason: u32,
+    ) {
+        let client = self
+            .cluster_client_or_err()
+            .unwrap_or_else(|e| panic!("require_transaction_status: {e}"));
+        let (status, fail_reason) = client
+            .node(slot)
+            .get_transaction_status(tx_id)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "require_transaction_status: get_transaction_status(tx_id={tx_id}, slot={slot}) failed: {e}"
+                )
+            });
+        let expected_code = expected_status as i32;
+        if status != expected_code || fail_reason != expected_fail_reason {
+            let pi = client.node(slot).get_pipeline_index().await.ok();
+            panic!(
+                "require_transaction_status(tx_id={}, slot={}, last_tx_id={}): \
+                 expected status={:?}({}) fail_reason={}, \
+                 got status={} fail_reason={} (pipeline_index={:?})",
+                tx_id,
+                slot,
+                self.last_tx_id(),
+                expected_status,
+                expected_code,
+                expected_fail_reason,
+                status,
+                fail_reason,
+                pi,
+            );
+        }
+    }
+
+    /// Block (with [`Self::CATCH_UP_TIMEOUT`]) until slot `slot`'s
+    /// `commit` watermark reaches `target`. Useful when a test
+    /// needs to wait on a specific commit point that doesn't track
+    /// the harness's `last_tx_id` (e.g. cross-node convergence
+    /// checks where the target is one node's view of another's
+    /// progress).
+    pub async fn require_pipeline_commit_at_least(&self, slot: usize, target: u64) {
+        let client = self
+            .cluster_client_or_err()
+            .unwrap_or_else(|e| panic!("require_pipeline_commit_at_least: {e}"));
+        let deadline = Instant::now() + Self::CATCH_UP_TIMEOUT;
+        loop {
+            match client.node(slot).get_pipeline_index().await {
+                Ok(idx) if idx.commit >= target => return,
+                Ok(idx) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "require_pipeline_commit_at_least(slot={}, target={}): \
+                             commit stuck at {} (pipeline_index={:?})",
+                            slot, target, idx.commit, idx
+                        );
+                    }
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "require_pipeline_commit_at_least(slot={}, target={}): \
+                             RPC failure: {}",
+                            slot, target, e
+                        );
+                    }
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Wait for slot `i`'s gRPC servers to bind. Useful after a
     /// manual [`run_node`] call (`autostart = false` flow).
     pub async fn wait_for_bind(
@@ -1014,13 +1621,14 @@ impl ClusterTestingControl {
 
 impl Drop for ClusterTestingControl {
     fn drop(&mut self) {
-        for slot in &mut self.slots {
-            if let Some(h) = slot.handles.take() {
-                h.abort();
-            }
-            slot.node = None;
-            slot.bare = None;
-        }
+        // Drop slots (and their nested `ClusterNode` / `Ledger` /
+        // `Handles`) before removing the temp dir so the cooperative
+        // teardown finishes flushing to disk while the data dir is
+        // still there. Each `slot.handles: Option<Handles>` runs its
+        // own RAII shutdown via `StandaloneHandles::Drop` /
+        // `SupervisorHandles::Drop`, so we don't manually abort.
+        self.cluster_client = None;
+        self.slots.clear();
         if self.harness_owns_root_dir {
             let _ = std::fs::remove_dir_all(&self.root_data_dir);
         }

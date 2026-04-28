@@ -39,8 +39,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cluster = ClusterNode::new(cfg)?;
     let handles = cluster.run().await?;
 
-    tokio::signal::ctrl_c().await?;
-    info!("received Ctrl+C, shutting down cluster");
-    handles.abort();
+    shutdown_signal().await;
+    info!("received shutdown signal, draining cluster");
+    drop(handles); // RAII teardown: cooperatively awaits every spawned task.
     Ok(())
+}
+
+/// Resolves when the process receives SIGINT (Ctrl+C) or SIGTERM
+/// (`docker stop`). We need to install both because PID-1 in a
+/// container does not get default signal handlers — without this the
+/// container hangs until Docker's grace period expires.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl+c handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl+C"),
+        _ = terminate => info!("received SIGTERM"),
+    }
 }

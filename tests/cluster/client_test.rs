@@ -17,14 +17,14 @@ async fn setup() -> (ClusterTestingControl, NodeClient) {
 
 // -- Submit (fire-and-forget) -----------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_deposit() {
     let (_ctl, client) = setup().await;
     let tx_id = client.deposit(1, 1000, 0).await.unwrap();
     assert!(tx_id > 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_withdraw() {
     let (_ctl, client) = setup().await;
     // Fund first.
@@ -36,7 +36,7 @@ async fn test_withdraw() {
     assert!(tx_id > 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_transfer() {
     let (_ctl, client) = setup().await;
     client
@@ -49,7 +49,7 @@ async fn test_transfer() {
 
 // -- Submit and wait --------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_deposit_and_wait_snapshot() {
     let (_ctl, client) = setup().await;
     let result = client
@@ -64,7 +64,7 @@ async fn test_deposit_and_wait_snapshot() {
     assert_eq!(balance.balance, 500);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_withdraw_and_wait_insufficient_funds() {
     let (_ctl, client) = setup().await;
     let result = client
@@ -76,7 +76,7 @@ async fn test_withdraw_and_wait_insufficient_funds() {
     assert_eq!(result.fail_reason, 1); // INSUFFICIENT_FUNDS
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_transfer_and_wait() {
     let (_ctl, client) = setup().await;
     client
@@ -99,7 +99,7 @@ async fn test_transfer_and_wait() {
 
 // -- Batch operations -------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_deposit_batch() {
     let (_ctl, client) = setup().await;
     let tx_ids = client
@@ -112,7 +112,7 @@ async fn test_deposit_batch() {
     assert!(tx_ids[2] > tx_ids[0]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_deposit_batch_and_wait() {
     let (_ctl, client) = setup().await;
     let results = client
@@ -132,14 +132,14 @@ async fn test_deposit_batch_and_wait() {
 
 // -- Balance queries --------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_balance_empty() {
     let (_ctl, client) = setup().await;
     let balance = client.get_balance(42).await.unwrap();
     assert_eq!(balance.balance, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_balances() {
     let (_ctl, client) = setup().await;
     client
@@ -153,7 +153,7 @@ async fn test_get_balances() {
 
 // -- Transaction status -----------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_transaction_status() {
     let (_ctl, client) = setup().await;
     let result = client
@@ -167,7 +167,7 @@ async fn test_get_transaction_status() {
     assert_eq!(fail_reason, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_transaction_statuses() {
     let (_ctl, client) = setup().await;
     let r1 = client
@@ -191,7 +191,7 @@ async fn test_get_transaction_statuses() {
 
 // -- Pipeline index ---------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_pipeline_index() {
     let (_ctl, client) = setup().await;
     let result = client
@@ -207,7 +207,7 @@ async fn test_get_pipeline_index() {
 
 // -- Transaction query ------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_transaction() {
     let (_ctl, client) = setup().await;
     let result = client
@@ -222,7 +222,7 @@ async fn test_get_transaction() {
 
 // -- Account history --------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_account_history() {
     let (_ctl, client) = setup().await;
     client
@@ -248,7 +248,7 @@ async fn test_get_account_history() {
 /// use the SAME client to withdraw. Expected to fail — tonic's channel
 /// does not automatically reconnect after the underlying connection breaks.
 /// This test exists to drive the reconnect feature in LedgerClient.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_deposit_restart_withdraw() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "client_restart".to_string(),

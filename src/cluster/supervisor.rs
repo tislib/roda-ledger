@@ -33,6 +33,7 @@
 //! pushes a [`Transition`] enum value.
 
 use crate::cluster::config::Config;
+use crate::cluster::lifecycle::drain_in_drop;
 use crate::cluster::node_handler::NodeHandlerCore;
 use crate::cluster::raft::{
     ElectionOutcome, ElectionTimer, ElectionTimerConfig, Leader, Quorum, Role, RoleFlag, Term,
@@ -45,7 +46,7 @@ use spdlog::{debug, error, info, warn};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 /// Events that drive the role state machine. Beyond timer expiry
@@ -72,13 +73,20 @@ pub type TransitionTx = mpsc::Sender<Transition>;
 pub type TransitionRx = mpsc::Receiver<Transition>;
 
 /// Output of [`RoleSupervisor::run`].
+///
+/// Lifecycle is RAII: dropping a `SupervisorHandles` *is* the shutdown.
+/// The `Drop` impl flips every cooperative flag, fires the gRPC servers'
+/// shutdown notifies, and awaits all four spawned tasks for graceful
+/// completion (bounded by the timeout in [`drain_in_drop`]). There is no
+/// separate `shutdown()` method — owning a live `SupervisorHandles` means
+/// the supervisor is running.
 pub struct SupervisorHandles {
-    pub client_handle: JoinHandle<()>,
-    pub node_handle: JoinHandle<()>,
-    pub watcher_handle: JoinHandle<()>,
+    pub client_handle: Option<JoinHandle<()>>,
+    pub node_handle: Option<JoinHandle<()>>,
+    pub watcher_handle: Option<JoinHandle<()>>,
     /// The role-driver task — a long-running loop that owns role
     /// transitions and per-role bring-up.
-    pub driver_handle: JoinHandle<()>,
+    pub driver_handle: Option<JoinHandle<()>>,
     /// Cooperative shutdown flag for peer-replication sub-tasks
     /// owned transiently by the driver in the Leader role.
     pub running: Arc<AtomicBool>,
@@ -89,36 +97,51 @@ pub struct SupervisorHandles {
     /// transitions; exposed for observability (`load_cluster`,
     /// tests) and the future quorum-gated commit path.
     pub quorum: Arc<Quorum>,
-    /// Shared NodeHandler state. `abort` flips its `shutdown` latch so
+    /// Shared NodeHandler state. `Drop` flips its `shutdown` latch so
     /// any in-flight or subsequent gRPC handler refuses immediately —
     /// this is the in-process stand-in for "the process is gone" and
     /// is what makes the dying-follower's slot in the leader's
-    /// `Quorum` actually stop refreshing on soft-abort. (Hard crashes
-    /// don't need this — they kill all handler tasks instantly.)
+    /// `Quorum` actually stop refreshing on soft-shutdown. (Hard
+    /// crashes don't need this — they kill all handler tasks
+    /// instantly.)
     pub node_core: Arc<crate::cluster::NodeHandlerCore>,
+    /// Cooperative shutdown trigger for the client-facing Ledger
+    /// gRPC server. `Drop` calls `notify_waiters()` so
+    /// `serve_with_shutdown` resolves and the server task exits.
+    pub client_shutdown: Arc<Notify>,
+    /// Cooperative shutdown trigger for the peer-facing Node gRPC
+    /// server.
+    pub node_shutdown: Arc<Notify>,
 }
 
-impl SupervisorHandles {
-    pub fn abort(&self) {
-        // Flip the gRPC-handler shutdown latch FIRST. After this
-        // store, every handler invocation on this node returns
-        // `Status::unavailable` — including any that the leader's
-        // `PeerReplication` is about to fire and any that arrive on
-        // already-accepted connections after the listener task is
-        // aborted. This is what severs the dying-follower's ability
-        // to keep its slot fresh in the leader's Quorum.
+impl Drop for SupervisorHandles {
+    fn drop(&mut self) {
+        // 1. Sync signals — fast, never block.
+        //    Flip the gRPC-handler shutdown latch FIRST so any
+        //    in-flight or newly-arriving handler returns
+        //    `Status::unavailable` immediately. This severs the
+        //    dying-follower's ability to keep its slot fresh in the
+        //    leader's Quorum before we even start awaiting tasks.
         self.node_core
             .shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         self.running
             .store(false, std::sync::atomic::Ordering::Release);
-        // A polite shutdown nudge for the driver loop in case it's
-        // mid-await on the transition channel.
+        // Wake the role driver if it's blocked on `transition_rx.recv()`.
         let _ = self.transition_tx.try_send(Transition::Shutdown);
-        self.driver_handle.abort();
-        self.watcher_handle.abort();
-        self.client_handle.abort();
-        self.node_handle.abort();
+        // Stop both gRPC servers from accepting new connections.
+        self.client_shutdown.notify_waiters();
+        self.node_shutdown.notify_waiters();
+
+        // 2. Drain in dependency order: the role driver owns the
+        //    leader's peer-replication drain, so awaiting it first
+        //    guarantees the leader's child tasks are gone before the
+        //    gRPC servers wind down.
+        let driver = self.driver_handle.take();
+        let watcher = self.watcher_handle.take();
+        let client = self.client_handle.take();
+        let node = self.node_handle.take();
+        drain_in_drop("supervisor", [driver, watcher, client, node]);
     }
 }
 
@@ -202,12 +225,16 @@ impl RoleSupervisor {
             .with_election_timer(election_timer.clone()),
         );
 
+        let client_shutdown = Arc::new(Notify::new());
+        let node_shutdown = Arc::new(Notify::new());
+
         let client_server = Server::new(
             self.ledger_slot.clone(),
             client_addr,
             self.role.clone(),
             self.term.clone(),
             cluster_commit_index.clone(),
+            client_shutdown.clone(),
         );
         let client_handle = tokio::spawn(async move {
             if let Err(e) = client_server.run().await {
@@ -217,7 +244,12 @@ impl RoleSupervisor {
 
         let node_handler = NodeHandler::new(node_core.clone());
         let node_max_bytes = cluster.append_entries_max_bytes * 2 + 4 * 1024;
-        let node_runtime = NodeServerRuntime::new(node_addr, node_handler, node_max_bytes);
+        let node_runtime = NodeServerRuntime::new(
+            node_addr,
+            node_handler,
+            node_max_bytes,
+            node_shutdown.clone(),
+        );
         let node_handle = tokio::spawn(async move {
             if let Err(e) = node_runtime.run().await {
                 error!("supervisor: node gRPC server exited: {}", e);
@@ -255,14 +287,16 @@ impl RoleSupervisor {
         );
 
         Ok(SupervisorHandles {
-            client_handle,
-            node_handle,
-            watcher_handle,
-            driver_handle,
+            client_handle: Some(client_handle),
+            node_handle: Some(node_handle),
+            watcher_handle: Some(watcher_handle),
+            driver_handle: Some(driver_handle),
             running,
             transition_tx,
             quorum,
             node_core,
+            client_shutdown,
+            node_shutdown,
         })
     }
 

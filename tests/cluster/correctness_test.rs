@@ -192,7 +192,14 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
     let new_client = ctl.client().leader().clone();
     for tx_id in &acked {
         let (status, _) = new_client.get_transaction_status(*tx_id).await.unwrap();
-        assert!(status >= 2, "tx {} lost after single-node failure", tx_id);
+        // proto::TransactionStatus: COMMITTED=2, ON_SNAPSHOT=3 (durable).
+        // Excluding ERROR=4 / TX_NOT_FOUND=5 which `>= 2` would also accept.
+        assert!(
+            status == 2 || status == 3,
+            "tx {} lost after single-node failure (status={}, expected COMMITTED=2 or ON_SNAPSHOT=3)",
+            tx_id,
+            status,
+        );
     }
 }
 

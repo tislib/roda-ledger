@@ -19,6 +19,7 @@ pub mod cluster_commit;
 pub mod config;
 pub mod ledger_handler;
 pub mod ledger_slot;
+pub(crate) mod lifecycle;
 pub mod mapping;
 pub mod node;
 pub mod node_handler;

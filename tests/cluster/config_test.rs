@@ -95,7 +95,7 @@ async fn standalone_serves_writes_with_no_node_grpc() {
         .expect("start");
 
     let h = ctl.handles(0).expect("handles");
-    assert!(h.node_handle().is_none(), "standalone has no Node gRPC");
+    assert!(!h.has_node_handle(), "standalone has no Node gRPC");
     assert!(h.quorum().is_none(), "standalone has no Quorum");
     assert!(h.as_cluster().is_none(), "standalone is not clustered");
 

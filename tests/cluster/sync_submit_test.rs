@@ -234,6 +234,7 @@ mod tests {
                 std::sync::Arc::new(RoleFlag::new(Role::Leader)),
                 term,
                 cci,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
             );
             server.run().await.unwrap();
         });

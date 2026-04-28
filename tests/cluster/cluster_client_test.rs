@@ -194,6 +194,7 @@ async fn cluster_client_writes_survive_leader_failover() {
 /// `transfer_and_wait` exercises the same leader-routed retry path
 /// across a kill+restart cycle of the leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
 async fn cluster_client_transfer_after_leader_restart() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await

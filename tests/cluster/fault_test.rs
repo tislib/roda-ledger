@@ -39,7 +39,13 @@ async fn kill_leader_no_committed_tx_lost() {
     let new_client = ctl.client().leader().clone();
     for tx_id in &acked {
         let (status, _) = new_client.get_transaction_status(*tx_id).await.unwrap();
-        assert!(status >= 2);
+        // proto::TransactionStatus: COMMITTED=2, ON_SNAPSHOT=3 (durable).
+        assert!(
+            status == 2 || status == 3,
+            "tx {} not durable (status={}, expected COMMITTED=2 or ON_SNAPSHOT=3)",
+            tx_id,
+            status,
+        );
     }
     let bal_post = new_client.get_balance(ACCOUNT).await.unwrap().balance;
     assert_eq!(bal_post, bal_pre);
@@ -226,7 +232,13 @@ async fn repeated_leader_churn_preserves_commits() {
     let final_client = ctl.client().leader().clone();
     for tx_id in &acked {
         let (status, _) = final_client.get_transaction_status(*tx_id).await.unwrap();
-        assert!(status >= 2, "tx {} lost across churn", tx_id);
+        // proto::TransactionStatus: COMMITTED=2, ON_SNAPSHOT=3 (durable).
+        assert!(
+            status == 2 || status == 3,
+            "tx {} lost across churn (status={}, expected COMMITTED=2 or ON_SNAPSHOT=3)",
+            tx_id,
+            status,
+        );
     }
 }
 
@@ -345,15 +357,15 @@ async fn slow_follower_does_not_block_majority() {
 /// Storage-failure injection (read-only fs, ENOSPC, partial fdatasync)
 /// requires test infrastructure not present in the harness. Documented
 /// stub.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "infra: storage-failure injection not implemented; needs FUSE-style \
             fault injector or a writable-fs wrapper that can fail on demand"]
 async fn term_log_write_failure_aborts_election_round() {}
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "infra: see term_log_write_failure_aborts_election_round"]
 async fn vote_log_fdatasync_failure_returns_no_grant() {}
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "infra: see term_log_write_failure_aborts_election_round"]
 async fn wal_append_failure_returns_reject_wal_append_failed() {}

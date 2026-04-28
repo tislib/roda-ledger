@@ -14,7 +14,7 @@
 use crate::cluster::proto::ledger as proto;
 use crate::cluster::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
 use crate::tools::backoff::{Backoff, BackoffPolicy};
-use spdlog::warn;
+use spdlog::{trace, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tonic::transport::Channel;
@@ -92,6 +92,12 @@ pub struct PipelineIndex {
     pub compute: u64,
     pub commit: u64,
     pub snapshot: u64,
+    /// Highest transaction_id known quorum-committed cluster-wide.
+    /// On the leader this is `Quorum::get()`. On followers this is
+    /// the watermark advertised by the most recent AppendEntries
+    /// from the leader, clamped to the follower's `last_commit_id`.
+    /// `0` in single-node mode.
+    pub cluster_commit: u64,
     /// True iff the responding node is currently the cluster leader.
     /// Cluster-aware clients use this to discover the leader without
     /// having to attempt a write.
@@ -164,6 +170,7 @@ pub struct FunctionInfo {
 pub struct NodeClient {
     inner: TonicLedgerClient<Channel>,
     retry: RetryConfig,
+    url: String,
 }
 
 impl NodeClient {
@@ -173,6 +180,7 @@ impl NodeClient {
         Ok(Self {
             inner,
             retry: RetryConfig::default(),
+            url: addr.to_string(),
         })
     }
 
@@ -182,6 +190,7 @@ impl NodeClient {
         Ok(Self {
             inner,
             retry: RetryConfig::default(),
+            url: url.to_string(),
         })
     }
 
@@ -258,6 +267,7 @@ impl NodeClient {
     pub async fn deposit(&self, account: u64, amount: u64, user_ref: u64) -> Result<u64> {
         self.with_retry("deposit", || async {
             let mut client = self.inner.clone();
+            trace!("deposit: account = {:?} amount = {:?} user_ref = {:?} at node_url: {:?}", account, amount, user_ref, self.url);
             let resp = client
                 .submit_operation(proto::SubmitOperationRequest {
                     operation: Some(proto::submit_operation_request::Operation::Deposit(
@@ -279,6 +289,7 @@ impl NodeClient {
     pub async fn withdraw(&self, account: u64, amount: u64, user_ref: u64) -> Result<u64> {
         self.with_retry("withdraw", || async {
             let mut client = self.inner.clone();
+            trace!("withdraw: account = {:?} amount = {:?} user_ref = {:?} at node_url: {:?}", account, amount, user_ref, self.url);
             let resp = client
                 .submit_operation(proto::SubmitOperationRequest {
                     operation: Some(proto::submit_operation_request::Operation::Withdrawal(
@@ -300,6 +311,7 @@ impl NodeClient {
     pub async fn transfer(&self, from: u64, to: u64, amount: u64, user_ref: u64) -> Result<u64> {
         self.with_retry("transfer", || async {
             let mut client = self.inner.clone();
+            trace!("transfer: from = {:?} to = {:?} amount = {:?} user_ref = {:?} at node_url: {:?}", from, to, amount, user_ref, self.url);
             let resp = client
                 .submit_operation(proto::SubmitOperationRequest {
                     operation: Some(proto::submit_operation_request::Operation::Transfer(
@@ -330,6 +342,7 @@ impl NodeClient {
     ) -> Result<SubmitResult> {
         self.with_retry("deposit_and_wait", || async {
             let mut client = self.inner.clone();
+            trace!("deposit_and_wait: account = {:?}, amount = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", account, amount, user_ref, wait_level, self.url);
             let resp = client
                 .submit_and_wait(proto::SubmitAndWaitRequest {
                     operation: Some(proto::submit_and_wait_request::Operation::Deposit(
@@ -361,6 +374,7 @@ impl NodeClient {
     ) -> Result<SubmitResult> {
         self.with_retry("withdraw_and_wait", || async {
             let mut client = self.inner.clone();
+            trace!("withdraw_and_wait: account = {:?}, amount = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", account, amount, user_ref, wait_level, self.url);
             let resp = client
                 .submit_and_wait(proto::SubmitAndWaitRequest {
                     operation: Some(proto::submit_and_wait_request::Operation::Withdrawal(
@@ -393,6 +407,7 @@ impl NodeClient {
     ) -> Result<SubmitResult> {
         self.with_retry("transfer_and_wait", || async {
             let mut client = self.inner.clone();
+            trace!("transfer_and_wait: from = {:?}, to = {:?}, amount = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", from, to, amount, user_ref, wait_level, self.url);
             let resp = client
                 .submit_and_wait(proto::SubmitAndWaitRequest {
                     operation: Some(proto::submit_and_wait_request::Operation::Transfer(
@@ -423,6 +438,7 @@ impl NodeClient {
     pub async fn deposit_batch(&self, deposits: &[(u64, u64, u64)]) -> Result<Vec<u64>> {
         self.with_retry("deposit_batch", || async {
             let mut client = self.inner.clone();
+            trace!("deposit_batch: deposits = {:?} at node_url: {:?}", deposits, self.url);
             let operations = deposits
                 .iter()
                 .map(
@@ -458,6 +474,7 @@ impl NodeClient {
     ) -> Result<Vec<SubmitResult>> {
         self.with_retry("deposit_batch_and_wait", || async {
             let mut client = self.inner.clone();
+            trace!("deposit_batch_and_wait: deposits = {:?} wait_level = {:?} at node_url: {:?}", deposits, wait_level, self.url);
             let operations = deposits
                 .iter()
                 .map(|(account, amount, user_ref)| proto::SubmitAndWaitRequest {
@@ -502,6 +519,7 @@ impl NodeClient {
     ) -> Result<Vec<SubmitResult>> {
         self.with_retry("transfer_batch_and_wait", || async {
             let mut client = self.inner.clone();
+            trace!("transfer_batch_and_wait: transfers = {:?} wait_level = {:?} at node_url: {:?}", transfers, wait_level, self.url);
             let operations = transfers
                 .iter()
                 .map(|(from, to, amount)| proto::SubmitAndWaitRequest {
@@ -543,6 +561,7 @@ impl NodeClient {
     pub async fn get_balance(&self, account_id: u64) -> Result<Balance> {
         self.with_retry("get_balance", || async {
             let mut client = self.inner.clone();
+            trace!("get_balance: account_id = {:?} at node_url: {:?}", account_id, self.url);
             let resp = client
                 .get_balance(proto::GetBalanceRequest { account_id })
                 .await?
@@ -559,6 +578,7 @@ impl NodeClient {
     pub async fn get_balances(&self, account_ids: &[u64]) -> Result<Vec<i64>> {
         self.with_retry("get_balances", || async {
             let mut client = self.inner.clone();
+            trace!("get_balances: account_ids = {:?} at node_url: {:?}", account_ids, self.url);
             let resp = client
                 .get_balances(proto::GetBalancesRequest {
                     account_ids: account_ids.to_vec(),
@@ -576,6 +596,7 @@ impl NodeClient {
     pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<(i32, u32)> {
         self.with_retry("get_transaction_status", || async {
             let mut client = self.inner.clone();
+            trace!("get_transaction_status: transaction_id = {:?} at node_url: {:?}", transaction_id, self.url);
             let resp = client
                 .get_transaction_status(proto::GetStatusRequest {
                     transaction_id,
@@ -595,6 +616,7 @@ impl NodeClient {
     ) -> Result<Vec<(i32, u32)>> {
         self.with_retry("get_transaction_statuses", || async {
             let mut client = self.inner.clone();
+            trace!("get_transaction_statuses: transaction_ids = {:?} at node_url: {:?}", transaction_ids, self.url);
             let resp = client
                 .get_transaction_statuses(proto::GetStatusesRequest {
                     transaction_ids: transaction_ids.to_vec(),
@@ -616,6 +638,7 @@ impl NodeClient {
     pub async fn get_pipeline_index(&self) -> Result<PipelineIndex> {
         self.with_retry("get_pipeline_index", || async {
             let mut client = self.inner.clone();
+            trace!("get_pipeline_index at node_url: {:?}", self.url);
             let resp = client
                 .get_pipeline_index(proto::GetPipelineIndexRequest {})
                 .await?
@@ -624,6 +647,7 @@ impl NodeClient {
                 compute: resp.compute_index,
                 commit: resp.commit_index,
                 snapshot: resp.snapshot_index,
+                cluster_commit: resp.cluster_commit_index,
                 is_leader: resp.is_leader,
             })
         })
@@ -636,6 +660,7 @@ impl NodeClient {
     pub async fn get_transaction(&self, tx_id: u64) -> Result<Transaction> {
         self.with_retry("get_transaction", || async {
             let mut client = self.inner.clone();
+            trace!("get_transaction: tx_id = {:?} at node_url: {:?}", tx_id, self.url);
             let resp = client
                 .get_transaction(proto::GetTransactionRequest { tx_id })
                 .await?
@@ -674,6 +699,7 @@ impl NodeClient {
     ) -> Result<AccountHistory> {
         self.with_retry("get_account_history", || async {
             let mut client = self.inner.clone();
+            trace!("get_account_history: account_id = {:?}, from_tx_id = {:?}, limit = {:?} at node_url: {:?}", account_id, from_tx_id, limit, self.url);
             let resp = client
                 .get_account_history(proto::GetAccountHistoryRequest {
                     account_id,
@@ -773,6 +799,7 @@ impl NodeClient {
     ) -> Result<SubmitResult> {
         self.with_retry("submit_function_and_wait", || async {
             let mut client = self.inner.clone();
+            trace!("submit_function_and_wait: name = {:?}, params = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", name, params, user_ref, wait_level, self.url);
             let resp = client
                 .submit_and_wait(proto::SubmitAndWaitRequest {
                     operation: Some(proto::submit_and_wait_request::Operation::Function(

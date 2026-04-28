@@ -14,7 +14,7 @@ use crate::entities::{WalEntry, WalEntryKind};
 use crate::storage::engine::Storage;
 use crate::storage::layout::{active_wal_path, segment_wal_path};
 use crate::storage::wal_serializer::parse_wal_record;
-use spdlog::debug;
+use spdlog::{debug, trace};
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -125,7 +125,7 @@ impl WalTailer {
                 let pre_position = cursor.position;
                 let pre_file_len = file_len;
                 if !self.advance_segment() {
-                    debug!(
+                    trace!(
                         "DIAG-flake-replication: tailer.tail advance_segment=false \
                          from_tx_id={} segment_id={} is_active={} position={} file_len={}",
                         from_tx_id,

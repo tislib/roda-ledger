@@ -34,6 +34,7 @@ mod tests {
                 Arc::new(RoleFlag::new(Role::Leader)),
                 term,
                 cci,
+                Arc::new(tokio::sync::Notify::new()),
             );
             server.run().await.unwrap();
         });

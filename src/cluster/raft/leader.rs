@@ -20,7 +20,7 @@ use crate::cluster::config::Config;
 use crate::cluster::supervisor::TransitionTx;
 use spdlog::info;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -156,27 +156,13 @@ impl Leader {
 /// [`Leader::run_role_tasks`]. The supervisor owns the gRPC servers
 /// and the long-lived `Quorum`; this is just the leader's
 /// role-specific sub-tree.
+///
+/// Cooperative teardown lives in the supervisor's `run_leader_role`:
+/// on step-down or shutdown it flips the leader-scoped `running`
+/// flag and `await`s every peer handle. There is no `abort` /
+/// `drain` method — the supervisor owns the drain.
 pub struct LeaderHandles {
     /// One handle per peer replication task. Positional with
     /// `config.cluster.peers` (with self filtered out).
     pub peer_handles: Vec<JoinHandle<()>>,
-}
-
-impl LeaderHandles {
-    /// Abort every peer task. The supervisor's gRPC servers are
-    /// independent and have to be aborted separately.
-    pub fn abort(&self) {
-        for h in &self.peer_handles {
-            h.abort();
-        }
-    }
-
-    /// Cooperative drain — flip the supervisor's `running` flag and
-    /// peer tasks exit on their next loop iteration. Caller is
-    /// responsible for `await`ing `peer_handles` if drain order
-    /// matters. Provided as a static helper so the supervisor can
-    /// drain without holding a `&mut LeaderHandles`.
-    pub fn drain(running: &Arc<AtomicBool>) {
-        running.store(false, Ordering::Release);
-    }
 }

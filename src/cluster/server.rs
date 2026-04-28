@@ -5,6 +5,11 @@
 //!   the leader variant against a zero-peer cluster.
 //! - [`NodeServerRuntime`] hosts the peer-facing `Node` service
 //!   ([`NodeHandler`]) that implements `AppendEntries`/`Ping`.
+//!
+//! Both servers use `serve_with_shutdown` driven by an `Arc<Notify>` owned by
+//! the corresponding `*Handles` struct. Dropping the handles fires
+//! `notify_waiters()`, which lets tonic stop accepting new connections, drain
+//! in-flight handlers, and exit cleanly.
 
 use crate::cluster::ledger_handler::LedgerHandler;
 use crate::cluster::node_handler::NodeHandler;
@@ -15,6 +20,7 @@ use crate::cluster::{ClusterCommitIndex, LedgerSlot};
 use spdlog::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tonic::transport::Server as TonicServer;
 
 // ── Client-facing Ledger server ─────────────────────────────────────────────
@@ -33,6 +39,10 @@ pub struct Server {
     /// the appropriate view of this value.
     term: Arc<Term>,
     pub cluster_commit_index: Arc<ClusterCommitIndex>,
+    /// Cooperative shutdown trigger. When the owning `*Handles`
+    /// drops, it calls `notify_waiters()` and `serve_with_shutdown`
+    /// resolves.
+    shutdown: Arc<Notify>,
 }
 
 impl Server {
@@ -42,6 +52,7 @@ impl Server {
         role: Arc<RoleFlag>,
         term: Arc<Term>,
         cluster_commit_index: Arc<ClusterCommitIndex>,
+        shutdown: Arc<Notify>,
     ) -> Self {
         Self {
             ledger_slot,
@@ -49,6 +60,7 @@ impl Server {
             role,
             term,
             cluster_commit_index,
+            shutdown,
         }
     }
 
@@ -69,10 +81,13 @@ impl Server {
             )))
             .build_v1()?;
 
+        let shutdown = self.shutdown.clone();
         TonicServer::builder()
             .add_service(LedgerServer::new(handler))
             .add_service(reflection_service)
-            .serve_with_shutdown(self.addr, shutdown_signal())
+            .serve_with_shutdown(self.addr, async move {
+                shutdown.notified().await;
+            })
             .await?;
 
         info!("Ledger gRPC server shut down cleanly");
@@ -87,17 +102,24 @@ pub struct NodeServerRuntime {
     addr: SocketAddr,
     handler: NodeHandler,
     max_message_bytes: usize,
+    shutdown: Arc<Notify>,
 }
 
 impl NodeServerRuntime {
     /// `max_message_bytes` bounds both inbound `AppendEntries` decoding and
     /// outbound response encoding. Must be at least as large as the leader's
     /// `append_entries_max_bytes` + protobuf framing overhead.
-    pub fn new(addr: SocketAddr, handler: NodeHandler, max_message_bytes: usize) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        handler: NodeHandler,
+        max_message_bytes: usize,
+        shutdown: Arc<Notify>,
+    ) -> Self {
         Self {
             addr,
             handler,
             max_message_bytes,
+            shutdown,
         }
     }
 
@@ -109,54 +131,14 @@ impl NodeServerRuntime {
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Node gRPC server listening on {}", self.addr);
+        let shutdown = self.shutdown.clone();
         TonicServer::builder()
             .add_service(Self::service(self.handler, self.max_message_bytes))
-            .serve(self.addr)
+            .serve_with_shutdown(self.addr, async move {
+                shutdown.notified().await;
+            })
             .await?;
+        info!("Node gRPC server shut down cleanly");
         Ok(())
-    }
-
-    pub async fn run_with_shutdown<F>(
-        self,
-        shutdown: F,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: Future<Output = ()>,
-    {
-        info!("Node gRPC server listening on {}", self.addr);
-        TonicServer::builder()
-            .add_service(Self::service(self.handler, self.max_message_bytes))
-            .serve_with_shutdown(self.addr, shutdown)
-            .await?;
-        Ok(())
-    }
-}
-
-/// Resolves when the process receives SIGINT (Ctrl+C) or SIGTERM (`docker
-/// stop`). Required because we run as PID 1 in the container, which does NOT
-/// install default signal handlers — without this, signals are silently
-/// dropped and the container hangs until Docker's grace period expires.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install ctrl+c handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => info!("received Ctrl+C, shutting down"),
-        _ = terminate => info!("received SIGTERM, shutting down"),
     }
 }
