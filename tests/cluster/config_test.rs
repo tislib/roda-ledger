@@ -99,8 +99,7 @@ async fn standalone_serves_writes_with_no_node_grpc() {
     assert!(h.quorum().is_none(), "standalone has no Quorum");
     assert!(h.as_cluster().is_none(), "standalone is not clustered");
 
-    let client = ctl.client().node(0).clone();
-    let tx_id = client.deposit(ACCOUNT, AMOUNT, 0).await.expect("deposit");
+    let tx_id = ctl.deposit(ACCOUNT, AMOUNT, 0).await.expect("deposit");
     assert_eq!(tx_id, 1);
 }
 
@@ -155,8 +154,7 @@ async fn single_node_cluster_boots_directly_as_leader() {
         .expect("immediate leader");
     assert_eq!(leader_idx, 0);
 
-    let client = ctl.client().node(0).clone();
-    let r = client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("submit");
@@ -187,8 +185,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
         .await
         .expect("leader");
 
-    let leader_client = ctl.client().leader().clone();
-    let r = leader_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("first ClusterCommit ack");
@@ -205,7 +202,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
     wait_port_free(follower_node_port, Duration::from_secs(5)).await;
 
     // ClusterCommit wait must time out.
-    let result = leader_client
+    let result = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await;
     assert!(
@@ -238,7 +235,6 @@ async fn three_node_cluster_tolerates_one_failure() {
         .expect("start");
 
     let _leader = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     let follower_idx = ctl.first_follower_index().await.expect("follower");
     ctl.stop_node(follower_idx)
@@ -246,7 +242,7 @@ async fn three_node_cluster_tolerates_one_failure() {
         .expect("stop one follower");
 
     // 2/3 alive — majority intact, ClusterCommit must still succeed.
-    let r = leader_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("ClusterCommit with one follower down");
@@ -263,7 +259,6 @@ async fn five_node_cluster_tolerates_two_failures() {
         .expect("start");
 
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(15)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     // Stop two followers (any two). Quorum size = 3, leader + 2
     // remaining followers = 3 → still reachable.
@@ -279,7 +274,7 @@ async fn five_node_cluster_tolerates_two_failures() {
         }
     }
 
-    let r = leader_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("ClusterCommit with 2 of 5 down");

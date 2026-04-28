@@ -27,8 +27,7 @@ async fn standalone_serves_writes_with_no_node_grpc() {
     assert!(handles.as_cluster().is_none());
 
     // Standalone is writable: a client can submit and observe a tx_id.
-    let client = ctl.client().node(0).clone();
-    let tx_id = client.deposit(1, 100, 0).await.expect("deposit");
+    let tx_id = ctl.deposit(1, 100, 0).await.expect("deposit");
     assert_eq!(tx_id, 1, "first standalone submit should be tx 1");
 }
 

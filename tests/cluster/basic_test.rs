@@ -41,11 +41,14 @@ async fn cluster_leader_replicates_to_follower() {
         ctl.node_id(leader_idx).unwrap()
     );
 
-    let leader_client = ctl.client().leader().clone();
-    let follower_client = ctl.client().next_follower().await.expect("follower index");
-
-    // ── Follower rejects writes ─────────────────────────────────────────
-    let write_err = follower_client
+    // ── Follower rejects writes (negative-path uses raw escape hatch) ──
+    let follower_idx = ctl
+        .first_follower_index()
+        .await
+        .expect("follower index");
+    let write_err = ctl
+        .raw_client_for_slot(follower_idx)
+        .expect("raw follower client")
         .deposit(1, 10, 0)
         .await
         .expect_err("follower must reject writes");
@@ -55,14 +58,12 @@ async fn cluster_leader_replicates_to_follower() {
         "follower should return FAILED_PRECONDITION on submit"
     );
 
-    // ── Drive writes on the leader ──────────────────────────────────────
-    // Single batch + wait so we don't pay 200 round-trips just to
-    // confirm the leader committed everything.
+    // ── Drive writes on the leader (bumps last_tx_id internally) ────────
     let account = 7u64;
     let amount = 100u64;
     let total_tx = 200u64;
     let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|_| (account, amount, 0u64)).collect();
-    let results = leader_client
+    let results = ctl
         .deposit_batch_and_wait(&deposits, WaitLevel::ClusterCommit)
         .await
         .expect("leader batch deposit");
@@ -71,56 +72,17 @@ async fn cluster_leader_replicates_to_follower() {
         assert_eq!(r.fail_reason, 0, "leader deposit must succeed");
     }
 
-    // ── Wait for follower to catch up ───────────────────────────────────
-    ctl.wait_for(Duration::from_secs(60), "follower commit_index", || {
-        let fc = follower_client.clone();
-        async move {
-            fc.get_pipeline_index()
-                .await
-                .map(|i| i.commit >= total_tx)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("follower commit");
-
-    ctl.wait_for(Duration::from_secs(60), "follower snapshot_index", || {
-        let fc = follower_client.clone();
-        async move {
-            fc.get_pipeline_index()
-                .await
-                .map(|i| i.snapshot >= total_tx)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("follower snapshot");
-
-    // ── Verification: balances match ─────────────────────────────────────
-    let leader_account_balance = leader_client.get_balance(account).await.unwrap().balance;
-    let follower_account_balance = follower_client.get_balance(account).await.unwrap().balance;
-    let leader_system_balance = leader_client
-        .get_balance(SYSTEM_ACCOUNT_ID)
-        .await
-        .unwrap()
-        .balance;
-    let follower_system_balance = follower_client
-        .get_balance(SYSTEM_ACCOUNT_ID)
-        .await
-        .unwrap()
-        .balance;
-
-    assert_eq!(
-        leader_account_balance, follower_account_balance,
-        "user account balance must match between leader and follower"
-    );
-    assert_eq!(
-        leader_system_balance, follower_system_balance,
-        "system account balance must match"
-    );
+    // ── Verification: leader and follower converge on the same balance ──
+    // `require_balance{,_on}` blocks each node's snapshot watermark
+    // until it has caught up to last_tx_id, then asserts.
     let expected_abs = (total_tx * amount) as i64;
-    assert_eq!(leader_account_balance.abs(), expected_abs);
-    assert_eq!(leader_account_balance + leader_system_balance, 0);
+    ctl.require_balance(account, expected_abs).await;
+    ctl.require_balance_on(follower_idx, account, expected_abs)
+        .await;
+    ctl.require_balance(SYSTEM_ACCOUNT_ID, -expected_abs).await;
+    ctl.require_balance_on(follower_idx, SYSTEM_ACCOUNT_ID, -expected_abs)
+        .await;
+    ctl.require_zero_sum(&[account, SYSTEM_ACCOUNT_ID]).await;
 
     // ── Shutdown ────────────────────────────────────────────────────────
     ctl.stop_all().await;

@@ -10,7 +10,6 @@
 
 #![cfg(feature = "cluster")]
 
-use roda_ledger::client::ClusterClient;
 use roda_ledger::cluster::proto::ledger::WaitLevel;
 use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
 use roda_ledger::entities::{FailReason, SYSTEM_ACCOUNT_ID};
@@ -32,32 +31,6 @@ async fn wait_leader(ctl: &ClusterTestingControl, timeout: Duration) -> usize {
     ctl.wait_for_leader(timeout)
         .await
         .expect("leader did not appear within timeout")
-}
-
-/// Confirm that account+system balances always sum to zero on the queried
-/// node. This is the cluster-level analog of the ledger's accounting
-/// invariant — it must hold across every replica after any sequence of
-/// faults.
-async fn assert_zero_sum(client: &ClusterClient) {
-    // Read both balances off the SAME node — the leader — so the two
-    // reads see the same snapshot. ClusterClient's read facades
-    // round-robin across every node and a follower's snapshot may
-    // briefly lag the leader's, which would silently yield mismatched
-    // balances even though the cluster invariant still holds.
-    let leader = client.leader();
-    let acct = leader.get_balance(ACCOUNT).await.expect("balance").balance;
-    let sys = leader
-        .get_balance(SYSTEM_ACCOUNT_ID)
-        .await
-        .expect("system balance")
-        .balance;
-    assert_eq!(
-        acct + sys,
-        0,
-        "zero-sum invariant violated: account={} system={}",
-        acct,
-        sys
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -87,14 +60,12 @@ async fn idempotent_retry_across_failover() {
     let l1_node_id = ctl.node_id(leader1_idx).expect("node_id");
     eprintln!("[idempotent] leader1 = node {}", l1_node_id);
 
-    let l1_client = ctl.client().leader().clone();
-
     // Phase 1: submit user_refs 1..=100 under L1, ClusterCommit-acked.
     let half: u64 = 100;
     let total: u64 = 200;
     let first_half: Vec<(u64, u64, u64)> = (1..=half).map(|ur| (ACCOUNT, AMOUNT, ur)).collect();
 
-    let r1 = l1_client
+    let r1 = ctl
         .deposit_batch_and_wait(&first_half, WaitLevel::ClusterCommit)
         .await
         .expect("first half ack under L1");
@@ -103,17 +74,11 @@ async fn idempotent_retry_across_failover() {
         assert_eq!(r.fail_reason, 0, "phase-1 deposit must succeed");
     }
 
-    let bal_pre_kill = l1_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("balance")
-        .balance;
-    assert_eq!(bal_pre_kill, (half as i64) * (AMOUNT as i64));
-    assert_zero_sum(ctl.client()).await;
+    let bal_pre_kill = (half as i64) * (AMOUNT as i64);
+    ctl.require_balance(ACCOUNT, bal_pre_kill).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
 
-    // Phase 2: kill L1. Drop the L1 client first so its in-flight RPCs
-    // can't accidentally hold the cluster busy past abort.
-    drop(l1_client);
+    // Phase 2: kill L1.
     ctl.stop_node(leader1_idx).await.expect("stop L1");
 
     // Phase 3: a different node must win the election.
@@ -125,14 +90,12 @@ async fn idempotent_retry_across_failover() {
     );
     eprintln!("[idempotent] leader2 = node {}", l2_node_id);
 
-    let l2_client = ctl.client().leader().clone();
-
     // Phase 4: retry the FULL 200-op batch. user_refs 1..=100 are
     // duplicates (already in dedup cache, replicated to L2's WAL);
     // 101..=200 are fresh.
     let full_batch: Vec<(u64, u64, u64)> = (1..=total).map(|ur| (ACCOUNT, AMOUNT, ur)).collect();
 
-    let r2 = l2_client
+    let r2 = ctl
         .deposit_batch_and_wait(&full_batch, WaitLevel::ClusterCommit)
         .await
         .expect("retry batch under L2");
@@ -155,48 +118,17 @@ async fn idempotent_retry_across_failover() {
     );
 
     // Phase 5: final balance reflects ONE application of the 200 deposits.
-    let bal_final = l2_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("balance")
-        .balance;
-    assert_eq!(
-        bal_final,
-        (total as i64) * (AMOUNT as i64),
-        "balance must equal one application of 200 deposits, not 300"
-    );
-    assert_zero_sum(ctl.client()).await;
+    let bal_final = (total as i64) * (AMOUNT as i64);
+    ctl.require_balance(ACCOUNT, bal_final).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
 
     // Cross-node check: surviving follower must agree.
-    let follower_client = ctl
-        .client()
-        .next_follower()
+    let follower_idx = ctl
+        .first_follower_index()
         .await
         .expect("there must still be a follower");
-    ctl.wait_for(
-        Duration::from_secs(30),
-        "follower commit catches up",
-        || {
-            let fc = follower_client.clone();
-            async move {
-                fc.get_pipeline_index()
-                    .await
-                    .map(|i| i.commit >= total)
-                    .unwrap_or(false)
-            }
-        },
-    )
-    .await
-    .expect("follower commit");
-    let follower_bal = follower_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("follower balance")
-        .balance;
-    assert_eq!(
-        follower_bal, bal_final,
-        "follower must converge on the same final balance"
-    );
+    ctl.require_balance_on(follower_idx, ACCOUNT, bal_final)
+        .await;
 
     ctl.stop_all().await;
 }
@@ -235,25 +167,17 @@ async fn balance_state_in_sync_after_failover() {
 
     let leader1_idx = wait_leader(&ctl, Duration::from_secs(10)).await;
     let l1_node_id = ctl.node_id(leader1_idx).expect("node_id");
-    let l1_client = ctl.client().leader().clone();
 
     // Fund A with 1000 on the leader; ack ClusterCommit so it's on
     // majority of WALs (and replicated to whichever survivor wins).
-    let r = l1_client
+    let r = ctl
         .deposit_and_wait(ACC_A, 1000, /*user_ref=*/ 1, WaitLevel::ClusterCommit)
         .await
         .expect("fund A");
     assert_eq!(r.fail_reason, 0);
+    ctl.require_balance(ACC_A, 1000).await;
 
-    let pre_a = l1_client
-        .get_balance(ACC_A)
-        .await
-        .expect("balance A")
-        .balance;
-    assert_eq!(pre_a, 1000);
-
-    // Kill L1. Drop client first so its in-flight RPCs don't linger.
-    drop(l1_client);
+    // Kill L1.
     ctl.stop_node(leader1_idx).await.expect("stop L1");
 
     // New leader emerges from the followers — its Transactor's
@@ -264,11 +188,10 @@ async fn balance_state_in_sync_after_failover() {
         l1_node_id,
         "killed leader cannot be the new one"
     );
-    let l2_client = ctl.client().leader().clone();
 
     // Transfer 600 from A to B on the new leader. The new leader's
     // Transactor must validate against an up-to-date `balances[A]`.
-    let r = l2_client
+    let r = ctl
         .transfer_and_wait(
             ACC_A,
             ACC_B,
@@ -285,65 +208,18 @@ async fn balance_state_in_sync_after_failover() {
         r.fail_reason
     );
 
-    let post_a = l2_client
-        .get_balance(ACC_A)
-        .await
-        .expect("balance A")
-        .balance;
-    let post_b = l2_client
-        .get_balance(ACC_B)
-        .await
-        .expect("balance B")
-        .balance;
-    let post_sys = l2_client
-        .get_balance(SYSTEM_ACCOUNT_ID)
-        .await
-        .expect("balance system")
-        .balance;
-    assert_eq!(
-        post_a, 400,
-        "A's balance after 1000 deposit + 600 transfer out"
-    );
-    assert_eq!(post_b, 600, "B's balance after 600 transfer in");
-    assert_eq!(
-        post_a + post_b + post_sys,
-        0,
-        "zero-sum invariant: A + B + system must be 0; got {} + {} + {} = {}",
-        post_a,
-        post_b,
-        post_sys,
-        post_a + post_b + post_sys,
-    );
+    ctl.require_balance(ACC_A, 400).await;
+    ctl.require_balance(ACC_B, 600).await;
+    ctl.require_zero_sum(&[ACC_A, ACC_B, SYSTEM_ACCOUNT_ID])
+        .await;
 
     // Cross-node convergence: surviving follower agrees.
-    let follower_client = ctl
-        .client()
-        .next_follower()
+    let follower_idx = ctl
+        .first_follower_index()
         .await
         .expect("a non-leader survives");
-    ctl.wait_for(
-        Duration::from_secs(15),
-        "follower commit catches up",
-        || {
-            let fc = follower_client.clone();
-            async move {
-                fc.get_pipeline_index()
-                    .await
-                    .map(|i| i.commit >= 2)
-                    .unwrap_or(false)
-            }
-        },
-    )
-    .await
-    .expect("follower catch-up");
-    assert_eq!(
-        follower_client.get_balance(ACC_A).await.unwrap().balance,
-        400
-    );
-    assert_eq!(
-        follower_client.get_balance(ACC_B).await.unwrap().balance,
-        600
-    );
+    ctl.require_balance_on(follower_idx, ACC_A, 400).await;
+    ctl.require_balance_on(follower_idx, ACC_B, 600).await;
 
     ctl.stop_all().await;
 }
@@ -357,61 +233,59 @@ async fn balance_state_in_sync_after_failover() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acked_cluster_commit_survives_full_restart() {
-    loop {
-        let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
-            label: "safety_full_restart".to_string(),
-            replication_poll_ms: 5,
-            append_entries_max_bytes: 256 * 1024,
-            ..ClusterTestingConfig::cluster(3)
-        })
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        label: "safety_full_restart".to_string(),
+        replication_poll_ms: 5,
+        append_entries_max_bytes: 256 * 1024,
+        ..ClusterTestingConfig::cluster(3)
+    })
+    .await
+    .expect("start");
+
+    let _leader_idx = wait_leader(&ctl, Duration::from_secs(10)).await;
+
+    // Submit N=20 deposits, each individually `submit_and_wait(ClusterCommit)`.
+    // Doing them one-at-a-time means each assertion ("acked => durable") is
+    // unambiguous. The harness tracks `last_tx_id` internally so the
+    // post-restart `require_*` reads block on the new leader's snapshot
+    // catch-up.
+    let n: u64 = 20;
+    let expected_balance = (n as i64) * (AMOUNT as i64);
+    let mut acked_tx_ids: Vec<u64> = Vec::with_capacity(n as usize);
+    for ur in 1..=n {
+        let r = ctl
+            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
-            .expect("start");
-
-        let _leader_idx = wait_leader(&ctl, Duration::from_secs(10)).await;
-
-        // Submit N=20 deposits, each individually `submit_and_wait(ClusterCommit)`.
-        // Doing them one-at-a-time means each assertion ("acked => durable") is
-        // unambiguous. The harness tracks `last_tx_id` internally so the
-        // post-restart `require_*` reads block on the new leader's snapshot
-        // catch-up.
-        let n: u64 = 20;
-        let expected_balance = (n as i64) * (AMOUNT as i64);
-        let mut acked_tx_ids: Vec<u64> = Vec::with_capacity(n as usize);
-        for ur in 1..=n {
-            let r = ctl
-                .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
-                .await
-                .expect("deposit_and_wait");
-            assert_eq!(r.fail_reason, 0);
-            assert!(r.tx_id > 0);
-            acked_tx_ids.push(r.tx_id);
-        }
-
-        ctl.require_balance(ACCOUNT, expected_balance).await;
-        ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
-
-        // Cold-restart the entire cluster on the same data dirs.
-        for i in 0..ctl.len() {
-            ctl.stop_node(i).await.expect("stop");
-        }
-        for i in 0..ctl.len() {
-            ctl.start_node(i).await.expect("start");
-        }
-
-        let _new_leader_idx = wait_leader(&ctl, Duration::from_secs(15)).await;
-
-        // Every acked tx_id must still be Committed (or further) on the
-        // new leader once it has caught up to last_tx_id.
-        for tx_id in &acked_tx_ids {
-            ctl.require_transaction_committed(*tx_id).await;
-        }
-
-        // Balance must be exactly preserved.
-        ctl.require_balance(ACCOUNT, expected_balance).await;
-        ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
-
-        ctl.stop_all().await;
+            .expect("deposit_and_wait");
+        assert_eq!(r.fail_reason, 0);
+        assert!(r.tx_id > 0);
+        acked_tx_ids.push(r.tx_id);
     }
+
+    ctl.require_balance(ACCOUNT, expected_balance).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
+
+    // Cold-restart the entire cluster on the same data dirs.
+    for i in 0..ctl.len() {
+        ctl.stop_node(i).await.expect("stop");
+    }
+    for i in 0..ctl.len() {
+        ctl.start_node(i).await.expect("start");
+    }
+
+    let _new_leader_idx = wait_leader(&ctl, Duration::from_secs(15)).await;
+
+    // Every acked tx_id must still be Committed (or further) on the
+    // new leader once it has caught up to last_tx_id.
+    for tx_id in &acked_tx_ids {
+        ctl.require_transaction_committed(*tx_id).await;
+    }
+
+    // Balance must be exactly preserved.
+    ctl.require_balance(ACCOUNT, expected_balance).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
+
+    ctl.stop_all().await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -435,25 +309,20 @@ async fn rotational_restart_resilience() {
     .expect("start");
 
     let _initial_leader = wait_leader(&ctl, Duration::from_secs(10)).await;
-    let leader_client = ctl.client().leader().clone();
 
     // Baseline: 30 deposits, ClusterCommit-acked individually, recorded.
     let baseline_count: u64 = 30;
+    let baseline_balance = (baseline_count as i64) * (AMOUNT as i64);
     let mut baseline_ids: Vec<u64> = Vec::with_capacity(baseline_count as usize);
     for ur in 1..=baseline_count {
-        let r = leader_client
+        let r = ctl
             .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("baseline deposit");
         assert_eq!(r.fail_reason, 0);
         baseline_ids.push(r.tx_id);
     }
-    let baseline_balance = leader_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("baseline balance")
-        .balance;
-    drop(leader_client);
+    ctl.require_balance(ACCOUNT, baseline_balance).await;
 
     // Restart every slot once, in slot-order. After each, the cluster must
     // have a leader within the election-timer budget AND the baseline must
@@ -465,65 +334,22 @@ async fn rotational_restart_resilience() {
         ctl.start_node(i).await.expect("start");
 
         // The cluster (with at most 1 node down) must keep a leader.
-        let new_leader = wait_leader(&ctl, Duration::from_secs(10)).await;
-        let new_client = ctl.client().node(new_leader).clone();
+        let _new_leader = wait_leader(&ctl, Duration::from_secs(10)).await;
 
-        // Every baseline tx must still report Committed or OnSnapshot.
-        // proto::TransactionStatus: PENDING=0, COMPUTED=1, COMMITTED=2,
-        // ON_SNAPSHOT=3, ERROR=4, TX_NOT_FOUND=5. The previous form
-        // `status >= 2` accepted ERROR and TX_NOT_FOUND too, which
-        // hid stale-replica reads as silent successes.
+        // Every baseline tx must still be Committed (or further) once
+        // the leader has caught up to last_tx_id.
         for tx_id in &baseline_ids {
-            let (status, fail_reason) = new_client
-                .get_transaction_status(*tx_id)
-                .await
-                .expect("status");
-            assert!(
-                status == 2 || status == 3,
-                "tx {} lost after restart of slot {}: status={} (expected COMMITTED=2 or ON_SNAPSHOT=3)",
-                tx_id,
-                i,
-                status
-            );
-            assert_eq!(fail_reason, 0);
+            ctl.require_transaction_committed(*tx_id).await;
         }
 
-        let bal = new_client
-            .get_balance(ACCOUNT)
-            .await
-            .expect("balance")
-            .balance;
-        assert_eq!(
-            bal, baseline_balance,
-            "balance changed after rotational restart of slot {}",
-            i
-        );
-        assert_zero_sum(ctl.client()).await;
+        ctl.require_balance(ACCOUNT, baseline_balance).await;
+        ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
     }
 
     // After the rotation completes, all three nodes must agree on the
     // baseline once their commit indices have caught up.
     for i in 0..ctl.len() {
-        let c = ctl.client().node(i).clone();
-        ctl.wait_for(Duration::from_secs(30), "node commit catches up", || {
-            let c = c.clone();
-            let target = baseline_count;
-            async move {
-                c.get_pipeline_index()
-                    .await
-                    .map(|p| p.commit >= target)
-                    .unwrap_or(false)
-            }
-        })
-        .await
-        .expect("post-rotation commit");
-        let bal = c.get_balance(ACCOUNT).await.expect("balance").balance;
-        assert_eq!(
-            bal,
-            baseline_balance,
-            "post-rotation node {} disagrees on baseline balance",
-            ctl.node_id(i).unwrap()
-        );
+        ctl.require_balance_on(i, ACCOUNT, baseline_balance).await;
     }
 
     ctl.stop_all().await;
@@ -579,7 +405,11 @@ async fn no_leader_blocks_writes() {
 
     // Submit must fail with FailedPrecondition. Try a few times across
     // the Initializing/Candidate oscillation — every attempt must reject.
-    let lone_client = ctl.client().node(0).clone();
+    // Negative-path: bypasses the harness's leader-routing retry loop.
+    let lone_client = ctl
+        .raw_client_for_slot(0)
+        .expect("raw lone-node client")
+        .clone();
     for attempt in 0..5 {
         let err = lone_client
             .deposit(ACCOUNT, AMOUNT, attempt + 1)
@@ -598,10 +428,7 @@ async fn no_leader_blocks_writes() {
     // The lone node must have NO committed user transactions yet (the
     // term log will still record genesis terms, but no Deposit landed).
     // Verify via pipeline index — commit should be 0.
-    let idx = lone_client
-        .get_pipeline_index()
-        .await
-        .expect("pipeline index");
+    let idx = ctl.pipeline_index_on(0).await.expect("pipeline index");
     assert_eq!(
         idx.commit, 0,
         "no submission should have produced a commit while no leader existed"
@@ -618,24 +445,15 @@ async fn no_leader_blocks_writes() {
     );
 
     // Submit succeeds against the new leader.
-    let new_client = ctl.client().leader().clone();
-    let r = new_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 999, WaitLevel::ClusterCommit)
         .await
         .expect("submit succeeds once leader exists");
     assert_eq!(r.fail_reason, 0);
     assert!(r.tx_id > 0);
 
-    let bal = new_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("balance")
-        .balance;
-    assert_eq!(
-        bal, AMOUNT as i64,
-        "exactly one deposit should be visible after quorum restored"
-    );
-    assert_zero_sum(ctl.client()).await;
+    ctl.require_balance(ACCOUNT, AMOUNT as i64).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
 
     ctl.stop_all().await;
 }
@@ -667,29 +485,23 @@ async fn mid_election_cluster_commit_not_lost() {
 
     let leader_idx = wait_leader(&ctl, Duration::from_secs(10)).await;
     let leader_node_id = ctl.node_id(leader_idx).expect("node_id");
-    let leader_client = ctl.client().leader().clone();
 
     // Submit N deposits, each ClusterCommit-acked. Snapshot each tx_id.
     let n: u64 = 25;
+    let pre_balance = (n as i64) * (AMOUNT as i64);
     let mut acked: Vec<u64> = Vec::with_capacity(n as usize);
     for ur in 1..=n {
-        let r = leader_client
+        let r = ctl
             .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("ClusterCommit deposit");
         assert_eq!(r.fail_reason, 0);
         acked.push(r.tx_id);
     }
-    let pre_balance = leader_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("balance")
-        .balance;
-    assert_eq!(pre_balance, (n as i64) * (AMOUNT as i64));
-    assert_zero_sum(ctl.client()).await;
+    ctl.require_balance(ACCOUNT, pre_balance).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
 
     // Pull the trigger on the leader.
-    drop(leader_client);
     ctl.stop_node(leader_idx).await.expect("stop leader");
 
     // A different node must take over.
@@ -700,69 +512,23 @@ async fn mid_election_cluster_commit_not_lost() {
         "killed node cannot also be the new leader"
     );
 
-    let new_client = ctl.client().leader().clone();
-
-    // Every acked tx must still be visible on the new leader.
-    // proto::TransactionStatus: COMMITTED=2, ON_SNAPSHOT=3 (durable).
+    // Every acked tx must still be Committed (or further) on the new
+    // leader once it has caught up to last_tx_id.
     for tx_id in &acked {
-        let (status, fail_reason) = new_client
-            .get_transaction_status(*tx_id)
-            .await
-            .expect("status RPC");
-        assert!(
-            status == 2 || status == 3,
-            "tx {} lost across re-election (status={}, expected COMMITTED=2 or ON_SNAPSHOT=3)",
-            tx_id,
-            status
-        );
-        assert_eq!(fail_reason, 0);
+        ctl.require_transaction_committed(*tx_id).await;
     }
 
-    let post_balance = new_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("balance")
-        .balance;
-    assert_eq!(
-        post_balance, pre_balance,
-        "balance regressed across re-election: {} -> {}",
-        pre_balance, post_balance
-    );
-    assert_zero_sum(ctl.client()).await;
+    ctl.require_balance(ACCOUNT, pre_balance).await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
 
     // The remaining follower (the one that wasn't elected) should also
     // converge on the same balance once its commit catches up.
-    let follower_client = ctl
-        .client()
-        .next_follower()
+    let follower_idx = ctl
+        .first_follower_index()
         .await
         .expect("there must still be a non-leader running node");
-    ctl.wait_for(
-        Duration::from_secs(30),
-        "follower commit catches up",
-        || {
-            let fc = follower_client.clone();
-            let target = n;
-            async move {
-                fc.get_pipeline_index()
-                    .await
-                    .map(|p| p.commit >= target)
-                    .unwrap_or(false)
-            }
-        },
-    )
-    .await
-    .expect("follower commit");
-    let follower_balance = follower_client
-        .get_balance(ACCOUNT)
-        .await
-        .expect("balance")
-        .balance;
-    assert_eq!(
-        follower_balance, pre_balance,
-        "follower disagrees on post-failover balance"
-    );
-    assert_zero_sum(ctl.client()).await;
+    ctl.require_balance_on(follower_idx, ACCOUNT, pre_balance)
+        .await;
 
     ctl.stop_all().await;
 }

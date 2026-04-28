@@ -135,32 +135,13 @@ async fn supervisor_reseeds_on_divergence_detected_via_node_grpc() {
     //
     // The cluster is in Initializing post-reseed, so reads work
     // (`get_pipeline_index` doesn't go through the writable gate).
-    let client = ctl.client().node(0).clone();
-    ctl.wait_for(
-        Duration::from_secs(10),
-        "supervisor reseed to land at watermark",
-        || {
-            let c = client.clone();
-            async move {
-                c.get_pipeline_index()
-                    .await
-                    .map(|i| i.commit == leader_commit)
-                    .unwrap_or(false)
-            }
-        },
-    )
-    .await
-    .expect("reseed");
+    // Reseed *truncates* commit down to exactly leader_commit;
+    // pre-reseed commit is above it. Use the `_eq` variant.
+    ctl.require_pipeline_commit_eq(0, leader_commit).await;
 
     // ── Verification: balances reflect only the surviving prefix ────
-    let idx = client.get_pipeline_index().await.expect("pipeline index");
-    assert_eq!(
-        idx.commit, leader_commit,
-        "ledger should be reseeded to the leader's watermark"
-    );
-
-    let b1 = client.get_balance(1).await.expect("balance 1").balance;
-    let b2 = client.get_balance(2).await.expect("balance 2").balance;
+    let b1 = ctl.get_balance_on(0, 1).await.expect("balance 1").balance;
+    let b2 = ctl.get_balance_on(0, 2).await.expect("balance 2").balance;
     assert_eq!(b1, 50, "account 1 prefix preserved");
     assert_eq!(b2, 0, "account 2 deposits truncated");
 

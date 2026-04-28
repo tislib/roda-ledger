@@ -249,22 +249,12 @@ async fn supervisor_reseeds_on_divergence() {
         .into_inner();
     assert!(!resp.success);
 
-    let client = ctl.client().node(0).clone();
-    ctl.wait_for(Duration::from_secs(10), "reseed lands at watermark", || {
-        let c = client.clone();
-        async move {
-            c.get_pipeline_index()
-                .await
-                .map(|i| i.commit == leader_commit)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("reseed");
+    // Reseed truncates commit down to exactly leader_commit.
+    ctl.require_pipeline_commit_eq(0, leader_commit).await;
 
     // Surviving prefix: account 1 keeps 50, account 2 truncated to 0.
-    let b1 = client.get_balance(1).await.unwrap().balance;
-    let b2 = client.get_balance(2).await.unwrap().balance;
+    let b1 = ctl.get_balance_on(0, 1).await.unwrap().balance;
+    let b2 = ctl.get_balance_on(0, 2).await.unwrap().balance;
     assert_eq!(b1, 50);
     assert_eq!(b2, 0);
 
@@ -322,26 +312,12 @@ async fn reseed_re_registers_on_commit_hook() {
         })
         .await;
 
-    let client = ctl.client().node(0).clone();
-    ctl.wait_for(Duration::from_secs(10), "reseed lands", || {
-        let c = client.clone();
-        async move {
-            c.get_pipeline_index()
-                .await
-                .map(|i| i.commit == 10)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("reseed");
-
     // Quorum (sized 1) should still publish the leader's commit
     // post-reseed via the re-registered on_commit hook. The node is
     // still in Initializing post-reseed (no peers, no leader role
     // promotion happens automatically here), so we just verify the
-    // commit_index reads the truncated value.
-    let idx = client.get_pipeline_index().await.unwrap();
-    assert_eq!(idx.commit, 10);
+    // commit_index settles at the truncated value.
+    ctl.require_pipeline_commit_eq(0, 10).await;
 
     ctl.stop_node(0).await.expect("stop");
 }
@@ -376,8 +352,7 @@ async fn grpc_servers_survive_reseed_swap() {
     ctl.run_node(0).await.expect("run");
     ctl.wait_for_bind(0, Duration::from_secs(5)).await.unwrap();
 
-    let client_held = ctl.client().node(0).clone();
-    let pre_idx = client_held.get_pipeline_index().await.unwrap();
+    let pre_idx = ctl.pipeline_index_on(0).await.unwrap();
     assert_eq!(pre_idx.commit, 10);
 
     // Trigger reseed.
@@ -399,18 +374,9 @@ async fn grpc_servers_survive_reseed_swap() {
         })
         .await;
 
-    // Same client still works after reseed.
-    ctl.wait_for(Duration::from_secs(10), "client sees reseed", || {
-        let c = client_held.clone();
-        async move {
-            c.get_pipeline_index()
-                .await
-                .map(|i| i.commit == 5)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("reseed visible to held client");
+    // Reseed truncates commit down to exactly 5; visible via the
+    // harness's per-slot pipeline reads.
+    ctl.require_pipeline_commit_eq(0, 5).await;
 
     ctl.stop_node(0).await.expect("stop");
 }

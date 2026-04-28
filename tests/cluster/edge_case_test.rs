@@ -24,8 +24,7 @@ async fn single_node_cluster_commit_index_self_advances() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client().node(0).clone();
-    let r = client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
@@ -106,8 +105,7 @@ async fn single_node_cluster_spawns_no_peer_tasks() {
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
     // Indirect: a single-node leader can ack ClusterCommit without
     // spawning any peer task.
-    let client = ctl.client().node(0).clone();
-    let r = client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
@@ -135,8 +133,7 @@ async fn phantom_peer_does_not_crash_leader() {
     sleep(Duration::from_millis(500)).await;
 
     // Server is alive; queries succeed.
-    let client = ctl.client().node(0).clone();
-    let _ = client.get_pipeline_index().await.expect("query");
+    let _ = ctl.pipeline_index_on(0).await.expect("query");
 }
 
 /// Restart the same clustered harness on the same data dir → Term log
@@ -163,8 +160,7 @@ async fn cluster_node_restart_rehydrates_term() {
     {
         let ctl = ClusterTestingControl::start(cfg()).await.unwrap();
         let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-        let client = ctl.client().node(0).clone();
-        let _ = client
+        let _ = ctl
             .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
             .await
             .unwrap();
@@ -296,8 +292,7 @@ async fn grpc_reflection_available_on_client_port() {
     // We don't have a reflection client dependency; instead verify
     // that the port is open and responds to a normal LedgerClient
     // call (proves the tonic transport is up).
-    let client = ctl.client().node(0).clone();
-    let _ = client.get_pipeline_index().await.expect("ping via client");
+    let _ = ctl.pipeline_index_on(0).await.expect("ping via client");
     let _ = port; // referenced
 }
 

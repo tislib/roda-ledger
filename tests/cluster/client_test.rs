@@ -6,12 +6,17 @@ use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
 
 /// Spin up a standalone cluster and connect a high-level client to
 /// it. Returns the harness (so the caller can keep it alive for the
-/// duration of the test) and a connected client.
+/// duration of the test) and a raw `NodeClient`.
+///
+/// This test suite intentionally exercises the raw client API surface
+/// (every test calls a specific `NodeClient` method to verify it
+/// works), so the negative-test escape hatch is the right tool here —
+/// not the higher-level `require_*` API on `ClusterTestingControl`.
 async fn setup() -> (ClusterTestingControl, NodeClient) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::standalone())
         .await
         .expect("standalone start");
-    let client = ctl.client().node(0).clone();
+    let client = ctl.raw_client_for_slot(0).expect("raw client").clone();
     (ctl, client)
 }
 
@@ -257,8 +262,10 @@ async fn test_deposit_restart_withdraw() {
     .await
     .expect("standalone start");
 
-    // -- Create client and deposit --
-    let client = ctl.client().node(0).clone();
+    // -- Create raw client and deposit (this test exercises the
+    // client surface across a process restart, so we keep a raw
+    // handle rather than going through the higher-level harness API) --
+    let client = ctl.raw_client_for_slot(0).expect("raw client").clone();
     let result = client
         .deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot)
         .await

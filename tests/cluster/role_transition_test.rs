@@ -100,18 +100,14 @@ async fn new_leader_quorum_slots_reset_correctly() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
-    leader_client
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+    ctl.deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
-    drop(leader_client);
 
     ctl.stop_node(leader_idx).await.expect("stop");
     let _new_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
-    let new_client = ctl.client().leader().clone();
-    let r = new_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await
         .expect("post-failover ClusterCommit");

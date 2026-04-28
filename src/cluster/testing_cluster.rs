@@ -808,19 +808,14 @@ impl ClusterTestingControl {
             .ok_or(ClusterTestingError::NotStarted { idx: i })
     }
 
-    /// The cluster-aware [`ClusterClient`] for this harness.
-    ///
-    /// Tests get every cluster operation through this accessor:
-    /// - leader-routed writes via `ctl.client().deposit(…)` or
-    ///   `ctl.client().leader().deposit_and_wait(…)`.
-    /// - per-node access via `ctl.client().node(i)`.
-    /// - read-style RPCs via `ctl.client().get_balance(…)` (round-
-    ///   robin across all nodes).
-    ///
-    /// Panics if the harness is in Bare mode (no client gRPC) or
-    /// `start()` was called with `autostart = false` and the caller
-    /// has not yet invoked [`Self::rebuild_cluster_client`].
-    pub fn client(&self) -> &ClusterClient {
+    /// **Internal-only** accessor for the embedded `ClusterClient`.
+    /// Tests must use the higher-level [`Self::deposit_and_wait`] /
+    /// [`Self::require_balance`] / etc. APIs instead — those handle
+    /// leader pinning, post-stop catch-up, and status-code interpretation
+    /// uniformly. For negative-path RPCs that need raw client access
+    /// (e.g. asserting a non-leader rejects a write), use
+    /// [`Self::raw_client_for_slot`].
+    fn client(&self) -> &ClusterClient {
         self.cluster_client.as_ref().expect(
             "ClusterTestingControl::client() called before the cluster client was built — \
              use autostart=true (the default) or call rebuild_cluster_client() after \
@@ -1503,6 +1498,140 @@ impl ClusterTestingControl {
                 fail_reason,
                 pi,
             );
+        }
+    }
+
+    /// Read slot `slot`'s balance for `account` without catch-up
+    /// or assertion. Useful for diagnostic logging or for tests
+    /// that need to compare two nodes' balances directly. For
+    /// positive-path assertions, prefer
+    /// [`Self::require_balance`] / [`Self::require_balance_on`].
+    pub async fn get_balance_on(
+        &self,
+        slot: usize,
+        account: u64,
+    ) -> Result<crate::client::Balance, ClusterTestingError> {
+        self.cluster_client_or_err()?
+            .node(slot)
+            .get_balance(account)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "get_balance",
+                source: e,
+            })
+    }
+
+    /// Read slot `slot`'s pipeline index without catch-up or
+    /// assertion.
+    pub async fn pipeline_index_on(
+        &self,
+        slot: usize,
+    ) -> Result<PipelineIndex, ClusterTestingError> {
+        self.cluster_client_or_err()?
+            .node(slot)
+            .get_pipeline_index()
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "get_pipeline_index",
+                source: e,
+            })
+    }
+
+    /// Read slot `slot`'s `(status, fail_reason)` for `tx_id`
+    /// without catch-up or assertion.
+    pub async fn get_transaction_status_on(
+        &self,
+        slot: usize,
+        tx_id: u64,
+    ) -> Result<(i32, u32), ClusterTestingError> {
+        self.cluster_client_or_err()?
+            .node(slot)
+            .get_transaction_status(tx_id)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "get_transaction_status",
+                source: e,
+            })
+    }
+
+    /// Submit a WASM function call and wait. Routes to leader,
+    /// bumps `last_tx_id`.
+    pub async fn submit_function_and_wait(
+        &self,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        wait_level: lproto::WaitLevel,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .submit_function_and_wait(name, params, user_ref, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "submit_function_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(r.tx_id);
+        Ok(r)
+    }
+
+    /// Register a WASM function. Routes to leader.
+    pub async fn register_function(
+        &self,
+        name: &str,
+        binary: &[u8],
+        override_existing: bool,
+    ) -> Result<(u16, u32), ClusterTestingError> {
+        self.cluster_client_or_err()?
+            .register_function(name, binary, override_existing)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "register_function",
+                source: e,
+            })
+    }
+
+    /// Unregister a WASM function. Routes to leader.
+    pub async fn unregister_function(&self, name: &str) -> Result<u16, ClusterTestingError> {
+        self.cluster_client_or_err()?
+            .unregister_function(name)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "unregister_function",
+                source: e,
+            })
+    }
+
+    /// Block (with [`Self::CATCH_UP_TIMEOUT`]) until slot `slot`'s
+    /// `commit` watermark settles at exactly `target`. Use this for
+    /// observing **truncation** events (e.g. divergence reseed)
+    /// where the watermark drops down to a known point — the
+    /// `_at_least` variant returns immediately if commit is already
+    /// above the target.
+    pub async fn require_pipeline_commit_eq(&self, slot: usize, target: u64) {
+        let deadline = Instant::now() + Self::CATCH_UP_TIMEOUT;
+        loop {
+            match self.pipeline_index_on(slot).await {
+                Ok(idx) if idx.commit == target => return,
+                Ok(idx) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "require_pipeline_commit_eq(slot={}, target={}): \
+                             commit settled at {} (pipeline_index={:?})",
+                            slot, target, idx.commit, idx
+                        );
+                    }
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "require_pipeline_commit_eq(slot={}, target={}): RPC failure: {}",
+                            slot, target, e
+                        );
+                    }
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
         }
     }
 

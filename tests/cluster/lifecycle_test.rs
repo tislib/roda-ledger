@@ -95,21 +95,17 @@ async fn cluster_node_restart_preserves_state() {
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
-    let client = ctl.client().node(0).clone();
-    let r = client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
     assert_eq!(r.fail_reason, 0);
-    drop(client);
 
     ctl.stop_node(0).await.expect("stop");
     ctl.start_node(0).await.expect("restart");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
-    let new_client = ctl.client().node(0).clone();
-    let bal = new_client.get_balance(ACCOUNT).await.unwrap().balance;
-    assert_eq!(bal, AMOUNT as i64);
+    ctl.require_balance(ACCOUNT, AMOUNT as i64).await;
 }
 
 /// Per-leader peer tasks observe the supervisor flag and drain on

@@ -19,36 +19,26 @@ async fn kill_leader_no_committed_tx_lost() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     let mut acked = Vec::new();
+    let mut bal_pre: i64 = 0;
     for ur in 1..=15u64 {
-        let r = leader_client
+        let r = ctl
             .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .unwrap();
         assert_eq!(r.fail_reason, 0);
         acked.push(r.tx_id);
+        bal_pre += AMOUNT as i64;
     }
-    let bal_pre = leader_client.get_balance(ACCOUNT).await.unwrap().balance;
-    drop(leader_client);
 
     ctl.stop_node(leader_idx).await.expect("stop");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
-    let new_client = ctl.client().leader().clone();
     for tx_id in &acked {
-        let (status, _) = new_client.get_transaction_status(*tx_id).await.unwrap();
-        // proto::TransactionStatus: COMMITTED=2, ON_SNAPSHOT=3 (durable).
-        assert!(
-            status == 2 || status == 3,
-            "tx {} not durable (status={}, expected COMMITTED=2 or ON_SNAPSHOT=3)",
-            tx_id,
-            status,
-        );
+        ctl.require_transaction_committed(*tx_id).await;
     }
-    let bal_post = new_client.get_balance(ACCOUNT).await.unwrap().balance;
-    assert_eq!(bal_post, bal_pre);
+    ctl.require_balance(ACCOUNT, bal_pre).await;
 }
 
 /// Kill follower → leader continues; ClusterCommit still works.
@@ -60,16 +50,14 @@ async fn kill_follower_leader_continues() {
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     let follower_idx = ctl.first_follower_index().await.expect("follower");
 
-    let leader_client = ctl.client().leader().clone();
-    leader_client
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+    ctl.deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
 
     ctl.stop_node(follower_idx).await.expect("stop follower");
 
     // Quorum still 2/3 reachable. ClusterCommit must succeed.
-    let r = leader_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await
         .expect("ClusterCommit with one follower down");
@@ -84,10 +72,7 @@ async fn kill_two_of_three_blocks_cluster_commit() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
-
-    leader_client
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+    ctl.deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
 
@@ -103,7 +88,7 @@ async fn kill_two_of_three_blocks_cluster_commit() {
     assert_eq!(stopped, 2);
 
     // ClusterCommit blocks (and the test's overall budget guards against hang).
-    let result = leader_client
+    let result = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err(), "ClusterCommit must NOT succeed");
@@ -130,8 +115,7 @@ async fn kill_two_of_five_cluster_continues() {
         }
     }
 
-    let leader_client = ctl.client().leader().clone();
-    let r = leader_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("2/5 down still leaves quorum");
@@ -158,8 +142,7 @@ async fn kill_three_of_five_blocks_cluster_commit() {
         }
     }
 
-    let leader_client = ctl.client().leader().clone();
-    let result = leader_client
+    let result = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err(), "no quorum → ClusterCommit must block");
@@ -175,16 +158,14 @@ async fn full_restart_preserves_committed_data() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     for ur in 1..=10u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+        ctl.deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .unwrap();
     }
-    let bal_pre = leader_client.get_balance(ACCOUNT).await.unwrap().balance;
-    drop(leader_client);
+    let expected = (10 * AMOUNT) as i64;
+    ctl.require_balance(ACCOUNT, expected).await;
 
     for i in 0..ctl.len() {
         ctl.stop_node(i).await.expect("stop");
@@ -194,10 +175,9 @@ async fn full_restart_preserves_committed_data() {
     }
     let _ = ctl.wait_for_leader(Duration::from_secs(15)).await.unwrap();
 
-    // Wait for any reads to hit a leader and converge.
-    let new_client = ctl.client().leader().clone();
-    let bal_post = new_client.get_balance(ACCOUNT).await.unwrap().balance;
-    assert_eq!(bal_post, bal_pre);
+    // After cold restart, the new leader catches up to last_tx_id
+    // before serving the read.
+    ctl.require_balance(ACCOUNT, expected).await;
 }
 
 /// Repeated leader churn (kill → re-elect)×N preserves every
@@ -212,9 +192,8 @@ async fn repeated_leader_churn_preserves_commits() {
     let mut user_ref: u64 = 1;
     let mut acked: Vec<u64> = Vec::new();
     for _ in 0..3 {
-        let leader_client = ctl.client().leader().clone();
         for _ in 0..5 {
-            let r = leader_client
+            let r = ctl
                 .deposit_and_wait(ACCOUNT, AMOUNT, user_ref, WaitLevel::ClusterCommit)
                 .await
                 .unwrap();
@@ -223,22 +202,13 @@ async fn repeated_leader_churn_preserves_commits() {
         }
         // Kill current leader.
         let li = ctl.leader_index().await.unwrap();
-        drop(leader_client);
         ctl.stop_node(li).await.expect("stop");
         ctl.start_node(li).await.expect("restart");
         let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
 
-    let final_client = ctl.client().leader().clone();
     for tx_id in &acked {
-        let (status, _) = final_client.get_transaction_status(*tx_id).await.unwrap();
-        // proto::TransactionStatus: COMMITTED=2, ON_SNAPSHOT=3 (durable).
-        assert!(
-            status == 2 || status == 3,
-            "tx {} lost across churn (status={}, expected COMMITTED=2 or ON_SNAPSHOT=3)",
-            tx_id,
-            status,
-        );
+        ctl.require_transaction_committed(*tx_id).await;
     }
 }
 
@@ -254,15 +224,12 @@ async fn killed_leader_rejoins_as_follower() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     for ur in 1..=10u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+        ctl.deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .unwrap();
     }
-    drop(leader_client);
 
     ctl.stop_node(leader_idx).await.expect("stop");
     let new_idx = ctl.wait_for_leader(Duration::from_secs(15)).await.unwrap();
@@ -322,14 +289,13 @@ async fn slow_follower_does_not_block_majority() {
     .expect("start");
 
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
     let follower_idx = ctl.first_follower_index().await.unwrap();
 
     // Stop one follower, drive writes (only 2/3 alive — still majority),
     // then restart.
     ctl.stop_node(follower_idx).await.expect("stop");
     for ur in 1..=20u64 {
-        let r = leader_client
+        let r = ctl
             .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("ClusterCommit");
@@ -337,19 +303,8 @@ async fn slow_follower_does_not_block_majority() {
     }
     ctl.start_node(follower_idx).await.expect("restart");
 
-    // Catch-up.
-    let lagged_client = ctl.client().node(follower_idx).clone();
-    ctl.wait_for(Duration::from_secs(30), "lagged catches up", || {
-        let c = lagged_client.clone();
-        async move {
-            c.get_pipeline_index()
-                .await
-                .map(|i| i.commit >= 20)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("catch up");
+    // Lagged follower must catch up via leader replication.
+    ctl.require_pipeline_commit_at_least(follower_idx, 20).await;
 }
 
 // ── §8.3 Storage failures (most need fault injection — stubs) -----------

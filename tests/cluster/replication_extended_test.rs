@@ -78,11 +78,15 @@ async fn leader_replicates_to_follower() {
     .expect("start");
 
     let _leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
-    let follower_client = ctl.client().next_follower().await.expect("follower index");
+    let follower_idx = ctl
+        .first_follower_index()
+        .await
+        .expect("follower index");
 
-    // Follower rejects writes.
-    let err = follower_client
+    // Follower rejects writes (negative-path needs raw RPC access).
+    let err = ctl
+        .raw_client_for_slot(follower_idx)
+        .expect("raw follower client")
         .deposit(ACCOUNT, AMOUNT, 0)
         .await
         .expect_err("follower rejects writes");
@@ -91,7 +95,7 @@ async fn leader_replicates_to_follower() {
     // Drive 200 deposits on the leader.
     let total = 200u64;
     let deposits: Vec<(u64, u64, u64)> = (0..total).map(|_| (ACCOUNT, AMOUNT, 0)).collect();
-    let r = leader_client
+    let r = ctl
         .deposit_batch_and_wait(&deposits, WaitLevel::Committed)
         .await
         .expect("batch");
@@ -99,30 +103,15 @@ async fn leader_replicates_to_follower() {
         assert_eq!(x.fail_reason, 0);
     }
 
-    // Wait for follower to catch up.
-    ctl.wait_for(Duration::from_secs(60), "follower commit", || {
-        let fc = follower_client.clone();
-        async move {
-            fc.get_pipeline_index()
-                .await
-                .map(|i| i.commit >= total)
-                .unwrap_or(false)
-        }
-    })
-    .await
-    .expect("catch up");
-
-    // Balances match across nodes.
-    let leader_bal = leader_client.get_balance(ACCOUNT).await.unwrap().balance;
-    let follower_bal = follower_client.get_balance(ACCOUNT).await.unwrap().balance;
-    assert_eq!(leader_bal, follower_bal);
-    assert_eq!(leader_bal, (total * AMOUNT) as i64);
-    let sys = follower_client
-        .get_balance(SYSTEM_ACCOUNT_ID)
-        .await
-        .unwrap()
-        .balance;
-    assert_eq!(leader_bal + sys, 0);
+    // Both leader and follower must converge on the same balance.
+    // require_balance_on blocks each slot until snapshot >= last_tx_id.
+    let expected = (total * AMOUNT) as i64;
+    ctl.require_balance(ACCOUNT, expected).await;
+    ctl.require_balance_on(follower_idx, ACCOUNT, expected).await;
+    ctl.require_balance(SYSTEM_ACCOUNT_ID, -expected).await;
+    ctl.require_balance_on(follower_idx, SYSTEM_ACCOUNT_ID, -expected)
+        .await;
+    ctl.require_zero_sum(&[ACCOUNT, SYSTEM_ACCOUNT_ID]).await;
 
     ctl.stop_all().await;
 }
@@ -141,12 +130,10 @@ async fn idle_heartbeats_close_stale_by_one_gap() {
     .expect("start");
 
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     // Submit a few txs.
     for ur in 1..=10u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+        ctl.deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("deposit");
     }
@@ -350,9 +337,8 @@ async fn single_node_cluster_commit_index_advances() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client().node(0).clone();
 
-    let r = client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("ClusterCommit ack on single-node cluster");
@@ -371,30 +357,18 @@ async fn follower_reads_reflect_lagging_state() {
     .expect("start");
 
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
-    let r = leader_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("deposit");
     assert!(r.tx_id > 0);
 
-    let follower_client = ctl.client().next_follower().await.expect("follower idx");
     // Follower must eventually report commit ≥ tx_id.
-    ctl.wait_for(
-        Duration::from_secs(10),
-        "follower commit catches up",
-        || {
-            let fc = follower_client.clone();
-            let target = r.tx_id;
-            async move {
-                fc.get_pipeline_index()
-                    .await
-                    .map(|idx| idx.commit >= target)
-                    .unwrap_or(false)
-            }
-        },
-    )
-    .await
-    .expect("follower commit");
+    let follower_idx = ctl
+        .first_follower_index()
+        .await
+        .expect("follower idx");
+    ctl.require_pipeline_commit_at_least(follower_idx, r.tx_id)
+        .await;
 }

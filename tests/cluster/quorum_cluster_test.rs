@@ -18,9 +18,8 @@ async fn leader_counts_itself_in_quorum() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    let client = ctl.client().node(0).clone();
 
-    let r = client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("ClusterCommit");
@@ -42,12 +41,10 @@ async fn cluster_commit_index_advances_under_replication() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
         .expect("start");
-    let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
+    let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     for ur in 1..=5u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+        ctl.deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("deposit");
     }
@@ -56,7 +53,7 @@ async fn cluster_commit_index_advances_under_replication() {
     // commit ≥ 5 (and the cluster_commit field, accessible only via the
     // bare pipeline index, must too — but the public client API only
     // surfaces `commit` so we sanity-check there).
-    let idx = leader_client.get_pipeline_index().await.unwrap();
+    let idx = ctl.pipeline_index_on(leader_idx).await.unwrap();
     assert!(idx.commit >= 5);
     assert!(idx.snapshot >= 5);
 }
@@ -75,11 +72,9 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
     .expect("start");
 
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     for ur in 1..=10u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+        ctl.deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("deposit");
     }
@@ -118,25 +113,21 @@ async fn new_leader_self_slot_repopulated_after_transition() {
         .await
         .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let leader_client = ctl.client().leader().clone();
 
     // Land some writes.
     for ur in 1..=5u64 {
-        leader_client
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+        ctl.deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("deposit");
     }
-    drop(leader_client);
 
     // Kill leader → new election.
     ctl.stop_node(leader_idx).await.expect("stop");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     // First write under new leader must reach ClusterCommit.
-    let new_client = ctl.client().leader().clone();
     let started = Instant::now();
-    let r = new_client
+    let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 6, WaitLevel::ClusterCommit)
         .await
         .expect("first write under new leader");
