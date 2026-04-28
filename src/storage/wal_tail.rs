@@ -14,6 +14,7 @@ use crate::entities::{WalEntry, WalEntryKind};
 use crate::storage::engine::Storage;
 use crate::storage::layout::{active_wal_path, segment_wal_path};
 use crate::storage::wal_serializer::parse_wal_record;
+use spdlog::{debug, trace};
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -117,7 +118,22 @@ impl WalTailer {
             };
             let available = file_len.saturating_sub(cursor.position);
             if available < WAL_RECORD_SIZE as u64 {
+                // DIAG-flake-replication: snapshot the cursor before the
+                // advance attempt so we can attribute the result.
+                let pre_segment_id = cursor.segment_id;
+                let pre_is_active = cursor.is_active;
+                let pre_position = cursor.position;
+                let pre_file_len = file_len;
                 if !self.advance_segment() {
+                    trace!(
+                        "DIAG-flake-replication: tailer.tail advance_segment=false \
+                         from_tx_id={} segment_id={} is_active={} position={} file_len={}",
+                        from_tx_id,
+                        pre_segment_id,
+                        pre_is_active,
+                        pre_position,
+                        pre_file_len,
+                    );
                     break;
                 }
                 continue;
@@ -169,8 +185,29 @@ impl WalTailer {
     /// sealed segments until the first transactional record's tx_id is
     /// `<= from_tx_id` (or we run out of segments).
     fn seek(&mut self, from_tx_id: u64) -> std::io::Result<()> {
+        // DIAG-flake-replication: capture pre-seek state so we can see
+        // both the path being opened and the storage's view of the
+        // current segment id. Especially relevant when from_tx_id=1
+        // and the active wal.bin has only a SegmentHeader (H2 in the
+        // diagnose plan) — the resulting cursor sits parked on an
+        // empty active segment and never recovers.
+        let data_dir_for_diag = self.storage.config().data_dir.clone();
+        let active_path_for_diag = active_wal_path(Path::new(&data_dir_for_diag));
+        let last_segment_id_for_diag = self.storage.last_segment_id();
+        debug!(
+            "DIAG-flake-replication: tailer.seek BEGIN from_tx_id={} \
+             active_path={:?} last_segment_id={}",
+            from_tx_id, active_path_for_diag, last_segment_id_for_diag
+        );
+
         self.open_active()?;
         if from_tx_id == 0 {
+            debug!(
+                "DIAG-flake-replication: tailer.seek END from_tx_id=0 (no walk-back) \
+                 segment_id={} is_active={}",
+                self.cursor.as_ref().map_or(0, |c| c.segment_id),
+                self.cursor.as_ref().is_some_and(|c| c.is_active),
+            );
             return Ok(());
         }
         let data_dir = self.storage.config().data_dir.clone();
@@ -178,23 +215,55 @@ impl WalTailer {
 
         loop {
             let Some(cursor) = self.cursor.as_ref() else {
+                debug!(
+                    "DIAG-flake-replication: tailer.seek END cursor=None from_tx_id={}",
+                    from_tx_id
+                );
                 return Ok(());
             };
-            match first_tx_id_in_file(&cursor.file) {
+            let first_tx_in_active = first_tx_id_in_file(&cursor.file);
+            match first_tx_in_active {
                 Some(first) if first > from_tx_id => {
                     if cursor.segment_id <= 1 {
+                        debug!(
+                            "DIAG-flake-replication: tailer.seek END walk-back stopped \
+                             at segment_id<=1 (segment_id={}, first_tx_in_segment={}, \
+                             from_tx_id={})",
+                            cursor.segment_id, first, from_tx_id
+                        );
                         return Ok(());
                     }
                     let prev = cursor.segment_id - 1;
                     let prev_path = segment_wal_path(data_dir, prev);
                     if !prev_path.exists() {
+                        debug!(
+                            "DIAG-flake-replication: tailer.seek END walk-back missing \
+                             prev segment file {:?} (from_tx_id={})",
+                            prev_path, from_tx_id
+                        );
                         return Ok(());
                     }
+                    debug!(
+                        "DIAG-flake-replication: tailer.seek walking back to sealed \
+                         segment {} (current first={}, from_tx_id={})",
+                        prev, first, from_tx_id
+                    );
                     self.open_sealed(prev)?;
                 }
                 // `None` (no tx records in this file yet) — caller is asking
                 // for tx_id in the future; nothing to do.
-                _ => return Ok(()),
+                other => {
+                    debug!(
+                        "DIAG-flake-replication: tailer.seek END parking cursor \
+                         from_tx_id={} segment_id={} is_active={} \
+                         first_tx_in_segment={:?} (None == only-header / no-tx-records)",
+                        from_tx_id,
+                        cursor.segment_id,
+                        cursor.is_active,
+                        other,
+                    );
+                    return Ok(());
+                }
             }
         }
     }

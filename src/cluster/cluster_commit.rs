@@ -20,6 +20,7 @@
 //! `get_pipeline_index`) call [`get`].
 
 use crate::ledger::Ledger;
+use spdlog::debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,13 +61,25 @@ impl ClusterCommitIndex {
     /// Called from `Quorum::advance` after `majority_index.fetch_max`.
     #[inline]
     pub(crate) fn set_from_quorum(&self, majority: u64) {
-        self.0.fetch_max(majority, Ordering::Release);
+        let prev = self.0.fetch_max(majority, Ordering::Release);
+        if majority > prev {
+            debug!(
+                "cluster_commit_index: advanced via quorum {} -> {}",
+                prev, majority
+            );
+        }
     }
 
     /// Follower-side write: advance to the leader-advertised watermark,
     /// already clamped by the caller to the follower's `last_commit_id`.
     #[inline]
     pub(crate) fn set_from_leader(&self, clamped: u64) {
-        self.0.fetch_max(clamped, Ordering::Release);
+        let prev = self.0.fetch_max(clamped, Ordering::Release);
+        if clamped > prev {
+            debug!(
+                "cluster_commit_index: advanced via leader heartbeat {} -> {}",
+                prev, clamped
+            );
+        }
     }
 }

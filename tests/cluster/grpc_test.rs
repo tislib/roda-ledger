@@ -5,7 +5,7 @@ mod tests {
         Deposit, GetBalanceRequest, GetBalancesRequest, GetPipelineIndexRequest, GetStatusRequest,
         GetStatusesRequest, SubmitBatchRequest, SubmitOperationRequest, Transfer, Withdrawal,
     };
-    use roda_ledger::cluster::{ClusterCommitIndex, Server, Term};
+    use roda_ledger::cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
     use roda_ledger::ledger::{Ledger, LedgerConfig};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -28,12 +28,28 @@ mod tests {
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
         let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
-            let server = Server::new(server_ledger, addr, term, cci);
+            let server = Server::new(
+                Arc::new(roda_ledger::cluster::LedgerSlot::new(server_ledger)),
+                addr,
+                Arc::new(RoleFlag::new(Role::Leader)),
+                term,
+                cci,
+                Arc::new(tokio::sync::Notify::new()),
+            );
             server.run().await.unwrap();
         });
 
-        // Give the server a moment to start
-        sleep(Duration::from_millis(100)).await;
+        // Wait for the server to actually bind by polling TCP connect.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("grpc server did not bind {} within 5s", addr);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
 
         (ledger, addr)
     }
@@ -229,20 +245,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Poll for balance until it's updated (as it reflects snapshot)
-        let mut balance = 0;
-        for _ in 0..20 {
-            let response = client
+        // Poll for balance until it's updated (as it reflects snapshot).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let balance = loop {
+            let v = client
                 .get_balance(GetBalanceRequest { account_id: 5 })
                 .await
                 .unwrap()
-                .into_inner();
-            balance = response.balance;
-            if balance == 500 {
-                break;
+                .into_inner()
+                .balance;
+            if v == 500 {
+                break v;
             }
-            sleep(Duration::from_millis(50)).await;
-        }
+            if std::time::Instant::now() >= deadline {
+                panic!("balance never converged to 500: got {}", v);
+            }
+            sleep(Duration::from_millis(10)).await;
+        };
 
         assert_eq!(balance, 500);
     }
@@ -285,21 +304,24 @@ mod tests {
             .await
             .unwrap();
 
-        let mut balances = vec![];
-        for _ in 0..20 {
-            let response = client
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let balances = loop {
+            let v = client
                 .get_balances(GetBalancesRequest {
                     account_ids: vec![10, 11],
                 })
                 .await
                 .unwrap()
-                .into_inner();
-            balances = response.balances;
-            if balances == vec![100, 200] {
-                break;
+                .into_inner()
+                .balances;
+            if v == vec![100, 200] {
+                break v;
             }
-            sleep(Duration::from_millis(50)).await;
-        }
+            if std::time::Instant::now() >= deadline {
+                panic!("balances never converged to [100, 200]: got {:?}", v);
+            }
+            sleep(Duration::from_millis(10)).await;
+        };
 
         assert_eq!(balances, vec![100, 200]);
     }
@@ -329,23 +351,26 @@ mod tests {
 
         let tx_id1 = res1.transaction_id;
 
-        let mut status = 0;
-        for _ in 0..20 {
-            let response = client
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let v = client
                 .get_transaction_status(GetStatusRequest {
                     transaction_id: tx_id1,
                     term: 0,
                 })
                 .await
                 .unwrap()
-                .into_inner();
-            status = response.status;
+                .into_inner()
+                .status;
             // 3 is ON_SNAPSHOT
-            if status == 3 {
-                break;
+            if v == 3 {
+                break v;
             }
-            sleep(Duration::from_millis(50)).await;
-        }
+            if std::time::Instant::now() >= deadline {
+                panic!("status never reached ON_SNAPSHOT: got {}", v);
+            }
+            sleep(Duration::from_millis(10)).await;
+        };
         assert_eq!(status, 3);
 
         // Test multi statuses
@@ -386,19 +411,25 @@ mod tests {
 
         let tx_id = res.transaction_id;
 
-        let mut snapshot_index = 0;
-        for _ in 0..20 {
-            let response = client
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let snapshot_index = loop {
+            let v = client
                 .get_pipeline_index(GetPipelineIndexRequest {})
                 .await
                 .unwrap()
-                .into_inner();
-            snapshot_index = response.snapshot_index;
-            if snapshot_index >= tx_id {
-                break;
+                .into_inner()
+                .snapshot_index;
+            if v >= tx_id {
+                break v;
             }
-            sleep(Duration::from_millis(50)).await;
-        }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "snapshot_index never caught up to tx_id={}: got {}",
+                    tx_id, v
+                );
+            }
+            sleep(Duration::from_millis(10)).await;
+        };
 
         assert!(snapshot_index >= tx_id);
     }
@@ -429,9 +460,8 @@ mod tests {
 
         let tx_id = res.transaction_id;
 
-        let mut status = 0;
-        let mut fail_reason = 0;
-        for _ in 0..20 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (status, fail_reason) = loop {
             let response = client
                 .get_transaction_status(GetStatusRequest {
                     transaction_id: tx_id,
@@ -440,14 +470,15 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner();
-            status = response.status;
-            fail_reason = response.fail_reason;
             // 4 is ERROR
-            if status == 4 {
-                break;
+            if response.status == 4 {
+                break (response.status, response.fail_reason);
             }
-            sleep(Duration::from_millis(50)).await;
-        }
+            if std::time::Instant::now() >= deadline {
+                panic!("status never reached ERROR: got {}", response.status);
+            }
+            sleep(Duration::from_millis(10)).await;
+        };
 
         assert_eq!(status, 4);
         // 1 is INSUFFICIENT_FUNDS

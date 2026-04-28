@@ -13,8 +13,9 @@
 
 use clap::Parser;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
-use roda_ledger::cluster::config::NodeServerSection;
-use roda_ledger::cluster::{self, ClusterNode, PeerConfig, Quorum, ServerSection};
+use roda_ledger::cluster::{
+    self, ClusterNode, ClusterNodeSection, ClusterSection, PeerConfig, Quorum, ServerSection,
+};
 use roda_ledger::config::{LedgerConfig, StorageConfig};
 use roda_ledger::ledger::Ledger;
 use roda_ledger::transaction::Operation;
@@ -128,36 +129,51 @@ async fn main() {
         follower_ports.push((free_port(), free_port()));
     }
 
+    // ── Build the symmetric `cluster.peers` list shared by every
+    //    node (ADR-0016 §1). node_id 1 = leader, 2..=N+1 = followers.
+    let leader_node_id: u64 = 1;
+    let mut all_peers: Vec<PeerConfig> = Vec::with_capacity(follower_count + 1);
+    all_peers.push(PeerConfig {
+        peer_id: leader_node_id,
+        host: format!("http://127.0.0.1:{}", leader_node_port),
+    });
+    for (idx, (_, node_port)) in follower_ports.iter().enumerate() {
+        all_peers.push(PeerConfig {
+            peer_id: (idx as u64) + 2,
+            host: format!("http://127.0.0.1:{}", node_port),
+        });
+    }
+
     // ── Boot followers first so their node ports are bound when the leader
     //    replication tasks try to connect. Keep their Cluster handles + ledgers.
     let mut follower_clusters = Vec::with_capacity(follower_count);
     let mut follower_handles = Vec::with_capacity(follower_count);
     let mut follower_ledgers: Vec<Arc<Ledger>> = Vec::with_capacity(follower_count);
     for (idx, (client_port, node_port)) in follower_ports.iter().enumerate() {
-        // node_ids: 2..=follower_count+1 (1 reserved for leader).
         let node_id = (idx as u64) + 2;
         let cfg = cluster::Config {
-            mode: cluster::Mode::Follower,
-            node_id,
-            term: 1,
-            peers: Vec::new(),
+            cluster: Some(ClusterSection {
+                node: ClusterNodeSection {
+                    node_id,
+                    host: "127.0.0.1".into(),
+                    port: *node_port,
+                },
+                peers: all_peers.clone(),
+                replication_poll_ms: args.replication_poll_ms,
+                append_entries_max_bytes: args.append_entries_max_bytes,
+            }),
             server: ServerSection {
                 host: "127.0.0.1".into(),
                 port: *client_port,
                 ..Default::default()
-            },
-            node: NodeServerSection {
-                host: "127.0.0.1".into(),
-                port: *node_port,
             },
             ledger: ledger_cfg(
                 account_count,
                 &tmp_dir(&format!("follower_{}", idx + 1)),
                 args.follower_segment_tx_count,
             ),
-            replication_poll_ms: args.replication_poll_ms,
-            append_entries_max_bytes: args.append_entries_max_bytes,
         };
+        cfg.validate().expect("follower cfg validate");
         let cluster = ClusterNode::new(cfg).expect("follower ledger");
         let handles = cluster.run().await.expect("follower run");
         follower_ledgers.push(cluster.ledger());
@@ -165,34 +181,28 @@ async fn main() {
         follower_clusters.push(cluster);
     }
 
-    // ── Leader config with one PeerConfig per follower ───────────────────
-    let peers: Vec<PeerConfig> = follower_ports
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, node_port))| PeerConfig {
-            id: (idx as u64) + 2,
-            node_addr: format!("http://127.0.0.1:{}", node_port),
-        })
-        .collect();
-
+    // TODO Stage 4: drop the hard-coded `leader_node_id = 1` once
+    // elections land — the harness should poll `Ping` on every node
+    // until one returns `NodeRole::Leader` and route writes there.
     let leader_cfg = cluster::Config {
-        mode: cluster::Mode::Leader,
-        node_id: 1,
-        term: 1,
-        peers,
+        cluster: Some(ClusterSection {
+            node: ClusterNodeSection {
+                node_id: leader_node_id,
+                host: "127.0.0.1".into(),
+                port: leader_node_port,
+            },
+            peers: all_peers,
+            replication_poll_ms: args.replication_poll_ms,
+            append_entries_max_bytes: args.append_entries_max_bytes,
+        }),
         server: ServerSection {
             host: "127.0.0.1".into(),
             port: leader_client_port,
             ..Default::default()
         },
-        node: NodeServerSection {
-            host: "127.0.0.1".into(),
-            port: leader_node_port,
-        },
         ledger: ledger_cfg(account_count, &tmp_dir("leader"), 10_000_000),
-        replication_poll_ms: args.replication_poll_ms,
-        append_entries_max_bytes: args.append_entries_max_bytes,
     };
+    leader_cfg.validate().expect("leader cfg validate");
 
     let leader = ClusterNode::new(leader_cfg).expect("leader ledger");
     let leader_handles = leader.run().await.expect("leader run");
@@ -275,10 +285,11 @@ async fn main() {
     println!("  ╚══════════════════════════════════════════════╝");
     println!();
 
-    leader_handles.abort();
-    for h in follower_handles {
-        h.abort();
-    }
+    // RAII teardown: dropping the handles bindings cooperatively
+    // awaits every spawned task (`SupervisorHandles::Drop` /
+    // `StandaloneHandles::Drop` handle the cascade).
+    drop(leader_handles);
+    drop(follower_handles);
 }
 
 /// Blocking write loop. Reads the shared `Quorum` (published by the

@@ -398,6 +398,8 @@ impl TransactorRunner {
 
     fn run_step(&mut self, ctx: &TransactorContext) {
         let inbound = ctx.input();
+        let mut did_work = false;
+
         while let Some(txi) = inbound.pop() {
             match txi {
                 TransactionInput::Single(tx) => {
@@ -438,15 +440,43 @@ impl TransactorRunner {
                         break;
                     }
                 }
+                TransactionInput::Replicated(entries) => {
+                    // Drain any prior leader-path work first — its tx_ids
+                    // are sequencer-assigned and would normally be earlier
+                    // than replicated tx_ids only during a role transition,
+                    // but flushing first preserves the invariant either way.
+                    if !self.transaction_buffer.is_empty() {
+                        self.flush_buffer(ctx);
+                    }
+                    self.apply_replicated_batch(entries, ctx);
+                    did_work = true;
+                }
             }
         }
 
-        if self.transaction_buffer.is_empty() {
+        // Flush any leader-path work accumulated in the buffer.
+        if !self.transaction_buffer.is_empty() {
+            self.flush_buffer(ctx);
+            did_work = true;
+        }
+
+        if !did_work {
             ctx.wait_strategy().retry(self.input_retry_count);
             self.input_retry_count += 1;
             return;
         }
         self.input_retry_count = 0;
+    }
+
+    /// Process the buffered leader-path transactions, push their
+    /// emitted entries to the WAL stage as `WalInput::Single`, advance
+    /// `compute_index`, and reset per-step state. Factored out so the
+    /// `Replicated` arm of `run_step` can flush prior leader-path
+    /// buffer before applying replicated entries.
+    fn flush_buffer(&mut self, ctx: &TransactorContext) {
+        if self.transaction_buffer.is_empty() {
+            return;
+        }
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -462,14 +492,14 @@ impl TransactorRunner {
         while i < entries_len {
             let entry = self.state.borrow().entries[i];
             let mut pending = WalInput::Single(entry);
-            let mut retry_count = 0;
+            let mut retry_count = 0u64;
             loop {
                 retry_count += 1;
                 match output.push(pending) {
                     Ok(()) => break,
                     Err(returned) => pending = returned,
                 }
-                if retry_count % 10000 == 0 && !ctx.is_running() {
+                if retry_count.is_multiple_of(10_000) && !ctx.is_running() {
                     return;
                 }
                 spin_loop();
@@ -481,7 +511,85 @@ impl TransactorRunner {
             ctx.set_processed_index(max_tx_id);
         }
 
-        self.reset();
+        self.transaction_buffer.clear();
+        self.state.borrow_mut().reset_step();
+    }
+
+    /// Follower-path: mirror the effects of pre-validated WAL entries
+    /// (already committed by the leader) onto this Transactor's
+    /// `balances` and `dedup` state, then forward the same vec to the
+    /// WAL stage as `WalInput::Multi`. NO validation, NO rollback, NO
+    /// re-emission. The Transactor remains the sole writer of its
+    /// internal state — this is what keeps a follower's state in sync
+    /// with the WAL so a promotion to leader does not start from
+    /// stale state.
+    fn apply_replicated_batch(&mut self, entries: Vec<WalEntry>, ctx: &TransactorContext) {
+        let mut max_tx_id: u64 = 0;
+
+        // Apply balances under a single mut-borrow of state.
+        {
+            let mut state = self.state.borrow_mut();
+            for entry in &entries {
+                match entry {
+                    WalEntry::Metadata(m) => {
+                        if m.tx_id > max_tx_id {
+                            max_tx_id = m.tx_id;
+                        }
+                    }
+                    WalEntry::Entry(e) => {
+                        if e.tx_id > max_tx_id {
+                            max_tx_id = e.tx_id;
+                        }
+                        // The leader's authoritative post-update balance is
+                        // recorded on the WAL record itself; just install
+                        // it (idempotent and matches Recover's semantics).
+                        if let Some(slot) = state.balances.get_mut(e.account_id as usize) {
+                            *slot = e.computed_balance;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Update dedup outside the state borrow. Filter mirrors
+        // `Recover` (skip DUPLICATE; skip user_ref==0).
+        for entry in &entries {
+            if let WalEntry::Metadata(m) = entry
+                && m.user_ref != 0
+                && m.fail_reason != FailReason::DUPLICATE
+            {
+                self.dedup.insert(m.user_ref, m.tx_id);
+            }
+        }
+
+        // Forward the entire batch to the WAL stage as Multi.
+        let output = ctx.output();
+        let mut pending = WalInput::Multi(entries);
+        let mut retry_count = 0u64;
+        loop {
+            match output.push(pending) {
+                Ok(()) => break,
+                Err(returned) => pending = returned,
+            }
+            retry_count += 1;
+            if retry_count.is_multiple_of(10_000) && !ctx.is_running() {
+                return;
+            }
+            spin_loop();
+        }
+
+        if max_tx_id > 0 {
+            ctx.set_processed_index(max_tx_id);
+            // Advance the sequencer's high-water mark too. Without this
+            // a follower's sequencer stays at its boot value and, on
+            // promotion to leader, the first client submit is assigned
+            // a tx_id that collides with replicated WAL entries.
+            ctx.bump_sequencer_to_at_least(max_tx_id);
+            if max_tx_id >= self.expected_next_id {
+                self.expected_next_id = max_tx_id + 1;
+            }
+        }
     }
 
     /// Process the buffered transactions, producing wal entries in the

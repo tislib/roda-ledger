@@ -5,7 +5,7 @@
 //! for CI and crash-recovery tests.
 
 use crate::e2e::lib::profile::Profile;
-use roda_ledger::client::LedgerClient;
+use roda_ledger::client::NodeClient;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -16,7 +16,7 @@ pub struct ProcessNode {
     /// The spawned server process (None after kill, before restart).
     child: Option<Child>,
     /// gRPC client connected to this node.
-    client: Option<LedgerClient>,
+    client: Option<NodeClient>,
     /// Listen address (stable across kill/restart — same port reused).
     pub addr: SocketAddr,
     /// Temp data directory (persists across kill/restart, removed on drop).
@@ -65,12 +65,12 @@ impl ProcessNode {
     }
 
     /// Poll until the server accepts a gRPC connection, with timeout.
-    async fn wait_for_ready(addr: SocketAddr) -> LedgerClient {
+    async fn wait_for_ready(addr: SocketAddr) -> NodeClient {
         let timeout = Duration::from_secs(10);
         let start = tokio::time::Instant::now();
 
         loop {
-            match LedgerClient::connect(addr).await {
+            match NodeClient::connect(addr).await {
                 Ok(client) => return client,
                 Err(_) if start.elapsed() < timeout => {
                     sleep(Duration::from_millis(100)).await;
@@ -86,7 +86,7 @@ impl ProcessNode {
     /// Get a reference to the client.
     ///
     /// Panics if the node has been killed and not yet restarted.
-    pub fn client(&self) -> &LedgerClient {
+    pub fn client(&self) -> &NodeClient {
         self.client
             .as_ref()
             .expect("node is killed — call restart() first")

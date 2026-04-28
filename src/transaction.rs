@@ -121,24 +121,32 @@ pub struct TransactionBatch {
 pub enum TransactionInput {
     Single(Transaction),
     Batch(TransactionBatch),
+    /// Pre-validated WAL entries shipped from the cluster's leader to
+    /// this follower via `AppendEntries`. The Transactor mirrors the
+    /// entries' effects onto its own state (balances + dedup) and
+    /// then forwards the same `Vec<WalEntry>` to the WAL stage as
+    /// `WalInput::Multi`. No validation, no rollback, no re-emission.
+    ///
+    /// Routing replicated entries through the Transactor (instead of
+    /// pushing them straight to the WAL stage) is what keeps a
+    /// follower's `balances` and `dedup` in sync with the WAL — so a
+    /// promotion to leader doesn't start from stale state and silently
+    /// double-apply user retries or mis-validate ops.
+    Replicated(Vec<crate::entities::WalEntry>),
 }
 
 impl TransactionInput {
     pub fn single(self) -> Transaction {
         match self {
             TransactionInput::Single(tx) => tx,
-            TransactionInput::Batch(_) => {
-                unreachable!("Batch transactions cannot be converted to single")
-            }
+            _ => unreachable!("not a Single TransactionInput"),
         }
     }
 
     pub fn batch(self) -> TransactionBatch {
         match self {
             TransactionInput::Batch(batch) => batch,
-            TransactionInput::Single(_) => {
-                unreachable!("Single transactions cannot be converted to batch")
-            }
+            _ => unreachable!("not a Batch TransactionInput"),
         }
     }
 }
