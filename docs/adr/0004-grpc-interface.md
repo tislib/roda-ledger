@@ -108,7 +108,7 @@ The interface supports:
 - **Named**: Invoke a registered operation by name with positional `repeated int64` params. Ties to WASM roadmap — no breaking change when ADR-008 lands.
 - **Queries**: Account balances (returning `last_snapshot_tx_id` to indicate currency/freshness) and transaction status polling.
 
-The full protobuf definition is maintained in [proto/ledger.proto](../../proto/ledger.proto).
+The full protobuf definition is maintained in [proto/ledger.proto](../../creates/proto/src/ledger.proto).
 
 ---
 

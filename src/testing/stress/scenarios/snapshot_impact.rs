@@ -1,5 +1,5 @@
 use crate::ledger::{Ledger, LedgerConfig};
-use crate::storage::StorageConfig;
+use storage::StorageConfig;
 use crate::testing::reporting::{Reporter, RunResult, WorkloadMetrics};
 use crate::testing::stress::direct_workload_client::DirectWorkloadClient;
 use crate::testing::stress::scenarios::scenario::Scenario;

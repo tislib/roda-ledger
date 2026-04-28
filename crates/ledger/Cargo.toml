@@ -1,0 +1,36 @@
+[package]
+name = "ledger"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+storage.workspace = true
+rand = "0.8"
+rustc-hash = "2"
+crossbeam-queue = "0.3.12"
+crossbeam-skiplist = "0.1"
+crossbeam-utils = "0.8"
+
+serde.workspace = true
+spdlog-rs.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+crossbeam.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+bytemuck = { version = "1.21.0", features = ["derive"] }
+crc32c = "0.6"
+wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
+wat = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+criterion.workspace = true
