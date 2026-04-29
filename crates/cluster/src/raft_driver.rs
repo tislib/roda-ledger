@@ -75,6 +75,12 @@ pub struct RaftHandle {
     /// Only the leader interprets it as `Event::LocalCommitAdvanced`;
     /// non-leaders swap-to-zero to discard.
     pending_local_commit: Arc<AtomicU64>,
+    /// Minimum cadence at which the wakeup sleeper is re-armed when
+    /// raft has no pending deadline of its own. Single-node leaders
+    /// emit no `SetWakeup` action (no peers to heartbeat, election
+    /// timer disarmed), so without this fallback the `on_commit` hook
+    /// stream never gets drained. Set from `RaftConfig::heartbeat_interval`.
+    fallback_wakeup_interval: std::time::Duration,
 }
 
 impl RaftHandle {
@@ -94,6 +100,7 @@ impl RaftHandle {
         let peer_ids: Vec<u64> = cluster.peers.iter().map(|p| p.peer_id).collect();
 
         let raft_cfg = RaftConfig::default();
+        let fallback_wakeup_interval = raft_cfg.heartbeat_interval;
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -104,7 +111,24 @@ impl RaftHandle {
             term: durable.term.clone(),
             vote: durable.vote.clone(),
         };
-        let node = RaftNode::new(self_id, peer_ids, persistence_for_node, raft_cfg, seed);
+        let mut node =
+            RaftNode::new(self_id, peer_ids, persistence_for_node, raft_cfg, seed);
+        // ADR-0017 has raft track `local_log_index` only via
+        // `Event::LogAppendComplete`. On restart the ledger may already
+        // hold tx 1..N persistently — without an explicit hint, raft
+        // starts at `local_log_index = 0` and §5.4.1's up-to-date check
+        // would let an out-of-date candidate win an election. Inform
+        // raft of the durable log size before it accepts any inbound
+        // event.
+        let durable_last_tx_id = ledger.ledger().last_commit_id();
+        if durable_last_tx_id > 0 {
+            let _ = node.step(
+                Instant::now(),
+                Event::LogAppendComplete {
+                    tx_id: durable_last_tx_id,
+                },
+            );
+        }
         // Snapshot initial state so consumers see post-construction values.
         mirror.snapshot_from(&node);
 
@@ -120,6 +144,7 @@ impl RaftHandle {
             fatal: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             pending_local_commit: Arc::new(AtomicU64::new(0)),
+            fallback_wakeup_interval,
         });
 
         // Arm the initial wakeup so the election timer starts running.
@@ -345,6 +370,12 @@ impl RaftHandle {
     /// Dispatch outbound side-effects collected from a step. Spawns
     /// detached tasks for outbound RPCs (so the raft mutex doesn't
     /// block on slow peers) and reschedules the wakeup sleeper.
+    ///
+    /// If raft did not request a wakeup (e.g. single-node leader with
+    /// no peers and a disarmed election timer), schedule a fallback at
+    /// `fallback_wakeup_interval`. This keeps the Tick loop alive so
+    /// `pending_local_commit` updates from `Ledger::on_commit` are
+    /// drained and `cluster_commit_index` advances.
     fn dispatch_outbound_and_wakeup(self: &Arc<Self>, outcome: &StepOutcome) {
         if self.drained.load(Ordering::Relaxed) {
             return;
@@ -355,9 +386,10 @@ impl RaftHandle {
         for action in &outcome.outbound_rv {
             self.spawn_outbound_request_vote(action.clone());
         }
-        if let Some(at) = outcome.wakeup {
-            self.wakeup.reschedule(at, Arc::downgrade(self));
-        }
+        let at = outcome
+            .wakeup
+            .unwrap_or_else(|| Instant::now() + self.fallback_wakeup_interval);
+        self.wakeup.reschedule(at, Arc::downgrade(self));
     }
 
     fn spawn_outbound_append_entries(self: &Arc<Self>, action: Action) {
