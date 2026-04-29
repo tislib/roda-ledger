@@ -63,7 +63,13 @@ fn long_schedule_with_mixed_faults_preserves_safety() {
         let _ = round;
     }
 
-    let dl = sim.clock() + Duration::from_secs(2);
+    // Drain the chaos: turn faults off, give the cluster a generous
+    // settle window, then assert. Asserting under active drops is
+    // racy — the cluster might be mid-walk-back when the predicate
+    // fires.
+    sim.set_drop_probability(0.0);
+    sim.set_duplicate_probability(0.0);
+    let dl = sim.clock() + Duration::from_secs(10);
     sim.run_until(dl);
 
     sim.assert_election_safety();

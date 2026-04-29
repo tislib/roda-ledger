@@ -31,7 +31,7 @@
 pub mod mem_persistence;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use raft::{
@@ -105,7 +105,12 @@ impl NodeBox {
 pub struct Sim {
     base: Instant,
     clock: Instant,
-    nodes: HashMap<NodeId, NodeBox>,
+    /// Keyed by `NodeId`, kept in a `BTreeMap` so iteration order is
+    /// deterministic across runs. The default `HashMap`'s randomised
+    /// hash makes bootstrap order vary, which under chaos
+    /// (drop/duplicate) sometimes leaves the cluster mid-convergence
+    /// when a test asserts safety properties.
+    nodes: BTreeMap<NodeId, NodeBox>,
     peer_list: Vec<NodeId>,
     cfg: RaftConfig,
     queue: BinaryHeap<Reverse<Scheduled>>,
@@ -134,7 +139,7 @@ impl Sim {
     pub fn new(node_ids: &[NodeId], cfg: RaftConfig, seed_base: u64) -> Self {
         use rand::SeedableRng;
         let base = Instant::now();
-        let mut nodes = HashMap::new();
+        let mut nodes = BTreeMap::new();
         for (i, id) in node_ids.iter().enumerate() {
             let seed = seed_base.wrapping_add(*id).wrapping_add(i as u64);
             let node = RaftNode::new(*id, node_ids.to_vec(), MemPersistence::new(), cfg, seed);
@@ -228,10 +233,35 @@ impl Sim {
     }
 
     /// Restart a previously-crashed node. Constructs a fresh
-    /// `RaftNode` over the preserved `MemPersistence`, re-bootstraps
-    /// it with a Tick.
+    /// `RaftNode` over the preserved `MemPersistence`, replays the
+    /// durable entry-log high-water mark via `LogAppendComplete`
+    /// (modelling a real driver's on-boot WAL recovery), and
+    /// re-bootstraps with a Tick.
+    ///
+    /// Replaying `local_log_index` is **required** for §5.4.1
+    /// correctness on restart — otherwise the node's `last_term` /
+    /// `last_tx_id` advertise as 0, the up-to-date check passes
+    /// for every candidate, and a candidate with strictly older log
+    /// state can be granted votes it shouldn't get. That produces
+    /// the kind of divergent log this simulator is meant to catch.
     pub fn restart(&mut self, id: NodeId) {
         let now = self.clock;
+        // Snapshot the durable WAL extent (harness mirror models
+        // disk; survives the crash). The trailing trim drops any
+        // padding sentinels so we report the highest *real* tx_id.
+        let last_tx = self
+            .nodes
+            .get(&id)
+            .map(|b| {
+                b.entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.tx_id != 0)
+                    .map(|e| e.tx_id)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
         let actions = {
             let b = match self.nodes.get_mut(&id) {
                 Some(b) => b,
@@ -242,6 +272,12 @@ impl Sim {
             }
             let p = b.saved_persistence.take().expect("not crashed");
             let mut n = RaftNode::new(id, self.peer_list.clone(), p, self.cfg, b.seed);
+            // Restore local_log_index from the durable WAL extent
+            // before the first Tick so the election-timeout path
+            // sees the correct last_term.
+            if last_tx > 0 {
+                let _ = n.step(now, Event::LogAppendComplete { tx_id: last_tx });
+            }
             let acts = n.step(now, Event::Tick);
             b.node = Some(n);
             acts
@@ -624,16 +660,61 @@ impl Sim {
                 for k in 0..n {
                     if a[k].tx_id == b[k].tx_id && a[k].term == b[k].term {
                         for p in 0..k {
-                            assert_eq!(
-                                a[p], b[p],
-                                "log matching violated: nodes {}, {} agree at index {} but differ at {}",
-                                nodes[i], nodes[j], k, p
-                            );
+                            if a[p] != b[p] {
+                                self.dump_logs_for_diagnosis();
+                                panic!(
+                                    "log matching violated: nodes {}, {} agree at index {} (entry {:?}) but differ at {}: {:?} vs {:?}",
+                                    nodes[i], nodes[j], k, a[k], p, a[p], b[p]
+                                );
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Dump every node's harness log + role/term/commit snapshot.
+    /// Called by `assert_log_matching` on a failure so the test
+    /// output explains the disagreement.
+    fn dump_logs_for_diagnosis(&self) {
+        let mut nodes: Vec<NodeId> = self.nodes.keys().copied().collect();
+        nodes.sort();
+        eprintln!(
+            "\n=== Sim log dump (clock={}ms) ===",
+            self.elapsed().as_millis()
+        );
+        for n in &nodes {
+            let b = &self.nodes[n];
+            let role = b
+                .node
+                .as_ref()
+                .map(|x| format!("{:?}", x.role()))
+                .unwrap_or_else(|| "Crashed".to_string());
+            let term = b
+                .node
+                .as_ref()
+                .map(|x| x.current_term().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let lci = b
+                .node
+                .as_ref()
+                .map(|x| x.commit_index().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let cci = b
+                .node
+                .as_ref()
+                .map(|x| x.cluster_commit_index().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            eprintln!(
+                "  node {}: role={} term={} local_commit={} cluster_commit={}",
+                n, role, term, lci, cci
+            );
+            for (i, e) in b.entries.iter().enumerate() {
+                eprintln!("    [{}] {:?}", i, e);
+            }
+        }
+        eprintln!("=== end dump ===\n");
     }
 
     /// Time elapsed in virtual time since the simulator started.

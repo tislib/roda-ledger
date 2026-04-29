@@ -7,7 +7,7 @@
 //! `LogMismatch`) and on every `Tick` to decide which peers need a
 //! fresh AppendEntries.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::types::{NodeId, TxId};
@@ -50,9 +50,11 @@ impl PeerProgress {
 
 #[derive(Clone, Debug)]
 pub struct LeaderState {
-    /// Per-peer progress keyed by `NodeId`. Built at Leader entry
-    /// from the cluster's peer list (excluding self).
-    pub peers: HashMap<NodeId, PeerProgress>,
+    /// Per-peer progress keyed by `NodeId`. `BTreeMap` so iteration
+    /// order is deterministic across runs — `leader_drive` scans
+    /// peers each tick to decide who to send to, and the simulator
+    /// relies on stable order for reproducibility.
+    pub peers: BTreeMap<NodeId, PeerProgress>,
     /// Cadence at which we send heartbeats to each peer.
     pub heartbeat_interval: Duration,
     /// Per-RPC deadline. Independent of the heartbeat cadence — an

@@ -841,16 +841,16 @@ impl<P: Persistence> RaftNode<P> {
     // ─── Helpers ─────────────────────────────────────────────────────────
 
     /// Observe a higher term via inbound RPC (request OR reply).
-    /// Updates BOTH the term log (so `current_term()` advances) and
-    /// the vote log (so the §5.4.1 grant check uses the right term).
+    /// **Only the vote log is updated.** The term log records actual
+    /// entry-term boundaries — observing a higher term via an RPC
+    /// without receiving entries from that term does not establish
+    /// a boundary, and writing one would pollute `term_at_tx` for
+    /// existing entries: the §5.3 prev-log-term check would later
+    /// match against the phantom record, so a leader's AE could
+    /// graft new entries onto a stale prefix without truncation.
+    /// (`current_term()` is `max(term-log, vote-log)`, so the read
+    /// API still reflects the higher term.)
     fn observe_higher_term(&mut self, term: Term) {
-        let start_tx_id = self.local_log_index + 1;
-        if let Err(e) = self.persistence.observe_term(term, start_tx_id) {
-            warn!(
-                "raft: node_id={} observe_term({}) failed: {}",
-                self.self_id, term, e
-            );
-        }
         if let Err(e) = self.persistence.observe_vote_term(term) {
             warn!(
                 "raft: node_id={} observe_vote_term({}) failed: {}",
