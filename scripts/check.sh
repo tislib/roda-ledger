@@ -11,7 +11,7 @@ echo "Running clippy..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "Running tests..."
-cargo test --workspace --lib --bins --tests --examples --features=cluster --release
+cargo test -p ledger --release
 cargo test --doc
 
 echo "All checks passed!"

@@ -1,0 +1,18 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ledger.workspace = true
+proto.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+spdlog-rs.workspace = true

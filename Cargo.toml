@@ -1,113 +1,90 @@
-[package]
-name = "roda-ledger"
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/storage",
+    "crates/ledger",
+    "crates/raft",
+    "crates/client",
+    "crates/cluster",
+    "crates/cluster-test-utils",
+    "crates/ctl",
+]
+
+# `cargo run` / `cargo build` from the root act on cluster (which produces the binary).
+default-members = ["crates/cluster"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "A zero-copy, lock-free multi-threaded stage engine for ultra-low latency pipelines."
-authors = ["Taleh Ibrahimli"]
-repository = "https://github.com/tislib/roda-ledger"
+authors = ["Taleh"]
 license = "Apache-2.0"
-keywords = ["lock-free", "ledger", "concurrency", "pipeline", "low-latency"]
-categories = ["concurrency", "data-structures", "ledger"]
+repository = "https://github.com/yourname/roda-ledger"
+rust-version = "1.85"
 
-[dependencies]
-crossbeam-queue = "0.3.12"
-crossbeam-skiplist = "0.1"
-crossbeam-utils = "0.8"
-bytemuck = { version = "1.21.0", features = ["derive"] }
-arc-swap = "1"
-tokio = { version = "1.43.0", features = ["full"] }
-sysinfo = "0.33.1"
-roda-latency-tracker = "0.1.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rand = "0.8"
-tonic = { version = "0.12", features = ["transport"], optional = true }
-spdlog-rs = "0.5.3"
-crc32c = "0.6"
-lz4_flex = "0.11"
-tonic-reflection = { version = "0.12", optional = true }
-prost = { version = "0.13", optional = true }
-tempfile = "3"
-clap = { version = "4", features = ["derive"] }
+[workspace.dependencies]
+# --- async runtime / RPC ---
+tokio = { version = "1.40", features = ["full"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# --- concurrency primitives ---
+arc-swap = "1.7"
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# --- serialization / config ---
+serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-rustc-hash = "2"
-wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
-# `wat` is available to library consumers (tests, benches, binaries like
-# `load_wasm`) so they can embed WAT source for registration without
-# shelling out to an external assembler. It is pulled in transitively by
-# wasmtime anyway.
-wat = "1"
 
-[dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+# --- logging ---
+spdlog-rs = "0.4"
 
-[features]
-default = []
-cluster = ["dep:tonic", "dep:prost", "dep:tonic-build", "dep:tonic-reflection"]
-e2e_tests = ["cluster"]
+# --- error handling ---
+thiserror = "1"
+anyhow = "1"
 
-[build-dependencies]
-tonic-build = { version = "0.12", optional = true }
+# --- utilities ---
+rand = "0.8"
+bytes = "1.7"
 
+# --- CLI parsing (for the binary) ---
+clap = { version = "4", features = ["derive"] }
 
-[[bench]]
-name = "transactor_bench"
-harness = false
+# --- test / bench ---
+tempfile = "3"
+proptest = "1.5"
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
 
-[[bench]]
-name = "transaction_runner_bench"
-harness = false
+# --- internal crates ---
+proto = { path = "crates/proto" }
+storage = { path = "crates/storage" }
+ledger = { path = "crates/ledger" }
+raft = { path = "crates/raft" }
+client = { path = "crates/client" }
+cluster = { path = "crates/cluster" }
+cluster-test-utils = { path = "crates/cluster-test-utils" }
+ctl = { path = "crates/ctl" }
 
-[[bench]]
-name = "transaction_runner_bench_wasm"
-harness = false
-
-[[bench]]
-name = "wal_bench"
-harness = false
-
-[[bench]]
-name = "wal_tail_bench"
-harness = false
-
-[[bench]]
-name = "snapshot_bench"
-harness = false
-
-[[bench]]
-name = "quorum_bench"
-harness = false
-required-features = ["cluster"]
-
-[[bin]]
-name = "roda-ledger"
-path = "src/bin/cluster.rs"
-required-features = ["cluster"]
-
-[[bin]]
-name = "power-tune"
-path = "src/bin/power_tune.rs"
-
-[[bin]]
-name = "roda-ctl"
-path = "src/bin/roda_ctl.rs"
-
-[[bin]]
-name = "load"
-path = "src/bin/load.rs"
-
-[[bin]]
-name = "load_wasm"
-path = "src/bin/load_wasm.rs"
-
-[[bin]]
-name = "load_cluster"
-path = "src/bin/load_cluster.rs"
-required-features = ["cluster"]
-
-[[bin]]
-name = "load_tail"
-path = "src/bin/load_tail.rs"
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1                       # frame pointers for samply/perf
 
 [profile.bench]
-debug = true
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# Profile for the deterministic raft simulator: optimized enough to run 10K
+# schedules without being slow, but with debug assertions on to catch invariant
+# violations during fault injection.
+[profile.sim]
+inherits = "release"
+debug = 2
+debug-assertions = true
+overflow-checks = true
