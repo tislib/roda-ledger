@@ -64,15 +64,11 @@ impl Persistence for MemPersistence {
         if current >= expected {
             return Ok(false);
         }
-        if current + 1 != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "mem_persistence: commit_term current={} expected={} (must observe first)",
-                    current, expected
-                ),
-            ));
-        }
+        // Allow term-log skips: when the vote log raced ahead of the
+        // term log (observed-higher-term-via-RPC, no entries yet) the
+        // candidate may legitimately commit a term several steps
+        // beyond `current`. The contract is `current < expected`,
+        // not `current + 1 == expected`.
         self.term_log.push(TermRecord {
             term: expected,
             start_tx_id,
@@ -185,11 +181,14 @@ mod tests {
         assert_eq!(p.current_term(), 5);
     }
 
+    /// `commit_term` accepts arbitrary forward jumps — the vote log
+    /// is allowed to race ahead of the term log, and Raft never
+    /// required term-log records to be contiguous.
     #[test]
-    fn commit_term_errors_on_lag() {
+    fn commit_term_accepts_forward_skips() {
         let mut p = MemPersistence::new();
-        let err = p.commit_term(5, 0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(p.commit_term(5, 0).unwrap());
+        assert_eq!(p.current_term(), 5);
     }
 
     #[test]

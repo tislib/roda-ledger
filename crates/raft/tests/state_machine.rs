@@ -29,9 +29,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{
-    Action, Event, NodeId, Persistence, RaftConfig, RaftNode, Role, TermRecord,
-};
+use raft::{Event, NodeId, Persistence, RaftConfig, RaftNode, Role, TermRecord};
 
 /// Build a candidate at term `T` with `local_log_index = 0` and
 /// `term_log = []`. The candidate will then observe a higher term
@@ -319,6 +317,15 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     );
 
     let mut node = RaftNode::new(1, vec![1, 2, 3], p, RaftConfig::default(), 42);
+    // Driver-side WAL recovery: the on-disk WAL has 3 entries from
+    // phase 1; the rebuilt node must learn its `local_log_index`
+    // before any election runs, otherwise `start_tx_id` for the
+    // post-election term boundary lands at 1 and shadows the
+    // existing entries on `term_at_tx` lookups.
+    let _ = node.step(
+        t0 + Duration::from_secs(119),
+        Event::LogAppendComplete { tx_id: 3 },
+    );
     let _ = node.step(t0 + Duration::from_secs(120), Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(180), Event::Tick);
     assert_eq!(node.role(), Role::Candidate);
@@ -335,9 +342,15 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
         },
     );
 
-    // Phase 3: shrink to single-node and self-elect.
+    // Phase 3: shrink to single-node and self-elect. Replay the
+    // WAL high-water mark again — `RaftNode::new` always starts
+    // `local_log_index = 0`.
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
+    let _ = node.step(
+        t0 + Duration::from_secs(181),
+        Event::LogAppendComplete { tx_id: 3 },
+    );
     let _ = node.step(t0 + Duration::from_secs(182), Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(240), Event::Tick);
     assert_eq!(node.role(), Role::Leader);
@@ -394,10 +407,10 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
 fn collect_term_records<P: Persistence>(p: &P) -> Vec<TermRecord> {
     let mut seen: Vec<TermRecord> = Vec::new();
     for tx in 0..=200 {
-        if let Some(rec) = p.term_at_tx(tx) {
-            if !seen.iter().any(|r| *r == rec) {
-                seen.push(rec);
-            }
+        if let Some(rec) = p.term_at_tx(tx)
+            && !seen.contains(&rec)
+        {
+            seen.push(rec);
         }
     }
     seen.sort_by_key(|r| r.start_tx_id);

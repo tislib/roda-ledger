@@ -68,15 +68,18 @@ pub trait Persistence {
     /// record (or the term log is empty).
     fn term_at_tx(&self, tx_id: TxId) -> Option<TermRecord>;
 
-    /// Election-win commit. Atomically asserts `current_term + 1 ==
-    /// expected` and persists the new boundary.
+    /// Election-win commit. Persists `(expected, start_tx_id)` as a
+    /// new term boundary iff `current_term < expected`. The check
+    /// is on strict-less-than, **not** `current + 1 == expected`:
+    /// the vote log can race ahead of the term log (a candidate that
+    /// observed a higher term via RPC then later won at an even
+    /// higher one), and Raft does not require term-log records to
+    /// be contiguous.
     ///
     /// - `Ok(true)`: write succeeded, `current_term` is now `expected`.
-    /// - `Ok(false)`: `current_term` already advanced past `expected`
-    ///   (a concurrent observer got there first); caller should treat
-    ///   the election as lost.
-    /// - `Err(InvalidInput)`: `expected` is more than one term ahead
-    ///   of current (programming error).
+    /// - `Ok(false)`: `current_term >= expected` — a concurrent
+    ///   observer got there first; caller should treat the election
+    ///   as lost.
     /// - `Err(_)`: I/O failure.
     fn commit_term(&mut self, expected: TermNum, start_tx_id: TxId) -> io::Result<bool>;
 

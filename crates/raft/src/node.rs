@@ -479,25 +479,18 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     fn become_leader_after_win(&mut self, new_term: Term, now: Instant, out: &mut Vec<Action>) {
-        // Catch the term log up if observe-via-RPC let the vote log
-        // run ahead. The new term's first entry will be at
-        // `local_log_index + 1`; existing entries belong to whatever
-        // previous term they were committed under, and we must NOT
-        // shadow them with a new boundary at `local_log_index`.
+        // The new term's first entry will live at `local_log_index +
+        // 1`; existing entries belong to whatever earlier term they
+        // were committed under, so the new boundary must not be
+        // recorded at or before `local_log_index` or it would
+        // shadow them in `term_at_tx` lookups.
+        //
+        // No catch-up record. The vote log can validly race ahead of
+        // the term log (observed-higher-term-via-RPC), and Raft does
+        // not require term-log records to be contiguous. The
+        // `Persistence::commit_term` contract permits any
+        // `current < expected` jump.
         let start_tx_id = self.local_log_index + 1;
-        let term_current = self.persistence.current_term();
-        if new_term > term_current + 1
-            && let Err(e) = self.persistence.observe_term(new_term - 1, start_tx_id)
-        {
-            warn!(
-                "raft: node_id={} observe_term(catch-up to {}) failed: {}; stepping down",
-                self.self_id,
-                new_term - 1,
-                e
-            );
-            self.transition_to_follower(now, None);
-            return;
-        }
 
         // Atomic election-win commit. ADR-0017 §"Required Invariants" #5.
         match self.persistence.commit_term(new_term, start_tx_id) {
@@ -973,9 +966,6 @@ mod tests {
             let cur = self.current_term();
             if cur >= expected {
                 return Ok(false);
-            }
-            if cur + 1 != expected {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "lag"));
             }
             self.term_log.push(crate::TermRecord {
                 term: expected,
