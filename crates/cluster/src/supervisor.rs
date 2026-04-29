@@ -542,7 +542,7 @@ async fn run_leader_role(
     // Stay in Leader until either a transition signals step-down
     // or the process is shutting down.
     let mut step_down_observed: Option<u64> = None;
-    while running.load(std::sync::atomic::Ordering::Relaxed) {
+    if running.load(std::sync::atomic::Ordering::Relaxed) {
         debug!(
             "supervisor[node_id={}]: leader awaiting transition signal (term={})",
             config.node_id(),
@@ -556,7 +556,6 @@ async fn run_leader_role(
                     observed
                 );
                 step_down_observed = Some(observed);
-                break;
             }
             Some(Transition::DivergenceDetected { .. }) => {
                 // Followers are the only nodes that detect
@@ -567,14 +566,12 @@ async fn run_leader_role(
                     "supervisor[node_id={}]: leader observed unexpected divergence; stepping down",
                     config.node_id()
                 );
-                break;
             }
             Some(Transition::Shutdown) | None => {
                 debug!(
                     "supervisor[node_id={}]: leader received shutdown signal — exiting role",
                     config.node_id()
                 );
-                break;
             }
         }
     }
