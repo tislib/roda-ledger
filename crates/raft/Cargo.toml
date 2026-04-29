@@ -13,16 +13,17 @@ path = "src/lib.rs"
 # - No tokio / async runtime. raft is a pure state machine.
 # - No tonic / proto. Wire types are translated by the cluster crate.
 # - No ledger / cluster. Upward dependencies break the layer.
+# - No storage. The library performs zero I/O. Durable term/vote
+#   persistence is a driver responsibility — raft emits
+#   `Action::PersistTerm` / `Action::PersistVote` and the driver
+#   acks via `Event::TermPersisted` / `Event::VotePersisted`.
 # If you're tempted to add any of these, return an Action variant instead.
 [dependencies]
-storage.workspace = true         # term log, vote log, raft-owned durable state
-
-serde.workspace = true
+rand.workspace = true            # seeded RNG (StdRng) for election-timeout randomization
 spdlog-rs.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
-rand.workspace = true            # seeded RNG for the deterministic simulator
 criterion.workspace = true
