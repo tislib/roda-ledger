@@ -7,7 +7,8 @@
 //! drives proptest schedules.
 //!
 //! Concept of operation:
-//! - The harness owns N `RaftNode`s, each with its own `data_dir`.
+//! - The harness owns N `RaftNode<MemPersistence>` instances, each
+//!   with its own in-memory persistence. No tempdirs.
 //! - A virtual clock starts at `Instant::now()` and only advances
 //!   when the harness explicitly advances it.
 //! - A min-heap of `Scheduled` items combines (a) inbound RPC events
@@ -18,7 +19,8 @@
 //!   `step(now, event)`, and processes returned `Action`s back into
 //!   `Scheduled`s.
 //! - Fault injection: configurable network delay, message drop,
-//!   per-node crash markers, partition sets.
+//!   crash via `into_persistence` (drops the volatile RaftNode while
+//!   retaining the durable persistence), partition sets.
 
 // Each integration test compiles `common/mod.rs` into its own test
 // binary, so methods unused by *that* binary look dead even when
@@ -26,14 +28,17 @@
 // API surface — silence the false positives.
 #![allow(dead_code)]
 
+pub mod mem_persistence;
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use raft::{
-    Action, ElectionTimerConfig, Event, LogEntryMeta, NodeId, RaftConfig, RaftInitialState,
-    RaftNode, Role, TxId,
+    Action, ElectionTimerConfig, Event, LogEntryMeta, NodeId, RaftConfig, RaftNode, Role, TxId,
 };
+
+use mem_persistence::MemPersistence;
 
 #[derive(Clone, Debug)]
 struct Scheduled {
@@ -66,35 +71,50 @@ impl Ord for Scheduled {
     }
 }
 
+/// Per-node simulator state.
+///
+/// `node` is `Some` while the node is running and `None` while
+/// crashed; `saved_persistence` is the inverse — it holds the durable
+/// state across a crash so a subsequent `restart` can rebuild a
+/// `RaftNode` from it. This models a real crash dropping all
+/// volatile state while leaving the on-disk term/vote logs intact.
 struct NodeBox {
-    node: RaftNode,
-    /// Append-only mirror of the local log. `tx_id` indexes
+    node: Option<RaftNode<MemPersistence>>,
+    saved_persistence: Option<MemPersistence>,
+    /// Append-only mirror of the local entry log. `tx_id` indexes
     /// `entries[tx_id - 1]` (1-based). Truncation drops the suffix.
+    /// Survives crash/restart (models on-disk WAL).
     entries: Vec<LogEntryMeta>,
     /// Cluster commit watermark observed via `Action::AdvanceClusterCommit`.
     cluster_commit: TxId,
-    /// Set of (term, tx_id) the node has been told to apply; used
+    /// (term, tx_id) pairs the node has been told to apply; used
     /// for state-machine safety checks.
     applied: Vec<LogEntryMeta>,
-    /// Crash flag — when true the harness drops every event for this
-    /// node (used by fault injection scenarios).
-    crashed: bool,
     /// Most recent `SetWakeup` requested by this node.
     pending_wakeup: Option<Instant>,
+    /// Stable seed used to recreate the node on restart.
+    seed: u64,
+}
+
+impl NodeBox {
+    fn is_crashed(&self) -> bool {
+        self.node.is_none()
+    }
 }
 
 pub struct Sim {
     base: Instant,
     clock: Instant,
     nodes: HashMap<NodeId, NodeBox>,
+    peer_list: Vec<NodeId>,
+    cfg: RaftConfig,
     queue: BinaryHeap<Reverse<Scheduled>>,
     seq: u64,
     network_delay: Duration,
     /// Pairs `(a, b)` such that any message a→b or b→a is dropped.
     /// Modelled as an undirected partition.
     partitioned: HashSet<(NodeId, NodeId)>,
-    /// All durations a node was observed in `Role::Leader`, by
-    /// `(term, leader_id)`. Used to verify Election Safety
+    /// Leaders observed per term — used to verify Election Safety
     /// (§5.4 #1: at most one leader per term).
     leaders_per_term: HashMap<u64, HashSet<NodeId>>,
     /// Recorded so callers can inspect after the run.
@@ -106,26 +126,18 @@ impl Sim {
         let base = Instant::now();
         let mut nodes = HashMap::new();
         for (i, id) in node_ids.iter().enumerate() {
-            // No tempdir / data_dir: ADR-0017 keeps I/O out of the
-            // library. The simulator round-trips
-            // `Action::Persist*` → `Event::*Persisted` immediately,
-            // emulating an instant-durable driver.
-            let node = RaftNode::new(
-                *id,
-                node_ids.to_vec(),
-                seed_base.wrapping_add(*id).wrapping_add(i as u64),
-                cfg,
-                RaftInitialState::default(),
-            );
+            let seed = seed_base.wrapping_add(*id).wrapping_add(i as u64);
+            let node = RaftNode::new(*id, node_ids.to_vec(), MemPersistence::new(), cfg, seed);
             nodes.insert(
                 *id,
                 NodeBox {
-                    node,
+                    node: Some(node),
+                    saved_persistence: None,
                     entries: Vec::new(),
                     cluster_commit: 0,
                     applied: Vec::new(),
-                    crashed: false,
                     pending_wakeup: None,
+                    seed,
                 },
             );
         }
@@ -133,6 +145,8 @@ impl Sim {
             base,
             clock: base,
             nodes,
+            peer_list: node_ids.to_vec(),
+            cfg,
             queue: BinaryHeap::new(),
             seq: 0,
             network_delay: Duration::from_millis(2),
@@ -151,8 +165,8 @@ impl Sim {
 
     fn deliver_bootstrap_tick(&mut self, id: NodeId) {
         let now = self.clock;
-        let actions = match self.nodes.get_mut(&id) {
-            Some(b) => b.node.step(now, Event::Tick),
+        let actions = match self.nodes.get_mut(&id).and_then(|b| b.node.as_mut()) {
+            Some(n) => n.step(now, Event::Tick),
             None => return,
         };
         self.process_actions(id, now, actions);
@@ -173,40 +187,78 @@ impl Sim {
         self.partitioned.remove(&canon_pair(a, b));
     }
 
+    /// Crash the node. Drops the volatile `RaftNode` (modelling the
+    /// loss of in-memory state); preserves the durable `Persistence`
+    /// state so a subsequent `restart` recovers from it.
     pub fn crash(&mut self, id: NodeId) {
-        if let Some(b) = self.nodes.get_mut(&id) {
-            b.crashed = true;
+        if let Some(b) = self.nodes.get_mut(&id)
+            && let Some(node) = b.node.take()
+        {
+            b.saved_persistence = Some(node.into_persistence());
+            b.pending_wakeup = None;
         }
     }
 
+    /// Restart a previously-crashed node. Constructs a fresh
+    /// `RaftNode` over the preserved `MemPersistence`, re-bootstraps
+    /// it with a Tick.
     pub fn restart(&mut self, id: NodeId) {
-        if let Some(b) = self.nodes.get_mut(&id) {
-            b.crashed = false;
-            // Re-prime the election timer post-restart.
-            let now = self.clock;
-            let actions = b.node.step(now, Event::Tick);
-            self.process_actions(id, now, actions);
-        }
+        let now = self.clock;
+        let actions = {
+            let b = match self.nodes.get_mut(&id) {
+                Some(b) => b,
+                None => return,
+            };
+            if b.node.is_some() {
+                return;
+            }
+            let p = b.saved_persistence.take().expect("not crashed");
+            let mut n = RaftNode::new(id, self.peer_list.clone(), p, self.cfg, b.seed);
+            let acts = n.step(now, Event::Tick);
+            b.node = Some(n);
+            acts
+        };
+        self.process_actions(id, now, actions);
     }
 
     pub fn role_of(&self, id: NodeId) -> Role {
-        self.nodes[&id].node.role()
+        self.nodes
+            .get(&id)
+            .and_then(|b| b.node.as_ref())
+            .map(|n| n.role())
+            .unwrap_or(Role::Initializing)
     }
 
     pub fn current_term_of(&self, id: NodeId) -> u64 {
-        self.nodes[&id].node.current_term()
+        self.nodes
+            .get(&id)
+            .and_then(|b| b.node.as_ref())
+            .map(|n| n.current_term())
+            .unwrap_or(0)
     }
 
     pub fn cluster_commit_of(&self, id: NodeId) -> TxId {
-        self.nodes[&id].node.cluster_commit_index()
+        self.nodes
+            .get(&id)
+            .and_then(|b| b.node.as_ref())
+            .map(|n| n.cluster_commit_index())
+            .unwrap_or(0)
     }
 
     pub fn local_commit_of(&self, id: NodeId) -> TxId {
-        self.nodes[&id].node.commit_index()
+        self.nodes
+            .get(&id)
+            .and_then(|b| b.node.as_ref())
+            .map(|n| n.commit_index())
+            .unwrap_or(0)
     }
 
     pub fn entries_of(&self, id: NodeId) -> &[LogEntryMeta] {
         &self.nodes[&id].entries
+    }
+
+    pub fn is_crashed(&self, id: NodeId) -> bool {
+        self.nodes.get(&id).map(|b| b.is_crashed()).unwrap_or(true)
     }
 
     /// Inject a "client write" on `leader_id`: simulates the leader's
@@ -220,12 +272,14 @@ impl Sim {
         }
         let now = self.clock;
         let mut actions_acc: Vec<(NodeId, Vec<Action>)> = Vec::new();
-        if let Some(b) = self.nodes.get_mut(&leader_id) {
-            let start = b.node.commit_index();
+        if let Some(b) = self.nodes.get_mut(&leader_id)
+            && let Some(node) = b.node.as_mut()
+        {
+            let start = node.commit_index();
             for i in 0..count {
                 let tx = start + 1 + i as u64;
                 b.entries.push(LogEntryMeta::new(tx, term));
-                let acts = b.node.step(now, Event::LocalCommitAdvanced { tx_id: tx });
+                let acts = node.step(now, Event::LocalCommitAdvanced { tx_id: tx });
                 actions_acc.push((leader_id, acts));
             }
         }
@@ -237,17 +291,8 @@ impl Sim {
     /// Drive the simulator until `deadline`. Returns the number of
     /// step invocations executed.
     pub fn run_until(&mut self, deadline: Instant) -> usize {
+        self.requeue_pending_wakeups();
         let mut steps = 0usize;
-        // Re-arm wakeups in the queue from any pending_wakeup the
-        // bootstrap left behind.
-        let pending: Vec<(NodeId, Instant)> = self
-            .nodes
-            .iter()
-            .filter_map(|(id, b)| b.pending_wakeup.map(|w| (*id, w)))
-            .collect();
-        for (id, w) in pending {
-            self.schedule(w, id, Event::Tick);
-        }
         while let Some(Reverse(s)) = self.queue.peek() {
             if s.at > deadline {
                 break;
@@ -268,15 +313,7 @@ impl Sim {
     where
         F: FnMut(&Sim) -> bool,
     {
-        // Same loop body as `run_until` but with an early-exit hook.
-        let pending: Vec<(NodeId, Instant)> = self
-            .nodes
-            .iter()
-            .filter_map(|(id, b)| b.pending_wakeup.map(|w| (*id, w)))
-            .collect();
-        for (id, w) in pending {
-            self.schedule(w, id, Event::Tick);
-        }
+        self.requeue_pending_wakeups();
         let mut steps = 0u32;
         while let Some(Reverse(s)) = self.queue.peek() {
             if s.at > deadline {
@@ -296,16 +333,27 @@ impl Sim {
         false
     }
 
+    fn requeue_pending_wakeups(&mut self) {
+        let pending: Vec<(NodeId, Instant)> = self
+            .nodes
+            .iter()
+            .filter_map(|(id, b)| b.pending_wakeup.map(|w| (*id, w)))
+            .collect();
+        for (id, w) in pending {
+            self.schedule(w, id, Event::Tick);
+        }
+    }
+
     fn dispatch(&mut self, s: Scheduled) {
         if !self.nodes.contains_key(&s.target) {
             return;
         }
-        if self.nodes[&s.target].crashed {
+        if self.nodes[&s.target].is_crashed() {
             return;
         }
         let now = s.at;
-        let actions = match self.nodes.get_mut(&s.target) {
-            Some(b) => b.node.step(now, s.event),
+        let actions = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut()) {
+            Some(n) => n.step(now, s.event),
             None => return,
         };
         self.process_actions(s.target, now, actions);
@@ -399,9 +447,6 @@ impl Sim {
                 }
                 Action::AppendLog { tx_id, term } => {
                     if let Some(b) = self.nodes.get_mut(&src) {
-                        // Pad the log if needed (the harness's mirror
-                        // is dense from tx_id 1..N — gaps shouldn't
-                        // happen with correct §5.3 prev-log matching).
                         while b.entries.len() < (tx_id as usize).saturating_sub(1) {
                             b.entries.push(LogEntryMeta::new(0, 0));
                         }
@@ -414,7 +459,8 @@ impl Sim {
                     let actions = self
                         .nodes
                         .get_mut(&src)
-                        .map(|b| b.node.step(now, Event::LogAppendComplete { tx_id }));
+                        .and_then(|b| b.node.as_mut())
+                        .map(|n| n.step(now, Event::LogAppendComplete { tx_id }));
                     if let Some(a) = actions {
                         self.process_actions(src, now, a);
                     }
@@ -423,10 +469,11 @@ impl Sim {
                     if let Some(b) = self.nodes.get_mut(&src) {
                         b.entries.truncate(after_tx_id as usize);
                     }
-                    let actions = self.nodes.get_mut(&src).map(|b| {
-                        b.node
-                            .step(now, Event::LogTruncateComplete { up_to: after_tx_id })
-                    });
+                    let actions = self
+                        .nodes
+                        .get_mut(&src)
+                        .and_then(|b| b.node.as_mut())
+                        .map(|n| n.step(now, Event::LogTruncateComplete { up_to: after_tx_id }));
                     if let Some(a) = actions {
                         self.process_actions(src, now, a);
                     }
@@ -459,27 +506,6 @@ impl Sim {
                     }
                     self.schedule(at, src, Event::Tick);
                 }
-                Action::PersistTerm { term, start_tx_id } => {
-                    // Emulate an instant-durable driver: feed the ack
-                    // back into the same node so the library can
-                    // advance `durable_term`.
-                    let actions = self
-                        .nodes
-                        .get_mut(&src)
-                        .map(|b| b.node.step(now, Event::TermPersisted { term, start_tx_id }));
-                    if let Some(a) = actions {
-                        self.process_actions(src, now, a);
-                    }
-                }
-                Action::PersistVote { term, voted_for } => {
-                    let actions = self
-                        .nodes
-                        .get_mut(&src)
-                        .map(|b| b.node.step(now, Event::VotePersisted { term, voted_for }));
-                    if let Some(a) = actions {
-                        self.process_actions(src, now, a);
-                    }
-                }
             }
         }
     }
@@ -496,7 +522,7 @@ impl Sim {
 
     fn is_dropped(&self, from: NodeId, to: NodeId) -> bool {
         self.partitioned.contains(&canon_pair(from, to))
-            || self.nodes.get(&to).map(|b| b.crashed).unwrap_or(true)
+            || self.nodes.get(&to).map(|b| b.is_crashed()).unwrap_or(true)
     }
 
     /// Election-safety check: at most one leader per term across all
@@ -546,7 +572,6 @@ impl Sim {
                 let n = a.len().min(b.len());
                 for k in 0..n {
                     if a[k].tx_id == b[k].tx_id && a[k].term == b[k].term {
-                        // All preceding entries must match.
                         for p in 0..k {
                             assert_eq!(
                                 a[p], b[p],

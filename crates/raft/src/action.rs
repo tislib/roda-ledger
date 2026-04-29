@@ -1,12 +1,14 @@
-//! Outputs from `RaftNode::step`. The driver reads the action list,
-//! executes each one in order (`Persist*` writes durably first, then
-//! `Send*`), and feeds completion events back through the next
-//! `step`.
+//! Outputs from `RaftNode::step`. The driver reads the action list
+//! and executes each one in order, then feeds completion events back
+//! through the next `step`.
 //!
 //! ADR-0017 §"Architectural Boundary": the library does not perform
-//! I/O. Every side effect — including durable writes to the term and
-//! vote logs raft logically owns — is described here; the driver
-//! does the actual work.
+//! I/O. Durable writes to the term and vote logs go through the
+//! synchronous [`crate::Persistence`] trait that `RaftNode` is
+//! parameterised over — they do **not** appear in this enum.
+//! Everything below is a side effect the *driver* must perform
+//! (sending wire RPCs, appending the entry log, advancing apply
+//! gates, etc.).
 
 use std::time::Instant;
 
@@ -16,19 +18,6 @@ use crate::types::{NodeId, Term, TxId};
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    // ── durable writes the driver routes to the term / vote logs ────────
-    /// Append `(term, start_tx_id)` to the term log. The driver
-    /// writes durably (e.g. `storage::TermStorage`), then feeds back
-    /// `Event::TermPersisted` so the library knows the on-disk state
-    /// caught up. The library has already updated its in-memory
-    /// model by the time it emits this action — the ack is purely
-    /// "the durable view matches the in-memory view".
-    PersistTerm { term: Term, start_tx_id: TxId },
-    /// Append `(term, voted_for)` to the vote log. `voted_for == 0`
-    /// is the wire encoding of "no vote granted in this term".
-    /// Acked via `Event::VotePersisted`.
-    PersistVote { term: Term, voted_for: NodeId },
-
     // ── outbound RPCs ───────────────────────────────────────────────────
     SendAppendEntries {
         to: NodeId,
@@ -57,10 +46,10 @@ pub enum Action {
     },
 
     // ── follower log directives ─────────────────────────────────────────
-    /// Drop log entries with `tx_id > after_tx_id`. The driver
-    /// truncates **both** the entry log and its term-log mirror to
-    /// keep the §5.3 invariant (paired truncation). Once durable it
-    /// feeds back `Event::LogTruncateComplete`.
+    /// Drop entry-log records with `tx_id > after_tx_id`. The library
+    /// has already truncated its term-log mirror via the
+    /// `Persistence` trait; this action is for the *entry* log the
+    /// driver owns. The driver acks via `Event::LogTruncateComplete`.
     TruncateLog { after_tx_id: TxId },
     /// Append the entry whose metadata matches `(tx_id, term)`. The
     /// driver already has the payload (it received it as part of the
@@ -83,6 +72,5 @@ pub enum Action {
     // ── timer management ────────────────────────────────────────────────
     /// Schedule the next `Event::Tick` at `at`. The library re-emits
     /// this on every transition that changes the soonest deadline.
-    /// The driver re-arms its `tokio::time::sleep_until`.
     SetWakeup { at: Instant },
 }

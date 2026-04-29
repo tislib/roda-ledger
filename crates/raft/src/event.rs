@@ -1,12 +1,15 @@
-//! Inputs to `RaftNode::step`. Everything the state machine reacts to
-//! arrives as one of these.
+//! Inputs to `RaftNode::step`. Everything the state machine reacts
+//! to arrives as one of these.
 //!
 //! Wall-clock time is **not** carried on the variants — `step` takes
 //! a `now: Instant` parameter that's authoritative for the call.
 //! `Event::Tick` is the explicit "wake up and re-check" signal the
-//! driver fires when an `Action::SetWakeup` deadline arrives; all
-//! other events ride the same `now` as the call that delivered
-//! them.
+//! driver fires when an `Action::SetWakeup` deadline arrives.
+//!
+//! Durable persistence of term/vote logs is mediated synchronously
+//! through the [`crate::Persistence`] trait — there is no
+//! `Event::*Persisted` ack. When a trait write returns `Ok(_)`, the
+//! library treats the change as durable and proceeds.
 //!
 //! Payload bytes do not flow through this enum (or through
 //! `Action`). The driver moves payloads between storage and the wire
@@ -57,28 +60,15 @@ pub enum Event {
     },
 
     /// Leader-only: ledger reports it durably committed an entry
-    /// locally. ADR-0017 §"Asymmetric write paths" — the on-commit
-    /// hook bridges from the leader's ledger into raft, so the
-    /// leader's slot in `Quorum::match_index` advances.
+    /// locally. Bridge from the ledger's on-commit hook into raft.
+    /// Advances the leader's own slot in match_index, feeding into
+    /// cluster_commit_index.
     LocalCommitAdvanced { tx_id: TxId },
 
     /// Driver acknowledges the most recent `Action::AppendLog` for
-    /// the follower path. After this fires, the follower's
-    /// `commit_index` (local) advances to `tx_id`.
+    /// the follower path.
     LogAppendComplete { tx_id: TxId },
 
     /// Driver acknowledges the most recent `Action::TruncateLog`.
-    /// The follower's local-log view is now `<= up_to`.
     LogTruncateComplete { up_to: TxId },
-
-    /// Driver acknowledges that `Action::PersistTerm { term, start_tx_id }`
-    /// is durable on disk. The library treats these as
-    /// observability hooks: it has already updated its in-memory
-    /// model when emitting the action; the ack confirms the durable
-    /// write completed and lets the driver round-trip its state
-    /// asynchronously without lying about durability.
-    TermPersisted { term: Term, start_tx_id: TxId },
-
-    /// Driver acknowledges `Action::PersistVote`.
-    VotePersisted { term: Term, voted_for: NodeId },
 }
