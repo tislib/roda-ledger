@@ -538,3 +538,220 @@ fn cluster_commit_query_matches_advance_action() {
     assert_eq!(advanced, Some(7));
     assert!(node.cluster_commit_index() >= 7);
 }
+
+// ── §5.4.1 up-to-date check (audit gap) ────────────────────────────────
+//
+// Raft §5.4.1: the voter denies its vote if the candidate's log is
+// less up-to-date than the voter's. "Up-to-date" is determined by
+// `(last_term, last_tx_id)` — strictly later term wins; same term
+// → strictly higher tx_id wins.
+
+#[test]
+fn vote_denied_when_candidate_last_term_below_ours() {
+    // Voter has accepted entries 1..3 at term 5, then a candidate
+    // running at term 6 contacts it claiming `last_term=2,
+    // last_tx_id=10`. Even though tx_id is higher, term is lower —
+    // deny.
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 5,
+            start_tx_id: 1,
+        }],
+        5,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 3 });
+
+    let actions = node.step(
+        Instant::now(),
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 6,
+            last_tx_id: 10, // higher than ours
+            last_term: 2,   // but older term — must deny
+        },
+    );
+    let granted = actions.iter().any(|a| matches!(
+        a,
+        Action::SendRequestVoteReply { granted: true, .. }
+    ));
+    assert!(!granted, "must deny when last_term < ours: {:?}", actions);
+}
+
+#[test]
+fn vote_denied_when_same_last_term_but_lower_last_tx_id() {
+    // Voter at term 5 with entries 1..10. Candidate at term 6
+    // claims `last_term=5, last_tx_id=7` — same term, fewer entries
+    // — deny.
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 5,
+            start_tx_id: 1,
+        }],
+        5,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 10 });
+
+    let actions = node.step(
+        Instant::now(),
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 6,
+            last_tx_id: 7, // strictly less than ours
+            last_term: 5,  // same as ours
+        },
+    );
+    let granted = actions.iter().any(|a| matches!(
+        a,
+        Action::SendRequestVoteReply { granted: true, .. }
+    ));
+    assert!(!granted, "must deny on equal term + lower tx_id: {:?}", actions);
+}
+
+#[test]
+fn vote_granted_when_candidate_last_term_above_ours() {
+    // Voter at term 5 with entries 1..10. Candidate at term 6 claims
+    // `last_term=7, last_tx_id=2` — strictly later term wins despite
+    // far fewer entries.
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 5,
+            start_tx_id: 1,
+        }],
+        5,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 10 });
+
+    let actions = node.step(
+        Instant::now(),
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 6,
+            last_tx_id: 2,
+            last_term: 7, // strictly above ours — grant
+        },
+    );
+    let granted = actions.iter().any(|a| matches!(
+        a,
+        Action::SendRequestVoteReply { granted: true, .. }
+    ));
+    assert!(granted, "must grant on strictly later last_term: {:?}", actions);
+}
+
+// ── Idempotent re-vote in the same term (audit gap) ────────────────────
+
+/// §5.2: a follower that has already voted for candidate X in term T
+/// must grant the same vote again if X re-asks (the original reply
+/// may have been lost). Different candidate at the same term is
+/// refused.
+#[test]
+fn duplicate_request_vote_from_same_candidate_grants_again() {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    let now = Instant::now();
+
+    // First RV from candidate 2 at term 3 — granted.
+    let first = node.step(
+        now,
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 3,
+            last_tx_id: 0,
+            last_term: 0,
+        },
+    );
+    assert!(first.iter().any(|a| matches!(
+        a,
+        Action::SendRequestVoteReply { granted: true, .. }
+    )));
+
+    // A second RV from the same candidate at the same term — must
+    // be granted again (idempotent on duplicate inbound RPCs).
+    let second = node.step(
+        now,
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 3,
+            last_tx_id: 0,
+            last_term: 0,
+        },
+    );
+    assert!(
+        second.iter().any(|a| matches!(
+            a,
+            Action::SendRequestVoteReply { granted: true, .. }
+        )),
+        "duplicate RV from same candidate must re-grant: {:?}",
+        second
+    );
+
+    // A different candidate at the same term — refused.
+    let third = node.step(
+        now,
+        Event::RequestVoteRequest {
+            from: 3,
+            term: 3,
+            last_tx_id: 0,
+            last_term: 0,
+        },
+    );
+    assert!(
+        third.iter().any(|a| matches!(
+            a,
+            Action::SendRequestVoteReply { granted: false, .. }
+        )),
+        "different candidate same term must be refused: {:?}",
+        third
+    );
+}
+
+// ── Heartbeat propagates leader_commit (audit gap) ─────────────────────
+
+/// A heartbeat (empty-entries AE) carries `leader_commit` and must
+/// advance the follower's `cluster_commit_index` even though no
+/// entries are appended. This is the only path that progresses
+/// cluster_commit on a follower without writing any new entries —
+/// e.g. after a leader retransmits a commit-watermark advance.
+#[test]
+fn heartbeat_propagates_leader_commit_advance() {
+    // Pre-load the follower with three durable entries at term 1.
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 1,
+            start_tx_id: 1,
+        }],
+        1,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 3 });
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Heartbeat at term 1 with leader_commit=2.
+    let actions = node.step(
+        Instant::now(),
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 3,
+            prev_log_term: 1,
+            entries: LogEntryRange::empty(),
+            leader_commit: 2,
+        },
+    );
+
+    assert_eq!(node.cluster_commit_index(), 2);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::AdvanceClusterCommit { tx_id: 2 }
+    )));
+    // Heartbeats also reply success synchronously (no parking).
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAppendEntriesReply { success: true, .. }
+    )));
+}

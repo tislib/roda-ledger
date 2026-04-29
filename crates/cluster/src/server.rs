@@ -11,12 +11,13 @@
 //! `notify_waiters()`, which lets tonic stop accepting new connections, drain
 //! in-flight handlers, and exit cleanly.
 
+use crate::cluster_mirror::ClusterMirror;
+use crate::durable::Term;
 use crate::ledger_handler::LedgerHandler;
 use crate::node_handler::NodeHandler;
 use ::proto::ledger::ledger_server::LedgerServer;
 use ::proto::node::node_server::NodeServer;
-use crate::raft::{RoleFlag, Term};
-use crate::{ClusterCommitIndex, LedgerSlot};
+use crate::LedgerSlot;
 use spdlog::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,16 +30,13 @@ pub struct Server {
     /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9).
     ledger_slot: Arc<LedgerSlot>,
     addr: SocketAddr,
-    /// Shared role state. The constructed [`LedgerHandler`] reads
-    /// this on every RPC to decide write/read permissions; the
-    /// supervisor flips it on role transitions, so a single
-    /// long-lived `Server` instance serves every role without
-    /// restart.
-    role: Arc<RoleFlag>,
-    /// Shared term state. Every submit/status/wait response stamps
-    /// the appropriate view of this value.
+    /// Lock-free read surface for raft state (role, current_term,
+    /// cluster_commit_index). `LedgerHandler` consults this on every
+    /// RPC; the raft driver mutates it under the raft mutex.
+    mirror: Arc<ClusterMirror>,
+    /// Shared durable term log — used for term-at-tx stamping. Read
+    /// path is independent of the raft mutex.
     term: Arc<Term>,
-    pub cluster_commit_index: Arc<ClusterCommitIndex>,
     /// Cooperative shutdown trigger. When the owning `*Handles`
     /// drops, it calls `notify_waiters()` and `serve_with_shutdown`
     /// resolves.
@@ -49,28 +47,21 @@ impl Server {
     pub fn new(
         ledger_slot: Arc<LedgerSlot>,
         addr: SocketAddr,
-        role: Arc<RoleFlag>,
+        mirror: Arc<ClusterMirror>,
         term: Arc<Term>,
-        cluster_commit_index: Arc<ClusterCommitIndex>,
         shutdown: Arc<Notify>,
     ) -> Self {
         Self {
             ledger_slot,
             addr,
-            role,
+            mirror,
             term,
-            cluster_commit_index,
             shutdown,
         }
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let handler = LedgerHandler::new(
-            self.ledger_slot,
-            self.role.clone(),
-            self.term,
-            self.cluster_commit_index,
-        );
+        let handler = LedgerHandler::new(self.ledger_slot, self.mirror.clone(), self.term);
 
         info!("Ledger gRPC server listening on {}", self.addr);
 

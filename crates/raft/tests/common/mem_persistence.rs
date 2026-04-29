@@ -23,6 +23,20 @@ pub struct MemPersistence {
     /// Test fault-injection: when set, `observe_term` returns an
     /// `io::Error`. Same purpose as `fail_truncate`.
     pub fail_observe_term: bool,
+    /// Test fault-injection: when set, `commit_term` returns an
+    /// `io::Error`. The library treats this as recoverable (the
+    /// underlying state was not modified) and steps down rather than
+    /// emitting `FatalError`.
+    pub fail_commit_term: bool,
+    /// Test fault-injection: when set, `observe_vote_term` returns
+    /// an `io::Error`. Audit declared this benign because the next
+    /// `vote(term, …)` call durably advances the vote-log term
+    /// itself; tests pin that recovery path.
+    pub fail_observe_vote_term: bool,
+    /// Test fault-injection: when set, `vote` returns an
+    /// `io::Error` (rather than `Ok(true)` / `Ok(false)`). Forces
+    /// the candidate path to abort and re-arm.
+    pub fail_vote: bool,
 }
 
 impl MemPersistence {
@@ -39,6 +53,9 @@ impl MemPersistence {
             voted_for,
             fail_truncate: false,
             fail_observe_term: false,
+            fail_commit_term: false,
+            fail_observe_vote_term: false,
+            fail_vote: false,
         }
     }
 }
@@ -71,6 +88,9 @@ impl Persistence for MemPersistence {
     }
 
     fn commit_term(&mut self, expected: TermNum, start_tx_id: TxId) -> io::Result<bool> {
+        if self.fail_commit_term {
+            return Err(io::Error::other("mem_persistence: injected commit_term failure"));
+        }
         let current = self.current_term();
         if current >= expected {
             return Ok(false);
@@ -134,6 +154,9 @@ impl Persistence for MemPersistence {
                 "mem_persistence: candidate_id must be non-zero",
             ));
         }
+        if self.fail_vote {
+            return Err(io::Error::other("mem_persistence: injected vote failure"));
+        }
         if term < self.vote_term {
             return Ok(false);
         }
@@ -151,6 +174,11 @@ impl Persistence for MemPersistence {
     }
 
     fn observe_vote_term(&mut self, term: TermNum) -> io::Result<()> {
+        if self.fail_observe_vote_term {
+            return Err(io::Error::other(
+                "mem_persistence: injected observe_vote_term failure",
+            ));
+        }
         if term == self.vote_term {
             return Ok(());
         }

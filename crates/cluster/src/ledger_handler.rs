@@ -1,10 +1,11 @@
 use ::proto::ledger as proto;
 use ::proto::ledger::ledger_server::Ledger;
-use crate::raft::{RoleFlag, Term};
-use crate::{ClusterCommitIndex, LedgerSlot};
+use crate::cluster_mirror::ClusterMirror;
+use crate::durable::Term;
+use crate::LedgerSlot;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
-use spdlog::{debug, trace, warn};
+use spdlog::{trace, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
@@ -15,44 +16,31 @@ pub struct LedgerHandler {
     /// out under a brief mutex on every RPC; supervisor swaps the
     /// underlying `Arc` during a divergence reseed.
     ledger_slot: Arc<LedgerSlot>,
-    /// Shared role state (ADR-0016 §2). The handler is writable iff
-    /// `role.is_leader()`; every other role rejects writes with
-    /// `FAILED_PRECONDITION`. The supervisor flips this atomically on
-    /// boot and on future role transitions, so a single long-lived
-    /// gRPC server can serve every role without restart.
-    role: Arc<RoleFlag>,
-    /// Shared term state. In single-node mode the handler is constructed
-    /// with a fresh in-memory-only term whose current value is 0.
+    /// Lock-free read surface for raft state (role, cluster commit
+    /// index, current term). Updated by the raft driver under the
+    /// raft mutex, observed atomically here.
+    mirror: Arc<ClusterMirror>,
+    /// Shared durable term log. Used for term-at-tx stamping in
+    /// status / wait responses. Reads go through `Term`'s internal
+    /// RwLock + AtomicU64 — independent of the raft mutex.
     term: Arc<Term>,
-    /// Cluster-commit watermark. Always present — `Server` only runs in
-    /// cluster mode. On a leader with zero peers the watermark tracks
-    /// the leader's own commit progress (Quorum slot 0 fed by
-    /// `Ledger::on_commit`), which equals `ledger.last_commit_id()`.
-    pub cluster_commit_index: Arc<ClusterCommitIndex>,
 }
 
 impl LedgerHandler {
-    /// Construct a role-aware handler. Writability is decided at
-    /// every RPC by reading `role.is_leader()` — there is no separate
-    /// read-only constructor.
-    pub fn new(
-        ledger_slot: Arc<LedgerSlot>,
-        role: Arc<RoleFlag>,
-        term: Arc<Term>,
-        cluster_commit_index: Arc<ClusterCommitIndex>,
-    ) -> Self {
+    /// Construct a role-aware handler. Writability is decided at every
+    /// RPC by reading `mirror.is_leader()`.
+    pub fn new(ledger_slot: Arc<LedgerSlot>, mirror: Arc<ClusterMirror>, term: Arc<Term>) -> Self {
         Self {
             ledger_slot,
-            role,
+            mirror,
             term,
-            cluster_commit_index,
         }
     }
 
-    /// Convenience — current leader term from the shared `Arc<Term>`.
+    /// Convenience — current term as observed by the raft driver.
     #[inline]
     fn current_term(&self) -> u64 {
-        self.term.get_current_term()
+        self.mirror.current_term()
     }
 
     /// Resolve the term that covered `tx_id`. Hot-path ring read falls
@@ -78,7 +66,7 @@ impl LedgerHandler {
     // `.map_err` at every call site for no benefit.
     #[allow(clippy::result_large_err)]
     fn ensure_writable(&self) -> Result<(), Status> {
-        if self.role.is_leader() {
+        if self.mirror.is_leader() {
             Ok(())
         } else {
             // Initializing / Follower / Candidate all reject writes
@@ -364,8 +352,8 @@ impl Ledger for LedgerHandler {
             commit_index: self.ledger_slot.ledger().last_commit_id(),
             snapshot_index: self.ledger_slot.ledger().last_snapshot_id(),
             term: self.current_term(),
-            cluster_commit_index: self.cluster_commit_index.get(),
-            is_leader: self.role.is_leader(),
+            cluster_commit_index: self.mirror.cluster_commit_index(),
+            is_leader: self.mirror.is_leader(),
         }))
     }
 
@@ -552,7 +540,7 @@ impl LedgerHandler {
             let compute = ledger.last_compute_id();
             let commit = ledger.last_commit_id();
             let snapshot = ledger.last_snapshot_id();
-            let cluster_commit = self.cluster_commit_index.get();
+            let cluster_commit = self.mirror.cluster_commit_index();
             let reached = match level {
                 proto::WaitLevel::Computed => compute >= transaction_id,
                 proto::WaitLevel::Committed => commit >= transaction_id,

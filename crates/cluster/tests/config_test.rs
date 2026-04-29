@@ -3,7 +3,7 @@
 
 
 use ::proto::ledger::WaitLevel;
-use cluster::{Config, Term};
+use cluster::Config;
 use cluster::config::ConfigError;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
@@ -95,47 +95,16 @@ async fn standalone_serves_writes_with_no_node_grpc() {
 
     let h = ctl.handles(0).expect("handles");
     assert!(!h.has_node_handle(), "standalone has no Node gRPC");
-    assert!(h.quorum().is_none(), "standalone has no Quorum");
+    assert!(h.mirror().is_none(), "standalone has no ClusterMirror");
     assert!(h.as_cluster().is_none(), "standalone is not clustered");
 
     let tx_id = ctl.deposit(ACCOUNT, AMOUNT, 0).await.expect("deposit");
     assert_eq!(tx_id, 1);
 }
 
-/// Standalone term log advances on every restart — the supervisor
-/// always bumps term once at boot regardless of mode.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn standalone_term_log_advances_on_restart() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut root = std::env::current_dir().unwrap();
-    root.push(format!("temp_standalone_term_advance_{}", nanos));
-
-    let cfg = || ClusterTestingConfig {
-        label: "term_advance".to_string(),
-        snapshot_frequency: 2,
-        data_dir_root: Some(root.clone()),
-        ..ClusterTestingConfig::standalone()
-    };
-
-    let data_dir = root.join("0");
-
-    {
-        let _ctl = ClusterTestingControl::start(cfg()).await.unwrap();
-        let term = Term::open_in_dir(&data_dir.to_string_lossy()).unwrap();
-        assert_eq!(term.get_current_term(), 1);
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    {
-        let _ctl = ClusterTestingControl::start(cfg()).await.unwrap();
-        let term = Term::open_in_dir(&data_dir.to_string_lossy()).unwrap();
-        assert_eq!(term.get_current_term(), 2);
-    }
-
-    let _ = std::fs::remove_dir_all(&root);
-}
+// (Removed `standalone_term_log_advances_on_restart` — ADR-0017
+// §"Required Invariants" #4 forbids boot-time term bumping. Term now
+// advances only on election win, which standalone mode never has.)
 
 /// A single-node cluster (one self-peer in the `cluster.peers` list)
 /// boots straight into Leader without an election round — the

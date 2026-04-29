@@ -2,27 +2,29 @@
 //!
 //! - **Standalone** (`config.cluster.is_none()`): spawns only the
 //!   writable client-facing Ledger gRPC server. No Node service, no
-//!   replication. Returns [`Handles::Standalone`].
+//!   replication, no raft. Returns [`Handles::Standalone`].
 //! - **Clustered**: builds a [`RoleSupervisor`] which owns the
-//!   long-lived gRPC servers and the role-state atomics, then
-//!   dispatches the boot role's role-specific tasks. Returns
-//!   [`Handles::Cluster`].
+//!   long-lived gRPC servers and the raft driver, then dispatches the
+//!   boot role's role-specific tasks. Returns [`Handles::Cluster`].
 //!
-//! Stage 3b: the cluster path always goes through the supervisor.
-//! Per-role bring-ups (`Leader`, future `Follower`/`Candidate`) no
-//! longer own gRPC servers — only their role-task sub-trees.
+//! Per ADR-0017 §"Required Invariants" #4 the term log is **not**
+//! bumped on boot — it stays at whatever the durable persistence layer
+//! reports until an actual election win advances it. The legacy
+//! `Term::new_term(start_tx)` boot-time bump is gone.
 //!
 //! Lifecycle is RAII: dropping a `Handles` (or `StandaloneHandles` /
 //! `SupervisorHandles`) is the shutdown. There is no separate
 //! `shutdown()` / `abort()` API.
 
+use crate::cluster_mirror::ClusterMirror;
 use crate::config::Config;
+use crate::durable::DurablePersistence;
 use crate::lifecycle::drain_in_drop;
-use crate::raft::{Quorum, Role, RoleFlag, Term};
 use crate::server::Server;
 use crate::supervisor::{RoleSupervisor, SupervisorHandles};
-use crate::{ClusterCommitIndex, LedgerSlot};
+use crate::LedgerSlot;
 use ledger::ledger::Ledger;
+use raft::Role;
 use spdlog::{error, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,32 +37,31 @@ pub struct ClusterNode {
     /// supervisor swap it during a divergence reseed (ADR-0016 §9)
     /// without tearing down the gRPC servers.
     ledger_slot: Arc<LedgerSlot>,
-    /// Always opened, even in standalone mode (so the term log
-    /// advances on every restart per ADR-0016 §11). Cluster code
-    /// paths share it across handlers via `Arc::clone`.
-    term: Arc<Term>,
+    /// Durable term + vote logs. Always opened, even in standalone
+    /// mode, so the cluster path can pick up where the standalone
+    /// path left off (and vice-versa). Per ADR-0017 §"Required
+    /// Invariants" #4 the term is **not** bumped on boot.
+    durable: Arc<DurablePersistence>,
 }
 
 impl ClusterNode {
-    /// Build (and start) the embedded Ledger, and open the durable
-    /// term log under `ledger.storage.data_dir`. The gRPC server(s)
-    /// are launched by [`ClusterNode::run`].
+    /// Build (and start) the embedded Ledger and open the durable
+    /// term + vote logs under `ledger.storage.data_dir`. The gRPC
+    /// server(s) are launched by [`ClusterNode::run`].
     pub fn new(config: Config) -> std::io::Result<Self> {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start()?;
-        let term = Arc::new(Term::open_in_dir(&config.ledger.storage.data_dir)?);
-        let start_tx = ledger.last_commit_id();
-        let new_term = term.new_term(start_tx)?;
+        let durable = Arc::new(DurablePersistence::open(&config.ledger.storage.data_dir)?);
         info!(
-            "cluster::new: bumped term to {} at start_tx_id={} (clustered={})",
-            new_term,
-            start_tx,
+            "cluster::new: opened durable persistence (term={}, voted_for={:?}, clustered={})",
+            durable.term.get_current_term(),
+            durable.vote.get_voted_for(),
             config.is_clustered()
         );
         Ok(Self {
             config,
             ledger_slot: Arc::new(LedgerSlot::new(Arc::new(ledger))),
-            term,
+            durable,
         })
     }
 
@@ -85,19 +86,19 @@ impl ClusterNode {
     pub async fn run(&self) -> Result<Handles, Box<dyn std::error::Error + Send + Sync>> {
         if !self.config.is_clustered() {
             // Standalone: just the writable client-facing Ledger gRPC.
-            // Construct a Leader-pinned `RoleFlag` so the LedgerHandler
-            // accepts writes; nothing else mutates it in standalone.
+            // Construct a Leader-pinned `ClusterMirror` so the
+            // LedgerHandler accepts writes; raft never runs in this
+            // mode.
             let client_addr = self.config.server.socket_addr()?;
-            let role = Arc::new(RoleFlag::new(Role::Leader));
-            let cluster_commit_index = ClusterCommitIndex::new();
+            let mirror = ClusterMirror::new();
+            mirror.set_role_for_standalone(Role::Leader);
             let client_running = Arc::new(AtomicBool::new(true));
             let client_shutdown = Arc::new(Notify::new());
             let server = Server::new(
                 self.ledger_slot.clone(),
                 client_addr,
-                role,
-                self.term.clone(),
-                cluster_commit_index,
+                mirror,
+                self.durable.term.clone(),
                 client_shutdown.clone(),
             );
             let client_handle = tokio::spawn(async move {
@@ -113,12 +114,11 @@ impl ClusterNode {
             }));
         }
 
-        // Clustered: hand off to the supervisor, which owns the
-        // long-lived gRPC servers + role-specific dispatch.
+        // Clustered: hand off to the supervisor.
         let supervisor = RoleSupervisor::new(
-            self.config.clone(),
+            Arc::new(self.config.clone()),
             self.ledger_slot.clone(),
-            self.term.clone(),
+            self.durable.clone(),
         )?;
         let handles = supervisor.run().await?;
         Ok(Handles::Cluster(handles))
@@ -140,10 +140,6 @@ pub enum Handles {
 pub struct StandaloneHandles {
     pub client_handle: Option<JoinHandle<()>>,
     /// Cooperative shutdown flag for the standalone gRPC server.
-    /// Currently unused by the server itself (it has no long-running
-    /// loop beyond `serve_with_shutdown`), but exists so the
-    /// `LedgerHandler` and any future async fan-out can observe
-    /// process shutdown alongside the cluster path.
     pub client_running: Arc<AtomicBool>,
     /// Cooperative shutdown trigger for the client-facing Ledger
     /// gRPC server.
@@ -160,21 +156,21 @@ impl Drop for StandaloneHandles {
 }
 
 impl Handles {
-    /// Shared quorum tracker (clustered only). The supervisor owns
-    /// the `Arc<Quorum>` for the process lifetime; reading
-    /// `quorum.get()` returns the cluster-wide majority watermark
-    /// regardless of which role this node is currently playing.
-    pub fn quorum(&self) -> Option<Arc<Quorum>> {
-        match self {
-            Handles::Cluster(h) => Some(h.quorum.clone()),
-            _ => None,
-        }
-    }
-
     /// Cooperative shutdown flag for clustered peer sub-tasks.
     pub fn running(&self) -> Option<Arc<AtomicBool>> {
         match self {
             Handles::Cluster(h) => Some(h.running.clone()),
+            _ => None,
+        }
+    }
+
+    /// Lock-free read surface for raft state (clustered only). Returns
+    /// `None` in standalone mode. Use `mirror.cluster_commit_index()`
+    /// to read the quorum-committed watermark, `mirror.role()` for the
+    /// current role, and so on.
+    pub fn mirror(&self) -> Option<Arc<ClusterMirror>> {
+        match self {
+            Handles::Cluster(h) => Some(h.mirror.clone()),
             _ => None,
         }
     }

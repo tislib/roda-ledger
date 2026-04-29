@@ -116,6 +116,66 @@ impl TermStorage {
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.sync_data()
     }
+
+    /// Drop every record whose `start_tx_id > tx_id`, preserving the rest.
+    ///
+    /// Atomicity contract (ADR-0017 §"Persistence trait contract"): the
+    /// rewrite uses rename-based replacement so a crash mid-truncate
+    /// leaves the original file intact. Steps:
+    ///
+    /// 1. Scan `term.log` and stage kept records into `term.log.tmp`.
+    /// 2. `fsync` the tmp file.
+    /// 3. `rename(tmp, term.log)` — POSIX-atomic on the same filesystem.
+    /// 4. `fsync` the parent directory (best-effort on macOS) so the
+    ///    rename itself is durable.
+    /// 5. Reopen `self.file` against the new inode.
+    pub fn truncate_after(&mut self, tx_id: u64) -> io::Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| io::Error::other("term: term.log has no parent directory"))?
+            .to_path_buf();
+        let tmp_path = parent.join("term.log.tmp");
+
+        let mut kept: Vec<TermRecord> = Vec::new();
+        self.scan(|rec| {
+            if rec.start_tx_id <= tx_id {
+                kept.push(rec);
+            }
+        })?;
+
+        {
+            let mut tmp = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            for rec in &kept {
+                tmp.write_all(&encode_record(*rec))?;
+            }
+            tmp.sync_data()?;
+        }
+
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        // Best-effort parent-dir fsync so the rename is durable. macOS does
+        // not strictly require this for crash safety on APFS, but Linux
+        // ext4/xfs do — and it's cheap.
+        if let Ok(dir) = File::open(&parent) {
+            let _ = dir.sync_all();
+        }
+
+        // Reopen against the new inode so subsequent appends/scans see the
+        // truncated file rather than the renamed-out one.
+        self.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(&self.path)?;
+        Ok(())
+    }
 }
 
 // ── encoding / decoding ────────────────────────────────────────────────────
@@ -251,6 +311,101 @@ mod tests {
                 start_tx_id: 200,
             })
         );
+    }
+
+    #[test]
+    fn truncate_after_drops_records_past_threshold() {
+        let (_td, mut storage) = open_fresh();
+        for (term, start) in [(1, 0), (2, 50), (3, 100), (4, 200), (5, 300)] {
+            storage
+                .append(TermRecord {
+                    term,
+                    start_tx_id: start,
+                })
+                .unwrap();
+        }
+        storage.sync().unwrap();
+
+        storage.truncate_after(150).unwrap();
+
+        let mut collected = Vec::new();
+        storage.scan(|r| collected.push(r)).unwrap();
+        assert_eq!(
+            collected,
+            vec![
+                TermRecord {
+                    term: 1,
+                    start_tx_id: 0,
+                },
+                TermRecord {
+                    term: 2,
+                    start_tx_id: 50,
+                },
+                TermRecord {
+                    term: 3,
+                    start_tx_id: 100,
+                },
+            ]
+        );
+
+        // Subsequent appends land at the new end of file.
+        storage
+            .append(TermRecord {
+                term: 6,
+                start_tx_id: 160,
+            })
+            .unwrap();
+        storage.sync().unwrap();
+        let mut after_append = Vec::new();
+        storage.scan(|r| after_append.push(r)).unwrap();
+        assert_eq!(after_append.len(), 4);
+        assert_eq!(after_append.last().unwrap().term, 6);
+    }
+
+    #[test]
+    fn truncate_after_keeps_all_when_threshold_above_max() {
+        let (_td, mut storage) = open_fresh();
+        storage
+            .append(TermRecord {
+                term: 1,
+                start_tx_id: 0,
+            })
+            .unwrap();
+        storage
+            .append(TermRecord {
+                term: 2,
+                start_tx_id: 50,
+            })
+            .unwrap();
+        storage.sync().unwrap();
+
+        storage.truncate_after(9_999).unwrap();
+        let mut collected = Vec::new();
+        storage.scan(|r| collected.push(r)).unwrap();
+        assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn truncate_after_drops_all_when_threshold_below_first() {
+        let (_td, mut storage) = open_fresh();
+        storage
+            .append(TermRecord {
+                term: 1,
+                start_tx_id: 50,
+            })
+            .unwrap();
+        storage
+            .append(TermRecord {
+                term: 2,
+                start_tx_id: 100,
+            })
+            .unwrap();
+        storage.sync().unwrap();
+
+        storage.truncate_after(10).unwrap();
+        let mut collected = Vec::new();
+        storage.scan(|r| collected.push(r)).unwrap();
+        assert!(collected.is_empty());
     }
 
     #[test]

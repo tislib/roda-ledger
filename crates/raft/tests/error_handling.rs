@@ -350,3 +350,317 @@ fn raftnode_new_panics_on_misconfigured_heartbeat_interval() {
     };
     let _ = RaftNode::new(1, vec![1, 2], MemPersistence::new(), cfg, 42);
 }
+
+// ─── pending_reply lifecycle (audit gaps) ─────────────────────────────────
+
+/// A `Follower → Candidate` transition (election timeout fires while
+/// the follower has a parked AppendEntries success reply waiting on
+/// `LogAppendComplete`) discards the parked reply along with the rest
+/// of the follower state. The leader will time out its in-flight RPC
+/// and retry; nothing in the library leaks the stale reply into the
+/// candidate role.
+#[test]
+fn pending_reply_lost_on_follower_to_candidate_transition() {
+    let mut node = make_follower(MemPersistence::new());
+    let now = Instant::now();
+
+    // Park a reply by sending non-empty entries.
+    let first = node.step(
+        now,
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 0,
+            prev_log_term: 0,
+            entries: LogEntryRange::new(1, 3, 1),
+            leader_commit: 0,
+        },
+    );
+    assert!(first.iter().any(|a| matches!(a, Action::AppendLog { .. })));
+    assert!(!first.iter().any(|a| matches!(
+        a,
+        Action::SendAppendEntriesReply { success: true, .. }
+    )));
+
+    // Election timeout fires → transition_to_follower replaces the
+    // FollowerState (drops the pending). LogAppendComplete arrives
+    // *after* — the now-Candidate has nowhere to send the reply.
+    let _ = node.step(now + Duration::from_secs(60), Event::Tick);
+    assert_eq!(node.role(), raft::Role::Candidate);
+
+    let after_ack = node.step(
+        now + Duration::from_secs(60),
+        Event::LogAppendComplete { tx_id: 3 },
+    );
+    assert!(
+        !after_ack.iter().any(|a| matches!(
+            a,
+            Action::SendAppendEntriesReply { success: true, .. }
+        )),
+        "candidate must not emit the parked follower reply: {:?}",
+        after_ack
+    );
+}
+
+/// Two AppendEntries arrive in rapid succession before the driver
+/// acks the first via `LogAppendComplete`. The follower must
+/// overwrite the parked reply with the second one. Replying for the
+/// older `last_tx_id` would tell the leader less than what was
+/// already shipped to the entry log; the leader's quorum logic is
+/// monotonic on success, so the single success reply at the higher
+/// `last_tx_id` is correct.
+///
+/// We model the "leader retransmits with an extended batch before
+/// the first ack lands" case: both AEs share `prev_log_tx_id=0`
+/// (start of log), so the §5.3 check passes for both even though
+/// the follower's `local_log_index` has not yet advanced.
+#[test]
+fn pending_reply_overwritten_when_second_ae_arrives_before_ack() {
+    let mut node = make_follower(MemPersistence::new());
+    let now = Instant::now();
+
+    // First AE: prev=0, entries 1..3.
+    let _ = node.step(
+        now,
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 0,
+            prev_log_term: 0,
+            entries: LogEntryRange::new(1, 3, 1),
+            leader_commit: 0,
+        },
+    );
+
+    // Second AE before any ack: same prev=0, but an extended range
+    // 1..5. (Models a leader retransmission with one more entry
+    // tacked on.)
+    let _ = node.step(
+        now,
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 0,
+            prev_log_term: 0,
+            entries: LogEntryRange::new(1, 5, 1),
+            leader_commit: 0,
+        },
+    );
+
+    // Driver finally acks durability up to 5 (covers the second
+    // batch, which subsumes the first).
+    let after = node.step(now, Event::LogAppendComplete { tx_id: 5 });
+    let replies: Vec<u64> = after
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendAppendEntriesReply {
+                success: true,
+                last_tx_id,
+                ..
+            } => Some(*last_tx_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec![5],
+        "only the most recent batch's reply should fire: {:?}",
+        after
+    );
+}
+
+// ─── observe_vote_term I/O failure (audit gap) ───────────────────────────
+
+/// `observe_vote_term` failing on a higher-term RPC is benign because
+/// the next durable `vote(...)` call advances `vote_term` itself (the
+/// `Persistence` contract bumps the vote-log term inside `vote`). The
+/// node does NOT freeze; it stays operable through the recovery path.
+/// This pins the contract so a future change cannot quietly turn it
+/// into a fatal.
+#[test]
+fn observe_vote_term_failure_is_recoverable_via_next_vote() {
+    let mut persistence = MemPersistence::new();
+    persistence.fail_observe_vote_term = true;
+    let mut node = make_follower(persistence);
+    let now = Instant::now();
+
+    // RV at higher term — observe_vote_term fails inside the handler.
+    let actions = node.step(
+        now,
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 5,
+            last_tx_id: 0,
+            last_term: 0,
+        },
+    );
+
+    // Must not have frozen the node.
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::FatalError { .. })),
+        "observe_vote_term failure must not be fatal: {:?}",
+        actions
+    );
+    // The vote() call inside the handler still bumps vote_term (its
+    // own write does not depend on observe_vote_term having
+    // succeeded), so the reply carries the new term.
+    let granted_at_5 = actions.iter().any(|a| matches!(
+        a,
+        Action::SendRequestVoteReply {
+            term: 5,
+            granted: true,
+            ..
+        }
+    ));
+    assert!(granted_at_5, "vote should still grant at the new term: {:?}", actions);
+    assert_eq!(node.current_term(), 5);
+    assert_eq!(node.voted_for(), Some(2));
+}
+
+// ─── commit_term failure paths at election win (audit gap) ───────────────
+
+/// `commit_term` returning `Err` at election win means the durable
+/// state was not modified (per the trait contract). The candidate
+/// steps down rather than promoting to leader. This is recoverable —
+/// not a fatal — because no on-disk divergence exists.
+#[test]
+fn commit_term_io_error_at_election_win_steps_down() {
+    let mut persistence = MemPersistence::new();
+    persistence.fail_commit_term = true;
+    let mut node = RaftNode::new(1, vec![1], persistence, RaftConfig::default(), 42);
+    let now = Instant::now();
+
+    // Single-node cluster: first Tick arms timer; second Tick after
+    // the timeout starts election + immediately commits the term as
+    // self-vote = majority. With fail_commit_term the win is
+    // refused → step down.
+    let _ = node.step(now, Event::Tick);
+    let actions = node.step(now + Duration::from_secs(60), Event::Tick);
+
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            Action::BecomeRole {
+                role: raft::Role::Leader,
+                ..
+            }
+        )),
+        "must not transition to Leader on commit_term Err: {:?}",
+        actions
+    );
+    assert_ne!(node.role(), raft::Role::Leader);
+    // Not a fatal — the node should be running and able to retry.
+    assert!(!actions
+        .iter()
+        .any(|a| matches!(a, Action::FatalError { .. })));
+}
+
+// Note on `commit_term` returning `Ok(false)` at election win: the
+// branch exists in `become_leader_after_win`, but is structurally
+// unreachable via the public step() API — the `start_election` →
+// vote() → become_leader_after_win → commit_term() chain runs inside
+// a single step, and `new_term` is always computed as `current + 1`
+// where `current = max(term_log, vote_log)`. There is no concurrent
+// writer that can bump `term_log` between the vote and the commit
+// inside one step. The branch is defense-in-depth for a corrupted
+// persistence; the persistence layer's own unit tests
+// (`mem_persistence::tests::commit_term_returns_false_when_already_advanced`)
+// cover the trait semantics.
+
+// ─── current_term composition (audit gap) ────────────────────────────────
+
+/// `current_term()` returns `max(term_log term, vote_log term)`.
+/// Pin the composition explicitly: a vote-log that has raced ahead of
+/// the term log (candidate self-voted at a term it has not yet won)
+/// is reflected in the public read.
+#[test]
+fn current_term_returns_max_of_term_log_and_vote_log() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 3,
+            start_tx_id: 0,
+        }],
+        7, // vote-log raced ahead by 4 terms
+        2,
+    );
+    let node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    assert_eq!(node.current_term(), 7);
+}
+
+#[test]
+fn current_term_returns_term_log_when_vote_log_is_lower() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 9,
+            start_tx_id: 0,
+        }],
+        4,
+        0,
+    );
+    let node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    assert_eq!(node.current_term(), 9);
+}
+
+// ─── failed flag is volatile (audit gap) ─────────────────────────────────
+
+/// The `failed` flag lives on the volatile `RaftNode` struct, not in
+/// `Persistence`. A graceful `into_persistence` + reconstruction (the
+/// closest the library models to "process restart with surviving
+/// disk") un-fails the node. The driver is expected to give up on
+/// the failed instance, but if it spins up a fresh one against the
+/// same on-disk state, the new instance starts clean.
+#[test]
+fn failed_flag_is_volatile_across_into_persistence_rebuild() {
+    let mut persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 2,
+            start_tx_id: 1,
+        }],
+        2,
+        0,
+    );
+    persistence.fail_truncate = true;
+    let mut node = make_follower(persistence);
+    let now = Instant::now();
+
+    let _ = node.step(now, Event::LogAppendComplete { tx_id: 5 });
+    let actions = node.step(
+        now,
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 2,
+            prev_log_tx_id: 3,
+            prev_log_term: 99,
+            entries: LogEntryRange::empty(),
+            leader_commit: 0,
+        },
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::FatalError { .. }
+    )));
+    // Now the node is frozen.
+    assert!(node
+        .step(now, Event::Tick)
+        .is_empty());
+
+    // Recover the persistence (clear the injected fault before we
+    // hand it to the new node — restart implies the underlying I/O
+    // problem has been resolved). Build a fresh RaftNode from it.
+    let mut persistence = node.into_persistence();
+    persistence.fail_truncate = false;
+    let mut restarted = make_follower(persistence);
+
+    // The restarted node is NOT frozen — it processes events
+    // normally. A simple Tick arms the election timer (initial).
+    let actions = restarted.step(now, Event::Tick);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::FatalError { .. })),
+        "restarted node must not be in failed state: {:?}",
+        actions
+    );
+}
