@@ -1,11 +1,11 @@
-//! §5.4 safety property tests using `proptest`.
+//! Raft §5.4 safety property tests using `proptest`. Election
+//! Safety, Log Matching, Leader Completeness, and State Machine
+//! Safety are checked across randomized schedules of writes,
+//! crash/restart cycles, and transient partitions.
 //!
-//! ADR-0017 §"Test Strategy": "property tests in `crates/raft/tests/`:
-//! §5.4 safety properties (Election Safety, Log Matching, Leader
-//! Completeness, State Machine Safety) verified across randomized
-//! event schedules using proptest". The harness in `tests/common/`
-//! drives an in-memory cluster; this file shrinks across schedules
-//! and seeds and reuses the harness's `assert_*` invariants.
+//! The harness in `tests/common/` drives an in-memory cluster;
+//! this file shrinks across schedules and seeds and reuses the
+//! harness's `assert_*` invariants.
 
 mod common;
 
@@ -100,11 +100,11 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 16,
-        max_shrink_iters: 32,
+        cases: 32,
+        max_shrink_iters: 64,
         // Each case spins up a full simulator + drives multiple
-        // seconds of virtual time; 16 is enough to find regressions
-        // without burning CI minutes.
+        // seconds of virtual time; 32 covers the safety-critical
+        // schedules without burning CI minutes.
         ..ProptestConfig::default()
     })]
 
@@ -114,5 +114,28 @@ proptest! {
     #[test]
     fn safety_under_random_schedule(seed in any::<u64>(), ops in proptest::collection::vec(op_strategy(), 1..6)) {
         drive(seed, ops);
+    }
+}
+
+// Election Safety: across many random seeds, no two nodes are
+// leaders of the same term. Leader Completeness is implied because
+// the simulator uses §5.4.1 up-to-date checks; we lean on
+// `assert_log_matching` to verify nothing committed has diverged.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn many_seeds_eventually_elect_a_unique_leader(seed in any::<u64>()) {
+        let mut sim = Sim::new(&[1, 2, 3], Sim::standard_cfg(), seed);
+        let dl = Instant::now() + Duration::from_secs(5);
+        let elected = sim.run_until_predicate(dl, |s| {
+            [1u64, 2, 3].iter().any(|n| s.role_of(*n) == Role::Leader)
+        });
+        prop_assert!(elected, "no leader within budget");
+        sim.assert_election_safety();
+        sim.assert_log_matching();
     }
 }

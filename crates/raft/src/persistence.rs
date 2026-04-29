@@ -92,6 +92,14 @@ pub trait Persistence {
 
     // ── vote log ────────────────────────────────────────────────────────
 
+    /// Term currently recorded in the vote log. May lead the term
+    /// log when a candidate has self-voted at term `N` but not yet
+    /// won (term log advances only on election win, via `commit_term`).
+    /// The library reads this together with `current_term()` to
+    /// compute "what term am I in" — the candidate uses
+    /// `max(current_term, vote_term) + 1` for the next election.
+    fn vote_term(&self) -> TermNum;
+
     /// `Some(node_id)` iff a vote was granted in the current
     /// vote-log term, `None` otherwise.
     fn voted_for(&self) -> Option<NodeId>;

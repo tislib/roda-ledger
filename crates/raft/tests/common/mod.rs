@@ -114,6 +114,15 @@ pub struct Sim {
     /// Pairs `(a, b)` such that any message a→b or b→a is dropped.
     /// Modelled as an undirected partition.
     partitioned: HashSet<(NodeId, NodeId)>,
+    /// Per-message drop probability in `[0.0, 1.0]`. Each outbound
+    /// message tosses a coin against this.
+    drop_probability: f64,
+    /// Per-message duplication probability — when set, each
+    /// outbound message is delivered twice with the same delay.
+    duplicate_probability: f64,
+    /// Seeded RNG used for the probabilistic faults above. Stays
+    /// deterministic across runs with the same `seed_base`.
+    fault_rng: rand::rngs::StdRng,
     /// Leaders observed per term — used to verify Election Safety
     /// (§5.4 #1: at most one leader per term).
     leaders_per_term: HashMap<u64, HashSet<NodeId>>,
@@ -123,6 +132,7 @@ pub struct Sim {
 
 impl Sim {
     pub fn new(node_ids: &[NodeId], cfg: RaftConfig, seed_base: u64) -> Self {
+        use rand::SeedableRng;
         let base = Instant::now();
         let mut nodes = HashMap::new();
         for (i, id) in node_ids.iter().enumerate() {
@@ -151,6 +161,9 @@ impl Sim {
             seq: 0,
             network_delay: Duration::from_millis(2),
             partitioned: HashSet::new(),
+            drop_probability: 0.0,
+            duplicate_probability: 0.0,
+            fault_rng: rand::rngs::StdRng::seed_from_u64(seed_base ^ 0xDEAD_BEEF),
             leaders_per_term: HashMap::new(),
             transitions: Vec::new(),
         };
@@ -175,6 +188,21 @@ impl Sim {
     /// Configure the (uniform) network delay applied to outbound RPCs.
     pub fn set_network_delay(&mut self, d: Duration) {
         self.network_delay = d;
+    }
+
+    /// Probability `[0.0, 1.0]` that any outbound message is silently
+    /// dropped. The drop is tossed independently per message.
+    pub fn set_drop_probability(&mut self, p: f64) {
+        assert!((0.0..=1.0).contains(&p));
+        self.drop_probability = p;
+    }
+
+    /// Probability `[0.0, 1.0]` that any outbound message is
+    /// delivered twice (the duplicate copy ships with the same
+    /// network delay). Models a flaky link that fans out retries.
+    pub fn set_duplicate_probability(&mut self, p: f64) {
+        assert!((0.0..=1.0).contains(&p));
+        self.duplicate_probability = p;
     }
 
     /// Mark `(a, b)` as partitioned — every direction-symmetric
@@ -370,22 +398,23 @@ impl Sim {
                     entries,
                     leader_commit,
                 } => {
-                    if self.is_dropped(src, to) {
+                    if self.is_dropped(src, to) || self.rolled_drop() {
                         continue;
                     }
                     let when = now + self.network_delay;
-                    self.schedule(
-                        when,
-                        to,
-                        Event::AppendEntriesRequest {
-                            from: src,
-                            term,
-                            prev_log_tx_id,
-                            prev_log_term,
-                            entries,
-                            leader_commit,
-                        },
-                    );
+                    let event = Event::AppendEntriesRequest {
+                        from: src,
+                        term,
+                        prev_log_tx_id,
+                        prev_log_term,
+                        entries,
+                        leader_commit,
+                    };
+                    let dup = self.rolled_duplicate();
+                    self.schedule(when, to, event.clone());
+                    if dup {
+                        self.schedule(when, to, event);
+                    }
                 }
                 Action::SendAppendEntriesReply {
                     to,
@@ -393,21 +422,22 @@ impl Sim {
                     success,
                     last_tx_id,
                 } => {
-                    if self.is_dropped(src, to) {
+                    if self.is_dropped(src, to) || self.rolled_drop() {
                         continue;
                     }
                     let when = now + self.network_delay;
-                    self.schedule(
-                        when,
-                        to,
-                        Event::AppendEntriesReply {
-                            from: src,
-                            term,
-                            success,
-                            last_tx_id,
-                            reject_reason: None,
-                        },
-                    );
+                    let event = Event::AppendEntriesReply {
+                        from: src,
+                        term,
+                        success,
+                        last_tx_id,
+                        reject_reason: None,
+                    };
+                    let dup = self.rolled_duplicate();
+                    self.schedule(when, to, event.clone());
+                    if dup {
+                        self.schedule(when, to, event);
+                    }
                 }
                 Action::SendRequestVote {
                     to,
@@ -415,35 +445,37 @@ impl Sim {
                     last_tx_id,
                     last_term,
                 } => {
-                    if self.is_dropped(src, to) {
+                    if self.is_dropped(src, to) || self.rolled_drop() {
                         continue;
                     }
                     let when = now + self.network_delay;
-                    self.schedule(
-                        when,
-                        to,
-                        Event::RequestVoteRequest {
-                            from: src,
-                            term,
-                            last_tx_id,
-                            last_term,
-                        },
-                    );
+                    let event = Event::RequestVoteRequest {
+                        from: src,
+                        term,
+                        last_tx_id,
+                        last_term,
+                    };
+                    let dup = self.rolled_duplicate();
+                    self.schedule(when, to, event.clone());
+                    if dup {
+                        self.schedule(when, to, event);
+                    }
                 }
                 Action::SendRequestVoteReply { to, term, granted } => {
-                    if self.is_dropped(src, to) {
+                    if self.is_dropped(src, to) || self.rolled_drop() {
                         continue;
                     }
                     let when = now + self.network_delay;
-                    self.schedule(
-                        when,
-                        to,
-                        Event::RequestVoteReply {
-                            from: src,
-                            term,
-                            granted,
-                        },
-                    );
+                    let event = Event::RequestVoteReply {
+                        from: src,
+                        term,
+                        granted,
+                    };
+                    let dup = self.rolled_duplicate();
+                    self.schedule(when, to, event.clone());
+                    if dup {
+                        self.schedule(when, to, event);
+                    }
                 }
                 Action::AppendLog { tx_id, term } => {
                     if let Some(b) = self.nodes.get_mut(&src) {
@@ -518,6 +550,25 @@ impl Sim {
             event,
             seq: self.seq,
         }));
+    }
+
+    /// Probabilistic drop check. Tossed once per outbound message;
+    /// hard-drops (partition / crashed target) take precedence and
+    /// don't consume RNG state.
+    fn rolled_drop(&mut self) -> bool {
+        if self.drop_probability <= 0.0 {
+            return false;
+        }
+        use rand::Rng;
+        self.fault_rng.r#gen::<f64>() < self.drop_probability
+    }
+
+    fn rolled_duplicate(&mut self) -> bool {
+        if self.duplicate_probability <= 0.0 {
+            return false;
+        }
+        use rand::Rng;
+        self.fault_rng.r#gen::<f64>() < self.duplicate_probability
     }
 
     fn is_dropped(&self, from: NodeId, to: NodeId) -> bool {

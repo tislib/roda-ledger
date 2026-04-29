@@ -149,6 +149,71 @@ mod tests {
         assert!(!timer.is_expired(t0()));
     }
 
+    /// Multiple `arm` calls produce a sequence of distinct deadlines
+    /// (the seeded RNG advances on each pull).
+    #[test]
+    fn many_arms_with_same_now_diverge_within_window() {
+        let cfg = ElectionTimerConfig {
+            min_ms: 100,
+            max_ms: 200,
+        };
+        let mut timer = ElectionTimer::new(cfg, 7);
+        let now = t0();
+        let mut deadlines = std::collections::HashSet::new();
+        for _ in 0..16 {
+            deadlines.insert(timer.arm(now));
+        }
+        // Not all 16 must differ — pigeonhole on a 100ms window in
+        // 1ms granularity makes collisions possible — but the rng
+        // must generate at least a few distinct values across 16
+        // tries.
+        assert!(
+            deadlines.len() >= 2,
+            "election timer never re-rolls (got {} unique deadlines / 16)",
+            deadlines.len()
+        );
+    }
+
+    /// A `now` earlier than the previous deadline still produces
+    /// `now + random(min, max)` — the deadline tracks the latest
+    /// call, not a monotonic clock.
+    #[test]
+    fn arm_with_earlier_now_still_resets_to_now_plus_window() {
+        let cfg = ElectionTimerConfig {
+            min_ms: 100,
+            max_ms: 200,
+        };
+        let mut timer = ElectionTimer::new(cfg, 7);
+        let later = t0();
+        let earlier = later - Duration::from_secs(10);
+        let d1 = timer.arm(later);
+        assert!(d1 > later);
+        let d2 = timer.arm(earlier);
+        // d2 is in the future relative to `earlier`, not `later`.
+        assert!(
+            d2 < later,
+            "arm should reset to `now + window`, not extend off d1"
+        );
+        let delta = d2.duration_since(earlier);
+        assert!(delta >= Duration::from_millis(100));
+        assert!(delta < Duration::from_millis(200));
+    }
+
+    /// `is_expired(deadline)` is true exactly at the deadline.
+    #[test]
+    fn is_expired_at_exact_deadline() {
+        let mut timer = ElectionTimer::new(
+            ElectionTimerConfig {
+                min_ms: 50,
+                max_ms: 51,
+            },
+            7,
+        );
+        let now = t0();
+        let deadline = timer.arm(now);
+        assert!(timer.is_expired(deadline));
+    }
+
     #[test]
     fn same_seed_produces_same_deadline_sequence() {
         let cfg = ElectionTimerConfig {

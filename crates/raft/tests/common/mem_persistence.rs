@@ -34,6 +34,10 @@ impl MemPersistence {
 
 impl Persistence for MemPersistence {
     fn current_term(&self) -> TermNum {
+        // Term-log term only — `current_term` and `vote_term` may
+        // diverge while a candidate has self-voted for a term it
+        // hasn't won. The library reads `max(current_term, vote_term)`
+        // for "what term am I in".
         self.term_log.last().map(|r| r.term).unwrap_or(0)
     }
 
@@ -97,6 +101,10 @@ impl Persistence for MemPersistence {
     fn truncate_term_after(&mut self, tx_id: TxId) -> io::Result<()> {
         self.term_log.retain(|r| r.start_tx_id <= tx_id);
         Ok(())
+    }
+
+    fn vote_term(&self) -> TermNum {
+        self.vote_term
     }
 
     fn voted_for(&self) -> Option<NodeId> {
@@ -229,5 +237,102 @@ mod tests {
         p.observe_vote_term(5).unwrap();
         let err = p.observe_vote_term(4).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // ── term-log boundary semantics ─────────────────────────────────────────
+
+    /// `commit_term(0)` returns `Ok(false)` — `current >= expected`
+    /// short-circuits before the lag check. Semantically a no-op.
+    #[test]
+    fn commit_term_zero_returns_false() {
+        let mut p = MemPersistence::new();
+        assert!(!p.commit_term(0, 0).unwrap());
+    }
+
+    /// `commit_term(5)` after `observe(5)` is a refused stale-election.
+    #[test]
+    fn commit_term_after_same_observe_returns_false() {
+        let mut p = MemPersistence::new();
+        p.observe_term(5, 0).unwrap();
+        assert!(!p.commit_term(5, 0).unwrap());
+    }
+
+    /// `commit_term(5)` after `observe(7)` is also refused — current
+    /// has advanced past expected.
+    #[test]
+    fn commit_term_after_higher_observe_returns_false() {
+        let mut p = MemPersistence::new();
+        p.observe_term(7, 0).unwrap();
+        assert!(!p.commit_term(5, 0).unwrap());
+    }
+
+    /// `term_at_tx(0)` when the only record starts at tx 0 returns it.
+    #[test]
+    fn term_at_tx_zero_with_zero_start_returns_record() {
+        let mut p = MemPersistence::new();
+        p.commit_term(1, 0).unwrap();
+        p.observe_term(5, 0).unwrap();
+        let r = p.term_at_tx(0).unwrap();
+        assert_eq!(r.term, 5);
+        assert_eq!(r.start_tx_id, 0);
+    }
+
+    /// `term_at_tx(0)` when the only record's start is past 0 returns None.
+    #[test]
+    fn term_at_tx_below_only_records_start_returns_none() {
+        let mut p = MemPersistence::new();
+        p.observe_term(5, 100).unwrap();
+        assert_eq!(p.term_at_tx(0), None);
+    }
+
+    /// `term_at_tx(u64::MAX)` returns the latest record.
+    #[test]
+    fn term_at_tx_max_returns_latest() {
+        let mut p = MemPersistence::new();
+        p.commit_term(1, 0).unwrap();
+        p.commit_term(2, 50).unwrap();
+        p.commit_term(3, 100).unwrap();
+        let r = p.term_at_tx(u64::MAX).unwrap();
+        assert_eq!(r.term, 3);
+        assert_eq!(r.start_tx_id, 100);
+    }
+
+    /// `truncate_after(u64::MAX)` is a no-op.
+    #[test]
+    fn truncate_after_u64_max_is_a_noop() {
+        let mut p = MemPersistence::new();
+        p.commit_term(1, 0).unwrap();
+        p.commit_term(2, 50).unwrap();
+        let before_term = p.current_term();
+        p.truncate_term_after(u64::MAX).unwrap();
+        assert_eq!(p.current_term(), before_term);
+    }
+
+    // ── vote-log semantics ──────────────────────────────────────────────────
+
+    /// Cross-term votes for the same node across an `observe_vote_term`
+    /// gap.
+    #[test]
+    fn cross_term_vote_sequence_for_same_node() {
+        let mut p = MemPersistence::new();
+        assert!(p.vote(1, 7).unwrap());
+        p.observe_vote_term(2).unwrap();
+        assert!(p.vote(2, 7).unwrap());
+        assert_eq!(p.voted_for(), Some(7));
+        // A vote at the older term is refused (vote-log term has
+        // moved past it).
+        assert!(!p.vote(1, 9).unwrap());
+    }
+
+    /// `observe_vote_term` clears the slot; an immediate `vote` in
+    /// the new term is granted.
+    #[test]
+    fn observe_vote_term_clears_then_vote_grants() {
+        let mut p = MemPersistence::new();
+        assert!(p.vote(7, 5).unwrap());
+        p.observe_vote_term(9).unwrap();
+        assert_eq!(p.voted_for(), None);
+        assert!(p.vote(9, 11).unwrap());
+        assert_eq!(p.voted_for(), Some(11));
     }
 }

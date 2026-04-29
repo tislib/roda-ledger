@@ -158,24 +158,28 @@ pub enum Event {
     // Driver acks for log directives (follower path).
     LogAppendComplete { tx_id: u64 },
     LogTruncateComplete { up_to: u64 },
+}
 
-    // Driver acks for durable term/vote writes. The library has
-    // already updated its in-memory model when emitting the matching
-    // Action::Persist*; these events confirm the on-disk state caught
-    // up and feed `durable_term()` / `durable_voted_for()`.
-    TermPersisted { term: u64, start_tx_id: u64 },
-    VotePersisted { term: u64, voted_for: NodeId },
+// Durable term/vote persistence is mediated by a `Persistence` trait
+// the driver supplies. The trait's writes are synchronous: when a
+// trait method returns `Ok(_)`, the change is durable and the
+// library proceeds. There are no `Action::PersistTerm` /
+// `Event::TermPersisted` ack pairs — that would re-introduce the
+// "pending persist" bookkeeping the trait approach is meant to
+// eliminate.
+pub trait Persistence {
+    fn current_term(&self) -> u64;
+    fn last_term_record(&self) -> Option<TermRecord>;
+    fn term_at_tx(&self, tx_id: u64) -> Option<TermRecord>;
+    fn commit_term(&mut self, expected: u64, start_tx_id: u64) -> io::Result<bool>;
+    fn observe_term(&mut self, term: u64, start_tx_id: u64) -> io::Result<()>;
+    fn truncate_term_after(&mut self, tx_id: u64) -> io::Result<()>;
+    fn voted_for(&self) -> Option<NodeId>;
+    fn vote(&mut self, term: u64, candidate_id: NodeId) -> io::Result<bool>;
+    fn observe_vote_term(&mut self, term: u64) -> io::Result<()>;
 }
 
 pub enum Action {
-    // Durable writes. The driver writes to its term log / vote log
-    // (e.g. storage::TermStorage / VoteStorage) and feeds back the
-    // matching Event::*Persisted. The library has already updated
-    // its in-memory model when emitting these — the driver is
-    // catching up.
-    PersistTerm { term: u64, start_tx_id: u64 },
-    PersistVote { term: u64, voted_for: NodeId },
-
     SendAppendEntries {
         to: NodeId,
         term: u64,
@@ -220,11 +224,29 @@ pub enum Action {
 }
 ```
 
-### Initial state
+### Construction
 
-The driver hydrates the durable state off disk and hands it in:
+`RaftNode<P: Persistence>` takes the already-opened `Persistence` and reads through it:
 
 ```rust
+pub fn new(
+    self_id: NodeId,
+    peers: Vec<NodeId>,
+    persistence: P,
+    cfg: RaftConfig,
+    seed: u64,
+) -> RaftNode<P>;
+
+/// Recover the persistence on shutdown / simulator crash.
+pub fn into_persistence(self) -> P;
+```
+
+`local_log_index` starts at 0; the driver feeds `Event::LogAppendComplete` for any entries already on disk before exposing the node to RPCs. The library trusts whatever the persistence says; ADR-0017 §"No boot-time term bumping": the constructor does not increment term.
+
+The previous `RaftInitialState` struct is gone — durable state lives behind the trait, not in a one-shot bootstrap argument:
+
+```rust
+// Old (pre-trait)
 pub struct RaftInitialState {
     pub current_term: u64,
     pub voted_for: Option<NodeId>,
@@ -233,13 +255,16 @@ pub struct RaftInitialState {
 }
 ```
 
-Empty-everything (`RaftInitialState::default()`) is the fresh-install case. The library does no validation beyond what its mutators normally enforce — a corrupt or out-of-order record list is the driver's bug to catch.
+### Synchronous trait persistence
 
-### Two-phase persistence
+The trait write methods are synchronous. When `commit_term`, `observe_term`, `truncate_term_after`, `vote`, or `observe_vote_term` returns `Ok(_)`, the change is durable on the underlying medium and the library may proceed to externalise its consequences (send replies, append log, etc.). The library does not maintain "pending" state behind the trait — `current_term()`, `voted_for()`, etc. delegate straight to the trait without caching.
 
-ADR-0017's "etcd-raft shape": for any state change that needs to survive a crash, the library updates its **in-memory** model first, emits the matching `Action::Persist*`, and only later observes `Event::*Persisted` to update its `durable_*` view. The library does not gate further state-machine progress on the ack — it relies on the driver applying actions in the order returned (Persist before Send/Append) so durability stays ahead of externalisation.
+The driver supplies the implementation:
 
-`durable_term()` and `durable_voted_for()` exist purely for observability — tests, the driver's own invariant checks, and a future Pre-Vote layer might want to inspect the gap between intent and durable state.
+- **Production** wires a disk-backed `DiskPersistence` that wraps the term + vote log files. Its writes `fdatasync` (or rename, in the case of `truncate_term_after`) before returning.
+- **Tests + simulator** wire a `MemPersistence` (in-memory `Vec<TermRecord>` plus two scalars). Same trait, same semantic contract — no temp dirs.
+
+This is the "etcd-raft shape": pure decision system + driver-supplied durable backing. There is no `Action::Persist*` / `Event::*Persisted` ack pair; that bookkeeping was traded for a synchronous trait callback.
 
 ### Read-only query API
 

@@ -170,10 +170,16 @@ impl<P: Persistence> RaftNode<P> {
         self.state.role()
     }
 
-    /// Current term as recorded in the term log. Delegates straight
-    /// to `Persistence`; not cached.
+    /// "What term am I in?" — `max(persistence.current_term(),
+    /// persistence.vote_term())`. The two can diverge while a
+    /// candidate has self-voted for a term it hasn't yet won (the
+    /// term log advances only on `commit_term`, the vote log
+    /// advances on every `vote` / `observe_vote_term`). Delegates
+    /// straight to the trait; not cached.
     pub fn current_term(&self) -> Term {
-        self.persistence.current_term()
+        self.persistence
+            .current_term()
+            .max(self.persistence.vote_term())
     }
 
     pub fn commit_index(&self) -> TxId {
@@ -296,7 +302,10 @@ impl<P: Persistence> RaftNode<P> {
     // ─── Election machinery ──────────────────────────────────────────────
 
     fn start_election(&mut self, now: Instant, out: &mut Vec<Action>) {
-        let new_term = self.persistence.current_term().saturating_add(1);
+        // Use max-of-(term-log, vote-log) so a candidate that fails
+        // round N still bumps to N+1 next round — the term log
+        // doesn't advance on a lost election, only the vote log does.
+        let new_term = self.current_term().saturating_add(1);
 
         // Self-vote (durable, synchronous through the trait).
         match self.persistence.vote(new_term, self.self_id) {
@@ -374,7 +383,7 @@ impl<P: Persistence> RaftNode<P> {
         last_term: Term,
         out: &mut Vec<Action>,
     ) {
-        let current_term = self.persistence.current_term();
+        let current_term = self.current_term();
 
         if term < current_term {
             out.push(Action::SendRequestVoteReply {
@@ -404,7 +413,7 @@ impl<P: Persistence> RaftNode<P> {
         if !candidate_up_to_date {
             out.push(Action::SendRequestVoteReply {
                 to: from,
-                term: self.persistence.current_term(),
+                term: self.current_term(),
                 granted: false,
             });
             return;
@@ -431,7 +440,7 @@ impl<P: Persistence> RaftNode<P> {
 
         out.push(Action::SendRequestVoteReply {
             to: from,
-            term: self.persistence.current_term(),
+            term: self.current_term(),
             granted,
         });
     }
@@ -563,7 +572,7 @@ impl<P: Persistence> RaftNode<P> {
         leader_commit: TxId,
         out: &mut Vec<Action>,
     ) {
-        let current_term = self.persistence.current_term();
+        let current_term = self.current_term();
 
         if term < current_term {
             out.push(Action::SendAppendEntriesReply {
@@ -609,7 +618,7 @@ impl<P: Persistence> RaftNode<P> {
                 }
                 out.push(Action::SendAppendEntriesReply {
                     to: from,
-                    term: self.persistence.current_term(),
+                    term: self.current_term(),
                     success: false,
                     last_tx_id: self.local_log_index,
                 });
@@ -645,7 +654,7 @@ impl<P: Persistence> RaftNode<P> {
 
         out.push(Action::SendAppendEntriesReply {
             to: from,
-            term: self.persistence.current_term(),
+            term: self.current_term(),
             success: true,
             last_tx_id: self.local_log_index,
         });
@@ -681,7 +690,7 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     fn leader_send_to(&mut self, peer: NodeId, now: Instant, out: &mut Vec<Action>) {
-        let current_term = self.persistence.current_term();
+        let current_term = self.current_term();
         let leader_commit = self.cluster_commit_index;
         let max_entries = self.cfg.max_entries_per_append;
 
@@ -752,7 +761,7 @@ impl<P: Persistence> RaftNode<P> {
         reject_reason: Option<RejectReason>,
         out: &mut Vec<Action>,
     ) {
-        let current_term = self.persistence.current_term();
+        let current_term = self.current_term();
         if term > current_term {
             self.observe_higher_term(term);
             self.transition_to_follower(now, None);
@@ -974,6 +983,9 @@ mod tests {
             self.term_log.retain(|r| r.start_tx_id <= tx_id);
             Ok(())
         }
+        fn vote_term(&self) -> Term {
+            self.vote_term
+        }
         fn voted_for(&self) -> Option<NodeId> {
             match self.voted_for {
                 0 => None,
@@ -1045,7 +1057,10 @@ mod tests {
         let _ = node.step(t0, Event::Tick);
         let actions = node.step(t0 + Duration::from_secs(60), Event::Tick);
         assert_eq!(node.role(), Role::Candidate);
-        assert_eq!(node.current_term(), 0); // term log untouched until win
+        // `current_term()` = max(term-log, vote-log). The term log
+        // stays at 0 until election win, but the candidate's
+        // self-vote bumps the vote log to 1, so the public read is 1.
+        assert_eq!(node.current_term(), 1);
         assert_eq!(node.voted_for(), Some(1));
         let send_count = actions
             .iter()

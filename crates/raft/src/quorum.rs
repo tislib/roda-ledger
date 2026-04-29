@@ -162,6 +162,47 @@ mod tests {
         assert_eq!(q.cluster_commit_index(), 100);
     }
 
+    /// Two-node degenerate cluster — majority = 2, both must agree
+    /// before a commit advances.
+    #[test]
+    fn two_node_cluster_requires_both_to_commit() {
+        let mut q = Quorum::new(2);
+        assert_eq!(q.majority(), 2);
+        // Only slot 0 — second-highest is 0.
+        assert_eq!(q.advance(0, 100), None);
+        assert_eq!(q.cluster_commit_index(), 0);
+        // Now both at 100 — second-highest = 100, advance.
+        assert_eq!(q.advance(1, 100), Some(100));
+        assert_eq!(q.cluster_commit_index(), 100);
+    }
+
+    /// Out-of-order advances cannot drop the watermark.
+    #[test]
+    fn watermark_monotonicity_under_reordered_advances() {
+        let mut q = Quorum::new(3);
+        q.advance(0, 100);
+        q.advance(1, 100);
+        assert_eq!(q.cluster_commit_index(), 100);
+        // Late, lower advance for slot 0. Per-slot guard
+        // (`if index > match_index[i]`) keeps slot 0 at 100; cluster
+        // commit unchanged.
+        assert_eq!(q.advance(0, 50), None);
+        assert_eq!(q.cluster_commit_index(), 100);
+        assert_eq!(q.match_index(0), 100);
+    }
+
+    /// `reset_peers` does not move the watermark.
+    #[test]
+    fn reset_peers_does_not_advance_the_watermark() {
+        let mut q = Quorum::new(3);
+        q.advance(0, 50);
+        q.advance(1, 50);
+        q.advance(2, 50);
+        assert_eq!(q.cluster_commit_index(), 50);
+        q.reset_peers(0);
+        assert_eq!(q.cluster_commit_index(), 50);
+    }
+
     #[test]
     fn reset_peers_clears_followers_only() {
         let mut q = Quorum::new(3);
