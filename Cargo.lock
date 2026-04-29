@@ -1637,9 +1637,7 @@ dependencies = [
  "criterion",
  "proptest",
  "rand 0.8.5",
- "serde",
  "spdlog-rs",
- "storage",
  "tempfile",
  "thiserror 1.0.69",
 ]
