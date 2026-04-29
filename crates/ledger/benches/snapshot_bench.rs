@@ -1,11 +1,11 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::config::{LedgerConfig, StorageConfig};
-use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
-use roda_ledger::ledger::WaitStrategy;
-use roda_ledger::pipeline::Pipeline;
-use roda_ledger::snapshot::{Snapshot, SnapshotMessage};
-use roda_ledger::storage::Storage;
-use roda_ledger::wasm_runtime::WasmRuntime;
+use ledger::config::{LedgerConfig, StorageConfig};
+use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
+use ledger::ledger::WaitStrategy;
+use ledger::pipeline::Pipeline;
+use ledger::snapshot::{Snapshot, SnapshotMessage};
+use storage::Storage;
+use ledger::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::time::Duration;

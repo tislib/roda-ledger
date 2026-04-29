@@ -378,6 +378,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
+name = "client"
+version = "0.1.0"
+dependencies = [
+ "ledger",
+ "proto",
+ "spdlog-rs",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "cluster"
 version = "0.1.0"
 dependencies = [
@@ -385,6 +396,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "clap",
+ "client",
  "cluster-test-utils",
  "criterion",
  "ledger",
@@ -402,6 +414,7 @@ dependencies = [
  "tokio-test",
  "toml",
  "tonic",
+ "tonic-reflection",
 ]
 
 [[package]]
@@ -410,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "client",
  "cluster",
  "ledger",
  "proto",
@@ -680,8 +694,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "bytemuck",
  "cluster",
+ "crc32c",
  "ledger",
+ "lz4_flex",
  "proto",
  "rand 0.8.5",
  "spdlog-rs",
@@ -1798,7 +1815,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2327,6 +2344,19 @@ dependencies = [
  "prost-types",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878d81f52e7fcfd80026b7fdb6a9b578b3c3653ba987f87f0dce4b64043cba27"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

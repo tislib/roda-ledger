@@ -13,16 +13,14 @@
 //! 4. `WaitForTransaction` short-circuits to `NOT_FOUND` on unknown tx
 //!    and `TERM_MISMATCH` on term fence failure.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger as proto;
-use roda_ledger::cluster::proto::ledger::ledger_server::Ledger as LedgerSvc;
-use roda_ledger::cluster::{
-    ClusterTestingConfig, ClusterTestingControl, LedgerHandler, Role, Term,
-};
-use roda_ledger::ledger::Ledger;
-use roda_ledger::storage::{TermRecord, TermStorage};
-use roda_ledger::transaction::Operation;
+use ::proto::ledger as proto;
+use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
+use cluster::{LedgerHandler, Role, Term};
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use ledger::ledger::Ledger;
+use storage::{TermRecord, TermStorage};
+use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -59,7 +57,7 @@ async fn wait_committed(ledger: &Ledger, tx_id: u64) {
 async fn ledger_get_transaction_status_returns_not_found_for_never_sequenced() {
     let (_ctl, ledger, _term, _handler) = setup().await;
 
-    use roda_ledger::transaction::TransactionStatus as LStatus;
+    use ledger::transaction::TransactionStatus as LStatus;
     // tx_id 0 is never assigned by the sequencer.
     assert!(matches!(
         ledger.get_transaction_status(0),

@@ -24,13 +24,12 @@
 //!      live ledger now has `commit == watermark` and balances
 //!      reflect only the surviving prefix.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::node as proto;
-use roda_ledger::cluster::proto::node::node_client::NodeClient;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
-use roda_ledger::entities::WalEntry;
-use roda_ledger::transaction::Operation;
+use ::proto::node as proto;
+use ::proto::node::node_client::NodeClient;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use storage::entities::WalEntry;
+use ledger::transaction::Operation;
 use std::time::Duration;
 use tonic::transport::Channel;
 

@@ -5,6 +5,7 @@ members = [
     "crates/storage",
     "crates/ledger",
     "crates/raft",
+    "crates/client",
     "crates/cluster",
     "crates/cluster-test-utils",
     "crates/ctl",
@@ -63,6 +64,7 @@ proto = { path = "crates/proto" }
 storage = { path = "crates/storage" }
 ledger = { path = "crates/ledger" }
 raft = { path = "crates/raft" }
+client = { path = "crates/client" }
 cluster = { path = "crates/cluster" }
 cluster-test-utils = { path = "crates/cluster-test-utils" }
 

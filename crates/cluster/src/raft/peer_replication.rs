@@ -8,13 +8,13 @@
 //!   onto every AppendEntries as `prev_tx_id` for Raft-style ordering).
 
 use super::Quorum;
-use crate::cluster::config::PeerConfig;
-use crate::cluster::proto::node as proto;
-use crate::cluster::proto::node::node_client::NodeClient;
-use crate::cluster::supervisor::{Transition, TransitionTx};
-use crate::ledger::Ledger;
+use crate::config::PeerConfig;
+use ::proto::node as proto;
+use ::proto::node::node_client::NodeClient;
+use crate::supervisor::{Transition, TransitionTx};
+use ledger::ledger::Ledger;
 use storage::WalTailer;
-use crate::tools::backoff::{Backoff, BackoffPolicy};
+use ledger::tools::backoff::{Backoff, BackoffPolicy};
 use spdlog::{debug, info, trace, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

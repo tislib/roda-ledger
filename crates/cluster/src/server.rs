@@ -11,12 +11,12 @@
 //! `notify_waiters()`, which lets tonic stop accepting new connections, drain
 //! in-flight handlers, and exit cleanly.
 
-use crate::cluster::ledger_handler::LedgerHandler;
-use crate::cluster::node_handler::NodeHandler;
-use crate::cluster::proto::ledger::ledger_server::LedgerServer;
-use crate::cluster::proto::node::node_server::NodeServer;
-use crate::cluster::raft::{RoleFlag, Term};
-use crate::cluster::{ClusterCommitIndex, LedgerSlot};
+use crate::ledger_handler::LedgerHandler;
+use crate::node_handler::NodeHandler;
+use ::proto::ledger::ledger_server::LedgerServer;
+use ::proto::node::node_server::NodeServer;
+use crate::raft::{RoleFlag, Term};
+use crate::{ClusterCommitIndex, LedgerSlot};
 use spdlog::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -75,10 +75,7 @@ impl Server {
         info!("Ledger gRPC server listening on {}", self.addr);
 
         let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/ledger_descriptor.bin"
-            )))
+            .register_encoded_file_descriptor_set(proto::ledger::FILE_DESCRIPTOR_SET)
             .build_v1()?;
 
         let shutdown = self.shutdown.clone();

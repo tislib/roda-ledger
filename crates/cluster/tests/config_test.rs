@@ -1,12 +1,11 @@
 //! Cluster configuration & topology — bring-up shapes, validation, and
 //! membership sizing.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::{
-    ClusterTestingConfig, ClusterTestingControl, Config, ConfigError, Term,
-};
+use ::proto::ledger::WaitLevel;
+use cluster::{Config, Term};
+use cluster::config::ConfigError;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 
 const ACCOUNT: u64 = 1;

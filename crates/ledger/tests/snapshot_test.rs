@@ -49,6 +49,7 @@ fn test_snapshot_creation() {
         user_ref: 0,
     });
     ledger.wait_for_transaction(last_id);
+    ledger.wait_for_seal();
 
     drop(ledger);
 

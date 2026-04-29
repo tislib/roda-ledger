@@ -8,9 +8,9 @@
 //! same shape as `Operation::Transfer` (one credit + one debit per tx).
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::transaction::{Operation, Transaction};
-use roda_ledger::transactor::TransactorRunner;
-use roda_ledger::wasm_runtime::WasmRuntime;
+use ledger::transaction::{Operation, Transaction};
+use ledger::transactor::TransactorRunner;
+use ledger::wasm_runtime::WasmRuntime;
 use std::sync::Arc;
 use std::time::Duration;
 

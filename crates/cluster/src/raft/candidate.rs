@@ -24,9 +24,9 @@
 
 use super::peer_replication::connect;
 use super::{Term, Vote};
-use crate::cluster::config::{Config, PeerConfig};
-use crate::cluster::proto::node as proto;
-use crate::ledger::Ledger;
+use crate::config::{Config, PeerConfig};
+use ::proto::node as proto;
+use ledger::ledger::Ledger;
 use spdlog::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;

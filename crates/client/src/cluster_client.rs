@@ -15,12 +15,12 @@
 //! The standalone [`NodeClient`] keeps working unchanged; cluster
 //! clients are an additive layer.
 
-use crate::client::node_client::{
+use crate::node_client::{
     AccountHistory, Balance, FunctionInfo, NodeClient, PipelineIndex, Result, RetryConfig,
     SubmitResult, Transaction,
 };
-use crate::cluster::proto::ledger as proto;
-use crate::tools::backoff::Backoff;
+use ::proto::ledger as proto;
+use ledger::tools::backoff::Backoff;
 use spdlog::warn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

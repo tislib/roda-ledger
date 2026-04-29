@@ -11,9 +11,9 @@
 //! that hasn't finished its first heartbeat) without them having to
 //! hand-roll a retry loop. Tune via [`RetryConfig`] on construction.
 
-use crate::cluster::proto::ledger as proto;
-use crate::cluster::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
-use crate::tools::backoff::{Backoff, BackoffPolicy};
+use ::proto::ledger as proto;
+use ::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
+use ledger::tools::backoff::{Backoff, BackoffPolicy};
 use spdlog::{trace, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -29,7 +29,7 @@ pub type Result<T> = std::result::Result<T, tonic::Status>;
 /// Retry policy for [`NodeClient`] and `ClusterClient` RPCs. Every
 /// public method runs through a retry loop that retries on any
 /// `tonic::Status` error using exponential backoff. Internally each
-/// loop drives a [`crate::tools::backoff::Backoff`] built from
+/// loop drives a [`ledger::tools::backoff::Backoff`] built from
 /// [`Self::backoff_policy`] — the same primitive the cluster's
 /// peer-replication loop uses.
 ///

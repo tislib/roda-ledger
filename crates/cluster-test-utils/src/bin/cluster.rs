@@ -7,7 +7,7 @@
 //! Config path precedence: CLI arg > `RODA_CONFIG` env > `RODA_CLUSTER_CONFIG`
 //! env (legacy) > `./config.toml`.
 
-use roda_ledger::cluster::{self, ClusterNode};
+use cluster::{self, ClusterNode};
 use spdlog::info;
 use std::env;
 use std::path::PathBuf;

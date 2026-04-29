@@ -1,6 +1,6 @@
 //! `Leader` — role-specific bring-up for the **role-task** part of
 //! the leader role. Stage 3b moves the gRPC servers into
-//! [`crate::cluster::supervisor::RoleSupervisor`] (so they can stay
+//! [`crate::supervisor::RoleSupervisor`] (so they can stay
 //! up across role transitions); what remains here is the leader's
 //! exclusive sub-tree:
 //!
@@ -15,9 +15,9 @@
 
 use super::peer_replication::{PeerReplication, ReplicationParams};
 use super::{Quorum, Term};
-use crate::cluster::LedgerSlot;
-use crate::cluster::config::Config;
-use crate::cluster::supervisor::TransitionTx;
+use crate::LedgerSlot;
+use crate::config::Config;
+use crate::supervisor::TransitionTx;
 use spdlog::info;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

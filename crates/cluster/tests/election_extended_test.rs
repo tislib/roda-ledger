@@ -1,10 +1,9 @@
 //! Leader election + term/vote durability (cluster-level).
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::node as nproto;
-use roda_ledger::cluster::proto::node::node_client::NodeClient;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, Role, Vote};
+use proto::node as nproto;
+use ::proto::node::node_client::NodeClient;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; use cluster::{Role, Vote};
 use spdlog::info;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -161,7 +160,7 @@ async fn request_vote_stale_term_refused_with_our_term() {
     term.observe(7, 0).unwrap(); // bring our term up to 7
     let handler = ctl.node_handler(0, 2).expect("handler");
 
-    use roda_ledger::cluster::proto::node::node_server::Node;
+    use ::proto::node::node_server::Node;
     let resp = handler
         .request_vote(Request::new(nproto::RequestVoteRequest {
             term: 5, // < our 7
@@ -185,7 +184,7 @@ async fn request_vote_already_voted_for_other_refused_same_idempotent() {
         .expect("bare start");
     let handler = ctl.node_handler(0, 2).expect("handler");
 
-    use roda_ledger::cluster::proto::node::node_server::Node;
+    use ::proto::node::node_server::Node;
 
     // First vote in term 3 for candidate 5. The handler observes term
     // 3 (term log gets a record `(3, 0)`), so for the up-to-date check
@@ -241,7 +240,7 @@ async fn request_vote_refuses_stale_log() {
     term.new_term(0).unwrap(); // term 1
 
     // Commit a tx so our last_tx_id > 0.
-    let tx_id = ledger.submit(roda_ledger::transaction::Operation::Deposit {
+    let tx_id = ledger.submit(ledger::transaction::Operation::Deposit {
         account: 1,
         amount: 1,
         user_ref: 0,
@@ -252,7 +251,7 @@ async fn request_vote_refuses_stale_log() {
     assert!(ledger.last_commit_id() >= 1);
 
     let handler = ctl.node_handler(0, 2).expect("handler");
-    use roda_ledger::cluster::proto::node::node_server::Node;
+    use ::proto::node::node_server::Node;
 
     // Candidate claims (last_term=1, last_tx_id=0). Ours is
     // (last_term=1, last_tx_id=1). Lex: candidate < ours → refuse.
@@ -289,7 +288,7 @@ async fn request_vote_higher_term_durably_observed() {
 
     // Commit so our log has something — candidate's stale log triggers refusal.
     let ledger = ctl.ledger(0).unwrap();
-    let tx_id = ledger.submit(roda_ledger::transaction::Operation::Deposit {
+    let tx_id = ledger.submit(ledger::transaction::Operation::Deposit {
         account: 1,
         amount: 1,
         user_ref: 0,
@@ -299,7 +298,7 @@ async fn request_vote_higher_term_durably_observed() {
         .expect("commit");
 
     let handler = ctl.node_handler(0, 2).expect("handler");
-    use roda_ledger::cluster::proto::node::node_server::Node;
+    use ::proto::node::node_server::Node;
 
     // Higher-term but stale-log: must be refused, but term observed.
     let _ = handler

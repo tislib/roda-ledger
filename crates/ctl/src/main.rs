@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use roda_ledger::ctl::RodaCtl;
+use ledger::ctl::RodaCtl;
 
 #[derive(Parser)]
 #[command(name = "roda-ctl", about = "Offline operational tools for roda-ledger")]

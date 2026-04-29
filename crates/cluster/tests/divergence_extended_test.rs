@@ -1,13 +1,12 @@
 //! Divergence detection + supervisor reseed.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::node as proto;
-use roda_ledger::cluster::proto::node::node_client::NodeClient;
-use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, Role};
-use roda_ledger::storage::{TermRecord, TermStorage};
-use roda_ledger::transaction::Operation;
+use ::proto::node as proto;
+use ::proto::node::node_client::NodeClient;
+use ::proto::node::node_server::Node;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; use cluster::{Role};
+use storage::{TermRecord, TermStorage};
+use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -16,9 +15,9 @@ use tonic::transport::Channel;
 
 async fn bare_follower() -> (
     ClusterTestingControl,
-    Arc<roda_ledger::ledger::Ledger>,
-    Arc<roda_ledger::cluster::Term>,
-    roda_ledger::cluster::NodeHandler,
+    Arc<ledger::ledger::Ledger>,
+    Arc<cluster::raft::Term>,
+    cluster::NodeHandler,
 ) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Follower))
         .await
@@ -29,7 +28,7 @@ async fn bare_follower() -> (
     (ctl, ledger, term, handler)
 }
 
-async fn wait_committed(ledger: &roda_ledger::ledger::Ledger, tx_id: u64) {
+async fn wait_committed(ledger: &ledger::ledger::Ledger, tx_id: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while ledger.last_commit_id() < tx_id {
         if Instant::now() > deadline {

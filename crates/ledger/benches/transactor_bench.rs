@@ -1,9 +1,9 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::ledger::{LedgerConfig, WaitStrategy};
-use roda_ledger::pipeline::Pipeline;
-use roda_ledger::transaction::{Operation, Transaction, TransactionInput};
-use roda_ledger::transactor::Transactor;
-use roda_ledger::wasm_runtime::WasmRuntime;
+use ledger::ledger::{LedgerConfig, WaitStrategy};
+use ledger::pipeline::Pipeline;
+use ledger::transaction::{Operation, Transaction, TransactionInput};
+use ledger::transactor::Transactor;
+use ledger::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::thread;

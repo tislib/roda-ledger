@@ -14,12 +14,11 @@
 //! - The standalone [`NodeClient`] still works (regression guard
 //!   for the rename + retry refactor).
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::client::{ClusterClient, NodeClient, RetryConfig};
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
-use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
+use client::{ClusterClient, NodeClient, RetryConfig};
+use ::proto::ledger::WaitLevel;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use storage::entities::SYSTEM_ACCOUNT_ID;
 use std::time::Duration;
 
 const ACCOUNT_A: u64 = 100;

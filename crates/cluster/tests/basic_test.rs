@@ -5,11 +5,10 @@
 //! - Leader's replication thread ships WAL bytes via AppendEntries.
 //! - Follower's balances catch up to the leader's.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
-use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
+use ::proto::ledger::WaitLevel;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use storage::entities::SYSTEM_ACCOUNT_ID;
 use std::time::Duration;
 
 // Stage 4: with the Candidate loop landed, multi-node clusters

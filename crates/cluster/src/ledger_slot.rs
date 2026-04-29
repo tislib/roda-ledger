@@ -13,7 +13,7 @@
 //! `AtomicUsize` load. No `Mutex`, no `await`, no contention with
 //! the async runtime threads.
 
-use crate::ledger::Ledger;
+use ledger::ledger::Ledger;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
@@ -54,7 +54,7 @@ impl LedgerSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LedgerConfig;
+    use ledger::config::LedgerConfig;
 
     fn build_started_ledger() -> Arc<Ledger> {
         let mut cfg = LedgerConfig::temp();

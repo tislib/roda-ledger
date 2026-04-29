@@ -23,7 +23,7 @@
 //! value remains correct: it reflects what the peer durably had at the
 //! moment it last responded.
 
-use crate::cluster::cluster_commit::ClusterCommitIndex;
+use crate::cluster_commit::ClusterCommitIndex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

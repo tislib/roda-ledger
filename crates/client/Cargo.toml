@@ -1,26 +1,18 @@
 [package]
-name = "cluster-test-utils"
+name = "client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 publish = false
-autobins = false
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-cluster.workspace = true
-client.workspace = true
 ledger.workspace = true
-storage.workspace = true
 proto.workspace = true
 
 tokio.workspace = true
 tonic.workspace = true
 spdlog-rs.workspace = true
-tempfile.workspace = true
-arc-swap.workspace = true
-rand.workspace = true
-anyhow.workspace = true

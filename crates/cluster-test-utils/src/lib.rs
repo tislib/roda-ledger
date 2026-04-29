@@ -23,22 +23,22 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
-use crate::client::{ClusterClient, NodeClient, PipelineIndex, SubmitResult};
-use crate::cluster::cluster_commit::ClusterCommitIndex;
-use crate::cluster::config::{
+use client::{ClusterClient, NodeClient, PipelineIndex, SubmitResult};
+use cluster::cluster_commit::ClusterCommitIndex;
+use cluster::config::{
     ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection,
 };
-use crate::cluster::ledger_handler::LedgerHandler;
-use crate::cluster::ledger_slot::LedgerSlot;
-use crate::cluster::node::{ClusterNode, Handles};
-use crate::cluster::node_handler::{NodeHandler, NodeHandlerCore};
-use crate::cluster::proto::ledger as lproto;
-use crate::cluster::proto::node as nproto;
-use crate::cluster::proto::node::node_client::NodeClient as ProtoNodeClient;
-use crate::cluster::raft::{Role, RoleFlag, Term, Vote};
-use crate::config::{LedgerConfig, StorageConfig};
-use crate::ledger::Ledger;
-use crate::wait_strategy::WaitStrategy;
+use cluster::ledger_handler::LedgerHandler;
+use cluster::ledger_slot::LedgerSlot;
+use cluster::node::{ClusterNode, Handles};
+use cluster::node_handler::{NodeHandler, NodeHandlerCore};
+use proto::ledger as lproto;
+use ::proto::node::{self as nproto, node_client::NodeClient as ProtoNodeClient};
+use cluster::raft::{Role, RoleFlag, Term, Vote};
+use ledger::config::LedgerConfig;
+use storage::StorageConfig;
+use ledger::ledger::Ledger;
+use ledger::wait_strategy::WaitStrategy;
 use spdlog::{info, warn, Level};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -1510,7 +1510,7 @@ impl ClusterTestingControl {
         &self,
         slot: usize,
         account: u64,
-    ) -> Result<crate::client::Balance, ClusterTestingError> {
+    ) -> Result<client::Balance, ClusterTestingError> {
         self.cluster_client_or_err()?
             .node(slot)
             .get_balance(account)

@@ -1,12 +1,11 @@
-#[cfg(feature = "cluster")]
 mod tests {
-    use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
-    use roda_ledger::cluster::proto::ledger::{
+    use ::proto::ledger::ledger_client::LedgerClient;
+    use ::proto::ledger::{
         Deposit, SubmitAndWaitRequest, SubmitBatchAndWaitRequest, Transfer, WaitLevel, Withdrawal,
     };
-    use roda_ledger::cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
-    use roda_ledger::ledger::{Ledger, LedgerConfig};
-    use roda_ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
+    use cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
+    use ledger::ledger::{Ledger, LedgerConfig};
+    use ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -229,7 +228,7 @@ mod tests {
         let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
             let server = Server::new(
-                std::sync::Arc::new(roda_ledger::cluster::LedgerSlot::new(server_ledger)),
+                std::sync::Arc::new(cluster::LedgerSlot::new(server_ledger)),
                 addr,
                 std::sync::Arc::new(RoleFlag::new(Role::Leader)),
                 term,
@@ -263,7 +262,7 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                proto::ledger::submit_and_wait_request::Operation::Deposit(
                     Deposit {
                         account: 1,
                         amount: 1000,
@@ -289,7 +288,7 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                proto::ledger::submit_and_wait_request::Operation::Deposit(
                     Deposit {
                         account: 5,
                         amount: 500,
@@ -319,7 +318,7 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Withdrawal(
+                proto::ledger::submit_and_wait_request::Operation::Withdrawal(
                     Withdrawal {
                         account: 100,
                         amount: 999,
@@ -348,7 +347,7 @@ mod tests {
         client
             .submit_and_wait(SubmitAndWaitRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                    proto::ledger::submit_and_wait_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -364,7 +363,7 @@ mod tests {
         let response = client
             .submit_and_wait(SubmitAndWaitRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Transfer(
+                    proto::ledger::submit_and_wait_request::Operation::Transfer(
                         Transfer {
                             from: 1,
                             to: 2,
@@ -395,7 +394,7 @@ mod tests {
             operations: vec![
                 SubmitAndWaitRequest {
                     operation: Some(
-                        roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                        proto::ledger::submit_and_wait_request::Operation::Deposit(
                             Deposit {
                                 account: 1,
                                 amount: 100,
@@ -407,7 +406,7 @@ mod tests {
                 },
                 SubmitAndWaitRequest {
                     operation: Some(
-                        roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                        proto::ledger::submit_and_wait_request::Operation::Deposit(
                             Deposit {
                                 account: 2,
                                 amount: 200,
@@ -446,7 +445,7 @@ mod tests {
             operations: vec![
                 SubmitAndWaitRequest {
                     operation: Some(
-                        roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                        proto::ledger::submit_and_wait_request::Operation::Deposit(
                             Deposit {
                                 account: 1,
                                 amount: 100,
@@ -458,7 +457,7 @@ mod tests {
                 },
                 SubmitAndWaitRequest {
                     operation: Some(
-                        roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Withdrawal(
+                        proto::ledger::submit_and_wait_request::Operation::Withdrawal(
                             Withdrawal {
                                 account: 99,
                                 amount: 999,
@@ -492,7 +491,7 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_and_wait_request::Operation::Deposit(
+                proto::ledger::submit_and_wait_request::Operation::Deposit(
                     Deposit {
                         account: 1,
                         amount: 100,

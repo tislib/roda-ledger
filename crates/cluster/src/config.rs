@@ -56,7 +56,7 @@
 //! configuration value — it is a runtime property driven by the
 //! role state machine (Stages 3b/4 work).
 
-use crate::config::LedgerConfig;
+use ledger::config::LedgerConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;

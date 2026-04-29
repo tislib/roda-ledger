@@ -1,8 +1,8 @@
 //! Benchmarks for `WalTailer` — the ADR-015 leader-side raw WAL reader.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use roda_ledger::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
-use roda_ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
+use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
+use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use std::time::Duration;
 
 const WAL_RECORD_SIZE: usize = 40;

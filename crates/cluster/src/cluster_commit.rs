@@ -19,7 +19,7 @@
 //! Readers ([`LedgerHandler::wait_for_transaction_level`](super::ledger_handler::LedgerHandler),
 //! `get_pipeline_index`) call [`get`].
 
-use crate::ledger::Ledger;
+use ledger::ledger::Ledger;
 use spdlog::debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

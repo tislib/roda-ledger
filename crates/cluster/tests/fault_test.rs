@@ -1,9 +1,8 @@
 //! Process / network / storage fault scenarios.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
+use ::proto::ledger::WaitLevel;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
 use std::time::Duration;
 
 const ACCOUNT: u64 = 1;

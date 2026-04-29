@@ -7,22 +7,10 @@
 //! Config path precedence: CLI arg > `RODA_CONFIG` env > `RODA_CLUSTER_CONFIG`
 //! env (legacy) > `./config.toml`.
 
+use cluster::{ClusterNode, Config};
 use spdlog::info;
 use std::env;
 use std::path::PathBuf;
-
-pub mod cluster_commit;
-pub mod config;
-pub mod ledger_handler;
-pub mod ledger_slot;
-pub(crate) mod lifecycle;
-pub mod mapping;
-pub mod node;
-pub mod node_handler;
-pub mod raft;
-pub mod server;
-pub mod supervisor;
-pub mod testing_cluster;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -33,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|| "config.toml".to_string())
         .into();
 
-    let cfg = cluster::Config::from_file(&config_path).map_err(|e| {
+    let cfg = Config::from_file(&config_path).map_err(|e| {
         format!(
             "failed to load config from {}: {}",
             config_path.display(),

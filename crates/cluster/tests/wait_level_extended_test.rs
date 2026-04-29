@@ -1,16 +1,14 @@
 //! Wait levels and read semantics on cluster.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger as proto;
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::proto::ledger::ledger_server::Ledger as LedgerSvc;
-use roda_ledger::cluster::{
-    ClusterTestingConfig, ClusterTestingControl, LedgerHandler, Role, Term,
-};
-use roda_ledger::ledger::Ledger;
-use roda_ledger::storage::{TermRecord, TermStorage};
-use roda_ledger::transaction::Operation;
+use ::proto::ledger as proto;
+use ::proto::ledger::WaitLevel;
+use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
+use cluster::{LedgerHandler, Role, Term};
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use ledger::ledger::Ledger;
+use storage::{TermRecord, TermStorage};
+use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;

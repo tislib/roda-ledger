@@ -1,9 +1,9 @@
-use crate::cluster::proto::ledger as proto;
-use crate::cluster::proto::ledger::ledger_server::Ledger;
-use crate::cluster::raft::{RoleFlag, Term};
-use crate::cluster::{ClusterCommitIndex, LedgerSlot};
-use crate::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use crate::transaction::Operation;
+use ::proto::ledger as proto;
+use ::proto::ledger::ledger_server::Ledger;
+use crate::raft::{RoleFlag, Term};
+use crate::{ClusterCommitIndex, LedgerSlot};
+use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
+use ledger::transaction::Operation;
 use spdlog::{debug, trace, warn};
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,7 +123,7 @@ impl LedgerHandler {
         };
 
         proto::GetStatusResponse {
-            status: proto::TransactionStatus::from(status) as i32,
+            status: crate::mapping::status_to_proto(status) as i32,
             fail_reason,
             term_mismatch: false,
             term: tx_term,
@@ -139,7 +139,7 @@ impl Ledger for LedgerHandler {
         request: Request<proto::SubmitOperationRequest>,
     ) -> Result<Response<proto::SubmitOperationResponse>, Status> {
         self.ensure_writable()?;
-        let op = request.into_inner().try_into()?;
+        let op = crate::mapping::submit_request_to_op(request.into_inner())?;
         let transaction_id = self.ledger_slot.ledger().submit(op);
         Ok(Response::new(proto::SubmitOperationResponse {
             transaction_id,
@@ -154,7 +154,7 @@ impl Ledger for LedgerHandler {
         self.ensure_writable()?;
         let req = request.into_inner();
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
-        let op = req.try_into()?;
+        let op = crate::mapping::submit_and_wait_request_to_op(req)?;
 
         let tx_id = self.ledger_slot.ledger().submit(op);
         self.wait_for_transaction_level(tx_id, level).await?;
@@ -184,7 +184,7 @@ impl Ledger for LedgerHandler {
         let mut operations: Vec<Operation> = Vec::with_capacity(len);
 
         for op_req in req.operations {
-            let op = op_req.try_into()?;
+            let op = crate::mapping::submit_request_to_op(op_req)?;
             operations.push(op);
         }
 
@@ -216,7 +216,7 @@ impl Ledger for LedgerHandler {
         let mut operations: Vec<Operation> = Vec::with_capacity(len);
 
         for op_req in req.operations {
-            let op = op_req.try_into()?;
+            let op = crate::mapping::submit_and_wait_request_to_op(op_req)?;
             operations.push(op);
         }
 
@@ -319,7 +319,7 @@ impl Ledger for LedgerHandler {
         // for this case.
         if matches!(
             self.ledger_slot.ledger().get_transaction_status(tx_id),
-            crate::transaction::TransactionStatus::NotFound
+            ledger::transaction::TransactionStatus::NotFound
         ) {
             return Ok(Response::new(proto::WaitForTransactionResponse {
                 outcome: proto::WaitOutcome::NotFound as i32,

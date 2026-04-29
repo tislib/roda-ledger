@@ -6,9 +6,8 @@
 //! still advances on every restart in lock-step with the cluster
 //! path (ADR-0016 §11).
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, Term};
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; use cluster::{Term};
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

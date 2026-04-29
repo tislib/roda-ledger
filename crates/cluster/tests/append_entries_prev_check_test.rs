@@ -7,14 +7,13 @@
 //! and asserts both the response code and the
 //! `take_divergence_watermark` side-effect.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::node as proto;
-use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, NodeHandler, Role, Term};
-use roda_ledger::ledger::Ledger;
-use roda_ledger::storage::{TermRecord, TermStorage};
-use roda_ledger::transaction::Operation;
+use ::proto::node as proto;
+use ::proto::node::node_server::Node;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; use cluster::{NodeHandler, Role, Term};
+use ledger::ledger::Ledger;
+use storage::{TermRecord, TermStorage};
+use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::Request;

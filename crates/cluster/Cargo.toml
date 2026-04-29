@@ -22,6 +22,7 @@ raft.workspace = true
 
 tokio.workspace = true
 tonic.workspace = true
+tonic-reflection = "0.12"
 prost.workspace = true
 
 serde.workspace = true
@@ -39,6 +40,9 @@ clap.workspace = true
 
 [dev-dependencies]
 cluster-test-utils.workspace = true
+client.workspace = true
+proto.workspace = true
+storage.workspace = true
 tempfile.workspace = true
 tokio-test.workspace = true
 proptest.workspace = true

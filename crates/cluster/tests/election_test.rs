@@ -16,11 +16,10 @@
 //!
 //! All Pings are observation-only; the test makes no writes.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::node as nproto;
-use roda_ledger::cluster::proto::node::node_client::NodeClient;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl};
+use proto::node as nproto;
+use ::proto::node::node_client::NodeClient;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 

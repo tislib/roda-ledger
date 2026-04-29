@@ -2,12 +2,12 @@
 //!
 //! Every gRPC handler that needs to know "what role is this node
 //! playing right now?" reads from a single `Arc<RoleFlag>`. The
-//! [`crate::cluster::supervisor::RoleSupervisor`] is the only writer.
+//! [`crate::supervisor::RoleSupervisor`] is the only writer.
 //! Lock-free reads on the hot path; transitions happen rarely
 //! (boot, election, divergence reseed) and use an `AcqRel`
 //! read-modify-write to publish a new role.
 //!
-//! `Role` mirrors the wire enum [`crate::cluster::proto::node::NodeRole`]
+//! `Role` mirrors the wire enum [`proto::node::NodeRole`]
 //! 1:1 so `Ping` / future `Status` responses can stamp the current
 //! value without extra mapping layers.
 //!
@@ -20,7 +20,7 @@
 //!   transition out of this; in Stage 3b the node sits in
 //!   Initializing forever (no leader to drive replication).
 
-use crate::cluster::proto::node as proto;
+use ::proto::node as proto;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Runtime role of a clustered node. Mirrors `proto::NodeRole`.

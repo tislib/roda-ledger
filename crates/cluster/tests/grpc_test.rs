@@ -1,12 +1,11 @@
-#[cfg(feature = "cluster")]
 mod tests {
-    use roda_ledger::cluster::proto::ledger::ledger_client::LedgerClient;
-    use roda_ledger::cluster::proto::ledger::{
+    use ::proto::ledger::ledger_client::LedgerClient;
+    use ::proto::ledger::{
         Deposit, GetBalanceRequest, GetBalancesRequest, GetPipelineIndexRequest, GetStatusRequest,
         GetStatusesRequest, SubmitBatchRequest, SubmitOperationRequest, Transfer, Withdrawal,
     };
-    use roda_ledger::cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
-    use roda_ledger::ledger::{Ledger, LedgerConfig};
+    use cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
+    use ledger::ledger::{Ledger, LedgerConfig};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -29,7 +28,7 @@ mod tests {
         let cci = ClusterCommitIndex::from_ledger(&ledger);
         tokio::spawn(async move {
             let server = Server::new(
-                Arc::new(roda_ledger::cluster::LedgerSlot::new(server_ledger)),
+                Arc::new(cluster::LedgerSlot::new(server_ledger)),
                 addr,
                 Arc::new(RoleFlag::new(Role::Leader)),
                 term,
@@ -63,7 +62,7 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                proto::ledger::submit_operation_request::Operation::Deposit(
                     Deposit {
                         account: 1,
                         amount: 1000,
@@ -96,7 +95,7 @@ mod tests {
         client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                    proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 2000,
@@ -110,7 +109,7 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Withdrawal(
+                proto::ledger::submit_operation_request::Operation::Withdrawal(
                     Withdrawal {
                         account: 1,
                         amount: 500,
@@ -141,7 +140,7 @@ mod tests {
         client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                    proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -155,7 +154,7 @@ mod tests {
 
         let request = SubmitOperationRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Transfer(
+                proto::ledger::submit_operation_request::Operation::Transfer(
                     Transfer {
                         from: 1,
                         to: 2,
@@ -187,7 +186,7 @@ mod tests {
             operations: vec![
                 SubmitOperationRequest {
                     operation: Some(
-                        roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                        proto::ledger::submit_operation_request::Operation::Deposit(
                             Deposit {
                                 account: 1,
                                 amount: 100,
@@ -198,7 +197,7 @@ mod tests {
                 },
                 SubmitOperationRequest {
                     operation: Some(
-                        roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                        proto::ledger::submit_operation_request::Operation::Deposit(
                             Deposit {
                                 account: 2,
                                 amount: 200,
@@ -233,7 +232,7 @@ mod tests {
         client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                    proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 5,
                             amount: 500,
@@ -279,7 +278,7 @@ mod tests {
                 operations: vec![
                     SubmitOperationRequest {
                         operation: Some(
-                            roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                            proto::ledger::submit_operation_request::Operation::Deposit(
                                 Deposit {
                                     account: 10,
                                     amount: 100,
@@ -290,7 +289,7 @@ mod tests {
                     },
                     SubmitOperationRequest {
                         operation: Some(
-                            roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                            proto::ledger::submit_operation_request::Operation::Deposit(
                                 Deposit {
                                     account: 11,
                                     amount: 200,
@@ -336,7 +335,7 @@ mod tests {
         let res1 = client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                    proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -396,7 +395,7 @@ mod tests {
         let res = client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                    proto::ledger::submit_operation_request::Operation::Deposit(
                         Deposit {
                             account: 1,
                             amount: 1000,
@@ -445,7 +444,7 @@ mod tests {
         let res = client
             .submit_operation(SubmitOperationRequest {
                 operation: Some(
-                    roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Withdrawal(
+                    proto::ledger::submit_operation_request::Operation::Withdrawal(
                         Withdrawal {
                             account: 100,
                             amount: 1000,

@@ -1,11 +1,10 @@
 //! Edge cases and adversarial input.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::proto::node as nproto;
-use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, Role};
+use ::proto::ledger::WaitLevel;
+use proto::node as nproto;
+use ::proto::node::node_server::Node;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; use cluster::{Role};
 use std::time::Duration;
 use tokio::time::sleep;
 use tonic::Request;
@@ -169,7 +168,7 @@ async fn cluster_node_restart_rehydrates_term() {
 
     {
         let _ctl = ClusterTestingControl::start(cfg()).await.unwrap();
-        let t = roda_ledger::cluster::Term::open_in_dir(&data_dir.to_string_lossy()).unwrap();
+        let t = cluster::raft::Term::open_in_dir(&data_dir.to_string_lossy()).unwrap();
         // Two boots → term bumped twice (≥ 2).
         assert!(t.get_current_term() >= 2, "term = {}", t.get_current_term());
     }
@@ -324,12 +323,12 @@ async fn candidate_rejects_writes() {
         .await
         .expect("bare start");
     let handler = ctl.ledger_handler(0).expect("handler");
-    use roda_ledger::cluster::proto::ledger as proto;
-    use roda_ledger::cluster::proto::ledger::ledger_server::Ledger as LedgerSvc;
+    use ::proto::ledger as proto;
+    use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
     let err = handler
         .submit_operation(Request::new(proto::SubmitOperationRequest {
             operation: Some(
-                roda_ledger::cluster::proto::ledger::submit_operation_request::Operation::Deposit(
+                proto::submit_operation_request::Operation::Deposit(
                     proto::Deposit {
                         account: 1,
                         amount: 1,

@@ -15,7 +15,7 @@
 //!    - In `Initializing` / `Follower`, awaits the election timer.
 //!      Expiry → transition to `Candidate`.
 //!    - In `Candidate`, runs one election round
-//!      ([`crate::cluster::raft::run_election_round`]).
+//!      ([`crate::raft::run_election_round`]).
 //!      `Won` → `Leader`. `HigherTermSeen` → `Initializing` (and
 //!      `Term::observe` is performed inside the round).
 //!      `Lost` → loop back to `Initializing` (re-arms timer).
@@ -32,16 +32,16 @@
 //! observes a higher term, every divergence-detected reseed,
 //! pushes a [`Transition`] enum value.
 
-use crate::cluster::config::Config;
-use crate::cluster::lifecycle::drain_in_drop;
-use crate::cluster::node_handler::NodeHandlerCore;
-use crate::cluster::raft::{
+use crate::config::Config;
+use crate::lifecycle::drain_in_drop;
+use crate::node_handler::NodeHandlerCore;
+use crate::raft::{
     ElectionOutcome, ElectionTimer, ElectionTimerConfig, Leader, Quorum, Role, RoleFlag, Term,
     Vote, run_election_round,
 };
-use crate::cluster::server::{NodeServerRuntime, Server};
-use crate::cluster::{LedgerSlot, NodeHandler};
-use crate::ledger::Ledger;
+use crate::server::{NodeServerRuntime, Server};
+use crate::{LedgerSlot, NodeHandler};
+use ledger::ledger::Ledger;
 use spdlog::{debug, error, info, warn};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -104,7 +104,7 @@ pub struct SupervisorHandles {
     /// `Quorum` actually stop refreshing on soft-shutdown. (Hard
     /// crashes don't need this — they kill all handler tasks
     /// instantly.)
-    pub node_core: Arc<crate::cluster::NodeHandlerCore>,
+    pub node_core: Arc<crate::NodeHandlerCore>,
     /// Cooperative shutdown trigger for the client-facing Ledger
     /// gRPC server. `Drop` calls `notify_waiters()` so
     /// `serve_with_shutdown` resolves and the server task exits.

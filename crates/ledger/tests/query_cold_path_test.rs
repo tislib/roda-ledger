@@ -360,6 +360,7 @@ fn test_query_survives_segment_rotation() {
 // ── Pre-seal and post-seal: data accessible via cold tier after seal ─────────
 
 #[test]
+
 #[ignore = "flaky test"]
 fn test_cold_tier_accessible_after_seal() {
     let dir = unique_dir("cold_after_seal");

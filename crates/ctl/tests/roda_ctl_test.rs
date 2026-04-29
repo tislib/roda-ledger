@@ -8,7 +8,7 @@ use storage::{WAL_MAGIC, WAL_VERSION};
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn roda_ctl() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_roda-ctl"))
+    Command::new(env!("CARGO_BIN_EXE_ctl"))
 }
 
 fn unique_dir(name: &str) -> PathBuf {

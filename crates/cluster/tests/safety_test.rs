@@ -8,11 +8,10 @@
 //! - `no_leader_blocks_writes`
 //! - `mid_election_cluster_commit_not_lost`
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
-use roda_ledger::entities::{FailReason, SYSTEM_ACCOUNT_ID};
+use ::proto::ledger::WaitLevel;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
+use storage::entities::{FailReason, SYSTEM_ACCOUNT_ID};
 use std::time::Duration;
 use tokio::time::sleep;
 

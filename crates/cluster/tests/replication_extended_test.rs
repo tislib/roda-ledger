@@ -1,15 +1,14 @@
 //! Lagged single-phase replication, AppendEntries semantics, lag
 //! observability.
 
-#![cfg(feature = "cluster")]
 
-use roda_ledger::cluster::proto::ledger::WaitLevel;
-use roda_ledger::cluster::proto::node as proto;
-use roda_ledger::cluster::proto::node::node_server::Node;
-use roda_ledger::cluster::{ClusterTestingConfig, ClusterTestingControl, Role};
-use roda_ledger::entities::SYSTEM_ACCOUNT_ID;
-use roda_ledger::ledger::Ledger;
-use roda_ledger::transaction::Operation;
+use ::proto::ledger::WaitLevel;
+use ::proto::node as proto;
+use ::proto::node::node_server::Node;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; use cluster::{Role};
+use storage::entities::SYSTEM_ACCOUNT_ID;
+use ledger::ledger::Ledger;
+use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -23,8 +22,8 @@ const AMOUNT: u64 = 100;
 async fn bare_follower() -> (
     ClusterTestingControl,
     Arc<Ledger>,
-    Arc<roda_ledger::cluster::Term>,
-    roda_ledger::cluster::NodeHandler,
+    Arc<cluster::raft::Term>,
+    cluster::NodeHandler,
 ) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::bare(Role::Follower))
         .await
@@ -282,7 +281,7 @@ async fn higher_term_append_entries_durably_observed() {
     // Reopen Term — durable. (Vote layer is independently maintained;
     // AE doesn't update it.)
     let dir = ctl.data_dir(0).unwrap().to_string_lossy().into_owned();
-    let t = roda_ledger::cluster::Term::open_in_dir(&dir).unwrap();
+    let t = cluster::raft::Term::open_in_dir(&dir).unwrap();
     assert_eq!(t.get_current_term(), 5);
 }
 

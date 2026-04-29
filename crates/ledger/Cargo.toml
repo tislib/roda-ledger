@@ -34,3 +34,23 @@ wat = "1"
 tempfile.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+
+[[bench]]
+name = "transactor_bench"
+harness = false
+
+[[bench]]
+name = "transaction_runner_bench"
+harness = false
+
+[[bench]]
+name = "transaction_runner_bench_wasm"
+harness = false
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "snapshot_bench"
+harness = false
