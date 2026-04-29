@@ -34,11 +34,26 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use raft::{
-    Action, ElectionTimerConfig, Event, LogEntryMeta, NodeId, RaftConfig, RaftNode, Role, TxId,
-};
+use raft::{Action, ElectionTimerConfig, Event, NodeId, RaftConfig, RaftNode, Role, Term, TxId};
 
 use mem_persistence::MemPersistence;
+
+/// Private harness mirror of one log entry. The library only ever
+/// talks about ranges; the harness expands ranges into per-entry
+/// records so the §5.3 / Log Matching property checks (which
+/// compare individual `(tx_id, term)` pairs across nodes) have
+/// something concrete to look at.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MirrorEntry {
+    pub tx_id: TxId,
+    pub term: Term,
+}
+
+impl MirrorEntry {
+    fn new(tx_id: TxId, term: Term) -> Self {
+        Self { tx_id, term }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Scheduled {
@@ -84,12 +99,12 @@ struct NodeBox {
     /// Append-only mirror of the local entry log. `tx_id` indexes
     /// `entries[tx_id - 1]` (1-based). Truncation drops the suffix.
     /// Survives crash/restart (models on-disk WAL).
-    entries: Vec<LogEntryMeta>,
+    entries: Vec<MirrorEntry>,
     /// Cluster commit watermark observed via `Action::AdvanceClusterCommit`.
     cluster_commit: TxId,
     /// (term, tx_id) pairs the node has been told to apply; used
     /// for state-machine safety checks.
-    applied: Vec<LogEntryMeta>,
+    applied: Vec<MirrorEntry>,
     /// Most recent `SetWakeup` requested by this node.
     pending_wakeup: Option<Instant>,
     /// Stable seed used to recreate the node on restart.
@@ -317,7 +332,7 @@ impl Sim {
             .unwrap_or(0)
     }
 
-    pub fn entries_of(&self, id: NodeId) -> &[LogEntryMeta] {
+    pub fn entries_of(&self, id: NodeId) -> &[MirrorEntry] {
         &self.nodes[&id].entries
     }
 
@@ -342,7 +357,7 @@ impl Sim {
             let start = node.commit_index();
             for i in 0..count {
                 let tx = start + 1 + i as u64;
-                b.entries.push(LogEntryMeta::new(tx, term));
+                b.entries.push(MirrorEntry::new(tx, term));
                 let acts = node.step(now, Event::LocalCommitAdvanced { tx_id: tx });
                 actions_acc.push((leader_id, acts));
             }
@@ -513,22 +528,35 @@ impl Sim {
                         self.schedule(when, to, event);
                     }
                 }
-                Action::AppendLog { tx_id, term } => {
+                Action::AppendLog { range } => {
+                    if range.is_empty() {
+                        continue;
+                    }
+                    let last_tx = range.last_tx_id().unwrap();
                     if let Some(b) = self.nodes.get_mut(&src) {
-                        while b.entries.len() < (tx_id as usize).saturating_sub(1) {
-                            b.entries.push(LogEntryMeta::new(0, 0));
-                        }
-                        if (tx_id as usize) <= b.entries.len() {
-                            b.entries[(tx_id - 1) as usize] = LogEntryMeta::new(tx_id, term);
-                        } else {
-                            b.entries.push(LogEntryMeta::new(tx_id, term));
+                        // Expand the range into individual mirror
+                        // entries. Pad with sentinel zeros if we'd
+                        // skip indices (shouldn't happen with a
+                        // correct §5.3 prev-log-term match — but be
+                        // defensive).
+                        for i in 0..range.count {
+                            let tx = range.start_tx_id + i;
+                            while b.entries.len() < (tx as usize).saturating_sub(1) {
+                                b.entries.push(MirrorEntry::new(0, 0));
+                            }
+                            let entry = MirrorEntry::new(tx, range.term);
+                            if (tx as usize) <= b.entries.len() {
+                                b.entries[(tx - 1) as usize] = entry;
+                            } else {
+                                b.entries.push(entry);
+                            }
                         }
                     }
                     let actions = self
                         .nodes
                         .get_mut(&src)
                         .and_then(|b| b.node.as_mut())
-                        .map(|n| n.step(now, Event::LogAppendComplete { tx_id }));
+                        .map(|n| n.step(now, Event::LogAppendComplete { tx_id: last_tx }));
                     if let Some(a) = actions {
                         self.process_actions(src, now, a);
                     }

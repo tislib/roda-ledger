@@ -9,22 +9,29 @@
 //! Everything below is a side effect the *driver* must perform
 //! (sending wire RPCs, appending the entry log, advancing apply
 //! gates, etc.).
+//!
+//! The library only ever talks about *ranges* — never individual
+//! entries — so `SendAppendEntries` and `AppendLog` both carry a
+//! single [`LogEntryRange`] (a contiguous, same-term chunk). The
+//! driver expands the range when reading from / writing to its WAL.
 
 use std::time::Instant;
 
-use crate::log_entry::LogEntryMeta;
+use crate::log_entry::LogEntryRange;
 use crate::role::Role;
 use crate::types::{NodeId, Term, TxId};
 
 #[derive(Clone, Debug)]
 pub enum Action {
     // ── outbound RPCs ───────────────────────────────────────────────────
+    /// `entries` is a single same-term contiguous range.
+    /// `LogEntryRange::empty()` is a heartbeat.
     SendAppendEntries {
         to: NodeId,
         term: Term,
         prev_log_tx_id: TxId,
         prev_log_term: Term,
-        entries: Vec<LogEntryMeta>,
+        entries: LogEntryRange,
         leader_commit: TxId,
     },
     SendAppendEntriesReply {
@@ -51,11 +58,12 @@ pub enum Action {
     /// `Persistence` trait; this action is for the *entry* log the
     /// driver owns. The driver acks via `Event::LogTruncateComplete`.
     TruncateLog { after_tx_id: TxId },
-    /// Append the entry whose metadata matches `(tx_id, term)`. The
-    /// driver already has the payload (it received it as part of the
-    /// inbound RPC); raft tells it to commit the metadata + payload
-    /// pair durably and then ack via `Event::LogAppendComplete`.
-    AppendLog { tx_id: TxId, term: Term },
+    /// Append the entries described by `range` to the entry log.
+    /// The driver already has the payloads (they came in on the
+    /// inbound RPC); this action tells it to commit metadata +
+    /// payloads durably and ack via `Event::LogAppendComplete` with
+    /// the highest tx_id in the range.
+    AppendLog { range: LogEntryRange },
 
     // ── apply pipeline gate ─────────────────────────────────────────────
     /// The cluster commit watermark advanced to `tx_id`. The driver

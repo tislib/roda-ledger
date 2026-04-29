@@ -38,7 +38,7 @@ use crate::candidate::CandidateState;
 use crate::event::Event;
 use crate::follower::FollowerState;
 use crate::leader::{InFlightAppend, LeaderState};
-use crate::log_entry::LogEntryMeta;
+use crate::log_entry::LogEntryRange;
 use crate::persistence::Persistence;
 use crate::quorum::Quorum;
 use crate::role::Role;
@@ -568,7 +568,7 @@ impl<P: Persistence> RaftNode<P> {
         term: Term,
         prev_log_tx_id: TxId,
         prev_log_term: Term,
-        entries: Vec<LogEntryMeta>,
+        entries: LogEntryRange,
         leader_commit: TxId,
         out: &mut Vec<Action>,
     ) {
@@ -626,25 +626,25 @@ impl<P: Persistence> RaftNode<P> {
             }
         }
 
-        // Append entries. Term-log mirror updates synchronously
-        // through the trait; the entry log is the driver's job.
-        for e in &entries {
-            if e.term > self.persistence.current_term()
-                && let Err(err) = self.persistence.observe_term(e.term, e.tx_id)
+        // Append entries. The range is same-term by construction —
+        // observe once if the term is new. The driver's entry log is
+        // updated via `Action::AppendLog`; the term-log mirror is
+        // updated synchronously through the trait above.
+        if !entries.is_empty() {
+            if entries.term > self.persistence.current_term()
+                && let Err(err) = self
+                    .persistence
+                    .observe_term(entries.term, entries.start_tx_id)
             {
                 warn!(
                     "raft: node_id={} observe_term({},{}) failed: {}",
-                    self.self_id, e.term, e.tx_id, err
+                    self.self_id, entries.term, entries.start_tx_id, err
                 );
             }
-            out.push(Action::AppendLog {
-                tx_id: e.tx_id,
-                term: e.term,
-            });
-        }
-
-        if let Some(last) = entries.last() {
-            self.local_log_index = last.tx_id;
+            out.push(Action::AppendLog { range: entries });
+            if let Some(last) = entries.last_tx_id() {
+                self.local_log_index = last;
+            }
         }
 
         let new_cluster = leader_commit.min(self.local_log_index);
@@ -711,22 +711,40 @@ impl<P: Persistence> RaftNode<P> {
                 .map(|r| r.term)
                 .unwrap_or(0);
 
-            let mut entries = Vec::new();
-            let mut tx = next_index;
-            while tx <= self.local_log_index && entries.len() < max_entries {
-                let term_at = self
+            // Build a single same-term contiguous range starting at
+            // next_index. The range stops at the next term boundary
+            // or at `max_entries`, whichever comes first; multi-term
+            // catch-up takes multiple AEs. Heartbeat (next_index >
+            // local_log_index) → empty range.
+            let entries = if next_index > self.local_log_index {
+                LogEntryRange::empty()
+            } else {
+                let range_term = self
                     .persistence
-                    .term_at_tx(tx)
+                    .term_at_tx(next_index)
                     .map(|r| r.term)
                     .unwrap_or(current_term);
-                entries.push(LogEntryMeta::new(tx, term_at));
-                tx += 1;
-            }
+                let mut count: u64 = 0;
+                let mut tx = next_index;
+                while tx <= self.local_log_index && count < max_entries as u64 {
+                    let t = self
+                        .persistence
+                        .term_at_tx(tx)
+                        .map(|r| r.term)
+                        .unwrap_or(current_term);
+                    if t != range_term {
+                        break;
+                    }
+                    count += 1;
+                    tx += 1;
+                }
+                LogEntryRange::new(next_index, count, range_term)
+            };
 
             (prev_log_tx_id, prev_log_term, entries)
         };
 
-        let last_tx_in_batch = entries.last().map(|e| e.tx_id).unwrap_or(prev_log_tx_id);
+        let last_tx_in_batch = entries.last_tx_id().unwrap_or(prev_log_tx_id);
 
         out.push(Action::SendAppendEntries {
             to: peer,
@@ -1122,17 +1140,20 @@ mod tests {
                 term: 1,
                 prev_log_tx_id: 0,
                 prev_log_term: 0,
-                entries: vec![LogEntryMeta::new(1, 1), LogEntryMeta::new(2, 1)],
+                entries: LogEntryRange::new(1, 2, 1),
                 leader_commit: 0,
             },
         );
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), 1);
-        let appends = actions
+        let appended_range: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, Action::AppendLog { .. }))
-            .count();
-        assert_eq!(appends, 2);
+            .filter_map(|a| match a {
+                Action::AppendLog { range } => Some(*range),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(appended_range, vec![LogEntryRange::new(1, 2, 1)]);
         let success = actions.iter().any(|a| match a {
             Action::SendAppendEntriesReply { success, .. } => *success,
             _ => false,
@@ -1154,7 +1175,7 @@ mod tests {
                 term: 2,
                 prev_log_tx_id: 5,
                 prev_log_term: 2,
-                entries: vec![],
+                entries: LogEntryRange::empty(),
                 leader_commit: 0,
             },
         );

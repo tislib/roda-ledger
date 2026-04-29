@@ -13,10 +13,11 @@
 //!
 //! Payload bytes do not flow through this enum (or through
 //! `Action`). The driver moves payloads between storage and the wire
-//! on its own; `LogEntryMeta` carries only the `(tx_id, term)` pair
-//! Raft needs for §5.3 prev_log_term matching.
+//! on its own; `LogEntryRange` carries only `(start_tx_id, count,
+//! term)` — the meta needed for §5.3 prev_log_term matching and
+//! durable term-log updates.
 
-use crate::log_entry::LogEntryMeta;
+use crate::log_entry::LogEntryRange;
 use crate::types::{NodeId, RejectReason, Term, TxId};
 
 #[derive(Clone, Debug)]
@@ -25,13 +26,14 @@ pub enum Event {
     /// `Action::SetWakeup` deadline arrives.
     Tick,
 
-    /// Inbound `AppendEntries` from a peer.
+    /// Inbound `AppendEntries` from a peer. `entries` is a single
+    /// same-term contiguous range — heartbeat is `LogEntryRange::empty()`.
     AppendEntriesRequest {
         from: NodeId,
         term: Term,
         prev_log_tx_id: TxId,
         prev_log_term: Term,
-        entries: Vec<LogEntryMeta>,
+        entries: LogEntryRange,
         leader_commit: TxId,
     },
 
@@ -66,7 +68,8 @@ pub enum Event {
     LocalCommitAdvanced { tx_id: TxId },
 
     /// Driver acknowledges the most recent `Action::AppendLog` for
-    /// the follower path.
+    /// the follower path. `tx_id` is the highest tx_id in the
+    /// just-appended range.
     LogAppendComplete { tx_id: TxId },
 
     /// Driver acknowledges the most recent `Action::TruncateLog`.

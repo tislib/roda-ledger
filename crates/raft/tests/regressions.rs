@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryMeta, NodeId, RaftConfig, RaftNode, Role};
+use raft::{Action, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, Role};
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
     RaftNode::new(
@@ -155,7 +155,7 @@ fn term_log_truncates_with_entry_log() {
             term: 1,
             prev_log_tx_id: 0,
             prev_log_term: 0,
-            entries: (1..=5).map(|tx| LogEntryMeta::new(tx, 1)).collect(),
+            entries: LogEntryRange::new(1, 5, 1),
             leader_commit: 0,
         },
     );
@@ -173,7 +173,7 @@ fn term_log_truncates_with_entry_log() {
             term: 2,
             prev_log_tx_id: 5,
             prev_log_term: 2,
-            entries: vec![],
+            entries: LogEntryRange::empty(),
             leader_commit: 0,
         },
     );

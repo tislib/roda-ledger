@@ -46,7 +46,7 @@ pub mod types;
 
 pub use action::Action;
 pub use event::Event;
-pub use log_entry::LogEntryMeta;
+pub use log_entry::LogEntryRange;
 pub use node::{RaftConfig, RaftNode};
 pub use persistence::{Persistence, TermRecord};
 pub use role::Role;

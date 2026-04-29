@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryMeta, NodeId, Persistence, RaftConfig, RaftNode, Role};
+use raft::{Action, Event, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, Role};
 
 fn pick_leader(sim: &Sim) -> Option<NodeId> {
     [1u64, 2, 3]
@@ -352,7 +352,7 @@ fn prev_log_tx_id_zero_skips_term_match_check() {
             // prev_log_term=99 would fail the term check, but tx 0
             // is the "start of log" sentinel — no check runs.
             prev_log_term: 99,
-            entries: vec![LogEntryMeta::new(1, 5)],
+            entries: LogEntryRange::new(1, 1, 5),
             leader_commit: 0,
         },
     );
@@ -376,11 +376,7 @@ fn leader_commit_clamp_to_local_log() {
             term: 1,
             prev_log_tx_id: 0,
             prev_log_term: 0,
-            entries: vec![
-                LogEntryMeta::new(1, 1),
-                LogEntryMeta::new(2, 1),
-                LogEntryMeta::new(3, 1),
-            ],
+            entries: LogEntryRange::new(1, 3, 1),
             leader_commit: 10, // intentionally beyond the batch
         },
     );
@@ -404,7 +400,7 @@ fn empty_append_entries_is_a_heartbeat() {
             term: 1,
             prev_log_tx_id: 0,
             prev_log_term: 0,
-            entries: vec![],
+            entries: LogEntryRange::empty(),
             leader_commit: 0,
         },
     );
@@ -444,7 +440,7 @@ fn append_entries_from_old_leader_is_rejected() {
             term: 3,
             prev_log_tx_id: 0,
             prev_log_term: 0,
-            entries: vec![],
+            entries: LogEntryRange::empty(),
             leader_commit: 0,
         },
     );
