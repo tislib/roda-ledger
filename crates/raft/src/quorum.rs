@@ -96,6 +96,23 @@ impl Quorum {
     pub fn match_index(&self, node_index: usize) -> u64 {
         self.match_index[node_index]
     }
+
+    /// Lower the slot for `node_index` to `target` if `target` is
+    /// strictly less than the current value. Defense-in-depth on
+    /// `RejectReason::LogMismatch` — standard Raft says
+    /// `match_index` is conservative (only ever raised on success),
+    /// but a partially-recovered peer that resurfaces with a
+    /// shorter durable log can leave the leader's `match_index`
+    /// stale, and a future majority tally would then count an
+    /// already-truncated index. The `cluster_commit_index`
+    /// watermark stays put: monotonicity is owned by `advance` and
+    /// `regress` does not republish it.
+    pub fn regress(&mut self, node_index: usize, target: u64) {
+        debug_assert!(node_index < self.match_index.len());
+        if target < self.match_index[node_index] {
+            self.match_index[node_index] = target;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +206,34 @@ mod tests {
         assert_eq!(q.advance(0, 50), None);
         assert_eq!(q.cluster_commit_index(), 100);
         assert_eq!(q.match_index(0), 100);
+    }
+
+    /// `regress` lowers a peer's slot but does not move the
+    /// cluster-commit watermark.
+    #[test]
+    fn regress_lowers_slot_but_does_not_lower_watermark() {
+        let mut q = Quorum::new(3);
+        q.advance(0, 100);
+        q.advance(1, 100);
+        assert_eq!(q.cluster_commit_index(), 100);
+
+        // Late LogMismatch reveals peer 1 is actually only at 50.
+        q.regress(1, 50);
+        assert_eq!(q.match_index(1), 50);
+        // Watermark held — `advance` is still the only writer.
+        assert_eq!(q.cluster_commit_index(), 100);
+    }
+
+    /// `regress` is a no-op when the target is at or above the
+    /// current slot value.
+    #[test]
+    fn regress_to_higher_or_equal_target_is_a_noop() {
+        let mut q = Quorum::new(3);
+        q.advance(0, 50);
+        q.regress(0, 50);
+        assert_eq!(q.match_index(0), 50);
+        q.regress(0, 100);
+        assert_eq!(q.match_index(0), 50);
     }
 
     /// `reset_peers` does not move the watermark.

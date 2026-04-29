@@ -103,6 +103,22 @@ pub struct RaftNode<P: Persistence> {
     local_log_index: TxId,
     cluster_commit_index: TxId,
 
+    /// First `tx_id` of the leader's current term — set on
+    /// `become_leader_after_win` to `local_log_index + 1` (matching
+    /// the `start_tx_id` passed to `commit_term`). Cleared on
+    /// step-down so a stale value doesn't leak into a follower's
+    /// `leader_commit` clamping.
+    ///
+    /// Raft §5.4.2 / Figure 8: a leader must not advance
+    /// `cluster_commit` to a tx_id below this watermark. Doing so
+    /// would commit prior-term entries by counting current-term
+    /// replicas, and a future leader could overwrite them. The
+    /// gate lives in `publish_cluster_commit`. Followers bypass it
+    /// (the field is reset to 0 on follower transition); they
+    /// trust the leader's `leader_commit`, which the leader has
+    /// already gated on its end.
+    current_term_first_tx: TxId,
+
     last_emitted_wakeup: Option<Instant>,
 
     cfg: RaftConfig,
@@ -150,6 +166,7 @@ impl<P: Persistence> RaftNode<P> {
             self_slot,
             local_log_index: 0,
             cluster_commit_index: 0,
+            current_term_first_tx: 0,
             last_emitted_wakeup: None,
             cfg,
         }
@@ -522,6 +539,10 @@ impl<P: Persistence> RaftNode<P> {
 
         self.election_timer.disarm();
         self.quorum.reset_peers(self.self_slot);
+        // Record this term's first-entry watermark *before* the
+        // first publish_cluster_commit can fire — Raft §5.4.2 /
+        // Figure 8 gate (see `publish_cluster_commit`).
+        self.current_term_first_tx = start_tx_id;
         if let Some(adv) = self.quorum.advance(self.self_slot, self.local_log_index) {
             self.publish_cluster_commit(adv, out);
         }
@@ -709,22 +730,35 @@ impl<P: Persistence> RaftNode<P> {
             // or at `max_entries`, whichever comes first; multi-term
             // catch-up takes multiple AEs. Heartbeat (next_index >
             // local_log_index) → empty range.
+            //
+            // Inside the `else` branch `next_index <= local_log_index`,
+            // so `next_index` indexes a real entry. Every in-log
+            // entry has a covering term-log record (`observe_term` is
+            // called for any new term, `commit_term` for a leader's
+            // own first entry; truncation drops both the entry and
+            // its term record together via `truncate_term_after`).
+            // A `None` from `term_at_tx` therefore signals a
+            // corrupted persistence — `expect` surfaces it instead
+            // of silently downgrading the entry to `current_term`,
+            // which would produce a malformed multi-term
+            // `LogEntryRange`.
             let entries = if next_index > self.local_log_index {
+                let _ = current_term; // not consulted in the heartbeat path
                 LogEntryRange::empty()
             } else {
                 let range_term = self
                     .persistence
                     .term_at_tx(next_index)
-                    .map(|r| r.term)
-                    .unwrap_or(current_term);
+                    .expect("term_at_tx must cover next_index when next_index <= local_log_index")
+                    .term;
                 let mut count: u64 = 0;
                 let mut tx = next_index;
                 while tx <= self.local_log_index && count < max_entries as u64 {
                     let t = self
                         .persistence
                         .term_at_tx(tx)
-                        .map(|r| r.term)
-                        .unwrap_or(current_term);
+                        .expect("term_at_tx must cover every in-log tx_id")
+                        .term;
                     if t != range_term {
                         break;
                     }
@@ -779,7 +813,12 @@ impl<P: Persistence> RaftNode<P> {
             return;
         }
 
-        let advanced = match &mut self.state {
+        // `Ok(adv)` — peer acked, advance the quorum slot to `adv`.
+        // `Err(Some(peer_last))` — `LogMismatch`; regress the
+        // quorum slot defensively to the peer's reported
+        // `last_tx_id`. `Err(None)` — non-mismatch reject (term
+        // behind, rpc timeout); leave the quorum alone.
+        let outcome: Result<TxId, Option<TxId>> = match &mut self.state {
             NodeState::Leader(l) => {
                 let progress = match l.peers.get_mut(&from) {
                     Some(p) => p,
@@ -791,33 +830,45 @@ impl<P: Persistence> RaftNode<P> {
                         progress.match_index = last_tx_id;
                     }
                     progress.next_index = last_tx_id + 1;
-                    Some(last_tx_id)
+                    Ok(last_tx_id)
                 } else {
                     match reject_reason {
-                        Some(RejectReason::TermBehind) => {}
-                        Some(RejectReason::RpcTimeout) => {}
+                        Some(RejectReason::TermBehind) | Some(RejectReason::RpcTimeout) => Err(None),
                         // LogMismatch (explicit) and the unannotated
                         // case both mean §5.3: walk `next_index` back
                         // one entry. Clamp at 1 — tx_id 0 is the "no
                         // entry" sentinel.
                         Some(RejectReason::LogMismatch) | None => {
                             progress.next_index = progress.next_index.saturating_sub(1).max(1);
+                            Err(Some(last_tx_id))
                         }
                     }
-                    None
                 }
             }
             _ => return,
         };
 
-        if let Some(advanced_to) = advanced {
-            let self_slot_index = match self.peers.iter().position(|p| *p == from) {
-                Some(idx) => idx,
-                None => return,
-            };
-            if let Some(new_cluster) = self.quorum.advance(self_slot_index, advanced_to) {
-                self.publish_cluster_commit(new_cluster, out);
+        let self_slot_index = match self.peers.iter().position(|p| *p == from) {
+            Some(idx) => idx,
+            None => return,
+        };
+        match outcome {
+            Ok(advanced_to) => {
+                if let Some(new_cluster) = self.quorum.advance(self_slot_index, advanced_to) {
+                    self.publish_cluster_commit(new_cluster, out);
+                }
             }
+            Err(Some(peer_last_tx)) => {
+                // Defense-in-depth: a partially-recovered peer can
+                // resurface with a shorter durable log than its
+                // earlier acks claimed; lower the slot to the
+                // peer's freshly-reported `last_tx_id`. The
+                // `cluster_commit_index` watermark stays put
+                // (`Quorum::regress` does not republish it), so a
+                // committed entry can never become uncommitted.
+                self.quorum.regress(self_slot_index, peer_last_tx);
+            }
+            Err(None) => {}
         }
     }
 
@@ -873,14 +924,22 @@ impl<P: Persistence> RaftNode<P> {
     /// Term of the local log entry at `local_log_index`. `0` means
     /// the log is empty — required by §5.4.1's up-to-date check,
     /// which treats the empty log as "term 0".
+    ///
+    /// When `local_log_index > 0` there is, by construction, a
+    /// term-log record covering it (every entry's term is recorded
+    /// via `observe_term` / `commit_term`, and truncation drops
+    /// the entry and its term record together). A `None` from
+    /// `term_at_tx` here therefore means the persistence layer is
+    /// corrupted: returning a default term would silently break
+    /// §5.4.1's election safety, so `expect` surfaces it loudly.
     fn local_last_term(&self) -> Term {
         if self.local_log_index == 0 {
             return 0;
         }
         self.persistence
             .term_at_tx(self.local_log_index)
-            .map(|r| r.term)
-            .unwrap_or(0)
+            .expect("term_at_tx must cover local_log_index when local_log_index > 0")
+            .term
     }
 
     fn transition_to_follower(&mut self, now: Instant, leader_id: Option<NodeId>) {
@@ -890,9 +949,33 @@ impl<P: Persistence> RaftNode<P> {
         };
         std::mem::swap(&mut self.state, &mut state);
         self.election_timer.arm(now);
+        // The §5.4.2 watermark is leader-only — clear it so a stale
+        // value does not block this node, now a follower, from
+        // accepting the new leader's `leader_commit`.
+        self.current_term_first_tx = 0;
     }
 
     fn publish_cluster_commit(&mut self, new_value: TxId, out: &mut Vec<Action>) {
+        // Raft §5.4.2 / Figure 8: a leader must not commit
+        // prior-term entries by counting replicas. Block any
+        // advance below this term's first-entry watermark — once
+        // an entry from the current term has been committed by
+        // replica count, the Log Matching Property carries prior
+        // entries along.
+        //
+        // Single-node clusters skip the gate: there are no peers
+        // to disagree, so no future leader can overwrite. The
+        // gate would otherwise leave a single-node leader unable
+        // to commit recovered prior-term entries until the next
+        // client write.
+        //
+        // Followers also bypass the gate via `current_term_first_tx
+        // == 0` (cleared in `transition_to_follower`); they trust
+        // the leader's `leader_commit`, which the leader has
+        // already gated on its end.
+        if self.peers.len() > 1 && new_value < self.current_term_first_tx {
+            return;
+        }
         if new_value > self.cluster_commit_index {
             self.cluster_commit_index = new_value;
             out.push(Action::AdvanceClusterCommit { tx_id: new_value });

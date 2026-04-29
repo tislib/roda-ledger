@@ -217,6 +217,124 @@ fn commit_term_refuses_when_already_advanced() {
     assert!(!p.commit_term(5, 0).unwrap());
 }
 
+/// **Raft §5.4.2 / Figure 8** — a new leader must not commit
+/// entries from previous terms by counting replicas. Only entries
+/// from the leader's current term may be committed by replica
+/// counting; prior-term entries become committed indirectly via
+/// the Log Matching Property, but only once a current-term entry
+/// has crossed the commit boundary.
+///
+/// **The trigger.** In a 5-node cluster, the old leader at term 1
+/// partially replicated entries 1..=5 to this node before
+/// crashing — but it never reached the 3-of-5 majority needed to
+/// advance `cluster_commit`, so this node holds the entries with
+/// `cluster_commit = 0`. This node now wins term 2 (its log is
+/// most up-to-date) and immediately receives `last_tx_id = 5`
+/// acks from a quorum of peers. The acks reflect each peer
+/// catching up the prior-term log; no current-term entry has been
+/// proposed yet.
+///
+/// Without the §5.4.2 guard, the leader counts 3-of-5 acks at
+/// `last_tx = 5` and advances `cluster_commit` to 5 — committing
+/// term-1 entries by counting term-2 replicas. A subsequent
+/// leader could then overwrite those entries, the canonical
+/// Figure 8 violation.
+#[test]
+fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
+    let mut node = fresh_node(1, vec![1, 2, 3, 4, 5]);
+    let t0 = Instant::now();
+    let _ = node.step(t0, Event::Tick);
+
+    // Phase 1 — receive entries 1..=5 at term 1 from a leader
+    // whose own commit watermark is still 0 (it crashed before
+    // achieving majority on these entries).
+    let _ = node.step(
+        t0 + Duration::from_millis(10),
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 0,
+            prev_log_term: 0,
+            entries: LogEntryRange::new(1, 5, 1),
+            leader_commit: 0,
+        },
+    );
+    let _ = node.step(
+        t0 + Duration::from_millis(11),
+        Event::LogAppendComplete { tx_id: 5 },
+    );
+    assert_eq!(node.commit_index(), 5, "local_log_index reflects entries");
+    assert_eq!(
+        node.cluster_commit_index(),
+        0,
+        "no commit propagated yet — old leader crashed pre-majority"
+    );
+
+    // Phase 2 — silence past the election timeout, become
+    // candidate at term 2, then collect votes from 2 peers (with
+    // self-vote that is 3/5, a majority) and become leader.
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    assert_eq!(node.role(), Role::Candidate);
+    let cand_term = node.current_term();
+    assert_eq!(cand_term, 2);
+
+    let now = t0 + Duration::from_secs(60) + Duration::from_millis(1);
+    let _ = node.step(
+        now,
+        Event::RequestVoteReply {
+            from: 3,
+            term: cand_term,
+            granted: true,
+        },
+    );
+    let _ = node.step(
+        now,
+        Event::RequestVoteReply {
+            from: 4,
+            term: cand_term,
+            granted: true,
+        },
+    );
+    assert!(
+        node.role().is_leader(),
+        "should be leader at term {cand_term} after 3-of-5 votes"
+    );
+
+    // Phase 3 — receive the catch-up acks. Each peer reports
+    // `last_tx_id = 5` after the new leader's first AE rounds
+    // bring their logs up to the prior-term high-water mark.
+    // Without §5.4.2, this advances `cluster_commit` to 5
+    // (committing term-1 entries by current-term replica count).
+    let _ = node.step(
+        now,
+        Event::AppendEntriesReply {
+            from: 3,
+            term: cand_term,
+            success: true,
+            last_tx_id: 5,
+            reject_reason: None,
+        },
+    );
+    let _ = node.step(
+        now,
+        Event::AppendEntriesReply {
+            from: 4,
+            term: cand_term,
+            success: true,
+            last_tx_id: 5,
+            reject_reason: None,
+        },
+    );
+
+    assert!(
+        node.cluster_commit_index() < 5,
+        "Figure 8 violation: new leader at term {} committed prior-term entries by replica counting (cluster_commit={}, local_log_index={})",
+        cand_term,
+        node.cluster_commit_index(),
+        node.commit_index(),
+    );
+}
+
 /// 3-node cluster after a leader crash converges with all four
 /// safety properties intact. The "system stays correct under
 /// failover" smoke test that catches regressions across the entire
