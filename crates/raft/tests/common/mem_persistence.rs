@@ -14,6 +14,15 @@ pub struct MemPersistence {
     term_log: Vec<TermRecord>,
     vote_term: TermNum,
     voted_for: NodeId,
+    /// Test fault-injection: when set, `truncate_term_after` returns
+    /// an `io::Error` instead of mutating the term log. Used by the
+    /// regression tests in `tests/error_handling.rs` to verify the
+    /// library promotes a persistence I/O failure into an
+    /// `Action::FatalError` instead of silently continuing.
+    pub fail_truncate: bool,
+    /// Test fault-injection: when set, `observe_term` returns an
+    /// `io::Error`. Same purpose as `fail_truncate`.
+    pub fail_observe_term: bool,
 }
 
 impl MemPersistence {
@@ -28,6 +37,8 @@ impl MemPersistence {
             term_log,
             vote_term,
             voted_for,
+            fail_truncate: false,
+            fail_observe_term: false,
         }
     }
 }
@@ -77,6 +88,9 @@ impl Persistence for MemPersistence {
     }
 
     fn observe_term(&mut self, term: TermNum, start_tx_id: TxId) -> io::Result<()> {
+        if self.fail_observe_term {
+            return Err(io::Error::other("mem_persistence: injected observe_term failure"));
+        }
         let current = self.current_term();
         if term == current {
             return Ok(());
@@ -95,6 +109,9 @@ impl Persistence for MemPersistence {
     }
 
     fn truncate_term_after(&mut self, tx_id: TxId) -> io::Result<()> {
+        if self.fail_truncate {
+            return Err(io::Error::other("mem_persistence: injected truncate_term_after failure"));
+        }
         self.term_log.retain(|r| r.start_tx_id <= tx_id);
         Ok(())
     }

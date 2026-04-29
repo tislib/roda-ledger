@@ -147,8 +147,10 @@ fn log_mismatch_decrements_next_index() {
 fn term_log_truncates_with_entry_log() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
 
-    // Drive entries 1..5 at term 1 into the follower.
-    let actions = node.step(
+    // Drive entries 1..5 at term 1 into the follower. The driver
+    // acks durability via LogAppendComplete, which is what advances
+    // `local_log_index` (and drains the parked success reply).
+    let _ = node.step(
         Instant::now(),
         Event::AppendEntriesRequest {
             from: 2,
@@ -159,7 +161,7 @@ fn term_log_truncates_with_entry_log() {
             leader_commit: 0,
         },
     );
-    let _ = actions;
+    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 5 });
     assert_eq!(node.commit_index(), 5);
 
     // Now arrive an AppendEntries from a leader at term 2 with

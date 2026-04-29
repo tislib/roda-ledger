@@ -81,4 +81,17 @@ pub enum Action {
     /// Schedule the next `Event::Tick` at `at`. The library re-emits
     /// this on every transition that changes the soonest deadline.
     SetWakeup { at: Instant },
+
+    // ── fatal failures ──────────────────────────────────────────────────
+    /// Unrecoverable failure (e.g. a `Persistence` write returned
+    /// `Err`). The library has frozen its state machine: subsequent
+    /// `step()` calls return an empty action vec. The driver MUST
+    /// shut the node down on receipt — continuing risks committing
+    /// non-durable entries or violating §5.3 / §5.4 because the
+    /// in-memory state and the on-disk state may have diverged.
+    ///
+    /// `reason` is a fixed `&'static str` from a closed set of failure
+    /// sites; it is intended for logging, not for branching driver
+    /// logic. Promote to `Box<str>` if dynamic context is ever needed.
+    FatalError { reason: &'static str },
 }

@@ -148,6 +148,12 @@ pub struct Sim {
     leaders_per_term: HashMap<u64, HashSet<NodeId>>,
     /// Recorded so callers can inspect after the run.
     transitions: Vec<(NodeId, Role, u64)>,
+    /// `Action::FatalError` emissions captured during the run. Test
+    /// assertions can check this to spot a Raft node that froze
+    /// itself due to a persistence I/O failure or invariant
+    /// violation. Most simulator scenarios should expect this to be
+    /// empty.
+    fatal_errors: Vec<(NodeId, &'static str)>,
 }
 
 impl Sim {
@@ -186,6 +192,7 @@ impl Sim {
             fault_rng: rand::rngs::StdRng::seed_from_u64(seed_base ^ 0xDEAD_BEEF),
             leaders_per_term: HashMap::new(),
             transitions: Vec::new(),
+            fatal_errors: Vec::new(),
         };
         // Bootstrap each node with an initial Tick — primes the
         // election timer per the lazy-arm convention in `node.rs`.
@@ -601,6 +608,14 @@ impl Sim {
                         b.pending_wakeup = Some(at);
                     }
                     self.schedule(at, src, Event::Tick);
+                }
+                Action::FatalError { reason } => {
+                    // The library has frozen — record it for the
+                    // assertion helpers. In simulator runs that don't
+                    // expect a fatal, this surfaces via
+                    // `Sim::fatal_errors()` (panic-on-unexpected is the
+                    // caller's responsibility).
+                    self.fatal_errors.push((src, reason));
                 }
             }
         }

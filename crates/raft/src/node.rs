@@ -68,6 +68,34 @@ impl Default for RaftConfig {
     }
 }
 
+impl RaftConfig {
+    /// Validate that the configuration won't pathologically misbehave
+    /// at runtime. Specifically:
+    ///
+    /// - The randomised election timeout range must be non-empty
+    ///   (`max_ms > min_ms`) — otherwise the random spread degenerates
+    ///   and split-vote storms become likely.
+    /// - The heartbeat interval must be safely below the minimum
+    ///   election timeout. We require `heartbeat_interval * 2 <
+    ///   min_ms` so a single missed heartbeat doesn't trigger an
+    ///   election; this is the standard Raft sizing rule.
+    ///
+    /// Returns the offending field name on failure. Called from
+    /// `RaftNode::new` so misconfiguration fails loudly at boot.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.election_timer.max_ms <= self.election_timer.min_ms {
+            return Err("RaftConfig: election_timer.max_ms must be > min_ms");
+        }
+        let hb_ms = self.heartbeat_interval.as_millis() as u64;
+        if hb_ms.saturating_mul(2) >= self.election_timer.min_ms {
+            return Err(
+                "RaftConfig: heartbeat_interval * 2 must be < election_timer.min_ms",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Role-specific state held inline so the type system enforces
 /// "you can only access leader state if you are the leader".
 enum NodeState {
@@ -99,6 +127,12 @@ pub struct RaftNode<P: Persistence> {
 
     quorum: Quorum,
     self_slot: usize,
+
+    /// Set once the library has emitted `Action::FatalError`. Every
+    /// subsequent `step()` returns an empty action vec — the node is
+    /// frozen and the driver must shut it down. We don't re-emit the
+    /// fatal: the driver already saw it once.
+    failed: bool,
 
     local_log_index: TxId,
     cluster_commit_index: TxId,
@@ -149,6 +183,8 @@ impl<P: Persistence> RaftNode<P> {
             peers.contains(&self_id),
             "raft: peers list must contain self_id"
         );
+        cfg.validate()
+            .expect("raft: RaftConfig::validate failed at construction");
 
         let self_slot = peers
             .iter()
@@ -164,6 +200,7 @@ impl<P: Persistence> RaftNode<P> {
             persistence,
             quorum,
             self_slot,
+            failed: false,
             local_log_index: 0,
             cluster_commit_index: 0,
             current_term_first_tx: 0,
@@ -232,6 +269,14 @@ impl<P: Persistence> RaftNode<P> {
     // ─── step() ──────────────────────────────────────────────────────────
 
     pub fn step(&mut self, now: Instant, event: Event) -> Vec<Action> {
+        // Once the library has emitted a `FatalError`, every
+        // subsequent step is a no-op. The driver already received the
+        // signal and must shut the node down; continuing would risk
+        // committing non-durable entries or violating §5.3 / §5.4
+        // because in-memory state and on-disk state may have diverged.
+        if self.failed {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         match event {
             Event::Tick => self.on_tick(now, &mut out),
@@ -285,11 +330,26 @@ impl<P: Persistence> RaftNode<P> {
             Event::LocalCommitAdvanced { tx_id } => {
                 self.on_local_commit_advanced(tx_id, &mut out);
             }
-            Event::LogAppendComplete { tx_id } => self.on_log_append_complete(tx_id),
+            Event::LogAppendComplete { tx_id } => {
+                self.on_log_append_complete(tx_id, &mut out);
+            }
             Event::LogTruncateComplete { up_to } => self.on_log_truncate_complete(up_to),
         }
-        self.emit_wakeup_if_changed(&mut out);
+        // Skip wakeup emission if a fatal happened in this step —
+        // there is no future work for the timer to wake up to.
+        if !self.failed {
+            self.emit_wakeup_if_changed(&mut out);
+        }
         out
+    }
+
+    /// Mark the node fatally failed and emit `Action::FatalError`.
+    /// Callers must `return` immediately after invoking this — once
+    /// `failed` is set, the rest of the current handler should not
+    /// queue further actions or mutate state.
+    fn fatal(&mut self, reason: &'static str, out: &mut Vec<Action>) {
+        self.failed = true;
+        out.push(Action::FatalError { reason });
     }
 
     // ─── Tick ────────────────────────────────────────────────────────────
@@ -615,14 +675,31 @@ impl<P: Persistence> RaftNode<P> {
             if !log_covers_prev || our_term_at_prev != prev_log_term {
                 if log_covers_prev {
                     let after = prev_log_tx_id.saturating_sub(1);
+                    // Leader Completeness §5.4: a leader cannot ask
+                    // a follower to truncate below the cluster commit
+                    // index. If this fires, a Raft invariant has
+                    // already been violated upstream — surface it
+                    // loudly in debug builds rather than silently
+                    // clamping over the bug. The release-build clamp
+                    // below stays as belt-and-suspenders.
+                    debug_assert!(
+                        after >= self.cluster_commit_index,
+                        "truncation below cluster_commit_index: after={} cluster={}",
+                        after,
+                        self.cluster_commit_index
+                    );
                     // Library's term-log mirror: durable through the
-                    // trait. The driver's entry log is truncated via
-                    // the action below.
+                    // trait. If this write fails the term log is
+                    // intact (rename-based replacement) but we cannot
+                    // proceed — the driver's entry log truncation
+                    // would otherwise leave the two stores diverged.
                     if let Err(e) = self.persistence.truncate_term_after(after) {
                         warn!(
                             "raft: node_id={} truncate_term_after({}) failed: {}",
                             self.self_id, after, e
                         );
+                        self.fatal("truncate_term_after failed", out);
+                        return;
                     }
                     out.push(Action::TruncateLog { after_tx_id: after });
                     self.local_log_index = after;
@@ -654,13 +731,39 @@ impl<P: Persistence> RaftNode<P> {
                     "raft: node_id={} observe_term({},{}) failed: {}",
                     self.self_id, entries.term, entries.start_tx_id, err
                 );
+                self.fatal("observe_term failed", out);
+                return;
             }
             out.push(Action::AppendLog { range: entries });
-            if let Some(last) = entries.last_tx_id() {
-                self.local_log_index = last;
+
+            // Park the success reply until the driver has durably
+            // appended the entries (it acks via
+            // `Event::LogAppendComplete`). Sending success here would
+            // let the leader count an entry as replicated before it
+            // is on disk on this follower — a write-ahead-invariant
+            // violation, see ADR-0017 §"Required Invariants" #3.
+            let parked_tx_id = entries
+                .last_tx_id()
+                .expect("non-empty range has a last_tx_id");
+            let reply_term = self.current_term();
+            if let NodeState::Follower(f) = &mut self.state {
+                f.park_reply(crate::follower::PendingReply {
+                    to: from,
+                    term: reply_term,
+                    last_tx_id: parked_tx_id,
+                    leader_commit,
+                });
             }
+
+            // Note: `local_log_index` and `cluster_commit_index` are
+            // NOT advanced here — they advance when
+            // `on_log_append_complete` runs, which is also where the
+            // parked reply is drained and `leader_commit` is applied.
+            return;
         }
 
+        // Heartbeat path (no entries): no durability needed, reply
+        // immediately. `leader_commit` still propagates.
         let new_cluster = leader_commit.min(self.local_log_index);
         if new_cluster > self.cluster_commit_index {
             self.publish_cluster_commit(new_cluster, out);
@@ -848,13 +951,13 @@ impl<P: Persistence> RaftNode<P> {
             _ => return,
         };
 
-        let self_slot_index = match self.peers.iter().position(|p| *p == from) {
+        let peer_slot_index = match self.peers.iter().position(|p| *p == from) {
             Some(idx) => idx,
             None => return,
         };
         match outcome {
             Ok(advanced_to) => {
-                if let Some(new_cluster) = self.quorum.advance(self_slot_index, advanced_to) {
+                if let Some(new_cluster) = self.quorum.advance(peer_slot_index, advanced_to) {
                     self.publish_cluster_commit(new_cluster, out);
                 }
             }
@@ -866,7 +969,7 @@ impl<P: Persistence> RaftNode<P> {
                 // `cluster_commit_index` watermark stays put
                 // (`Quorum::regress` does not republish it), so a
                 // committed entry can never become uncommitted.
-                self.quorum.regress(self_slot_index, peer_last_tx);
+                self.quorum.regress(peer_slot_index, peer_last_tx);
             }
             Err(None) => {}
         }
@@ -885,9 +988,30 @@ impl<P: Persistence> RaftNode<P> {
         }
     }
 
-    fn on_log_append_complete(&mut self, tx_id: TxId) {
+    fn on_log_append_complete(&mut self, tx_id: TxId, out: &mut Vec<Action>) {
         if tx_id > self.local_log_index {
             self.local_log_index = tx_id;
+        }
+        // If a follower had a deferred AppendEntries success reply
+        // waiting on this durability ack, drain it now and apply
+        // `leader_commit` (Raft §5.3 commit advance). Heartbeats and
+        // rejections never park anything here.
+        let drained = if let NodeState::Follower(f) = &mut self.state {
+            f.take_ready_reply(tx_id)
+        } else {
+            None
+        };
+        if let Some(pending) = drained {
+            let new_cluster = pending.leader_commit.min(self.local_log_index);
+            if new_cluster > self.cluster_commit_index {
+                self.publish_cluster_commit(new_cluster, out);
+            }
+            out.push(Action::SendAppendEntriesReply {
+                to: pending.to,
+                term: pending.term,
+                success: true,
+                last_tx_id: pending.last_tx_id,
+            });
         }
     }
 
@@ -1227,9 +1351,28 @@ mod tests {
             })
             .collect();
         assert_eq!(appended_range, vec![LogEntryRange::new(1, 2, 1)]);
-        let success = actions.iter().any(|a| match a {
-            Action::SendAppendEntriesReply { success, .. } => *success,
-            _ => false,
+        // Per the durability-before-reply rule the success reply is
+        // parked until the driver acks via `LogAppendComplete`. The
+        // first step must NOT contain a success reply.
+        let early_success = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SendAppendEntriesReply { success: true, .. }
+            )
+        });
+        assert!(!early_success);
+
+        // After the driver confirms durability, the parked success
+        // reply fires.
+        let after_ack = node.step(
+            Instant::now(),
+            Event::LogAppendComplete { tx_id: 2 },
+        );
+        let success = after_ack.iter().any(|a| {
+            matches!(
+                a,
+                Action::SendAppendEntriesReply { success: true, .. }
+            )
         });
         assert!(success);
     }
@@ -1304,5 +1447,50 @@ mod tests {
         assert_eq!(restarted.voted_for(), Some(1));
         assert_eq!(restarted.role(), Role::Initializing);
         assert_eq!(restarted.commit_index(), 0);
+    }
+
+    // ── RaftConfig::validate (audit finding #5) ──────────────────────────
+
+    #[test]
+    fn raftconfig_validate_accepts_default() {
+        assert!(RaftConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn raftconfig_validate_rejects_heartbeat_too_close_to_election_timeout() {
+        let cfg = RaftConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            election_timer: ElectionTimerConfig {
+                min_ms: 150,
+                max_ms: 300,
+            },
+            rpc_timeout: Duration::from_millis(500),
+            max_entries_per_append: 64,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn raftconfig_validate_rejects_inverted_election_timer_range() {
+        let cfg = RaftConfig {
+            election_timer: ElectionTimerConfig {
+                min_ms: 300,
+                max_ms: 150,
+            },
+            ..RaftConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn raftconfig_validate_rejects_equal_election_timer_range() {
+        let cfg = RaftConfig {
+            election_timer: ElectionTimerConfig {
+                min_ms: 200,
+                max_ms: 200,
+            },
+            ..RaftConfig::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }

@@ -339,11 +339,12 @@ fn leader_log_is_append_only() {
 
 /// AppendEntries with `prev_log_tx_id=0` (start of log) is accepted
 /// without a §5.3 check — that's the convention for the empty-log
-/// boundary.
+/// boundary. The success reply is parked until the driver
+/// acknowledges the durable append via `LogAppendComplete`.
 #[test]
 fn prev_log_tx_id_zero_skips_term_match_check() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let actions = node.step(
+    let first = node.step(
         Instant::now(),
         Event::AppendEntriesRequest {
             from: 2,
@@ -356,20 +357,29 @@ fn prev_log_tx_id_zero_skips_term_match_check() {
             leader_commit: 0,
         },
     );
-    let success = actions.iter().any(|a| match a {
-        Action::SendAppendEntriesReply { success, .. } => *success,
-        _ => false,
-    });
+    // No early success reply: it must wait for durability.
+    assert!(!first.iter().any(|a| matches!(
+        a,
+        Action::SendAppendEntriesReply { success: true, .. }
+    )));
+    // Driver acks durability; success reply now fires.
+    let after = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 1 });
+    let success = after.iter().any(|a| matches!(
+        a,
+        Action::SendAppendEntriesReply { success: true, .. }
+    ));
     assert!(success);
 }
 
 /// Follower clamps `leader_commit` to its local log length: a leader
 /// telling it `leader_commit=10` while it only has up to tx 3
-/// advances `cluster_commit_index` to 3, not 10.
+/// advances `cluster_commit_index` to 3, not 10. The advance is
+/// emitted only after the driver durably appends the entries —
+/// `cluster_commit` cannot ride ahead of durability.
 #[test]
 fn leader_commit_clamp_to_local_log() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let actions = node.step(
+    let first = node.step(
         Instant::now(),
         Event::AppendEntriesRequest {
             from: 2,
@@ -380,7 +390,16 @@ fn leader_commit_clamp_to_local_log() {
             leader_commit: 10, // intentionally beyond the batch
         },
     );
-    let advance: Option<u64> = actions.iter().find_map(|a| match a {
+    // Cluster commit cannot advance before the entries are durable.
+    assert!(!first
+        .iter()
+        .any(|a| matches!(a, Action::AdvanceClusterCommit { .. })));
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Driver acks durability — `leader_commit` is now applied,
+    // clamped at the new `local_log_index = 3`.
+    let after = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 3 });
+    let advance: Option<u64> = after.iter().find_map(|a| match a {
         Action::AdvanceClusterCommit { tx_id } => Some(*tx_id),
         _ => None,
     });
