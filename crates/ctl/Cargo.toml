@@ -6,22 +6,18 @@ authors.workspace = true
 license.workspace = true
 publish = false
 
-[main]
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "roda-ctl"
 path = "src/main.rs"
 
 [dependencies]
-cluster.workspace = true
-ledger.workspace = true
 storage.workspace = true
-proto.workspace = true
 bytemuck = { version = "1.21.0", features = ["derive"] }
 crc32c = "0.6"
 lz4_flex = "0.11"
-
-tokio.workspace = true
-tonic.workspace = true
-spdlog-rs.workspace = true
+serde_json = "1"
+clap.workspace = true
 tempfile.workspace = true
-arc-swap.workspace = true
-rand.workspace = true
-anyhow.workspace = true

@@ -1,7 +1,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::entities::*;
+use storage::entities::*;
 
 use super::json::{compute_tx_crc_with_links, verify_tx_crc_with_links, wal_entry_to_json};
 use super::{CtlError, open_segment_from_path};

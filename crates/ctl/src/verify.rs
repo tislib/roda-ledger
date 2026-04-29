@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::entities::*;
+use storage::entities::*;
 use storage::{SegmentStaus, WAL_MAGIC, WAL_VERSION};
 
 use super::json::{compute_tx_crc_with_links, verify_tx_crc_with_links};

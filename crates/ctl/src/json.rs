@@ -1,5 +1,5 @@
-use crate::entities::TxLinkKind;
-use crate::entities::*;
+use storage::entities::TxLinkKind;
+use storage::entities::*;
 use storage::{WAL_MAGIC, WAL_VERSION};
 
 pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {

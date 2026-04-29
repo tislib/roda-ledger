@@ -1,11 +1,10 @@
 //! End-to-end correctness invariants: balance convergence, byte-exact
 //! WAL replication, durable acknowledged writes.
 
-
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
-use storage::entities::SYSTEM_ACCOUNT_ID;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
+use storage::entities::SYSTEM_ACCOUNT_ID;
 
 const ACCOUNT_A: u64 = 11;
 const ACCOUNT_B: u64 = 22;
@@ -15,44 +14,42 @@ const AMOUNT: u64 = 100;
 /// converge on the same balances for every account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn balances_converge_across_nodes_after_churn() {
-    loop {
-        let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
-            .await
-            .expect("start");
-        let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
+    let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
-        let mut user_ref: u64 = 1;
-        for round in 0..3 {
-            for _ in 0..10 {
-                ctl.deposit_and_wait(ACCOUNT_A, AMOUNT, user_ref, WaitLevel::ClusterCommit)
-                    .await
-                    .unwrap();
-                user_ref += 1;
-                ctl.deposit_and_wait(ACCOUNT_B, AMOUNT, user_ref, WaitLevel::ClusterCommit)
-                    .await
-                    .unwrap();
-                user_ref += 1;
-            }
-            // Kill current leader and let a new one rise (except on last round).
-            if round < 2 {
-                let li = ctl.leader_index().await.unwrap();
-                ctl.stop_node(li).await.expect("stop");
-                ctl.start_node(li).await.expect("restart");
-                let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-            }
+    let mut user_ref: u64 = 1;
+    for round in 0..3 {
+        for _ in 0..10 {
+            ctl.deposit_and_wait(ACCOUNT_A, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+                .await
+                .unwrap();
+            user_ref += 1;
+            ctl.deposit_and_wait(ACCOUNT_B, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+                .await
+                .unwrap();
+            user_ref += 1;
         }
+        // Kill current leader and let a new one rise (except on last round).
+        if round < 2 {
+            let li = ctl.leader_index().await.unwrap();
+            ctl.stop_node(li).await.expect("stop");
+            ctl.start_node(li).await.expect("restart");
+            let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        }
+    }
 
-        // Final convergence: every node sees the same A and B balance.
-        // 30 deposits per account × 3 rounds = 30 each (the round-2 deposits
-        // were also counted) — actually 10 deposits/account × 3 rounds = 30.
-        let target_a = (30 * AMOUNT) as i64;
-        let target_b = (30 * AMOUNT) as i64;
-        for i in 0..ctl.len() {
-            ctl.require_balance_on(i, ACCOUNT_A, target_a).await;
-            ctl.require_balance_on(i, ACCOUNT_B, target_b).await;
-            ctl.require_balance_on(i, SYSTEM_ACCOUNT_ID, -(target_a + target_b))
-                .await;
-        }
+    // Final convergence: every node sees the same A and B balance.
+    // 30 deposits per account × 3 rounds = 30 each (the round-2 deposits
+    // were also counted) — actually 10 deposits/account × 3 rounds = 30.
+    let target_a = (30 * AMOUNT) as i64;
+    let target_b = (30 * AMOUNT) as i64;
+    for i in 0..ctl.len() {
+        ctl.require_balance_on(i, ACCOUNT_A, target_a).await;
+        ctl.require_balance_on(i, ACCOUNT_B, target_b).await;
+        ctl.require_balance_on(i, SYSTEM_ACCOUNT_ID, -(target_a + target_b))
+            .await;
     }
 }
 
@@ -78,7 +75,8 @@ async fn zero_sum_holds_on_every_node_after_load() {
 
     // Every node must converge to the same balances + zero-sum.
     for i in 0..ctl.len() {
-        ctl.require_balance_on(i, ACCOUNT_A, 10_000 - 50 * 100).await;
+        ctl.require_balance_on(i, ACCOUNT_A, 10_000 - 50 * 100)
+            .await;
         ctl.require_balance_on(i, ACCOUNT_B, 50 * 100).await;
         ctl.require_balance_on(i, SYSTEM_ACCOUNT_ID, -10_000).await;
     }

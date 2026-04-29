@@ -1,7 +1,7 @@
 use std::io::BufRead;
 use std::path::Path;
 
-use crate::entities::*;
+use storage::entities::*;
 
 use super::json::{compute_tx_crc, json_to_wal_entry};
 use super::{CtlError, make_storage};

@@ -67,6 +67,7 @@ raft = { path = "crates/raft" }
 client = { path = "crates/client" }
 cluster = { path = "crates/cluster" }
 cluster-test-utils = { path = "crates/cluster-test-utils" }
+ctl = { path = "crates/ctl" }
 
 [profile.release]
 opt-level = 3
