@@ -8,22 +8,38 @@ Extract a pure, deterministic Raft state machine as a separate crate inside the 
 
 ## Architectural Boundary
 
-**Pure state machine.** No internal threads, no tokio, no tonic, no I/O, no timers. The library transitions state and returns actions describing what the driver must do. The driver (cluster crate) executes actions and feeds results back as new events.
+**Pure state machine.** No internal threads, no tokio, no tonic, no I/O — including no disk writes, no `data_dir`, no `Storage` handle. The library transitions in-memory state and returns actions describing what the driver must do. The driver (cluster crate) executes actions, performs the durable writes, and feeds results back as new events.
 
 ```rust
 impl RaftNode {
-    // Construction. Seed is for randomized election timeouts.
-    // Tests use fixed seeds for reproducibility; production seeds from time.
-    pub fn new(storage: Storage, node_id: NodeId, peers: Vec<NodeId>, seed: u64) -> Self;
+    // Construction. The driver hydrates `(current_term, voted_for,
+    // term_records, local_log_index)` off disk and hands them in.
+    // Seed is for randomized election timeouts; tests use fixed seeds
+    // for reproducibility, production seeds from time.
+    pub fn new(
+        node_id: NodeId,
+        peers: Vec<NodeId>,
+        seed: u64,
+        cfg: RaftConfig,
+        initial: RaftInitialState,
+    ) -> Self;
 
-    // Primary state transition entry point.
-    pub fn step(&mut self, event: Event) -> Vec<Action>;
+    // Primary state transition entry point. `now` is the only way
+    // wall-clock time enters the library — `Event::Tick` is the
+    // explicit "wake and re-check" signal but every event rides this
+    // `now`.
+    pub fn step(&mut self, now: Instant, event: Event) -> Vec<Action>;
 
     // Read-only queries — &self, no side effects, cheap.
     pub fn role(&self) -> Role;
     pub fn current_term(&self) -> u64;
     pub fn commit_index(&self) -> u64;
     pub fn cluster_commit_index(&self) -> u64;
+    pub fn voted_for(&self) -> Option<NodeId>;
+    // Trails `current_term` between an `Action::Persist*` and its
+    // matching `Event::*Persisted` ack — observability only.
+    pub fn durable_term(&self) -> u64;
+    pub fn durable_voted_for(&self) -> Option<NodeId>;
 }
 ```
 
@@ -31,9 +47,9 @@ That is the entire public surface.
 
 **Crate constraints (enforced via `Cargo.toml`):**
 
-- `raft` depends only on minimal utility crates (serde, thiserror, spdlog-rs, etc.)
-- `raft` does NOT depend on `storage`, `tokio`, `tonic`, `proto`, `ledger`, or `cluster`
-- If any of these creep in, the boundary is broken
+- `raft` depends only on minimal utility crates (`rand`, `spdlog-rs`, `thiserror`).
+- `raft` does NOT depend on `storage`, `tokio`, `tonic`, `proto`, `ledger`, or `cluster`. The library performs zero I/O; durable persistence is the driver's responsibility.
+- If any of these creep in, the boundary is broken.
 
 ## Log Ownership Model: Option 3
 
@@ -73,8 +89,7 @@ The design must enforce these under all schedules:
 
 ## What raft Owns
 
-- Term log (`Term`, durable, raft's own file)
-- Vote log (`Vote`, durable, raft's own file)
+- **In-memory model** of the term log (`Term`) and vote state (`Vote`). Pure data structures — no file handles, no storage crate, no I/O. Mutators update memory; the driver mirrors the change to disk via the action stream.
 - Role state and transitions (`Initializing`, `Candidate`, `Leader`, `Follower`)
 - Election timer state (deadlines as data, not as `tokio::sleep`)
 - Per-peer replication state (`next_index`, `match_index`, in-flight tracking) — internal, not exposed
@@ -83,22 +98,29 @@ The design must enforce these under all schedules:
 
 ## What raft Does NOT Own
 
-- Log bytes or log durability mechanics (the storage layer is external; raft requests operations via `Action`)
-- Tx_id assignment (ledger does this on the leader)
-- Application of committed entries (ledger's pipeline does this; raft just signals "tx_id N is committed")
-- Network transport (driver translates `Action::SendAppendEntries` to a tonic RPC)
-- Tokio/async (driver wraps the library in async)
-- Wall-clock time (raft observes time only through `Event::Tick { now }`)
+- **Durable persistence of the term/vote logs.** The driver instantiates whatever storage layer it likes (`storage::TermStorage`, `storage::VoteStorage`, or otherwise), routes `Action::PersistTerm` / `Action::PersistVote` into it, and acks back via `Event::TermPersisted` / `Event::VotePersisted`.
+- Log bytes and log durability mechanics for entry data (the storage layer is external; raft requests operations via `Action`).
+- Tx_id assignment (ledger does this on the leader).
+- Application of committed entries (ledger's pipeline does this; raft just signals "tx_id N is committed").
+- Network transport (driver translates `Action::SendAppendEntries` to a tonic RPC).
+- Tokio/async (driver wraps the library in async).
+- Wall-clock time (raft observes time only through `step(now, _)`).
+- Filesystem paths and `data_dir` configuration. The library does not know — and refuses to know — where the disk lives.
 
 ## Public API
 
 ### Event/Action — state transitions
 
+Payload bytes do **not** flow through the library. `LogEntryMeta` carries only `(tx_id, term)` — enough for §5.3 prev-log-term matching and `match_index`/`next_index` arithmetic. The driver moves payload bytes between storage and the wire on its own, indexed by `tx_id`.
+
 ```rust
+pub struct LogEntryMeta { pub tx_id: u64, pub term: u64 }
+
 pub enum Event {
-    // Heartbeat of the system: the only way wall-clock time enters the library.
-    // Driver issues ticks at the cadence of the next pending deadline.
-    Tick { now: Instant },
+    // The driver fires Tick whenever an Action::SetWakeup deadline arrives.
+    // Wall-clock time enters via the `now` parameter to step(), not via
+    // a field on the variant itself.
+    Tick,
 
     // Inbound RPCs
     AppendEntriesRequest {
@@ -106,7 +128,7 @@ pub enum Event {
         term: u64,
         prev_log_tx_id: u64,
         prev_log_term: u64,
-        entries: Vec<LogEntry>,
+        entries: Vec<LogEntryMeta>,
         leader_commit: u64,
     },
     AppendEntriesReply {
@@ -129,17 +151,28 @@ pub enum Event {
     },
 
     // Leader-only: ledger reports it durably committed an entry locally.
-    // This is the bridge from the ledger's on-commit hook into raft.
-    // Raft uses this to advance its own slot in match_index, which feeds
-    // into cluster_commit_index calculation.
+    // Bridge from the ledger's on-commit hook into raft. Advances the
+    // leader's own slot in match_index, feeding into cluster_commit_index.
     LocalCommitAdvanced { tx_id: u64 },
 
-    // Driver acks for actions raft requested (follower path).
+    // Driver acks for log directives (follower path).
     LogAppendComplete { tx_id: u64 },
     LogTruncateComplete { up_to: u64 },
+
+    // Driver acks for durable term/vote writes. The library has
+    // already updated its in-memory model when emitting the matching
+    // Action::Persist*; these events confirm the on-disk state caught
+    // up and feed `durable_term()` / `durable_voted_for()`.
+    TermPersisted { term: u64, start_tx_id: u64 },
+    VotePersisted { term: u64, voted_for: NodeId },
 }
 
 pub enum Action {
+    // Durable writes. The driver writes to its term log / vote log
+    // (e.g. storage::TermStorage / VoteStorage) and feeds back the
+    // matching Event::*Persisted. The library has already updated
+    // its in-memory model when emitting these — the driver is
+    // catching up.
     PersistTerm { term: u64, start_tx_id: u64 },
     PersistVote { term: u64, voted_for: NodeId },
 
@@ -148,7 +181,7 @@ pub enum Action {
         term: u64,
         prev_log_tx_id: u64,
         prev_log_term: u64,
-        entries: Vec<LogEntry>,
+        entries: Vec<LogEntryMeta>,
         leader_commit: u64,
     },
     SendAppendEntriesReply {
@@ -169,9 +202,12 @@ pub enum Action {
         granted: bool,
     },
 
-    // Follower: raft directs the log layer
+    // Follower: raft directs the log layer. TruncateLog implies
+    // both the entry-log truncation and the paired term-log
+    // truncation (§5.3). AppendLog metadata only — payload routing is
+    // entirely on the driver.
     TruncateLog { after_tx_id: u64 },
-    AppendLog { tx_id: u64, term: u64, payload: Bytes },
+    AppendLog { tx_id: u64, term: u64 },
 
     // Both: signal cluster commit advanced — ledger should apply through here
     AdvanceClusterCommit { tx_id: u64 },
@@ -183,6 +219,27 @@ pub enum Action {
     SetWakeup { at: Instant },
 }
 ```
+
+### Initial state
+
+The driver hydrates the durable state off disk and hands it in:
+
+```rust
+pub struct RaftInitialState {
+    pub current_term: u64,
+    pub voted_for: Option<NodeId>,
+    pub term_records: Vec<TermRecord>,  // raft::TermRecord, oldest first
+    pub local_log_index: u64,
+}
+```
+
+Empty-everything (`RaftInitialState::default()`) is the fresh-install case. The library does no validation beyond what its mutators normally enforce — a corrupt or out-of-order record list is the driver's bug to catch.
+
+### Two-phase persistence
+
+ADR-0017's "etcd-raft shape": for any state change that needs to survive a crash, the library updates its **in-memory** model first, emits the matching `Action::Persist*`, and only later observes `Event::*Persisted` to update its `durable_*` view. The library does not gate further state-machine progress on the ack — it relies on the driver applying actions in the order returned (Persist before Send/Append) so durability stays ahead of externalisation.
+
+`durable_term()` and `durable_voted_for()` exist purely for observability — tests, the driver's own invariant checks, and a future Pre-Vote layer might want to inspect the gap between intent and durable state.
 
 ### Read-only query API
 
@@ -247,24 +304,62 @@ The library never sleeps. The driver sleeps. The library only checks "is `now >=
 
 ```rust
 loop {
-// After every step, scan actions for SetWakeup and re-arm sleep.
-let next_wakeup = current_wakeup;
+    // After every step, scan actions for SetWakeup and re-arm sleep.
+    let next_wakeup = current_wakeup;
 
-tokio::select! {
-_ = tokio::time::sleep_until(next_wakeup) => {
-let actions = raft.step(Event::Tick { now: Instant::now() });
-process_actions(actions);
+    tokio::select! {
+        _ = tokio::time::sleep_until(next_wakeup) => {
+            let actions = raft.step(Instant::now(), Event::Tick);
+            process_actions(actions).await;
+        }
+        msg = inbound_rpc.recv() => {
+            let actions = raft.step(Instant::now(), Event::from(msg));
+            process_actions(actions).await;
+        }
+        commit = ledger_on_commit.recv() => {
+            let actions = raft.step(Instant::now(),
+                Event::LocalCommitAdvanced { tx_id: commit });
+            process_actions(actions).await;
+        }
+        // ... other event sources
+    }
 }
-msg = inbound_rpc.recv() => {
-let actions = raft.step(Event::from(msg));
-process_actions(actions);
-}
-commit = ledger_on_commit.recv() => {
-let actions = raft.step(Event::LocalCommitAdvanced { tx_id: commit });
-process_actions(actions);
-}
-// ... other event sources
-}
+
+// Sketch — `process_actions` walks the action list in order. Persist
+// actions write durably *before* any Send is issued, then the driver
+// feeds the ack back through step(now, Event::*Persisted).
+async fn process_actions(actions: Vec<Action>) {
+    for a in actions {
+        match a {
+            Action::PersistTerm { term, start_tx_id } => {
+                term_log.append(TermRecord { term, start_tx_id })?;
+                term_log.sync()?;
+                inject(Event::TermPersisted { term, start_tx_id });
+            }
+            Action::PersistVote { term, voted_for } => {
+                vote_log.append(VoteRecord { term, voted_for })?;
+                vote_log.sync()?;
+                inject(Event::VotePersisted { term, voted_for });
+            }
+            Action::TruncateLog { after_tx_id } => {
+                wal.truncate_after(after_tx_id)?;
+                term_log.truncate_after(after_tx_id)?;
+                inject(Event::LogTruncateComplete { up_to: after_tx_id });
+            }
+            Action::AppendLog { tx_id, .. } => {
+                // payload was extracted from the inbound AE on receipt;
+                // the driver writes (metadata + payload) here.
+                wal.append(...)?;
+                inject(Event::LogAppendComplete { tx_id });
+            }
+            Action::SendAppendEntries { .. } => grpc.send_append_entries(...).await,
+            // ...
+            Action::SetWakeup { at } => current_wakeup = at,
+            Action::BecomeRole { .. } | Action::AdvanceClusterCommit { .. } => {
+                // observability + apply-pipeline gating
+            }
+        }
+    }
 }
 ```
 
@@ -289,7 +384,8 @@ Raft requires randomized election timeouts to prevent split votes. The library i
 - **Internal `tokio::sync::Notify` or channels** — would mean raft is wired into a runtime.
 - **`async fn step`** — raft must be synchronous; the driver handles async.
 - **Background tasks inside the library** — anything that needs to run "in the background" is the driver's job.
-- **Direct calls to `Instant::now()` inside the library** — time enters only through `Event::Tick { now }`.
+- **Direct calls to `Instant::now()` inside the library** — time enters only through the `now` parameter to `step`.
+- **Disk I/O inside the library** — no `File`, no `fdatasync`, no `data_dir`. Durability is the driver's job, mediated by `Action::Persist*` and `Event::*Persisted`.
 
 ## Workspace Layout
 
@@ -299,24 +395,25 @@ crates/
     src/
       lib.rs
       node.rs                     # RaftNode + step() + read-only queries
-      event.rs                    # Event enum
-      action.rs                   # Action enum
+      event.rs                    # Event enum (incl. *Persisted ack events)
+      action.rs                   # Action enum (incl. Persist* directives)
       role.rs                     # Role state machine
       leader.rs                   # leader-specific state
       candidate.rs                # candidate-specific state
       follower.rs                 # follower-specific state
-      term.rs                     # term log (durable, raft-owned)
-      vote.rs                     # vote log (durable, raft-owned)
+      term.rs                     # in-memory term-log model (no I/O)
+      vote.rs                     # in-memory vote model (no I/O)
       timer.rs                    # election timer (deadlines as data)
       quorum.rs                   # match_index tracking, cluster_commit_index calculation
+      log_entry.rs                # LogEntryMeta { tx_id, term }
+      types.rs                    # NodeId, RejectReason
     tests/
-      simulator.rs                # deterministic harness
-      election_safety.rs          # property tests for §5.4
-      log_matching.rs
-      leader_completeness.rs
-      state_machine_safety.rs
-      fault_injection.rs
+      common/mod.rs               # shared deterministic harness
+      simulator.rs                # end-to-end scenarios
+      safety_properties.rs        # proptest §5.4 properties
 ```
+
+The driver lives outside the raft crate (today: `cluster::*`, future: any consumer). It owns the disk-backed term and vote logs (e.g. `storage::TermStorage`, `storage::VoteStorage`), instantiates them, and routes the action stream into them.
 
 ## Test Strategy
 
