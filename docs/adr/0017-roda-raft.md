@@ -1,45 +1,38 @@
-# roda-raft Design Summary
+# roda-raft Design
 
 ## Goals
 
 Extract a pure, deterministic Raft state machine as a separate crate inside the roda-ledger workspace. The library is specialized to roda-ledger (not generalized), independent of cluster/ledger code, and testable in isolation with a deterministic simulator. The current `cluster::raft` module is replaced; existing bugs (term-bump-before-win race, missing §5.3 truncation logic, ghost-term bumping on boot) are addressed by the new design.
 
+`RaftNode` is a **single-node decision system**. It models one node's view of Raft: takes events in, returns actions out, exposes the minimum read surface the driver needs to gate writes and stamp wire responses. Anything that's not a decision input or a decision output does not belong in the library.
+
 ## Architectural Boundary
 
-**Pure state machine.** The library exposes a primary entry point for state transitions plus a set of read-only query methods for the driver to inspect current state without mutating it.
+**Pure state machine.** No internal threads, no tokio, no tonic, no I/O, no timers. The library transitions state and returns actions describing what the driver must do. The driver (cluster crate) executes actions and feeds results back as new events.
 
 ```rust
 impl RaftNode {
-// Primary state transition entry point.
-pub fn step(&mut self, event: Event) -> Vec<Action>;
+    // Construction. Seed is for randomized election timeouts.
+    // Tests use fixed seeds for reproducibility; production seeds from time.
+    pub fn new(storage: Storage, node_id: NodeId, peers: Vec<NodeId>, seed: u64) -> Self;
+
+    // Primary state transition entry point.
+    pub fn step(&mut self, event: Event) -> Vec<Action>;
 
     // Read-only queries — &self, no side effects, cheap.
     pub fn role(&self) -> Role;
-    pub fn current_term(&self) -> Term;
-    pub fn voted_for(&self) -> Option<NodeId>;
-    pub fn leader_id(&self) -> Option<NodeId>;
+    pub fn current_term(&self) -> u64;
     pub fn commit_index(&self) -> u64;
-    pub fn last_log_index(&self) -> u64;
-    pub fn last_log_term(&self) -> Term;
-
-    // Per-peer replication state (leader only; returns empty otherwise).
-    pub fn peer_state(&self, peer: NodeId) -> Option<PeerState>;
-    pub fn all_peer_states(&self) -> Vec<(NodeId, PeerState)>;
-
-    // Election timing — for observability and the driver's tick scheduler.
-    pub fn election_deadline(&self) -> Option<Instant>;
-
-    // Aggregate snapshot for status RPCs / debugging — one call instead of many.
-    pub fn status(&self) -> RaftStatus;
+    pub fn cluster_commit_index(&self) -> u64;
 }
 ```
 
-No internal threads, no tokio, no tonic, no I/O, no timers. The library transitions state and returns actions describing what the driver must do. The driver (cluster crate) is responsible for executing actions and feeding results back as new events.
+That is the entire public surface.
 
 **Crate constraints (enforced via `Cargo.toml`):**
 
 - `raft` depends only on minimal utility crates (serde, thiserror, spdlog-rs, etc.)
-- `raft` does NOT depend on `tokio`, `tonic`, `proto`, `ledger`, or `cluster`
+- `raft` does NOT depend on `storage`, `tokio`, `tonic`, `proto`, `ledger`, or `cluster`
 - If any of these creep in, the boundary is broken
 
 ## Log Ownership Model: Option 3
@@ -48,10 +41,21 @@ No internal threads, no tokio, no tonic, no I/O, no timers. The library transiti
 
 **Asymmetric write paths:**
 
-- **Leader:** Ledger assigns tx_id, writes to its store, then notifies raft via `Event::LocalEntryAppended`. Raft replicates via `Action::SendAppendEntries`.
+- **Leader:** Ledger assigns tx_id, writes to its store, then notifies raft via `Event::LocalCommitAdvanced`. Raft replicates via `Action::SendAppendEntries`.
 - **Follower:** Raft receives AppendEntries, validates §5.3 prev_log_term match, directs the storage layer via `Action::AppendLog` and `Action::TruncateLog`. Follower's ledger is passive — apply only.
 
-**Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal (`Action::AdvanceCommit { tx_id }`), not on storage durability. This eliminates the rollback-after-truncation problem.
+**Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal (`Action::AdvanceClusterCommit { tx_id }`), not on storage durability. This eliminates the rollback-after-truncation problem.
+
+## Two Commit Indexes
+
+The library distinguishes them explicitly:
+
+- **`commit_index`** — local. The largest tx_id this node has durably committed in its own log. On the leader, advanced when the ledger's on-commit hook fires (delivered as `Event::LocalCommitAdvanced`). On followers, advanced when an AppendEntries write durably lands.
+- **`cluster_commit_index`** — cluster-wide. The largest tx_id known to be quorum-committed across the cluster. On the leader, recomputed from per-peer `match_index` whenever an AppendEntries reply arrives. On a follower, the leader's most-recent `leader_commit` clamped to local `commit_index`.
+
+These are different facts. The leader's `commit_index` can be ahead of `cluster_commit_index` (it's persisted locally but not yet quorum-acked). A follower's `commit_index` can be ahead of its `cluster_commit_index` (it's persisted entries the leader hasn't yet told it are committed cluster-wide).
+
+The cluster's writers use `cluster_commit_index` to gate things like `wait_for_transaction_level`. The local apply pipeline uses `cluster_commit_index` (apply-on-commit) — never `commit_index`.
 
 ## Required Invariants
 
@@ -73,8 +77,8 @@ The design must enforce these under all schedules:
 - Vote log (`Vote`, durable, raft's own file)
 - Role state and transitions (`Initializing`, `Candidate`, `Leader`, `Follower`)
 - Election timer state (deadlines as data, not as `tokio::sleep`)
-- Replication state per peer (`next_index`, `match_index`, in-flight tracking)
-- Quorum / commit_index calculation
+- Per-peer replication state (`next_index`, `match_index`, in-flight tracking) — internal, not exposed
+- Quorum / `cluster_commit_index` calculation
 - All policy decisions: when to truncate, when to apply, when to send AppendEntries, when to grant a vote
 
 ## What raft Does NOT Own
@@ -84,165 +88,214 @@ The design must enforce these under all schedules:
 - Application of committed entries (ledger's pipeline does this; raft just signals "tx_id N is committed")
 - Network transport (driver translates `Action::SendAppendEntries` to a tonic RPC)
 - Tokio/async (driver wraps the library in async)
+- Wall-clock time (raft observes time only through `Event::Tick { now }`)
 
 ## Public API
 
-### Event/Action — state transitions (sketch, refined during implementation)
+### Event/Action — state transitions
 
 ```rust
 pub enum Event {
-Tick { now: Instant },
+    // Heartbeat of the system: the only way wall-clock time enters the library.
+    // Driver issues ticks at the cadence of the next pending deadline.
+    Tick { now: Instant },
 
     // Inbound RPCs
     AppendEntriesRequest {
         from: NodeId,
-        term: Term,
+        term: u64,
         prev_log_tx_id: u64,
-        prev_log_term: Term,
+        prev_log_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
     },
     AppendEntriesReply {
         from: NodeId,
-        term: Term,
+        term: u64,
         success: bool,
         last_tx_id: u64,
         reject_reason: Option<RejectReason>,
     },
     RequestVoteRequest {
         from: NodeId,
-        term: Term,
+        term: u64,
         last_tx_id: u64,
-        last_term: Term,
+        last_term: u64,
     },
     RequestVoteReply {
         from: NodeId,
-        term: Term,
+        term: u64,
         granted: bool,
     },
 
-    // Leader-only: ledger reports it durably wrote an entry
-    LocalEntryAppended { tx_id: u64, term: Term },
+    // Leader-only: ledger reports it durably committed an entry locally.
+    // This is the bridge from the ledger's on-commit hook into raft.
+    // Raft uses this to advance its own slot in match_index, which feeds
+    // into cluster_commit_index calculation.
+    LocalCommitAdvanced { tx_id: u64 },
 
-    // Driver acks for actions raft requested
+    // Driver acks for actions raft requested (follower path).
     LogAppendComplete { tx_id: u64 },
     LogTruncateComplete { up_to: u64 },
 }
 
 pub enum Action {
-PersistTerm { term: Term, start_tx_id: u64 },
-PersistVote { term: Term, voted_for: NodeId },
+    PersistTerm { term: u64, start_tx_id: u64 },
+    PersistVote { term: u64, voted_for: NodeId },
 
     SendAppendEntries {
         to: NodeId,
-        term: Term,
+        term: u64,
         prev_log_tx_id: u64,
-        prev_log_term: Term,
+        prev_log_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
     },
     SendAppendEntriesReply {
         to: NodeId,
-        term: Term,
+        term: u64,
         success: bool,
         last_tx_id: u64,
     },
     SendRequestVote {
         to: NodeId,
-        term: Term,
+        term: u64,
         last_tx_id: u64,
-        last_term: Term,
+        last_term: u64,
     },
     SendRequestVoteReply {
         to: NodeId,
-        term: Term,
+        term: u64,
         granted: bool,
     },
 
     // Follower: raft directs the log layer
     TruncateLog { after_tx_id: u64 },
-    AppendLog { tx_id: u64, term: Term, payload: Bytes },
+    AppendLog { tx_id: u64, term: u64, payload: Bytes },
 
-    // Both: signal commit advanced (ledger should apply through here)
-    AdvanceCommit { tx_id: u64 },
+    // Both: signal cluster commit advanced — ledger should apply through here
+    AdvanceClusterCommit { tx_id: u64 },
 
     // Role transition
-    BecomeRole { role: Role, term: Term },
+    BecomeRole { role: Role, term: u64 },
+
+    // Time management — see "Timeout Handling" below
+    SetWakeup { at: Instant },
 }
 ```
 
 ### Read-only query API
 
-The driver and gRPC handlers need to inspect raft state on every RPC (e.g. "am I leader?" before accepting a write, "what's the cluster commit watermark?" for client reads). These queries are `&self` — they don't mutate state, they don't return actions, they're cheap.
-
 ```rust
-// Role and term — used by every gRPC handler to gate writes and to stamp wire responses.
+// Current role of this node — used by gRPC handlers to gate writes
+// (Leader accepts, others reject) and to stamp wire responses.
 pub fn role(&self) -> Role;
-pub fn current_term(&self) -> Term;
-pub fn voted_for(&self) -> Option<NodeId>;
 
-// Who's the leader? `None` if no current leader is known (e.g. Initializing or election in progress).
-pub fn leader_id(&self) -> Option<NodeId>;
+// Current durable term known to this node.
+pub fn current_term(&self) -> u64;
 
-// Cluster-wide commit watermark — the largest tx_id known to be quorum-committed.
-// On the leader, this is the recomputed majority. On followers, this is the leader's
-// most-recent leader_commit clamped to local last_tx_id.
-// This replaces today's ClusterCommitIndex; readers (e.g. wait_for_transaction_level)
-// query raft for it.
+// Local: largest tx_id durably committed in this node's own log.
 pub fn commit_index(&self) -> u64;
 
-// Local log extent.
-pub fn last_log_index(&self) -> u64;
-pub fn last_log_term(&self) -> Term;
+// Cluster-wide: largest tx_id known quorum-committed.
+// On the leader, recomputed from peer match_indexes.
+// On a follower, the leader's leader_commit clamped to local commit_index.
+// This is what wait_for_transaction_level and similar consumers query.
+pub fn cluster_commit_index(&self) -> u64;
+```
 
-// Per-peer replication state — leader-only, returns None on followers/candidates.
-pub fn peer_state(&self, peer: NodeId) -> Option<PeerState>;
-pub fn all_peer_states(&self) -> Vec<(NodeId, PeerState)>;
+That's it. Anything beyond these — peer states, election deadlines, leader id, log extents, voted_for — is internal to raft.
 
-pub struct PeerState {
-pub next_index: u64,
-pub match_index: u64,
-pub in_flight: bool,
-pub last_contact: Option<Instant>,    // when did we last hear back from this peer
+**Why no `leader_id`:** the role tells the driver everything it needs. A non-leader rejects writes regardless of who the leader is.
+
+**Why no `voted_for`:** internal to raft's election logic. The driver has no decision to make based on it.
+
+**Why no `last_log_index` / `last_log_term`:** raft doesn't own the log. The storage layer knows.
+
+**Why no `peer_state` or `election_deadline` or `status`:** observability concerns, not decision inputs. v1 is the decision system, nothing more.
+
+## Timeout Handling
+
+`RaftNode` cannot call `tokio::time::sleep`, cannot spawn tasks, cannot wake itself. Yet Raft fundamentally depends on time. The library cannot *measure* time — it can only *reason about* time.
+
+### Pattern: deadlines as data
+
+Every timeout is represented as an `Instant` deadline owned by the library:
+
+1. Library computes the deadline (e.g. "election fires at `now + random(150..300ms)`").
+2. Stores it in internal state.
+3. Emits `Action::SetWakeup { at: Instant }` whenever the next deadline changes.
+
+The driver:
+
+1. Receives the deadline.
+2. Schedules `tokio::time::sleep_until(deadline)`.
+3. When the sleep fires, calls `raft.step(Event::Tick { now: Instant::now() })`.
+4. Raft checks "has any deadline elapsed?" and reacts.
+
+The library never sleeps. The driver sleeps. The library only checks "is `now >= deadline`?" on each `Tick`.
+
+### Three timeout categories
+
+**Election timeout (Follower / Candidate / Initializing).** If no leader heartbeat arrives within the window, transition to Candidate and start an election. Internal `election_deadline: Instant`. Reset whenever a valid AppendEntries arrives, a vote is granted, or a new term begins. On `Tick` with `now >= election_deadline`, transition to Candidate and emit candidacy actions (`PersistTerm`, `PersistVote`, `SendRequestVote × N`).
+
+**Heartbeat interval (Leader).** The leader sends AppendEntries to every peer at a regular interval to suppress their election timers. Per-peer `next_heartbeat: Instant`. On `Tick`, scan peers; for each with `now >= next_heartbeat` and no in-flight AppendEntries, emit a fresh `SendAppendEntries`.
+
+**RPC deadline (Candidate / Leader).** An RPC fired at a peer might never come back. Library tracks per-RPC `expires_at: Instant`. On `Tick`, expired RPCs are treated as failed replies. (Alternatively, the driver enforces via `tokio::time::timeout` and synthesizes an `Event::AppendEntriesReply { reject_reason: RpcTimeout }` — either works.)
+
+### Driver loop
+
+```rust
+loop {
+// After every step, scan actions for SetWakeup and re-arm sleep.
+let next_wakeup = current_wakeup;
+
+tokio::select! {
+_ = tokio::time::sleep_until(next_wakeup) => {
+let actions = raft.step(Event::Tick { now: Instant::now() });
+process_actions(actions);
 }
-
-// Election timing — useful for the driver to schedule its tokio sleep correctly,
-// and for observability dashboards. Returns None when election timer is disabled
-// (e.g. while Leader).
-pub fn election_deadline(&self) -> Option<Instant>;
-
-// Aggregate snapshot — single call for status RPCs / debug endpoints / metrics.
-pub fn status(&self) -> RaftStatus;
-
-pub struct RaftStatus {
-pub node_id: NodeId,
-pub role: Role,
-pub current_term: Term,
-pub voted_for: Option<NodeId>,
-pub leader_id: Option<NodeId>,
-pub commit_index: u64,
-pub last_log_index: u64,
-pub last_log_term: Term,
-pub election_deadline: Option<Instant>,
-pub peers: Vec<(NodeId, PeerState)>,
+msg = inbound_rpc.recv() => {
+let actions = raft.step(Event::from(msg));
+process_actions(actions);
+}
+commit = ledger_on_commit.recv() => {
+let actions = raft.step(Event::LocalCommitAdvanced { tx_id: commit });
+process_actions(actions);
+}
+// ... other event sources
+}
 }
 ```
 
-**Why these exist as queries, not actions:** queries describe *current state* the driver needs to react to (e.g. "should I accept this write?"), not *future state changes* the driver needs to execute. Putting them in `Action` would force the driver to remember state across `step` calls or cache fields that raft already owns. Read methods give the driver a fresh, authoritative view on demand without coupling.
+After every `step`, scan the action list for `SetWakeup` and re-arm `current_wakeup`. That's the entire interaction model.
 
-**Why these are not in `Event`:** queries don't change raft state, so they don't fit the event/action pattern. They're side-effect-free reads.
+### Why this works
 
-## What replaces `ClusterCommitIndex`
+**Determinism.** The library's behaviour is a function of `(state, event_stream)`. No hidden time dependency. Tests feed `Event::Tick { now: <chosen instant> }` and assert on outputs. The simulator can compress 10 minutes of cluster activity into 50ms of test time.
 
-The current `ClusterCommitIndex` (atomic u64 read by `LedgerHandler::wait_for_transaction_level` and friends) is replaced by `RaftNode::commit_index()`. The driver provides whatever wrapper it needs — typically an `Arc<RwLock<RaftNode>>` or an `Arc<AtomicU64>` mirror that the driver updates whenever it processes an `Action::AdvanceCommit`. The library itself just reports the value.
+**No async leakage.** No `tokio::time` in the library. No `Future`. No `async fn`. The library compiles without an async runtime.
 
-This means the cluster crate's `LedgerHandler` no longer holds a separate `Arc<ClusterCommitIndex>` — it holds a handle to the driver, and asks the driver "what's the current commit index?" which delegates to `raft.commit_index()`.
+**Crisp testability of timeout-sensitive bugs.** Timer race conditions become trivial to reproduce: feed events in a chosen order, assert on actions. No real clock involved.
+
+### Election timeout randomization
+
+Raft requires randomized election timeouts to prevent split votes. The library is pure, so it can't call `rand::thread_rng()`.
+
+`RaftNode::new` takes a `seed: u64`. Internal RNG is seeded from this. Tests use fixed seeds for reproducibility; production uses time-based seeding done by the driver. Less round-tripping than the alternative (driver provides randomness via events), and "raft owns its own RNG seeded externally" is a clean abstraction.
+
+### What this rules out
+
+- **Internal `tokio::sync::Notify` or channels** — would mean raft is wired into a runtime.
+- **`async fn step`** — raft must be synchronous; the driver handles async.
+- **Background tasks inside the library** — anything that needs to run "in the background" is the driver's job.
+- **Direct calls to `Instant::now()` inside the library** — time enters only through `Event::Tick { now }`.
 
 ## Workspace Layout
 
 ```
 crates/
-  raft/                           # this design
+  raft/
     src/
       lib.rs
       node.rs                     # RaftNode + step() + read-only queries
@@ -255,8 +308,7 @@ crates/
       term.rs                     # term log (durable, raft-owned)
       vote.rs                     # vote log (durable, raft-owned)
       timer.rs                    # election timer (deadlines as data)
-      quorum.rs                   # match_index tracking, commit_index calculation
-      status.rs                   # PeerState, RaftStatus types
+      quorum.rs                   # match_index tracking, cluster_commit_index calculation
     tests/
       simulator.rs                # deterministic harness
       election_safety.rs          # property tests for §5.4
@@ -276,7 +328,9 @@ crates/
 
 **Fault injection in the simulator:** message drop, reorder, duplication, network partition, node crash and recovery mid-operation.
 
-**Read-API tests:** assert that `role()`, `current_term()`, `commit_index()`, etc. return values consistent with the actions the same `step` call returned. (E.g. if `step` returned `Action::BecomeRole { role: Leader, term: 5 }`, then `role()` must return `Leader` and `current_term()` must return 5 immediately after.) These are cheap consistency checks that catch a whole class of bugs where the read API drifts from the action stream.
+**Read-API tests:** assert that `role()`, `current_term()`, `commit_index()`, `cluster_commit_index()` return values consistent with the action stream emitted by the same `step` call. (E.g. if `step` returned `Action::BecomeRole { role: Leader, term: 5 }`, then `role()` must return `Leader` and `current_term()` must return 5 immediately after.)
+
+**Timer tests:** since time enters only through `Event::Tick { now }`, every timer-related scenario is reproducible. Tests construct specific `Tick` sequences and assert the resulting `Action` stream — no flakiness from real clocks.
 
 ## Non-Goals (v1, deferred to later)
 
@@ -284,6 +338,7 @@ crates/
 - **Leader leases / read-index.** All reads go through the leader and use the same commit-index check as writes.
 - **Joint consensus / online membership changes.** Cluster membership is fixed at config-file time.
 - **InstallSnapshot.** Scaffold only; full implementation deferred.
+- **Observability surface.** No `peer_state`, `election_deadline`, `status`, or per-peer introspection in v1. Add when there's a concrete consumer.
 
 These are documented in `crates/raft/README.md` so consumers know what the library does and doesn't guarantee.
 
@@ -295,3 +350,4 @@ The new library is correct when:
 2. The deterministic simulator runs 1M+ random events without invariant violations.
 3. Bug class regressions from the previous implementation cannot recur: term-bump-before-win, ghost-term-on-boot, missing §5.3 truncation, term log not truncating alongside log truncation.
 4. Read-API consistency: query results agree with the action stream emitted by `step` at every transition.
+5. All timer-sensitive scenarios are reproducibly testable through synthetic `Event::Tick` sequences with no real-clock dependency.
