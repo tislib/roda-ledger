@@ -1,0 +1,49 @@
+[package]
+name = "cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "cluster"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roda-server"
+path = "src/main.rs"
+
+[dependencies]
+proto.workspace = true
+storage.workspace = true
+ledger.workspace = true
+raft.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+tonic-reflection = "0.12"
+prost.workspace = true
+
+serde.workspace = true
+toml.workspace = true
+spdlog-rs.workspace = true
+arc-swap.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+
+# Binary-only deps. They could be split out with feature flags but the win
+# is too small to be worth the complexity.
+clap.workspace = true
+
+[dev-dependencies]
+cluster-test-utils.workspace = true
+client.workspace = true
+proto.workspace = true
+storage.workspace = true
+tempfile.workspace = true
+tokio-test.workspace = true
+proptest.workspace = true
+criterion.workspace = true
