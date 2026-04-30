@@ -251,11 +251,6 @@ impl Ledger {
         self.transactor.get_rejected_count()
     }
 
-    /// Register a callback fired every time the WAL commit-index advances.
-    pub fn on_commit(&self, handler: CommitHandler) -> Result<(), CommitHandler> {
-        self.pipeline.set_commit_handler(handler)
-    }
-
     /// Drive the cluster-commit gate consulted by the seal stage
     /// (ADR-0016 §10). The seal stage refuses to seal a segment whose
     /// last `tx_id` exceeds this value — guaranteeing sealed segments
