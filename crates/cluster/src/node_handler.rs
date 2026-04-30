@@ -1,54 +1,46 @@
 //! `NodeHandler` — gRPC service implementation for peer-to-peer RPCs
 //! (`AppendEntries`, `Ping`, `RequestVote`, `InstallSnapshot`).
 //!
-//! After the ADR-0017 migration the handler is a thin translation layer:
-//! every mutating RPC is forwarded to [`RaftHandle`] which holds the raft
-//! state machine behind one `tokio::sync::Mutex`. The handler itself owns
-//! no raft state.
+//! The handler is a thin translation layer: every mutating RPC is
+//! wrapped in a [`Command`] and posted to the raft loop's mpsc channel
+//! along with a `oneshot` reply channel. The handler awaits the
+//! oneshot and returns the response. The handler owns no raft state.
 //!
-//! `Ping` is read-only (consults [`ClusterMirror`] + the ledger), so it
-//! does not lock the raft mutex.
+//! `Ping` is read-only (consults [`ClusterMirror`] + the ledger) so it
+//! does not go through the raft loop.
+//!
+//! Shutdown is RAII on the `cmd_tx` side: when the supervisor drops
+//! its sender clone and the loop drains, this handler's
+//! `cmd_tx.send()` calls return errors and the handler reports
+//! `Status::unavailable`. Closing the channel *is* the shutdown
+//! signal — there is no separate latch and no race window between
+//! "check latch" and "enter raft body".
 
 use crate::cluster_mirror::ClusterMirror;
 use crate::ledger_slot::LedgerSlot;
-use crate::raft_driver::RaftHandle;
 use ::proto::node as proto;
 use ::proto::node::node_server::Node;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
+use crate::command::Command;
 
-/// State shared across the gRPC service handler and the supervisor.
-/// Constructed once at cluster bring-up and kept alive for the process
-/// lifetime; the gRPC server holds an `Arc` and observes every
-/// raft-driver mutation atomically.
+/// State shared across the gRPC service handler. Constructed once at
+/// cluster bring-up and kept alive for the process lifetime; the gRPC
+/// server holds an `Arc` and clones the `cmd_tx` per-request.
 pub struct NodeHandlerCore {
-    /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9). Used by the
-    /// read-only `Ping` handler — every mutating RPC goes through the
-    /// raft driver, which holds its own `LedgerSlot` reference.
+    /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9). Used by
+    /// the read-only `Ping` handler — every mutating RPC goes through
+    /// the raft loop, which holds its own `LedgerSlot` reference.
     pub ledger: Arc<LedgerSlot>,
     pub node_id: u64,
-    /// Lock-free read surface for role / term stamping in `Ping` and
-    /// for shutdown latch checks.
+    /// Lock-free read surface for role / term stamping in `Ping`.
     pub mirror: Arc<ClusterMirror>,
-    /// The raft driver. All mutating RPCs delegate here.
-    pub raft: Arc<RaftHandle>,
-    /// Shutdown latch — when set, every gRPC handler returns
-    /// `Status::unavailable` immediately.
-    ///
-    /// This is the in-process equivalent of "the process is gone".
-    /// Tonic's `JoinHandle::abort` cancels the listen task but cannot
-    /// stop already-spawned per-RPC handler tasks; without this latch,
-    /// the dying follower's in-flight handlers complete normally,
-    /// returning fresh `last_tx_id` values that the leader's outbound
-    /// dispatch advances into raft's quorum tracker — which is the
-    /// exact behaviour a hard crash would NOT exhibit.
-    ///
-    /// The supervisor's shutdown path flips this latch *before*
-    /// aborting handles, so any handler that hasn't yet entered its
-    /// state-touching body refuses; in-flight handlers that already
-    /// passed the check finish naturally but no new ones start.
-    pub shutdown: AtomicBool,
+    /// Sender into the raft loop. Cloned per RPC; dropping the loop's
+    /// receiver causes `send().await` to fail, which surfaces as
+    /// `Status::unavailable` to the caller — the in-process equivalent
+    /// of "the process is gone".
+    pub cmd_tx: mpsc::Sender<Command>,
 }
 
 impl NodeHandlerCore {
@@ -56,27 +48,14 @@ impl NodeHandlerCore {
         ledger: Arc<LedgerSlot>,
         node_id: u64,
         mirror: Arc<ClusterMirror>,
-        raft: Arc<RaftHandle>,
+        cmd_tx: mpsc::Sender<Command>,
     ) -> Self {
         Self {
             ledger,
             node_id,
             mirror,
-            raft,
-            shutdown: AtomicBool::new(false),
+            cmd_tx,
         }
-    }
-
-    /// Flip the shutdown latch. Idempotent.
-    #[inline]
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-    }
-
-    /// Check the shutdown latch. Inlined into every handler's first line.
-    #[inline]
-    fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
     }
 }
 
@@ -103,12 +82,18 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::AppendEntriesRequest>,
     ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
-        let core = &self.core;
-        if core.is_shutdown() {
-            return Err(Status::unavailable("node shutting down"));
-        }
-        let req = request.into_inner();
-        let resp = core.raft.handle_append_entries(req).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core
+            .cmd_tx
+            .send(Command::AppendEntries {
+                req: request.into_inner(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("raft loop unavailable"))?;
+        let resp = reply_rx
+            .await
+            .map_err(|_| Status::internal("raft loop dropped reply"))?;
         Ok(Response::new(resp))
     }
 
@@ -116,12 +101,18 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
-        let core = &self.core;
-        if core.is_shutdown() {
-            return Err(Status::unavailable("node shutting down"));
-        }
-        let req = request.into_inner();
-        let resp = core.raft.handle_request_vote(req).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core
+            .cmd_tx
+            .send(Command::RequestVote {
+                req: request.into_inner(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("raft loop unavailable"))?;
+        let resp = reply_rx
+            .await
+            .map_err(|_| Status::internal("raft loop dropped reply"))?;
         Ok(Response::new(resp))
     }
 
@@ -130,9 +121,6 @@ impl Node for NodeHandler {
         request: Request<proto::PingRequest>,
     ) -> Result<Response<proto::PingResponse>, Status> {
         let core = &self.core;
-        if core.is_shutdown() {
-            return Err(Status::unavailable("node shutting down"));
-        }
         let req = request.into_inner();
         Ok(Response::new(proto::PingResponse {
             node_id: core.node_id,
@@ -147,9 +135,6 @@ impl Node for NodeHandler {
         &self,
         _request: Request<proto::InstallSnapshotRequest>,
     ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
-        if self.core.is_shutdown() {
-            return Err(Status::unavailable("node shutting down"));
-        }
         Err(Status::unimplemented("InstallSnapshot deferred to ADR-016"))
     }
 }

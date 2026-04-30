@@ -738,7 +738,7 @@ impl ClusterTestingControl {
             .node
             .as_ref()
             .ok_or(ClusterTestingError::NotStarted { idx: i })?;
-        Ok(node.ledger_slot().clone())
+        Ok(node.ledger_slot())
     }
 
     /// Bare-mode-only accessors (the running modes hide these

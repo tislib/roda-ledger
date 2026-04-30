@@ -7,10 +7,11 @@
 //! Config path precedence: CLI arg > `RODA_CONFIG` env > `RODA_CLUSTER_CONFIG`
 //! env (legacy) > `./config.toml`.
 
-use cluster::{ClusterNode, Config};
 use spdlog::info;
 use std::env;
 use std::path::PathBuf;
+use cluster::Config;
+use cluster::node::ClusterNode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
