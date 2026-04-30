@@ -330,6 +330,9 @@ impl<P: Persistence> RaftNode<P> {
             Event::LocalCommitAdvanced { tx_id } => {
                 self.on_local_commit_advanced(tx_id, &mut out);
             }
+            Event::LocalWriteAdvanced { tx_id } => {
+                self.on_local_write_advanced(tx_id);
+            }
             Event::LogAppendComplete { tx_id } => {
                 self.on_log_append_complete(tx_id, &mut out);
             }
@@ -616,6 +619,7 @@ impl<P: Persistence> RaftNode<P> {
         let leader = LeaderState::new(
             &other_peers,
             self.local_log_index,
+            self.local_log_index,
             now,
             self.cfg.heartbeat_interval,
             self.cfg.rpc_timeout,
@@ -812,8 +816,8 @@ impl<P: Persistence> RaftNode<P> {
         let max_entries = self.cfg.max_entries_per_append;
 
         let (prev_log_tx_id, prev_log_term, entries) = {
-            let progress = match &self.state {
-                NodeState::Leader(l) => l.peers.get(&peer).cloned(),
+            let (progress, last_written) = match &self.state {
+                NodeState::Leader(l) => (l.peers.get(&peer).cloned(), l.last_written),
                 _ => return,
             };
             let progress = match progress {
@@ -832,9 +836,17 @@ impl<P: Persistence> RaftNode<P> {
             // next_index. The range stops at the next term boundary
             // or at `max_entries`, whichever comes first; multi-term
             // catch-up takes multiple AEs. Heartbeat (next_index >
-            // local_log_index) → empty range.
+            // last_written) → empty range.
             //
-            // Inside the `else` branch `next_index <= local_log_index`,
+            // The upper bound is `last_written` — the leader's
+            // raft-log durability watermark, advanced by
+            // `Event::LocalWriteAdvanced`. Replication is gated on
+            // raft-log durability, NOT on the ledger-commit signal
+            // (`local_log_index` / `LocalCommitAdvanced`); shipping
+            // an entry to followers as soon as it is on disk is
+            // safe and correct.
+            //
+            // Inside the `else` branch `next_index <= last_written`,
             // so `next_index` indexes a real entry. Every in-log
             // entry has a covering term-log record (`observe_term` is
             // called for any new term, `commit_term` for a leader's
@@ -845,18 +857,18 @@ impl<P: Persistence> RaftNode<P> {
             // of silently downgrading the entry to `current_term`,
             // which would produce a malformed multi-term
             // `LogEntryRange`.
-            let entries = if next_index > self.local_log_index {
+            let entries = if next_index > last_written {
                 let _ = current_term; // not consulted in the heartbeat path
                 LogEntryRange::empty()
             } else {
                 let range_term = self
                     .persistence
                     .term_at_tx(next_index)
-                    .expect("term_at_tx must cover next_index when next_index <= local_log_index")
+                    .expect("term_at_tx must cover next_index when next_index <= last_written")
                     .term;
                 let mut count: u64 = 0;
                 let mut tx = next_index;
-                while tx <= self.local_log_index && count < max_entries as u64 {
+                while tx <= last_written && count < max_entries as u64 {
                     let t = self
                         .persistence
                         .term_at_tx(tx)
@@ -985,6 +997,21 @@ impl<P: Persistence> RaftNode<P> {
             && let Some(new_cluster) = self.quorum.advance(self.self_slot, tx_id)
         {
             self.publish_cluster_commit(new_cluster, out);
+        }
+    }
+
+    // ─── LocalWriteAdvanced (leader) ─────────────────────────────────────
+
+    /// Driver acks that the leader's raft log is durable up to
+    /// `tx_id`. Bounds the AE replication window only — does not
+    /// touch `local_log_index`, the quorum self-slot, or
+    /// `cluster_commit_index`. No-op outside the leader role: the
+    /// driver may legitimately fire this around a role transition.
+    fn on_local_write_advanced(&mut self, tx_id: TxId) {
+        if let NodeState::Leader(l) = &mut self.state
+            && tx_id > l.last_written
+        {
+            l.last_written = tx_id;
         }
     }
 

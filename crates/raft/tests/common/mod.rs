@@ -348,9 +348,10 @@ impl Sim {
     }
 
     /// Inject a "client write" on `leader_id`: simulates the leader's
-    /// ledger appending the next tx_id and notifying raft via
-    /// `LocalCommitAdvanced`. Skips silently if the named node is not
-    /// (or no longer) a leader.
+    /// ledger appending the next tx_id, notifying raft of raft-log
+    /// durability via `LocalWriteAdvanced` and of ledger-commit via
+    /// `LocalCommitAdvanced`. Skips silently if the named node is
+    /// not (or no longer) a leader.
     pub fn client_write(&mut self, leader_id: NodeId, count: usize) {
         let term = self.current_term_of(leader_id);
         if !self.role_of(leader_id).is_leader() {
@@ -365,8 +366,17 @@ impl Sim {
             for i in 0..count {
                 let tx = start + 1 + i as u64;
                 b.entries.push(MirrorEntry::new(tx, term));
-                let acts = node.step(now, Event::LocalCommitAdvanced { tx_id: tx });
-                actions_acc.push((leader_id, acts));
+                // Raft-log durability first: bounds the AE
+                // replication window so the leader can immediately
+                // ship this entry to followers.
+                let write_acts = node.step(now, Event::LocalWriteAdvanced { tx_id: tx });
+                actions_acc.push((leader_id, write_acts));
+                // Ledger-commit second: advances `local_log_index`
+                // and the leader's quorum self-slot, which is what
+                // lets `cluster_commit_index` move once a majority
+                // has acked.
+                let commit_acts = node.step(now, Event::LocalCommitAdvanced { tx_id: tx });
+                actions_acc.push((leader_id, commit_acts));
             }
         }
         for (id, acts) in actions_acc {
