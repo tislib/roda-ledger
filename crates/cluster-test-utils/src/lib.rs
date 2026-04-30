@@ -23,28 +23,26 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
-use client::{ClusterClient, NodeClient, PipelineIndex, SubmitResult};
+use ::proto::node::{self as nproto, node_client::NodeClient as ProtoNodeClient};
+use client::{ClusterClient, NodeClient, PipelineIndex, RetryConfig, SubmitResult};
+use cluster::Role;
 use cluster::cluster_mirror::ClusterMirror;
-use cluster::config::{
-    ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection,
-};
+use cluster::config::{ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection};
 use cluster::durable::{Term, Vote};
 use cluster::ledger_handler::LedgerHandler;
 use cluster::ledger_slot::LedgerSlot;
 use cluster::node::{ClusterNode, Handles};
-use proto::ledger as lproto;
-use ::proto::node::{self as nproto, node_client::NodeClient as ProtoNodeClient};
-use cluster::Role;
 use ledger::config::LedgerConfig;
-use storage::StorageConfig;
 use ledger::ledger::Ledger;
 use ledger::wait_strategy::WaitStrategy;
-use spdlog::{info, warn, Level};
+use proto::ledger as lproto;
+use spdlog::{Level, info, warn};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use storage::StorageConfig;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
@@ -201,6 +199,7 @@ pub struct ClusterTestingConfig {
     /// `temp_cluster_<label>_<nanos>/` under `current_dir()` and
     /// removes it in `Drop`.
     pub data_dir_root: Option<PathBuf>,
+    pub retry_config: RetryConfig,
 }
 
 impl Default for ClusterTestingConfig {
@@ -218,6 +217,7 @@ impl Default for ClusterTestingConfig {
             ledger_log_level: Level::Info,
             autostart: true,
             data_dir_root: None,
+            retry_config: Default::default(),
         }
     }
 }
@@ -325,6 +325,7 @@ pub struct ClusterTestingControl {
     /// watermark. Used by [`Self::ensure_caught_up_at`] as the catch-
     /// up target for `require_*` reads.
     last_tx_id: Arc<AtomicU64>,
+    retry_config: RetryConfig,
 }
 
 impl ClusterTestingControl {
@@ -452,6 +453,7 @@ impl ClusterTestingControl {
             cached_leader_idx: Arc::new(Mutex::new(None)),
             cluster_client: None,
             last_tx_id: Arc::new(AtomicU64::new(0)),
+            retry_config: config.retry_config.clone(),
         };
 
         // 5) Optionally start every slot. Standalone/Cluster also
@@ -490,7 +492,7 @@ impl ClusterTestingControl {
             self.cluster_client = None;
             return Ok(());
         }
-        let cc = ClusterClient::connect(&urls)
+        let cc = ClusterClient::connect_with_retry(&urls, self.retry_config.clone())
             .await
             .map_err(ClusterTestingError::Connect)?;
         self.cluster_client = Some(cc);

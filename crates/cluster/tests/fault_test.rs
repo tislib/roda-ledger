@@ -1,8 +1,8 @@
 //! Process / network / storage fault scenarios.
 
-
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use client::RetryConfig;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 
 const ACCOUNT: u64 = 1;
@@ -219,9 +219,12 @@ async fn repeated_leader_churn_preserves_commits() {
 /// single leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_leader_rejoins_as_follower() {
-    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
-        .await
-        .expect("start");
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        retry_config: RetryConfig::no_retry(),
+        ..ClusterTestingConfig::cluster(3)
+    })
+    .await
+    .expect("start");
     let leader_idx = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
 
     for ur in 1..=10u64 {

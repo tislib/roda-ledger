@@ -54,6 +54,16 @@ pub struct RetryConfig {
     pub max_backoff_ms: u64,
 }
 
+impl RetryConfig {
+    pub fn no_retry() -> RetryConfig {
+        Self {
+            max_retry_count: 0,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+        }
+    }
+}
+
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {

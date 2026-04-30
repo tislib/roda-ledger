@@ -1,8 +1,8 @@
 //! Cluster configuration & topology — bring-up shapes, validation, and
 //! membership sizing.
 
-
 use ::proto::ledger::WaitLevel;
+use client::RetryConfig;
 use cluster::Config;
 use cluster::config::ConfigError;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
@@ -144,9 +144,11 @@ async fn single_node_cluster_boots_directly_as_leader() {
 /// advance and `WaitLevel::ClusterCommit` correctly times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_cluster_requires_both_for_cluster_commit() {
-    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(2))
-        .await
-        .expect("start");
+    let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        ..ClusterTestingConfig::cluster(2)
+    })
+    .await
+    .expect("start");
 
     let _leader = ctl
         .wait_for_leader(Duration::from_secs(10))

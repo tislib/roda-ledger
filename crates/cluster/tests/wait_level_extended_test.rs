@@ -1,16 +1,16 @@
 //! Wait levels and read semantics on cluster.
 
-
 use ::proto::ledger as proto;
 use ::proto::ledger::WaitLevel;
 use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
+use client::RetryConfig;
 use cluster::{LedgerHandler, Role, Term};
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use ledger::ledger::Ledger;
-use storage::{TermRecord, TermStorage};
 use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage::{TermRecord, TermStorage};
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tonic::Request;
@@ -86,9 +86,12 @@ async fn wait_level_snapshot_on_cluster() {
 /// cluster proves the wait succeeds when all three advance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_level_cluster_commit_requires_full_advance() {
-    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
-        .await
-        .expect("start");
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        retry_config: RetryConfig::no_retry(),
+        ..ClusterTestingConfig::cluster(3)
+    })
+    .await
+    .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
@@ -271,10 +274,7 @@ async fn submit_on_follower_returns_failed_precondition() {
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let follower_idx = ctl
-        .first_follower_index()
-        .await
-        .expect("follower idx");
+    let follower_idx = ctl.first_follower_index().await.expect("follower idx");
     let err = ctl
         .raw_client_for_slot(follower_idx)
         .expect("raw follower client")

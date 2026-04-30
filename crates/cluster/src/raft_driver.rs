@@ -239,14 +239,28 @@ impl RaftHandle {
             if let Some(range) = outcome.append_log {
                 let entries = payload.clone();
                 let ledger = self.ledger.ledger();
-                let res = tokio::task::spawn_blocking(move || ledger.append_wal_entries(entries))
-                    .await
-                    .unwrap_or_else(|e| {
-                        Err(std::io::Error::other(format!(
-                            "append_wal_entries spawn_blocking panicked: {}",
-                            e
-                        )))
-                    });
+                let last = range.last_tx_id().expect("non-empty range");
+                // ADR-0017 §"Durability before externalisation" #5b:
+                // the follower's success reply must wait for actual
+                // durability. `append_wal_entries` only enqueues —
+                // we then block until `last_commit_id` reaches `last`.
+                // The user's "all node.proto handlers must be
+                // sequential" directive keeps the raft mutex held
+                // during this wait.
+                let res = tokio::task::spawn_blocking(move || {
+                    ledger.append_wal_entries(entries)?;
+                    while ledger.last_commit_id() < last {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(std::io::Error::other(format!(
+                        "append_wal_entries spawn_blocking panicked: {}",
+                        e
+                    )))
+                });
                 if let Err(e) = res {
                     warn!(
                         "raft_driver: append_wal_entries failed on follower path: {}",
@@ -259,7 +273,6 @@ impl RaftHandle {
                         reject_reason: proto::RejectReason::RejectWalAppendFailed as u32,
                     };
                 }
-                let last = range.last_tx_id().expect("non-empty range");
                 current_event = Event::LogAppendComplete { tx_id: last };
                 continue;
             }
