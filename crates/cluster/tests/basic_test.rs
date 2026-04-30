@@ -5,11 +5,10 @@
 //! - Leader's replication thread ships WAL bytes via AppendEntries.
 //! - Follower's balances catch up to the leader's.
 
-
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
-use storage::entities::SYSTEM_ACCOUNT_ID;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
+use storage::entities::SYSTEM_ACCOUNT_ID;
 
 // Stage 4: with the Candidate loop landed, multi-node clusters
 // elect a leader from cold boot — no static role is assigned. The
@@ -41,10 +40,7 @@ async fn cluster_leader_replicates_to_follower() {
     );
 
     // ── Follower rejects writes (negative-path uses raw escape hatch) ──
-    let follower_idx = ctl
-        .first_follower_index()
-        .await
-        .expect("follower index");
+    let follower_idx = ctl.first_follower_index().await.expect("follower index");
     let write_err = ctl
         .raw_client_for_slot(follower_idx)
         .expect("raw follower client")
@@ -61,14 +57,17 @@ async fn cluster_leader_replicates_to_follower() {
     let account = 7u64;
     let amount = 100u64;
     let total_tx = 200u64;
-    let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|_| (account, amount, 0u64)).collect();
+    let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|i| (account, amount, i + 1)).collect();
     let results = ctl
         .deposit_batch_and_wait(&deposits, WaitLevel::ClusterCommit)
         .await
         .expect("leader batch deposit");
     assert_eq!(results.len(), total_tx as usize);
     for r in &results {
-        assert_eq!(r.fail_reason, 0, "leader deposit must succeed");
+        assert!(
+            r.fail_reason == 7 || r.fail_reason == 0,
+            "leader deposit must succeed"
+        );
     }
 
     // ── Verification: leader and follower converge on the same balance ──

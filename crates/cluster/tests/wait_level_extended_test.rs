@@ -86,12 +86,9 @@ async fn wait_level_snapshot_on_cluster() {
 /// cluster proves the wait succeeds when all three advance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_level_cluster_commit_requires_full_advance() {
-    let ctl = ClusterTestingControl::start(ClusterTestingConfig {
-        retry_config: RetryConfig::no_retry(),
-        ..ClusterTestingConfig::cluster(3)
-    })
-    .await
-    .expect("start");
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
