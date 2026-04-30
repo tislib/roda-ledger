@@ -46,6 +46,17 @@ These are different facts. The leader's `commit_index` can be ahead of `cluster_
 
 Cluster-level reads (e.g. `wait_for_transaction_level`) and the apply pipeline use `cluster_commit_index`. The local `commit_index` is for raft's own bookkeeping and per-node introspection.
 
+### AE reply: write vs commit watermark
+
+`AppendEntriesResponse` carries **two** watermarks, each gating a different leader decision:
+
+- **`last_commit_id`** — the highest tx_id the follower has *durably committed* after this RPC. The leader uses it to advance the per-peer `match_index` and the cluster-wide quorum (`cluster_commit_index`). Only durably-replicated entries count toward quorum, and the §5.4 Figure-8 guard reads this watermark.
+- **`last_write_id`** — the highest tx_id the follower has *accepted/written* into its log. The leader uses it solely to advance `next_index` (the replication window — "what to ship next"). The point of `next_index` is to avoid re-shipping entries the follower already has; using the durable watermark for that conflates "what's safe to commit" with "what's already on the wire to this peer", which causes the leader to re-ship entries the follower has accepted but not yet fsync'd.
+
+Invariant: `last_write_id >= last_commit_id`. A peer that violates it is treated as misbehaving — debug builds panic via `debug_assert!`, release builds clamp `last_commit_id` to `last_write_id` defensively (same posture as the truncation-below-cluster-commit guard).
+
+The library treats the two watermarks as independent inputs even when the cluster driver currently populates them from the same durability ack (the follower-side handler waits for fsync before replying). This makes future split-ack architectures — a follower that emits an early write-only ack ahead of fsync — safe to introduce without any further raft-library changes.
+
 ## Required Invariants
 
 The design must enforce these under all schedules:
@@ -58,7 +69,7 @@ The design must enforce these under all schedules:
 
 4. **No boot-time term bumping.** A node coming back up sits at its persisted term; only candidates running an actual election bump term. The constructor never advances state.
 
-5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and any `cluster_commit` advance derived from `leader_commit` wait for the driver's `LogAppendComplete` ack before being emitted; the leader cannot count an entry as durably replicated on a peer until the peer has actually written it.
+5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and any `cluster_commit` advance derived from `leader_commit` wait for the driver's `LogAppendComplete` ack before being emitted; the leader cannot count an entry as durably replicated on a peer until the peer has actually written it. The reply carries `last_commit_id` (durable) and `last_write_id` (accepted) separately — see §"AE reply: write vs commit watermark" — so that future split-ack architectures can decouple the two without breaking the durability-gates-quorum invariant.
 
 6. **Fatal-on-unrecoverable-persistence-failure.** If the persistence trait returns `Err` from a write that, if the library proceeded, would diverge in-memory state from on-disk state (term-log truncate, term observation), the library emits a fatal-error action, freezes the node, and refuses further forward progress. The driver must shut the node down on receipt — partial state recovery from this point is not safe. (Errors that leave the on-disk state untouched, like a refused vote or a refused `commit_term`, are recoverable and the library reacts in-band.)
 

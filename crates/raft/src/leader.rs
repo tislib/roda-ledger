@@ -6,6 +6,10 @@
 //! to advance/regress `next_index` (Raft §5.3 `next_index -= 1` on
 //! `LogMismatch`) and on every `Tick` to decide which peers need a
 //! fresh AppendEntries.
+//!
+//! The reply's two watermarks (`last_write_id`, `last_commit_id`) drive
+//! `next_index` and `match_index` independently — see ADR-0017 §"AE
+//! reply: write vs commit watermark".
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -13,10 +17,12 @@ use std::time::{Duration, Instant};
 use crate::types::{NodeId, TxId};
 
 /// One in-flight AppendEntries window. The state machine only
-/// matches on `expires_at` (for timeouts) and `last_tx_id_in_batch`
-/// (for advancing `match_index` on success); no rpc-id is needed
-/// because the library serialises one in-flight RPC per peer at a
-/// time.
+/// matches on `expires_at` (for timeouts); the field
+/// `last_tx_id_in_batch` is kept for diagnostics/symmetry but is no
+/// longer consulted to advance `match_index` — replies carry a
+/// `last_commit_id` of their own (the peer's durable end), which is
+/// what the leader uses. No rpc-id is needed because the library
+/// serialises one in-flight RPC per peer at a time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InFlightAppend {
     pub last_tx_id_in_batch: TxId,
@@ -27,9 +33,14 @@ pub struct InFlightAppend {
 pub struct PeerProgress {
     /// Next tx_id to ship to this peer. On `LogMismatch` reject we
     /// decrement (clamped at 1) until we find the agreement point.
-    /// On success we advance to `last_tx_id_in_batch + 1`.
+    /// On success we advance to the reply's `last_write_id + 1` (the
+    /// peer's accepted/written end — "what the peer already has, so
+    /// don't re-ship it"). See ADR-0017 §"AE reply: write vs commit
+    /// watermark" for why this is the write-id, not the commit-id.
     pub next_index: TxId,
-    /// Highest tx_id known durably replicated on this peer.
+    /// Highest tx_id known durably replicated on this peer. Advanced
+    /// from each reply's `last_commit_id` (the peer's durable end).
+    /// Drives the cluster-wide quorum.
     pub match_index: TxId,
     pub in_flight: Option<InFlightAppend>,
     /// Deadline at which this peer needs a fresh AppendEntries (real

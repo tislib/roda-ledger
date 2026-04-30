@@ -146,7 +146,8 @@ fn unsolicited_append_entries_reply_is_ignored() {
             from: 99, // never a peer
             term: term_before,
             success: true,
-            last_tx_id: 99,
+            last_commit_id: 99,
+            last_write_id: 99,
             reject_reason: None,
         },
     );
@@ -178,7 +179,8 @@ fn late_reply_after_rpc_timeout_does_not_crash() {
             from: 2, // a phantom peer in this single-node cluster
             term: node.current_term(),
             success: true,
-            last_tx_id: 0,
+            last_commit_id: 0,
+            last_write_id: 0,
             reject_reason: Some(RejectReason::RpcTimeout),
         },
     );

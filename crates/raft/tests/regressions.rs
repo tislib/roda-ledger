@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, Role};
+use raft::{Action, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, Role, TxId};
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
     RaftNode::new(
@@ -115,7 +115,8 @@ fn log_mismatch_decrements_next_index() {
                 from: 2,
                 term: node.current_term(),
                 success: false,
-                last_tx_id: 0,
+                last_commit_id: 0,
+                last_write_id: 0,
                 reject_reason: Some(RejectReason::LogMismatch),
             },
         );
@@ -313,7 +314,8 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
             from: 3,
             term: cand_term,
             success: true,
-            last_tx_id: 5,
+            last_commit_id: 5,
+            last_write_id: 5,
             reject_reason: None,
         },
     );
@@ -323,7 +325,8 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
             from: 4,
             term: cand_term,
             success: true,
-            last_tx_id: 5,
+            last_commit_id: 5,
+            last_write_id: 5,
             reject_reason: None,
         },
     );
@@ -334,6 +337,281 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
         cand_term,
         node.cluster_commit_index(),
         node.commit_index(),
+    );
+}
+
+// ─── AE reply: split watermark (last_write_id vs last_commit_id) ───────────
+//
+// The leader's `on_append_entries_reply` reads two distinct
+// watermarks from each reply and uses them for orthogonal
+// decisions (ADR-0017 §"AE reply: write vs commit watermark"):
+//
+//   `last_write_id`  → `progress.next_index` (the replication
+//                      window — "what to ship next")
+//   `last_commit_id` → `progress.match_index` and `quorum`
+//                      (the durable end — "what's safe to
+//                      commit cluster-wide")
+//
+// These tests pin the split: the library must treat them as
+// independent inputs even though today's cluster bridge happens to
+// populate both from the same durability ack. They exercise the
+// library by injecting `Event::AppendEntriesReply` directly.
+
+/// Drive a fresh node to leader of a 3-node cluster at term 1, with
+/// `local_log_index = last_written = entries` after construction.
+/// Returns `(node, term, t_after_setup)` so the caller can keep
+/// stepping with consistent timestamps.
+fn leader_with_entries(entries: TxId, t0: Instant) -> (RaftNode<MemPersistence>, u64, Instant) {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    let _ = node.step(t0, Event::Tick);
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    let term = node.current_term();
+    // 3-node cluster majority = 2 (self-vote + 1 peer = win).
+    let _ = node.step(
+        t0 + Duration::from_secs(60),
+        Event::RequestVoteReply { from: 2, term, granted: true },
+    );
+    assert!(node.role().is_leader(), "test setup: did not become leader");
+
+    let after = t0 + Duration::from_secs(61);
+    if entries > 0 {
+        let _ = node.step(after, Event::LocalCommitAdvanced { tx_id: entries });
+        let _ = node.step(after, Event::LocalWriteAdvanced { tx_id: entries });
+    }
+    // Drain the initial AE round so peers have an in-flight set;
+    // subsequent replies clear it cleanly.
+    let _ = node.step(after + Duration::from_millis(1), Event::Tick);
+    (node, term, after + Duration::from_millis(1))
+}
+
+/// Bug repro: with the old single-watermark logic, `next_index`
+/// advanced from the durable end (`last_commit_id + 1`), causing the
+/// leader to re-ship entries the follower had already accepted but
+/// not yet fsync'd. After the fix `next_index` advances from
+/// `last_write_id + 1`.
+#[test]
+fn ae_reply_advances_next_index_from_write_id_not_commit_id() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(5, t0);
+
+    // Peer 2 has accepted all 5 entries into its log but only fsync'd
+    // 3 of them. Its reply carries the split watermark.
+    let _ = node.step(
+        t_setup + Duration::from_millis(10),
+        Event::AppendEntriesReply {
+            from: 2,
+            term,
+            success: true,
+            last_commit_id: 3,
+            last_write_id: 5,
+            reject_reason: None,
+        },
+    );
+
+    // Advance past `next_heartbeat` (default 50ms) so the leader
+    // re-evaluates what to send. With the fix `next_index = 6`, so
+    // the next AE to peer 2 is a heartbeat. Under the bug
+    // `next_index = 4`, so the leader would re-ship entries [4, 5].
+    let actions = node.step(t_setup + Duration::from_millis(100), Event::Tick);
+    let entries_to_peer_2: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendAppendEntries { to: 2, entries, .. } => Some(entries.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !entries_to_peer_2.is_empty(),
+        "expected the leader to send to peer 2 after next_heartbeat fires; got {:?}",
+        actions
+    );
+    for entries in &entries_to_peer_2 {
+        assert!(
+            entries.is_empty(),
+            "leader re-shipped entries the follower already accepted: \
+             next_index must advance from last_write_id (5)+1=6 \
+             (heartbeat), not last_commit_id (3)+1=4 (re-ship). \
+             Got entries={:?}",
+            entries
+        );
+    }
+}
+
+/// Quorum / `cluster_commit_index` must advance from `last_commit_id`
+/// only (the durable watermark), never from `last_write_id`. Two
+/// peers ack with `last_write_id = 5, last_commit_id = 3`; the
+/// leader's self-slot is at 5. The quorum's middle-of-three is 3,
+/// not 5 — committing entries 4 and 5 here would let a future
+/// leader overwrite them (the canonical write-not-yet-durable
+/// hazard).
+#[test]
+fn ae_reply_quorum_advances_only_to_commit_id() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(5, t0);
+
+    let _ = node.step(
+        t_setup + Duration::from_millis(10),
+        Event::AppendEntriesReply {
+            from: 2,
+            term,
+            success: true,
+            last_commit_id: 3,
+            last_write_id: 5,
+            reject_reason: None,
+        },
+    );
+    let _ = node.step(
+        t_setup + Duration::from_millis(11),
+        Event::AppendEntriesReply {
+            from: 3,
+            term,
+            success: true,
+            last_commit_id: 3,
+            last_write_id: 5,
+            reject_reason: None,
+        },
+    );
+
+    assert_eq!(
+        node.cluster_commit_index(),
+        3,
+        "cluster_commit must reflect the durable end (last_commit_id=3), \
+         not the accepted end (last_write_id=5). Both peers' write-but-not-durable \
+         entries 4-5 must NOT count toward quorum."
+    );
+}
+
+/// A second reply from the same peer with the same `last_write_id`
+/// but a higher `last_commit_id` advances `match_index` (durability
+/// progressing) without disturbing `next_index`. Pins the
+/// monotonicity contract for the watermark split.
+#[test]
+fn ae_reply_commit_lagging_write_does_not_regress_next_index() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(10, t0);
+
+    // First reply: peer 2 has accepted all 10 but only durable to 3.
+    let _ = node.step(
+        t_setup + Duration::from_millis(10),
+        Event::AppendEntriesReply {
+            from: 2,
+            term,
+            success: true,
+            last_commit_id: 3,
+            last_write_id: 10,
+            reject_reason: None,
+        },
+    );
+    // Peer 3 too — gives us a 3/3 majority at commit=3 so we can
+    // observe further commit progress via `cluster_commit_index`.
+    let _ = node.step(
+        t_setup + Duration::from_millis(11),
+        Event::AppendEntriesReply {
+            from: 3,
+            term,
+            success: true,
+            last_commit_id: 3,
+            last_write_id: 10,
+            reject_reason: None,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 3);
+
+    // Second reply from peer 2: write watermark unchanged, commit
+    // moved up by one. `next_index` must not regress.
+    let _ = node.step(
+        t_setup + Duration::from_millis(20),
+        Event::AppendEntriesReply {
+            from: 2,
+            term,
+            success: true,
+            last_commit_id: 4,
+            last_write_id: 10,
+            reject_reason: None,
+        },
+    );
+    let _ = node.step(
+        t_setup + Duration::from_millis(21),
+        Event::AppendEntriesReply {
+            from: 3,
+            term,
+            success: true,
+            last_commit_id: 4,
+            last_write_id: 10,
+            reject_reason: None,
+        },
+    );
+    assert_eq!(
+        node.cluster_commit_index(),
+        4,
+        "match_index must advance with last_commit_id even when last_write_id is unchanged"
+    );
+
+    // And next_index is still at 11 — heartbeat to peer 2 on the
+    // next Tick.
+    let actions = node.step(t_setup + Duration::from_millis(120), Event::Tick);
+    let entries_to_peer_2: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendAppendEntries { to: 2, entries, .. } => Some(entries.clone()),
+            _ => None,
+        })
+        .collect();
+    for entries in &entries_to_peer_2 {
+        assert!(
+            entries.is_empty(),
+            "next_index regressed: leader re-shipped entries after the \
+             second reply. Got {:?}",
+            entries
+        );
+    }
+}
+
+/// Defensive clamp on a malformed reply where the peer claims to
+/// have committed more than it has written. Debug builds must
+/// panic (`debug_assert!`); release builds clamp commit down to
+/// write and proceed. Same posture as the truncation-below-cluster-
+/// commit guard elsewhere in this file.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "AE reply: last_commit_id="))]
+fn ae_reply_clamps_commit_above_write_defensively() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(10, t0);
+
+    // Malformed: peer claims commit=5 with write=3. Library either
+    // panics (debug) or clamps commit to 3 (release).
+    let _ = node.step(
+        t_setup + Duration::from_millis(10),
+        Event::AppendEntriesReply {
+            from: 2,
+            term,
+            success: true,
+            last_commit_id: 5,
+            last_write_id: 3,
+            reject_reason: None,
+        },
+    );
+
+    // Release-build path: clamp brought commit down to 3, so peer
+    // 2's match_index = 3 and next_index = 4. We can verify the
+    // latter by triggering a Tick and inspecting the next AE.
+    let actions = node.step(t_setup + Duration::from_millis(100), Event::Tick);
+    let to_peer_2 = actions.iter().find_map(|a| match a {
+        Action::SendAppendEntries { to: 2, entries, prev_log_tx_id, .. } => {
+            Some((entries.clone(), *prev_log_tx_id))
+        }
+        _ => None,
+    });
+    let (entries, prev) = to_peer_2.expect("expected an AE to peer 2 after Tick");
+    assert_eq!(
+        prev, 3,
+        "release-build clamp: next_index must be 4 (= clamped commit + 1), \
+         so prev_log_tx_id = 3. Got prev_log_tx_id = {}",
+        prev
+    );
+    assert!(
+        !entries.is_empty(),
+        "expected the leader to ship entries [4, 10] starting at next_index=4"
     );
 }
 

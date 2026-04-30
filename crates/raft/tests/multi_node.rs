@@ -259,7 +259,8 @@ fn higher_term_in_append_reply_demotes_leader() {
             from: 1,
             term: 99,
             success: false,
-            last_tx_id: 0,
+            last_commit_id: 0,
+            last_write_id: 0,
             reject_reason: None,
         },
     );

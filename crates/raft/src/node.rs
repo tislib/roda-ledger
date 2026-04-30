@@ -303,7 +303,8 @@ impl<P: Persistence> RaftNode<P> {
                 from,
                 term,
                 success,
-                last_tx_id,
+                last_commit_id,
+                last_write_id,
                 reject_reason,
             } => {
                 self.on_append_entries_reply(
@@ -311,7 +312,8 @@ impl<P: Persistence> RaftNode<P> {
                     from,
                     term,
                     success,
-                    last_tx_id,
+                    last_commit_id,
+                    last_write_id,
                     reject_reason,
                     &mut out,
                 );
@@ -657,7 +659,8 @@ impl<P: Persistence> RaftNode<P> {
                 to: from,
                 term: current_term,
                 success: false,
-                last_tx_id: self.local_log_index,
+                last_commit_id: self.local_log_index,
+                last_write_id: self.local_log_index,
             });
             return;
         }
@@ -715,7 +718,8 @@ impl<P: Persistence> RaftNode<P> {
                     to: from,
                     term: self.current_term(),
                     success: false,
-                    last_tx_id: self.local_log_index,
+                    last_commit_id: self.local_log_index,
+                    last_write_id: self.local_log_index,
                 });
                 return;
             }
@@ -751,10 +755,14 @@ impl<P: Persistence> RaftNode<P> {
                 .expect("non-empty range has a last_tx_id");
             let reply_term = self.current_term();
             if let NodeState::Follower(f) = &mut self.state {
+                // Today the driver waits for full durability before
+                // posting `LogAppendComplete`, so by the time this
+                // reply fires both watermarks equal `parked_tx_id`.
                 f.park_reply(crate::follower::PendingReply {
                     to: from,
                     term: reply_term,
-                    last_tx_id: parked_tx_id,
+                    last_commit_id: parked_tx_id,
+                    last_write_id: parked_tx_id,
                     leader_commit,
                 });
             }
@@ -777,7 +785,8 @@ impl<P: Persistence> RaftNode<P> {
             to: from,
             term: self.current_term(),
             success: true,
-            last_tx_id: self.local_log_index,
+            last_commit_id: self.local_log_index,
+            last_write_id: self.local_log_index,
         });
     }
 
@@ -917,7 +926,8 @@ impl<P: Persistence> RaftNode<P> {
         from: NodeId,
         term: Term,
         success: bool,
-        last_tx_id: TxId,
+        last_commit_id: TxId,
+        last_write_id: TxId,
         reject_reason: Option<RejectReason>,
         out: &mut Vec<Action>,
     ) {
@@ -928,11 +938,31 @@ impl<P: Persistence> RaftNode<P> {
             return;
         }
 
-        // `Ok(adv)` — peer acked, advance the quorum slot to `adv`.
+        // The two reply watermarks drive different leader decisions
+        // (ADR-0017 §"AE reply: write vs commit watermark"):
+        //   `last_commit_id` — peer's durable end → match_index +
+        //                      quorum advance/regress.
+        //   `last_write_id`  — peer's accepted end → next_index
+        //                      (replication window).
+        // Invariant: `last_write_id >= last_commit_id`. A peer that
+        // violates it is treated as misbehaving: panic in debug,
+        // clamp in release. Same posture as the §5.4 truncation guard
+        // earlier in this file.
+        debug_assert!(
+            last_write_id >= last_commit_id,
+            "AE reply: last_commit_id={} > last_write_id={} from peer={}",
+            last_commit_id,
+            last_write_id,
+            from
+        );
+        let last_commit_id = last_commit_id.min(last_write_id);
+
+        // `Ok(adv)` — peer acked, advance the quorum slot to `adv`
+        // (the durable watermark).
         // `Err(Some(peer_last))` — `LogMismatch`; regress the
-        // quorum slot defensively to the peer's reported
-        // `last_tx_id`. `Err(None)` — non-mismatch reject (term
-        // behind, rpc timeout); leave the quorum alone.
+        // quorum slot defensively to the peer's reported durable end.
+        // `Err(None)` — non-mismatch reject (term behind, rpc
+        // timeout); leave the quorum alone.
         let outcome: Result<TxId, Option<TxId>> = match &mut self.state {
             NodeState::Leader(l) => {
                 let progress = match l.peers.get_mut(&from) {
@@ -941,11 +971,11 @@ impl<P: Persistence> RaftNode<P> {
                 };
                 progress.in_flight = None;
                 if success {
-                    if last_tx_id > progress.match_index {
-                        progress.match_index = last_tx_id;
+                    if last_commit_id > progress.match_index {
+                        progress.match_index = last_commit_id;
                     }
-                    progress.next_index = last_tx_id + 1;
-                    Ok(last_tx_id)
+                    progress.next_index = last_write_id + 1;
+                    Ok(last_commit_id)
                 } else {
                     match reject_reason {
                         Some(RejectReason::TermBehind) | Some(RejectReason::RpcTimeout) => Err(None),
@@ -955,7 +985,7 @@ impl<P: Persistence> RaftNode<P> {
                         // entry" sentinel.
                         Some(RejectReason::LogMismatch) | None => {
                             progress.next_index = progress.next_index.saturating_sub(1).max(1);
-                            Err(Some(last_tx_id))
+                            Err(Some(last_commit_id))
                         }
                     }
                 }
@@ -973,15 +1003,15 @@ impl<P: Persistence> RaftNode<P> {
                     self.publish_cluster_commit(new_cluster, out);
                 }
             }
-            Err(Some(peer_last_tx)) => {
+            Err(Some(peer_last_commit)) => {
                 // Defense-in-depth: a partially-recovered peer can
                 // resurface with a shorter durable log than its
                 // earlier acks claimed; lower the slot to the
-                // peer's freshly-reported `last_tx_id`. The
+                // peer's freshly-reported durable end. The
                 // `cluster_commit_index` watermark stays put
                 // (`Quorum::regress` does not republish it), so a
                 // committed entry can never become uncommitted.
-                self.quorum.regress(peer_slot_index, peer_last_tx);
+                self.quorum.regress(peer_slot_index, peer_last_commit);
             }
             Err(None) => {}
         }
@@ -1037,7 +1067,8 @@ impl<P: Persistence> RaftNode<P> {
                 to: pending.to,
                 term: pending.term,
                 success: true,
-                last_tx_id: pending.last_tx_id,
+                last_commit_id: pending.last_commit_id,
+                last_write_id: pending.last_write_id,
             });
         }
     }

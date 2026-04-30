@@ -38,11 +38,19 @@ pub enum Event {
     },
 
     /// Reply to an `AppendEntries` we sent.
+    ///
+    /// Two watermarks: `last_commit_id` is the follower's durably-
+    /// committed end (drives `match_index` and the cluster quorum);
+    /// `last_write_id` is the follower's accepted/written end (drives
+    /// the replication window — `next_index`). Invariant:
+    /// `last_write_id >= last_commit_id`. See ADR-0017 §"AE reply:
+    /// write vs commit watermark".
     AppendEntriesReply {
         from: NodeId,
         term: Term,
         success: bool,
-        last_tx_id: TxId,
+        last_commit_id: TxId,
+        last_write_id: TxId,
         reject_reason: Option<RejectReason>,
     },
 

@@ -34,11 +34,15 @@ pub enum Action {
         entries: LogEntryRange,
         leader_commit: TxId,
     },
+    /// Two watermarks — see `Event::AppendEntriesReply` doc and
+    /// ADR-0017 §"AE reply: write vs commit watermark". The driver
+    /// stamps both onto the wire.
     SendAppendEntriesReply {
         to: NodeId,
         term: Term,
         success: bool,
-        last_tx_id: TxId,
+        last_commit_id: TxId,
+        last_write_id: TxId,
     },
     SendRequestVote {
         to: NodeId,

@@ -264,13 +264,15 @@ fn success_reply_waits_for_log_append_complete() {
     if let Action::SendAppendEntriesReply {
         to,
         success,
-        last_tx_id,
+        last_commit_id,
+        last_write_id,
         ..
     } = reply
     {
         assert_eq!(*to, 2);
         assert!(*success);
-        assert_eq!(*last_tx_id, 3);
+        assert_eq!(*last_commit_id, 3);
+        assert_eq!(*last_write_id, 3);
     }
 }
 
@@ -455,9 +457,9 @@ fn pending_reply_overwritten_when_second_ae_arrives_before_ack() {
         .filter_map(|a| match a {
             Action::SendAppendEntriesReply {
                 success: true,
-                last_tx_id,
+                last_commit_id,
                 ..
-            } => Some(*last_tx_id),
+            } => Some(*last_commit_id),
             _ => None,
         })
         .collect();

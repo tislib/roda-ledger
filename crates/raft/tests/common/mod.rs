@@ -488,7 +488,8 @@ impl Sim {
                     to,
                     term,
                     success,
-                    last_tx_id,
+                    last_commit_id,
+                    last_write_id,
                 } => {
                     if self.is_dropped(src, to) || self.rolled_drop() {
                         continue;
@@ -498,7 +499,8 @@ impl Sim {
                         from: src,
                         term,
                         success,
-                        last_tx_id,
+                        last_commit_id,
+                        last_write_id,
                         reject_reason: None,
                     };
                     let dup = self.rolled_duplicate();
