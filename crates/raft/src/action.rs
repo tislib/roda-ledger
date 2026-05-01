@@ -16,26 +16,21 @@
 //! (truncate / append) itself, then calls
 //! `RaftNode::advance(write, commit)` once the entries are durable.
 //! The wire reply is built from the post-advance getters.
+//!
+//! Leader-side AppendEntries dispatch does **not** flow through
+//! `Action` either — see `RaftNode::replication` /
+//! [`crate::replication::PeerReplication::get_append_range`] for the
+//! direct-method pull path. The cluster owns the per-peer loop;
+//! raft owns the per-peer state and decides what to ship.
 
 use std::time::Instant;
 
-use crate::log_entry::LogEntryRange;
 use crate::role::Role;
 use crate::types::{NodeId, Term, TxId};
 
 #[derive(Clone, Debug)]
 pub enum Action {
     // ── outbound RPCs ───────────────────────────────────────────────────
-    /// `entries` is a single same-term contiguous range.
-    /// `LogEntryRange::empty()` is a heartbeat.
-    SendAppendEntries {
-        to: NodeId,
-        term: Term,
-        prev_log_tx_id: TxId,
-        prev_log_term: Term,
-        entries: LogEntryRange,
-        leader_commit: TxId,
-    },
     SendRequestVote {
         to: NodeId,
         term: Term,

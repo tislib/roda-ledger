@@ -35,7 +35,7 @@
 
 use std::time::{Duration, Instant};
 
-use spdlog::{debug, info, trace, warn};
+use spdlog::{debug, info, warn};
 
 use crate::action::Action;
 use crate::candidate::CandidateState;
@@ -475,9 +475,8 @@ impl<P: Persistence> RaftNode<P> {
             return None;
         }
 
-        // Mirror `leader_drive`'s expired-RPC sweep so a stale
-        // `in_flight` doesn't prevent the build path below from
-        // finding the peer.
+        // Sweep expired in-flight first so a peer with a stale RPC
+        // can re-send on the same call.
         if let NodeState::Leader(l) = &mut self.state
             && let Some(p) = l.peers.get_mut(&peer_id)
             && let Some(infl) = p.in_flight
@@ -486,15 +485,28 @@ impl<P: Persistence> RaftNode<P> {
             p.in_flight = None;
         }
 
+        // Gate (matches the legacy `leader_drive` filter): skip
+        // when an RPC is already in flight or the heartbeat
+        // deadline hasn't elapsed yet. Lets the cluster (or
+        // simulator) call `get_append_range` freely without
+        // spamming the wire — a `None` here means "not due, sleep
+        // until next_heartbeat".
+        let progress = match &self.state {
+            NodeState::Leader(l) => l.peers.get(&peer_id).cloned()?,
+            _ => return None,
+        };
+        if progress.in_flight.is_some() {
+            return None;
+        }
+        if now < progress.next_heartbeat {
+            return None;
+        }
+
         let current_term = self.current_term();
         let leader_commit = self.cluster_commit_index;
         let max_entries = self.cfg.max_entries_per_append;
         let last_written = self.local_write_index;
-
-        let next_index = match &self.state {
-            NodeState::Leader(l) => l.peers.get(&peer_id).map(|p| p.next_index)?,
-            _ => return None,
-        };
+        let next_index = progress.next_index;
 
         let prev_log_tx_id = next_index.saturating_sub(1);
         let prev_log_term = self
@@ -697,10 +709,6 @@ impl<P: Persistence> RaftNode<P> {
         // Drain expired in-flight RequestVote RPCs (treat as no-vote).
         if let NodeState::Candidate(c) = &mut self.state {
             let _expired = c.drain_expired(now);
-        }
-
-        if let NodeState::Leader(_) = &self.state {
-            self.leader_drive(now, out);
         }
     }
 
@@ -977,9 +985,13 @@ impl<P: Persistence> RaftNode<P> {
             term: new_term,
         });
 
-        // Immediate first-round AppendEntries (heartbeat) so peers
-        // don't run their election timers out.
-        self.leader_drive(now, out);
+        // The cluster's per-peer replication loop (driven via
+        // `RaftNode::replication`) picks up from here. Each peer's
+        // `next_heartbeat` is initialised to `now` in
+        // `LeaderState::new`, so the very first
+        // `PeerReplication::get_append_range` after this `BecomeRole`
+        // returns Some — that's the immediate first-round AE that
+        // suppresses peer election timers.
     }
 
     // ─── AppendEntries (follower path) ───────────────────────────────────
@@ -1154,52 +1166,6 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     // ─── AppendEntries (leader path) ─────────────────────────────────────
-
-    fn leader_drive(&mut self, now: Instant, out: &mut Vec<Action>) {
-        if let NodeState::Leader(l) = &mut self.state {
-            for p in l.peers.values_mut() {
-                if let Some(infl) = p.in_flight
-                    && now >= infl.expires_at
-                {
-                    trace!("raft: in-flight AppendEntries timed out");
-                    p.in_flight = None;
-                }
-            }
-        }
-
-        let peers_to_send: Vec<NodeId> = match &self.state {
-            NodeState::Leader(l) => l
-                .peers
-                .iter()
-                .filter(|(_, p)| p.in_flight.is_none() && now >= p.next_heartbeat)
-                .map(|(id, _)| *id)
-                .collect(),
-            _ => return,
-        };
-
-        for peer in peers_to_send {
-            self.leader_send_to(peer, now, out);
-        }
-    }
-
-    fn leader_send_to(&mut self, peer: NodeId, now: Instant, out: &mut Vec<Action>) {
-        // Single source of truth for AE construction + in-flight
-        // arming: shared with the cluster-pull path (see
-        // `replication_get_append_range`). The action-emitting
-        // wrapper here is what the simulator and `leader_drive`
-        // depend on; the cluster's per-peer task uses the
-        // `Replication` view directly.
-        if let Some(req) = self.replication_get_append_range(peer, now) {
-            out.push(Action::SendAppendEntries {
-                to: req.to,
-                term: req.term,
-                prev_log_tx_id: req.prev_log_tx_id,
-                prev_log_term: req.prev_log_term,
-                entries: req.entries,
-                leader_commit: req.leader_commit,
-            });
-        }
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn on_append_entries_reply(
@@ -1908,18 +1874,28 @@ mod tests {
     /// the timeout, and a `RequestVoteReply { granted: true }`
     /// from one peer is enough to make a 3-node majority
     /// (self-vote + that one).
-    fn fresh_leader_3node(self_id: NodeId, peers: Vec<NodeId>) -> RaftNode<TestPersistence> {
+    ///
+    /// Returns `(node, leader_now)` so callers can issue
+    /// subsequent calls with timestamps `>= leader_now` —
+    /// `LeaderState::new` initialises every peer's `next_heartbeat`
+    /// to that instant, so the in-place gate in
+    /// `replication_get_append_range` rejects earlier `now` values.
+    fn fresh_leader_3node(
+        self_id: NodeId,
+        peers: Vec<NodeId>,
+    ) -> (RaftNode<TestPersistence>, Instant) {
         let mut node = fresh(self_id, peers.clone());
         let t0 = Instant::now();
+        let leader_now = t0 + Duration::from_secs(60);
         let _ = node.step(t0, Event::Tick);
-        let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+        let _ = node.step(leader_now, Event::Tick);
         if node.role().is_leader() {
-            return node;
+            return (node, leader_now);
         }
         let term = node.current_term();
         for peer in peers.iter().filter(|&&p| p != self_id) {
             let _ = node.step(
-                t0 + Duration::from_secs(60),
+                leader_now,
                 Event::RequestVoteReply {
                     from: *peer,
                     term,
@@ -1927,7 +1903,7 @@ mod tests {
                 },
             );
             if node.role().is_leader() {
-                return node;
+                return (node, leader_now);
             }
         }
         panic!("fresh_leader_3node: did not become leader (role={:?})", node.role());
@@ -1961,13 +1937,12 @@ mod tests {
 
     #[test]
     fn replication_get_append_range_returns_heartbeat_when_caught_up() {
-        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
-        let now = Instant::now();
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
         let req = node
             .replication()
             .peer(2)
             .unwrap()
-            .get_append_range(now)
+            .get_append_range(leader_now)
             .expect("leader should produce an AE");
         // No entries durably written → heartbeat (empty range).
         assert!(req.entries.is_empty());
@@ -1977,18 +1952,17 @@ mod tests {
 
     #[test]
     fn replication_get_append_range_ships_new_entries_after_advance() {
-        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
         // Leader-side ledger writes entries 1..=3 at the current term
         // (set by the election win as `current_term_first_tx`'s
         // start_tx_id) and acks durability via `advance`.
         node.advance(3, 3);
 
-        let now = Instant::now();
         let req = node
             .replication()
             .peer(2)
             .unwrap()
-            .get_append_range(now)
+            .get_append_range(leader_now)
             .expect("leader with durable entries should produce an AE");
         // next_index started at local_write_index + 1 = 1 (peer's
         // initial estimate), and the leader's local_write is now 3,
@@ -2000,24 +1974,24 @@ mod tests {
 
     #[test]
     fn replication_append_result_success_advances_match_and_next_index() {
-        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
         node.advance(3, 3);
-        let now = Instant::now();
         // Pull the request to arm in_flight.
-        let _ = node.replication().peer(2).unwrap().get_append_range(now);
-
-        let term = node.current_term();
-        node.replication()
+        let _ = node
+            .replication()
             .peer(2)
             .unwrap()
-            .append_result(
-                now,
-                AppendResult::Success {
-                    term,
-                    last_write_id: 3,
-                    last_commit_id: 3,
-                },
-            );
+            .get_append_range(leader_now);
+
+        let term = node.current_term();
+        node.replication().peer(2).unwrap().append_result(
+            leader_now,
+            AppendResult::Success {
+                term,
+                last_write_id: 3,
+                last_commit_id: 3,
+            },
+        );
 
         let pr = node.replication().peer(2).unwrap();
         assert_eq!(pr.match_index(), 3);
@@ -2027,85 +2001,94 @@ mod tests {
 
     #[test]
     fn replication_append_result_log_mismatch_walks_back_next_index() {
-        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
         node.advance(5, 5);
-        let now = Instant::now();
-        // Pull AE; next_index for peer is 1 (initial after election).
-        // Wait — after election, next_index = local_write_index + 1
-        // *at election time*. We bumped local_write to 5 via
-        // `advance` *after* the election, so peer next_index is
-        // still 1. Set it explicitly to model a peer that has
-        // already accepted a few entries.
+        // After election, next_index = local_write_index + 1 *at
+        // election time*. We bumped local_write to 5 via `advance`
+        // *after* the election, so peer next_index is still 1.
+        // Set it explicitly to model a peer that has already
+        // accepted a few entries.
         if let NodeState::Leader(l) = &mut node.state {
             l.peers.get_mut(&2).unwrap().next_index = 4;
         }
 
-        let _ = node.replication().peer(2).unwrap().get_append_range(now);
-
-        let term = node.current_term();
-        node.replication()
+        let _ = node
+            .replication()
             .peer(2)
             .unwrap()
-            .append_result(
-                now,
-                AppendResult::Reject {
-                    term,
-                    reason: RejectReason::LogMismatch,
-                    last_write_id: 0,
-                    last_commit_id: 0,
-                },
-            );
+            .get_append_range(leader_now);
+
+        let term = node.current_term();
+        node.replication().peer(2).unwrap().append_result(
+            leader_now,
+            AppendResult::Reject {
+                term,
+                reason: RejectReason::LogMismatch,
+                last_write_id: 0,
+                last_commit_id: 0,
+            },
+        );
         // §5.3: walk back next_index by 1 (clamped at 1).
         assert_eq!(node.replication().peer(2).unwrap().next_index(), 3);
     }
 
     #[test]
     fn replication_append_result_term_behind_steps_down() {
-        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
         let leader_term = node.current_term();
-        let now = Instant::now();
-        let _ = node.replication().peer(2).unwrap().get_append_range(now);
-
-        node.replication()
+        let _ = node
+            .replication()
             .peer(2)
             .unwrap()
-            .append_result(
-                now,
-                AppendResult::Reject {
-                    term: leader_term + 5,
-                    reason: RejectReason::TermBehind,
-                    last_write_id: 0,
-                    last_commit_id: 0,
-                },
-            );
+            .get_append_range(leader_now);
+
+        node.replication().peer(2).unwrap().append_result(
+            leader_now,
+            AppendResult::Reject {
+                term: leader_term + 5,
+                reason: RejectReason::TermBehind,
+                last_write_id: 0,
+                last_commit_id: 0,
+            },
+        );
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), leader_term + 5);
     }
 
     #[test]
     fn replication_append_result_timeout_clears_in_flight_only() {
-        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
         node.advance(3, 3);
-        let now = Instant::now();
-        let _ = node.replication().peer(2).unwrap().get_append_range(now);
+        let _ = node
+            .replication()
+            .peer(2)
+            .unwrap()
+            .get_append_range(leader_now);
 
-        // In-flight is set; next_index/match_index unchanged from
-        // the get_append_range call.
         let nx_before = node.replication().peer(2).unwrap().next_index();
         let mi_before = node.replication().peer(2).unwrap().match_index();
 
         node.replication()
             .peer(2)
             .unwrap()
-            .append_result(now, AppendResult::Timeout);
+            .append_result(leader_now, AppendResult::Timeout);
 
         assert_eq!(node.replication().peer(2).unwrap().next_index(), nx_before);
         assert_eq!(node.replication().peer(2).unwrap().match_index(), mi_before);
-        // Verify in_flight cleared by issuing a fresh get_append_range —
-        // it would build a new request only if in_flight is None or
-        // expired. Here `now` hasn't moved, so the only way a new
-        // request comes back is if in_flight was cleared.
-        let req2 = node.replication().peer(2).unwrap().get_append_range(now);
-        assert!(req2.is_some(), "timeout must clear in_flight so a fresh request can fire");
+
+        // Verify in_flight was cleared by pulling a fresh request
+        // *after* the heartbeat deadline elapses. The gate respects
+        // `next_heartbeat`; in-flight being None is necessary but not
+        // sufficient.
+        let later = leader_now + Duration::from_millis(100);
+        let req2 = node
+            .replication()
+            .peer(2)
+            .unwrap()
+            .get_append_range(later);
+        assert!(
+            req2.is_some(),
+            "timeout must clear in_flight so a fresh request can fire after next_heartbeat"
+        );
     }
 }

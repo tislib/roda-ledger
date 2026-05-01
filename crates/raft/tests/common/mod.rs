@@ -233,6 +233,7 @@ impl Sim {
             None => return,
         };
         self.process_actions(id, now, actions);
+        self.drive_replication(id, now);
         self.observe_cluster_commit(id);
     }
 
@@ -332,6 +333,7 @@ impl Sim {
             acts
         };
         self.process_actions(id, now, actions);
+        self.drive_replication(id, now);
         self.observe_cluster_commit(id);
     }
 
@@ -408,6 +410,7 @@ impl Sim {
         for (id, acts) in actions_acc {
             self.process_actions(id, now, acts);
         }
+        self.drive_replication(leader_id, now);
         self.observe_cluster_commit(leader_id);
     }
 
@@ -507,6 +510,7 @@ impl Sim {
                     None => return,
                 };
                 self.process_actions(s.target, now, actions);
+                self.drive_replication(s.target, now);
                 self.observe_cluster_commit(s.target);
             }
         }
@@ -599,6 +603,7 @@ impl Sim {
             None => return,
         };
         self.process_actions(target, now, tick_actions);
+        self.drive_replication(target, now);
         self.observe_cluster_commit(target);
 
         // Synthesize the reply from getters (ADR-0017 §"AE reply:
@@ -633,6 +638,59 @@ impl Sim {
         }
     }
 
+    /// Cluster-driver-side leader replication: walk every peer of
+    /// `src` and pull the next `AppendEntries` via the
+    /// `Replication` API, scheduling the result as a
+    /// `Delivery::AppendEntries` (subject to the network drop /
+    /// duplicate model). This replaces the legacy
+    /// `Action::SendAppendEntries` push path.
+    ///
+    /// Called after every `step` on a node so that:
+    ///
+    /// - new entries shipped via `client_write` (advance + Tick)
+    ///   get fanned out immediately;
+    /// - heartbeat deadlines firing on `Tick` get serviced;
+    /// - newly-elected leaders' first round of AEs goes out as
+    ///   soon as `BecomeRole { Leader, .. }` is observed.
+    ///
+    /// `get_append_range` itself gates on `next_heartbeat` and
+    /// in-flight, so calling it on every step is idempotent — a
+    /// peer that's not due returns `None`.
+    fn drive_replication(&mut self, src: NodeId, now: Instant) {
+        let peers = match self.nodes.get_mut(&src).and_then(|b| b.node.as_mut()) {
+            Some(n) => n.replication().peers(),
+            None => return,
+        };
+        for peer in peers {
+            let req = match self.nodes.get_mut(&src).and_then(|b| b.node.as_mut()) {
+                Some(n) => n
+                    .replication()
+                    .peer(peer)
+                    .and_then(|mut p| p.get_append_range(now)),
+                None => return,
+            };
+            let Some(req) = req else { continue };
+
+            if self.is_dropped(src, peer) || self.rolled_drop() {
+                continue;
+            }
+            let when = now + self.network_delay;
+            let dup = self.rolled_duplicate();
+            let delivery = Delivery::AppendEntries {
+                from: src,
+                term: req.term,
+                prev_log_tx_id: req.prev_log_tx_id,
+                prev_log_term: req.prev_log_term,
+                entries: req.entries,
+                leader_commit: req.leader_commit,
+            };
+            self.schedule(when, peer, delivery.clone());
+            if dup {
+                self.schedule(when, peer, delivery);
+            }
+        }
+    }
+
     /// Poll the node's `cluster_commit_index()` and apply any
     /// advance to the harness mirror. Replaces the former
     /// `Action::AdvanceClusterCommit` consumer (ADR-0017 §"Driver
@@ -664,32 +722,6 @@ impl Sim {
     fn process_actions(&mut self, src: NodeId, now: Instant, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::SendAppendEntries {
-                    to,
-                    term,
-                    prev_log_tx_id,
-                    prev_log_term,
-                    entries,
-                    leader_commit,
-                } => {
-                    if self.is_dropped(src, to) || self.rolled_drop() {
-                        continue;
-                    }
-                    let when = now + self.network_delay;
-                    let dup = self.rolled_duplicate();
-                    let delivery = Delivery::AppendEntries {
-                        from: src,
-                        term,
-                        prev_log_tx_id,
-                        prev_log_term,
-                        entries,
-                        leader_commit,
-                    };
-                    self.schedule(when, to, delivery.clone());
-                    if dup {
-                        self.schedule(when, to, delivery);
-                    }
-                }
                 Action::SendRequestVote {
                     to,
                     term,

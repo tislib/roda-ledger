@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
-    Action, AppendEntriesDecision, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, RejectReason,
-    Role, TxId,
+    Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, RaftConfig,
+    RaftNode, RejectReason, Role, TxId,
 };
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
@@ -105,28 +105,33 @@ fn log_mismatch_decrements_next_index() {
     }
 
     // Inject 3 successive LogMismatch rejects from peer 2 — each
-    // should produce a `SendAppendEntries` with a strictly smaller
-    // `prev_log_tx_id`.
-    use raft::RejectReason;
+    // pull from `Replication::get_append_range` should produce a
+    // strictly smaller `prev_log_tx_id`. (Single-node cluster has
+    // no real peer 2, so `peer(2)` returns None and the assertion
+    // is vacuous; the test stays here to pin the public surface
+    // against regressions.)
+    let term = node.current_term();
     let mut last_prev_log: Option<u64> = None;
     for i in 0..3 {
-        let actions = node.step(
-            t0 + Duration::from_secs(70 + i),
-            Event::AppendEntriesReply {
-                from: 2,
-                term: node.current_term(),
-                success: false,
-                last_commit_id: 0,
-                last_write_id: 0,
-                reject_reason: Some(RejectReason::LogMismatch),
-            },
-        );
-        // The leader's next leader_drive() will fire on the next Tick.
-        let _ = node.step(t0 + Duration::from_secs(80 + i), Event::Tick);
-        if let Some(prev) = actions.iter().find_map(|a| match a {
-            Action::SendAppendEntries { prev_log_tx_id, .. } => Some(*prev_log_tx_id),
-            _ => None,
-        }) {
+        let now_reply = t0 + Duration::from_secs(70 + i);
+        if let Some(mut p) = node.replication().peer(2) {
+            p.append_result(
+                now_reply,
+                AppendResult::Reject {
+                    term,
+                    reason: RejectReason::LogMismatch,
+                    last_write_id: 0,
+                    last_commit_id: 0,
+                },
+            );
+        }
+        let now_pull = t0 + Duration::from_secs(80 + i);
+        if let Some(req) = node
+            .replication()
+            .peer(2)
+            .and_then(|mut p| p.get_append_range(now_pull))
+        {
+            let prev = req.prev_log_tx_id;
             if let Some(p) = last_prev_log {
                 assert!(
                     prev < p,
@@ -380,9 +385,6 @@ fn leader_with_entries(entries: TxId, t0: Instant) -> (RaftNode<MemPersistence>,
         node.advance(entries, entries);
         let _ = node.step(after, Event::Tick);
     }
-    // Drain the initial AE round so peers have an in-flight set;
-    // subsequent replies clear it cleanly.
-    let _ = node.step(after + Duration::from_millis(1), Event::Tick);
     (node, term, after + Duration::from_millis(1))
 }
 
@@ -398,45 +400,34 @@ fn ae_reply_advances_next_index_from_write_id_not_commit_id() {
 
     // Peer 2 has accepted all 5 entries into its log but only fsync'd
     // 3 of them. Its reply carries the split watermark.
-    let _ = node.step(
+    node.replication().peer(2).unwrap().append_result(
         t_setup + Duration::from_millis(10),
-        Event::AppendEntriesReply {
-            from: 2,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 3,
             last_write_id: 5,
-            reject_reason: None,
+            last_commit_id: 3,
         },
     );
 
-    // Advance past `next_heartbeat` (default 50ms) so the leader
-    // re-evaluates what to send. With the fix `next_index = 6`, so
-    // the next AE to peer 2 is a heartbeat. Under the bug
-    // `next_index = 4`, so the leader would re-ship entries [4, 5].
-    let actions = node.step(t_setup + Duration::from_millis(100), Event::Tick);
-    let entries_to_peer_2: Vec<_> = actions
-        .iter()
-        .filter_map(|a| match a {
-            Action::SendAppendEntries { to: 2, entries, .. } => Some(entries.clone()),
-            _ => None,
-        })
-        .collect();
+    // Advance past `next_heartbeat` (default 50ms) and pull the
+    // next AE for peer 2 via `Replication`. With the fix
+    // `next_index = 6`, so the next AE is a heartbeat. Under the
+    // bug `next_index = 4`, the leader would re-ship entries
+    // [4, 5].
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(t_setup + Duration::from_millis(100))
+        .expect("expected the leader to ship a fresh AE to peer 2 after next_heartbeat fires");
     assert!(
-        !entries_to_peer_2.is_empty(),
-        "expected the leader to send to peer 2 after next_heartbeat fires; got {:?}",
-        actions
+        req.entries.is_empty(),
+        "leader re-shipped entries the follower already accepted: \
+         next_index must advance from last_write_id (5)+1=6 \
+         (heartbeat), not last_commit_id (3)+1=4 (re-ship). \
+         Got entries={:?}",
+        req.entries
     );
-    for entries in &entries_to_peer_2 {
-        assert!(
-            entries.is_empty(),
-            "leader re-shipped entries the follower already accepted: \
-             next_index must advance from last_write_id (5)+1=6 \
-             (heartbeat), not last_commit_id (3)+1=4 (re-ship). \
-             Got entries={:?}",
-            entries
-        );
-    }
 }
 
 /// Quorum / `cluster_commit_index` must advance from `last_commit_id`
@@ -550,21 +541,18 @@ fn ae_reply_commit_lagging_write_does_not_regress_next_index() {
     );
 
     // And next_index is still at 11 — heartbeat to peer 2 on the
-    // next Tick.
-    let actions = node.step(t_setup + Duration::from_millis(120), Event::Tick);
-    let entries_to_peer_2: Vec<_> = actions
-        .iter()
-        .filter_map(|a| match a {
-            Action::SendAppendEntries { to: 2, entries, .. } => Some(entries.clone()),
-            _ => None,
-        })
-        .collect();
-    for entries in &entries_to_peer_2 {
+    // next pull.
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(t_setup + Duration::from_millis(120));
+    if let Some(req) = req {
         assert!(
-            entries.is_empty(),
+            req.entries.is_empty(),
             "next_index regressed: leader re-shipped entries after the \
              second reply. Got {:?}",
-            entries
+            req.entries
         );
     }
 }
@@ -595,24 +583,22 @@ fn ae_reply_clamps_commit_above_write_defensively() {
     );
 
     // Release-build path: clamp brought commit down to 3, so peer
-    // 2's match_index = 3 and next_index = 4. We can verify the
-    // latter by triggering a Tick and inspecting the next AE.
-    let actions = node.step(t_setup + Duration::from_millis(100), Event::Tick);
-    let to_peer_2 = actions.iter().find_map(|a| match a {
-        Action::SendAppendEntries { to: 2, entries, prev_log_tx_id, .. } => {
-            Some((entries.clone(), *prev_log_tx_id))
-        }
-        _ => None,
-    });
-    let (entries, prev) = to_peer_2.expect("expected an AE to peer 2 after Tick");
+    // 2's match_index = 3 and next_index = 4. Verify the latter
+    // by pulling the next AE via `Replication`.
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(t_setup + Duration::from_millis(100))
+        .expect("expected an AE to peer 2");
     assert_eq!(
-        prev, 3,
+        req.prev_log_tx_id, 3,
         "release-build clamp: next_index must be 4 (= clamped commit + 1), \
          so prev_log_tx_id = 3. Got prev_log_tx_id = {}",
-        prev
+        req.prev_log_tx_id
     );
     assert!(
-        !entries.is_empty(),
+        !req.entries.is_empty(),
         "expected the leader to ship entries [4, 10] starting at next_index=4"
     );
 }

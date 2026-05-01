@@ -11,6 +11,15 @@
 //! bumped on boot — it stays at whatever the durable persistence layer
 //! reports until an actual election win advances it.
 //!
+//! Each gRPC server runs on its own OS thread with a private
+//! `current_thread` tokio runtime ([`spawn_grpc_thread`]). That keeps
+//! the ledger-facing service loop (writes, balance reads) and the
+//! peer-facing service loop (`AppendEntries`, `RequestVote`) from
+//! contending on the same tokio worker pool, and from contending with
+//! the raft loop. The raft loop stays on the host runtime (e.g. the
+//! one set up by `#[tokio::main]`); cross-runtime mpsc/oneshot
+//! channels carry every command and reply.
+//!
 //! Lifecycle is RAII: dropping a `Handles` is the shutdown. The
 //! clustered shutdown protocol:
 //!
@@ -19,19 +28,22 @@
 //!   2. `Drop` drops the supervisor's `mpsc::Sender<Command>` clone.
 //!      In-flight gRPC handlers still hold sender clones, so the
 //!      channel doesn't close yet.
-//!   3. The two gRPC server tasks drain their in-flight handlers and
-//!      exit. As each handler exits, its `cmd_tx` clone drops.
+//!   3. `Drop` joins the two gRPC OS threads (via `block_in_place`
+//!      where available, so the host runtime can keep driving the
+//!      raft loop). Each dedicated runtime drains its in-flight
+//!      handlers and exits. As each handler exits, its `cmd_tx`
+//!      clone drops.
 //!   4. When the last handler exits, the loop's `cmd_rx.recv()`
 //!      returns `None`. The loop drops its parked replies (the
 //!      oneshots' `Drop` surfaces as `Status::internal` to any
 //!      lingering caller) and exits.
-//!   5. `Drop` awaits all three task handles via `drain_in_drop`.
+//!   5. `Drop` awaits the raft `JoinHandle` via `drain_in_drop`.
 
 use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
 use crate::config::Config;
 use crate::durable::DurablePersistence;
-use crate::lifecycle::drain_in_drop;
+use crate::lifecycle::{drain_in_drop, join_grpc_threads, spawn_grpc_thread};
 use crate::node_handler::{NodeHandler, NodeHandlerCore};
 use crate::raft_loop::RaftLoop;
 use crate::server::{NodeServerRuntime, Server};
@@ -39,6 +51,7 @@ use ledger::ledger::Ledger;
 use raft::{RaftConfig, RaftNode, Role};
 use spdlog::{error, info};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -106,7 +119,10 @@ impl ClusterNode {
     // ── Standalone bring-up ──────────────────────────────────────────────
 
     /// Standalone: only the writable client-facing Ledger gRPC. No
-    /// raft loop, no Node service, no peers.
+    /// raft loop, no Node service, no peers. The Ledger gRPC runs on
+    /// its own OS thread + dedicated `current_thread` tokio runtime
+    /// (matches the clustered shape so single-node and clustered code
+    /// paths share the same isolation model).
     fn run_standalone(
         &self,
     ) -> Result<StandaloneHandles, Box<dyn std::error::Error + Send + Sync>> {
@@ -126,18 +142,18 @@ impl ClusterNode {
             self.durable.term.clone(),
             client_shutdown.clone(),
         );
-        let client_handle = tokio::spawn(async move {
+        let client_thread = spawn_grpc_thread("ledger-grpc", async move {
             if let Err(e) = server.run().await {
                 error!("standalone ledger gRPC server exited: {}", e);
             }
-        });
+        })?;
         info!(
-            "standalone: client-facing Ledger gRPC up on {}",
+            "standalone: client-facing Ledger gRPC up on {} (dedicated thread)",
             client_addr
         );
 
         Ok(StandaloneHandles {
-            client_handle: Some(client_handle),
+            client_thread: Some(client_thread),
             client_shutdown,
         })
     }
@@ -200,7 +216,9 @@ impl ClusterNode {
         );
 
         // Client-facing Ledger gRPC server (writable on leader,
-        // read-only on follower; consults mirror for routing).
+        // read-only on follower; consults mirror for routing). Runs on
+        // its own OS thread + dedicated `current_thread` runtime so
+        // ledger I/O scheduling cannot starve the peer-facing service.
         let client_shutdown = Arc::new(Notify::new());
         let client_server = Server::new(
             self.ledger_slot.clone(),
@@ -209,13 +227,16 @@ impl ClusterNode {
             self.durable.term.clone(),
             client_shutdown.clone(),
         );
-        let client_handle = tokio::spawn(async move {
+        let client_thread = spawn_grpc_thread("ledger-grpc", async move {
             if let Err(e) = client_server.run().await {
                 error!("ledger gRPC server exited: {}", e);
             }
-        });
+        })?;
 
-        // Peer-facing Node gRPC server.
+        // Peer-facing Node gRPC server. Runs on its own OS thread +
+        // dedicated `current_thread` runtime — heartbeat / AE traffic
+        // is isolated from the ledger-facing service and from the
+        // raft loop.
         let node_core = Arc::new(NodeHandlerCore::new(
             self.ledger_slot.clone(),
             self_id,
@@ -231,14 +252,15 @@ impl ClusterNode {
             node_max_bytes,
             node_shutdown.clone(),
         );
-        let node_grpc_handle = tokio::spawn(async move {
+        let node_grpc_thread = spawn_grpc_thread("node-grpc", async move {
             if let Err(e) = node_runtime.run().await {
                 error!("node gRPC server exited: {}", e);
             }
-        });
+        })?;
 
         info!(
-            "cluster: bring-up complete (node_id={}, peers={}, client={}, node={})",
+            "cluster: bring-up complete (node_id={}, peers={}, client={}, node={}; \
+             ledger-grpc and node-grpc on dedicated threads)",
             self_id,
             cluster.peers.len(),
             client_addr,
@@ -247,8 +269,8 @@ impl ClusterNode {
 
         Ok(ClusterHandles {
             raft_handle: Some(raft_handle),
-            client_handle: Some(client_handle),
-            node_grpc_handle: Some(node_grpc_handle),
+            client_thread: Some(client_thread),
+            node_grpc_thread: Some(node_grpc_thread),
             mirror,
             cmd_tx: Some(cmd_tx),
             client_shutdown,
@@ -305,34 +327,41 @@ impl Handles {
 /// Handles produced by a successful standalone bring-up. Single
 /// gRPC server, nothing else.
 pub struct StandaloneHandles {
-    pub client_handle: Option<JoinHandle<()>>,
+    /// OS thread hosting the client-facing Ledger gRPC server's
+    /// dedicated `current_thread` tokio runtime. Joined cooperatively
+    /// in `Drop` after `client_shutdown` fires.
+    pub client_thread: Option<thread::JoinHandle<()>>,
     /// Cooperative shutdown trigger for the client-facing Ledger
     /// gRPC server. `Drop` calls `notify_waiters()` so
-    /// `serve_with_shutdown` resolves and the server task exits.
+    /// `serve_with_shutdown` resolves and the dedicated runtime exits.
     pub client_shutdown: Arc<Notify>,
 }
 
 impl Drop for StandaloneHandles {
     fn drop(&mut self) {
         self.client_shutdown.notify_waiters();
-        let client = self.client_handle.take();
-        drain_in_drop("standalone", [client]);
+        let client = self.client_thread.take();
+        join_grpc_threads("standalone", [client]);
     }
 }
 
 // ── Clustered handles ───────────────────────────────────────────────────
 
 /// Handles produced by a successful clustered bring-up. Owns the raft
-/// loop's join handle, both gRPC server tasks, and the mirror clone.
+/// loop's join handle, both gRPC server OS threads, and the mirror
+/// clone.
 pub struct ClusterHandles {
-    /// Raft loop task. Exits when the last `cmd_tx` clone drops, which
-    /// happens after both gRPC server tasks have drained their
-    /// in-flight handlers.
+    /// Raft loop task on the host runtime. Exits when the last
+    /// `cmd_tx` clone drops, which happens after both gRPC server
+    /// runtimes have drained their in-flight handlers (and those
+    /// handlers' `cmd_tx` clones with them).
     pub raft_handle: Option<JoinHandle<()>>,
-    /// Client-facing Ledger gRPC server task.
-    pub client_handle: Option<JoinHandle<()>>,
-    /// Peer-facing Node gRPC server task.
-    pub node_grpc_handle: Option<JoinHandle<()>>,
+    /// OS thread hosting the client-facing Ledger gRPC server's
+    /// dedicated `current_thread` tokio runtime.
+    pub client_thread: Option<thread::JoinHandle<()>>,
+    /// OS thread hosting the peer-facing Node gRPC server's dedicated
+    /// `current_thread` tokio runtime.
+    pub node_grpc_thread: Option<thread::JoinHandle<()>>,
     /// Lock-free read surface for raft state.
     pub mirror: Arc<ClusterMirror>,
     /// Sender into the raft loop. Held here only so `Drop` can drop
@@ -349,8 +378,9 @@ pub struct ClusterHandles {
 impl Drop for ClusterHandles {
     fn drop(&mut self) {
         // Stop both gRPC servers from accepting new connections.
-        // In-flight handlers continue running and are awaited below;
-        // new connections immediately fail at the tonic layer.
+        // In-flight handlers continue running on their dedicated
+        // runtimes and are joined below; new connections immediately
+        // fail at the tonic layer.
         self.client_shutdown.notify_waiters();
         self.node_shutdown.notify_waiters();
 
@@ -361,11 +391,16 @@ impl Drop for ClusterHandles {
         self.cmd_tx.take();
 
         // Drain in dependency order:
-        //   gRPC servers → drains their handlers → handlers' cmd_tx
-        //   clones drop → channel closes → raft loop exits.
-        let client = self.client_handle.take();
-        let node = self.node_grpc_handle.take();
+        //   gRPC threads → drained dedicated runtimes → handlers'
+        //   cmd_tx clones drop → channel closes → raft loop exits.
+        // Joining the threads first while the host runtime keeps
+        // driving the raft loop (under `block_in_place`) lets
+        // parked AppendEntries replies advance to completion.
+        let client = self.client_thread.take();
+        let node = self.node_grpc_thread.take();
+        join_grpc_threads("cluster", [client, node]);
+
         let raft = self.raft_handle.take();
-        drain_in_drop("cluster", [client, node, raft]);
+        drain_in_drop("cluster", [raft]);
     }
 }

@@ -16,6 +16,8 @@
 //! signal — there is no separate latch and no race window between
 //! "check latch" and "enter raft body".
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::cluster_mirror::ClusterMirror;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
