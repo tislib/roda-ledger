@@ -294,18 +294,12 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), 1);
 
-    let _ = node.step(
-        t0 + Duration::from_secs(61),
-        Event::LocalCommitAdvanced { tx_id: 1 },
-    );
-    let _ = node.step(
-        t0 + Duration::from_secs(61),
-        Event::LocalCommitAdvanced { tx_id: 2 },
-    );
-    let _ = node.step(
-        t0 + Duration::from_secs(61),
-        Event::LocalCommitAdvanced { tx_id: 3 },
-    );
+    node.advance(1, 1);
+    let _ = node.step(t0 + Duration::from_secs(61), Event::Tick);
+    node.advance(2, 2);
+    let _ = node.step(t0 + Duration::from_secs(61), Event::Tick);
+    node.advance(3, 3);
+    let _ = node.step(t0 + Duration::from_secs(61), Event::Tick);
     assert_eq!(node.commit_index(), 3);
 
     // Phase 2: rebuild as multi-node and force a vote-log race.
@@ -318,14 +312,12 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
 
     let mut node = RaftNode::new(1, vec![1, 2, 3], p, RaftConfig::default(), 42);
     // Driver-side WAL recovery: the on-disk WAL has 3 entries from
-    // phase 1; the rebuilt node must learn its `local_log_index`
+    // phase 1; the rebuilt node must learn its `local_write_index`
     // before any election runs, otherwise `start_tx_id` for the
     // post-election term boundary lands at 1 and shadows the
     // existing entries on `term_at_tx` lookups.
-    let _ = node.step(
-        t0 + Duration::from_secs(119),
-        Event::LogAppendComplete { tx_id: 3 },
-    );
+    node.advance(3, 3);
+    let _ = node.step(t0 + Duration::from_secs(119), Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(120), Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(180), Event::Tick);
     assert_eq!(node.role(), Role::Candidate);
@@ -347,10 +339,8 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // `local_log_index = 0`.
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
-    let _ = node.step(
-        t0 + Duration::from_secs(181),
-        Event::LogAppendComplete { tx_id: 3 },
-    );
+    node.advance(3, 3);
+    let _ = node.step(t0 + Duration::from_secs(181), Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(182), Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(240), Event::Tick);
     assert_eq!(node.role(), Role::Leader);

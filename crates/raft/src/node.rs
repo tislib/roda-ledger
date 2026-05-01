@@ -24,8 +24,12 @@
 //!   on graceful shutdown / simulator crash.
 //! - `quorum: Quorum` — per-peer match-index tracker. Active under
 //!   the leader.
-//! - `local_log_index` / `cluster_commit_index` — read API surface,
-//!   advanced by `Event::*Complete` and `Event::LocalCommitAdvanced`.
+//! - `local_write_index` / `local_commit_index` /
+//!   `cluster_commit_index` — read API surface; the first two are
+//!   advanced by the driver-side `advance(write, commit)` method,
+//!   the third is updated in-place when a quorum advances or
+//!   `leader_commit` propagates (drivers poll the getter — there
+//!   is no dedicated action).
 //! - `election_timer: ElectionTimer` — armed only when a non-leader
 //!   role needs one.
 
@@ -134,22 +138,34 @@ pub struct RaftNode<P: Persistence> {
     /// fatal: the driver already saw it once.
     failed: bool,
 
-    local_log_index: TxId,
+    /// Highest tx_id durably written to this node's raft log.
+    /// Advanced by the driver via `advance(write, commit)`. Bounds
+    /// the AE replication window in `leader_send_to`, gates §5.4.1's
+    /// up-to-date check, and feeds the §5.3 prev_log coverage check.
+    /// Survives role transitions. Invariant:
+    /// `local_write_index >= local_commit_index >= 0`.
+    local_write_index: TxId,
+    /// Highest tx_id durably committed to this node's ledger.
+    /// Advanced by the driver via `advance(write, commit)`. Feeds
+    /// the leader's quorum self-slot (entries committed locally
+    /// count toward cluster_commit). Read by `commit_index()`.
+    local_commit_index: TxId,
     cluster_commit_index: TxId,
 
     /// First `tx_id` of the leader's current term — set on
-    /// `become_leader_after_win` to `local_log_index + 1` (matching
-    /// the `start_tx_id` passed to `commit_term`). Cleared on
-    /// step-down so a stale value doesn't leak into a follower's
+    /// `become_leader_after_win` to `local_write_index + 1`
+    /// (matching the `start_tx_id` passed to `commit_term`). Cleared
+    /// on step-down so a stale value doesn't leak into a follower's
     /// `leader_commit` clamping.
     ///
     /// Raft §5.4.2 / Figure 8: a leader must not advance
     /// `cluster_commit` to a tx_id below this watermark. Doing so
     /// would commit prior-term entries by counting current-term
     /// replicas, and a future leader could overwrite them. The
-    /// gate lives in `publish_cluster_commit`. Followers bypass it
-    /// (the field is reset to 0 on follower transition); they
-    /// trust the leader's `leader_commit`, which the leader has
+    /// gate is inlined at every cluster_commit advance site.
+    /// Followers bypass it (the field is reset to 0 on follower
+    /// transition); they trust the leader's `leader_commit`, which
+    /// the leader has
     /// already gated on its end.
     current_term_first_tx: TxId,
 
@@ -164,9 +180,9 @@ impl<P: Persistence> RaftNode<P> {
     /// disk (term log + vote log) before calling `new`. The library
     /// reads through the trait — no separate "rehydrate" event.
     ///
-    /// `local_log_index` starts at 0; the driver feeds
-    /// `Event::LogAppendComplete` for any entries already on disk
-    /// before exposing the node to RPCs.
+    /// `local_write_index` and `local_commit_index` start at 0; the
+    /// driver feeds `node.advance(write, commit)` for any entries
+    /// already on disk before exposing the node to RPCs.
     ///
     /// Starting role is always `Initializing`. ADR-0017 §"No
     /// boot-time term bumping": the library does not increment term
@@ -201,7 +217,8 @@ impl<P: Persistence> RaftNode<P> {
             quorum,
             self_slot,
             failed: false,
-            local_log_index: 0,
+            local_write_index: 0,
+            local_commit_index: 0,
             cluster_commit_index: 0,
             current_term_first_tx: 0,
             last_emitted_wakeup: None,
@@ -237,7 +254,15 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     pub fn commit_index(&self) -> TxId {
-        self.local_log_index
+        self.local_commit_index
+    }
+
+    /// Highest tx_id durably written to this node's raft log. See the
+    /// field doc on `local_write_index`. After step 2 of the split
+    /// refactor this becomes the §5.4.1 / §5.3 reference and the
+    /// replication-window upper bound.
+    pub fn write_index(&self) -> TxId {
+        self.local_write_index
     }
 
     pub fn cluster_commit_index(&self) -> TxId {
@@ -263,6 +288,60 @@ impl<P: Persistence> RaftNode<P> {
         match &self.state {
             NodeState::Follower(f) => f.leader_id,
             _ => None,
+        }
+    }
+
+    // ─── advance() ───────────────────────────────────────────────────────
+
+    /// Driver-side update of the local watermarks. The driver calls
+    /// this whenever it observes a change in raft-log durability
+    /// (`local_write_index`) or ledger-apply (`local_commit_index`).
+    /// On the leader, advancing `local_commit_index` feeds the
+    /// quorum self-slot and may advance `cluster_commit_index`
+    /// in-place — there is no dedicated `Action` for that signal;
+    /// the driver polls `cluster_commit_index()` after each call
+    /// (ADR-0017 §"Driver call pattern").
+    ///
+    /// Returns `()` and queues no actions. Convention: the driver
+    /// always follows `advance` with `step(Event::Tick)` to flush
+    /// deferred outputs (heartbeats, `SetWakeup` re-arming). After
+    /// a fatal failure the call is a no-op, mirroring `step`.
+    ///
+    /// Invariant: `local_commit_index <= local_write_index`. Debug
+    /// builds panic on violation; release builds clamp the commit
+    /// argument down to the write argument (same posture as the
+    /// AE-reply guard).
+    pub fn advance(&mut self, local_write_index: TxId, local_commit_index: TxId) {
+        if self.failed {
+            return;
+        }
+        debug_assert!(
+            local_commit_index <= local_write_index,
+            "advance: commit_index={} > write_index={}",
+            local_commit_index,
+            local_write_index
+        );
+        let new_commit = local_commit_index.min(local_write_index);
+
+        if local_write_index > self.local_write_index {
+            self.local_write_index = local_write_index;
+        }
+        if new_commit > self.local_commit_index {
+            self.local_commit_index = new_commit;
+            // Leader-only: feed the new local commit into the quorum
+            // self-slot. The Figure-8 §5.4.2 gate is enforced inside
+            // the inlined cluster_commit update — single-node clusters
+            // bypass it (no peer can overwrite), and followers bypass
+            // it via `current_term_first_tx == 0`.
+            if matches!(self.state, NodeState::Leader(_))
+                && let Some(adv) = self
+                    .quorum
+                    .advance(self.self_slot, self.local_commit_index)
+                && !(self.peers.len() > 1 && adv < self.current_term_first_tx)
+                && adv > self.cluster_commit_index
+            {
+                self.cluster_commit_index = adv;
+            }
         }
     }
 
@@ -315,7 +394,6 @@ impl<P: Persistence> RaftNode<P> {
                     last_commit_id,
                     last_write_id,
                     reject_reason,
-                    &mut out,
                 );
             }
             Event::RequestVoteRequest {
@@ -329,15 +407,6 @@ impl<P: Persistence> RaftNode<P> {
                 term,
                 granted,
             } => self.on_request_vote_reply(now, from, term, granted, &mut out),
-            Event::LocalCommitAdvanced { tx_id } => {
-                self.on_local_commit_advanced(tx_id, &mut out);
-            }
-            Event::LocalWriteAdvanced { tx_id } => {
-                self.on_local_write_advanced(tx_id);
-            }
-            Event::LogAppendComplete { tx_id } => {
-                self.on_log_append_complete(tx_id, &mut out);
-            }
             Event::LogTruncateComplete { up_to } => self.on_log_truncate_complete(up_to),
         }
         // Skip wakeup emission if a fatal happened in this step —
@@ -379,6 +448,13 @@ impl<P: Persistence> RaftNode<P> {
         if let NodeState::Leader(_) = &self.state {
             self.leader_drive(now, out);
         }
+
+        // Drain a parked AE-success reply if the follower's
+        // `local_write_index` now covers it. The driver convention
+        // (per ADR-0017 §"Driver call pattern") is `advance` followed
+        // by `Tick`; this is where the post-advance flush emits the
+        // ack the leader is waiting on.
+        self.drain_follower_pending_reply_if_ready(out);
     }
 
     // ─── Election machinery ──────────────────────────────────────────────
@@ -434,7 +510,7 @@ impl<P: Persistence> RaftNode<P> {
             return;
         }
 
-        let last_tx_id = self.local_log_index;
+        let last_tx_id = self.local_write_index;
         let last_term = self.local_last_term();
 
         let expires_at = now + self.cfg.rpc_timeout;
@@ -477,7 +553,7 @@ impl<P: Persistence> RaftNode<P> {
         }
 
         // Higher term observed — persist FIRST, then step down. The
-        // helper `observe_higher_term` uses `local_log_index + 1` as
+        // helper `observe_higher_term` uses `local_write_index + 1` as
         // the term-log boundary so we never shadow our own entries
         // (using the candidate's `last_tx_id` would record the new
         // term at a tx that already has a term assigned, breaking
@@ -487,8 +563,12 @@ impl<P: Persistence> RaftNode<P> {
             self.transition_to_follower(now, None);
         }
 
-        // §5.4.1 up-to-date check.
-        let our_last_tx = self.local_log_index;
+        // §5.4.1 up-to-date check. The voter compares its own durable
+        // log extent (`local_write_index`) — not its commit watermark —
+        // to the candidate's claim. Using commit would let a candidate
+        // with strictly older on-disk state win votes from a node whose
+        // ledger had merely fallen behind its own raft-log.
+        let our_last_tx = self.local_write_index;
         let our_last_term = self.local_last_term();
         let candidate_up_to_date = (last_term > our_last_term)
             || (last_term == our_last_term && last_tx_id >= our_last_tx);
@@ -561,18 +641,21 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     fn become_leader_after_win(&mut self, new_term: Term, now: Instant, out: &mut Vec<Action>) {
-        // The new term's first entry will live at `local_log_index +
+        // The new term's first entry will live at `local_write_index +
         // 1`; existing entries belong to whatever earlier term they
         // were committed under, so the new boundary must not be
-        // recorded at or before `local_log_index` or it would
-        // shadow them in `term_at_tx` lookups.
+        // recorded at or before `local_write_index` or it would
+        // shadow them in `term_at_tx` lookups. We anchor on the
+        // *write* extent (not the commit extent) because the new
+        // leader's first entry sits after the last on-disk one,
+        // regardless of which entries the local ledger has applied.
         //
         // No catch-up record. The vote log can validly race ahead of
         // the term log (observed-higher-term-via-RPC), and Raft does
         // not require term-log records to be contiguous. The
         // `Persistence::commit_term` contract permits any
         // `current < expected` jump.
-        let start_tx_id = self.local_log_index + 1;
+        let start_tx_id = self.local_write_index + 1;
 
         // Atomic election-win commit. ADR-0017 §"Required Invariants" #5.
         match self.persistence.commit_term(new_term, start_tx_id) {
@@ -605,11 +688,20 @@ impl<P: Persistence> RaftNode<P> {
         self.election_timer.disarm();
         self.quorum.reset_peers(self.self_slot);
         // Record this term's first-entry watermark *before* the
-        // first publish_cluster_commit can fire — Raft §5.4.2 /
-        // Figure 8 gate (see `publish_cluster_commit`).
+        // first cluster_commit advance can fire — the §5.4.2 / Figure
+        // 8 gate is inlined at every advance site.
         self.current_term_first_tx = start_tx_id;
-        if let Some(adv) = self.quorum.advance(self.self_slot, self.local_log_index) {
-            self.publish_cluster_commit(adv, out);
+        // Quorum self-slot is seeded from the new leader's *commit*
+        // watermark, not the write watermark. The cluster_commit
+        // quorum advances on durably-committed-locally entries; a
+        // written-but-uncommitted entry must not contribute its
+        // replica count to cluster_commit (Figure-8 §5.4.2 gate
+        // below blocks any advance below `current_term_first_tx`).
+        if let Some(adv) = self.quorum.advance(self.self_slot, self.local_commit_index)
+            && !(self.peers.len() > 1 && adv < self.current_term_first_tx)
+            && adv > self.cluster_commit_index
+        {
+            self.cluster_commit_index = adv;
         }
 
         let other_peers: Vec<NodeId> = self
@@ -618,10 +710,15 @@ impl<P: Persistence> RaftNode<P> {
             .copied()
             .filter(|p| *p != self.self_id)
             .collect();
+        // `last_local_tx` is the write extent — replication's initial
+        // `next_index = last_local_tx + 1` must include any entries
+        // that are written-but-not-yet-locally-committed so the leader
+        // can ship them to followers without first re-fsyncing. The
+        // replication-window upper bound itself is read directly from
+        // `self.local_write_index` in `leader_send_to`.
         let leader = LeaderState::new(
             &other_peers,
-            self.local_log_index,
-            self.local_log_index,
+            self.local_write_index,
             now,
             self.cfg.heartbeat_interval,
             self.cfg.rpc_timeout,
@@ -659,8 +756,8 @@ impl<P: Persistence> RaftNode<P> {
                 to: from,
                 term: current_term,
                 success: false,
-                last_commit_id: self.local_log_index,
-                last_write_id: self.local_log_index,
+                last_commit_id: self.local_commit_index,
+                last_write_id: self.local_write_index,
             });
             return;
         }
@@ -671,14 +768,16 @@ impl<P: Persistence> RaftNode<P> {
         self.transition_to_follower(now, Some(from));
         self.election_timer.reset(now);
 
-        // §5.3 prev_log_term match.
+        // §5.3 prev_log_term match. `local_write_index` is the §5.3
+        // reference — entries up to that watermark exist on disk and
+        // can be checked against the leader's prev_log_term.
         if prev_log_tx_id != 0 {
             let our_term_at_prev = self
                 .persistence
                 .term_at_tx(prev_log_tx_id)
                 .map(|r| r.term)
                 .unwrap_or(0);
-            let log_covers_prev = prev_log_tx_id <= self.local_log_index;
+            let log_covers_prev = prev_log_tx_id <= self.local_write_index;
             if !log_covers_prev || our_term_at_prev != prev_log_term {
                 if log_covers_prev {
                     let after = prev_log_tx_id.saturating_sub(1);
@@ -688,12 +787,21 @@ impl<P: Persistence> RaftNode<P> {
                     // already been violated upstream — surface it
                     // loudly in debug builds rather than silently
                     // clamping over the bug. The release-build clamp
-                    // below stays as belt-and-suspenders.
+                    // below stays as belt-and-suspenders. The local-
+                    // commit guard catches the same invariant from
+                    // the follower's side: applied entries must never
+                    // be truncated.
                     debug_assert!(
                         after >= self.cluster_commit_index,
                         "truncation below cluster_commit_index: after={} cluster={}",
                         after,
                         self.cluster_commit_index
+                    );
+                    debug_assert!(
+                        after >= self.local_commit_index,
+                        "truncation below local_commit_index: after={} local_commit={}",
+                        after,
+                        self.local_commit_index
                     );
                     // Library's term-log mirror: durable through the
                     // trait. If this write fails the term log is
@@ -709,17 +817,23 @@ impl<P: Persistence> RaftNode<P> {
                         return;
                     }
                     out.push(Action::TruncateLog { after_tx_id: after });
-                    self.local_log_index = after;
-                    if self.cluster_commit_index > self.local_log_index {
-                        self.cluster_commit_index = self.local_log_index;
+                    // Clamp all three watermarks; preserves the
+                    // invariant `local_write >= local_commit` and
+                    // `local_write >= cluster_commit`.
+                    self.local_write_index = after;
+                    if self.local_commit_index > after {
+                        self.local_commit_index = after;
+                    }
+                    if self.cluster_commit_index > after {
+                        self.cluster_commit_index = after;
                     }
                 }
                 out.push(Action::SendAppendEntriesReply {
                     to: from,
                     term: self.current_term(),
                     success: false,
-                    last_commit_id: self.local_log_index,
-                    last_write_id: self.local_log_index,
+                    last_commit_id: self.local_commit_index,
+                    last_write_id: self.local_write_index,
                 });
                 return;
             }
@@ -745,19 +859,22 @@ impl<P: Persistence> RaftNode<P> {
             out.push(Action::AppendLog { range: entries });
 
             // Park the success reply until the driver has durably
-            // appended the entries (it acks via
-            // `Event::LogAppendComplete`). Sending success here would
-            // let the leader count an entry as replicated before it
-            // is on disk on this follower — a write-ahead-invariant
-            // violation, see ADR-0017 §"Required Invariants" #3.
+            // appended the entries and called `advance(write, …)` to
+            // bump `local_write_index` past `parked_tx_id`. The next
+            // `Tick` flushes the parked reply (canonical drain site).
+            // Sending success here would let the leader count an
+            // entry as replicated before it is on disk on this
+            // follower — a write-ahead-invariant violation, see
+            // ADR-0017 §"Required Invariants" #3.
             let parked_tx_id = entries
                 .last_tx_id()
                 .expect("non-empty range has a last_tx_id");
             let reply_term = self.current_term();
             if let NodeState::Follower(f) = &mut self.state {
-                // Today the driver waits for full durability before
-                // posting `LogAppendComplete`, so by the time this
-                // reply fires both watermarks equal `parked_tx_id`.
+                // The parked struct's `last_*_id` are stale-snapshot
+                // hints — only `parked_tx_id` (in `last_commit_id`)
+                // is consulted as the drain threshold. The actual
+                // wire watermarks are read at drain time.
                 f.park_reply(crate::follower::PendingReply {
                     to: from,
                     term: reply_term,
@@ -767,26 +884,38 @@ impl<P: Persistence> RaftNode<P> {
                 });
             }
 
-            // Note: `local_log_index` and `cluster_commit_index` are
-            // NOT advanced here — they advance when
-            // `on_log_append_complete` runs, which is also where the
-            // parked reply is drained and `leader_commit` is applied.
+            // Note: `local_write_index` and `cluster_commit_index`
+            // are NOT advanced here — they advance when
+            // `on_log_append_complete` runs (write side) and when the
+            // parked reply drains (cluster side, via `leader_commit`
+            // clamped to `local_commit_index`). `local_commit_index`
+            // moves separately via the driver's `advance` call after
+            // the ledger applies.
             return;
         }
 
         // Heartbeat path (no entries): no durability needed, reply
-        // immediately. `leader_commit` still propagates.
-        let new_cluster = leader_commit.min(self.local_log_index);
-        if new_cluster > self.cluster_commit_index {
-            self.publish_cluster_commit(new_cluster, out);
+        // immediately. `leader_commit` still propagates, clamped to
+        // the follower's *local commit* watermark — ADR-0017 §"Two
+        // Commit Indexes": cluster_commit on a follower is bounded by
+        // what the local ledger has applied, not by raft-log
+        // durability. If the ledger lags, cluster_commit catches up
+        // on the next heartbeat after the next `advance` call. The
+        // §5.4.2 gate is a no-op on followers (`current_term_first_tx`
+        // is cleared in `transition_to_follower`).
+        let new_cluster = leader_commit.min(self.local_commit_index);
+        if !(self.peers.len() > 1 && new_cluster < self.current_term_first_tx)
+            && new_cluster > self.cluster_commit_index
+        {
+            self.cluster_commit_index = new_cluster;
         }
 
         out.push(Action::SendAppendEntriesReply {
             to: from,
             term: self.current_term(),
             success: true,
-            last_commit_id: self.local_log_index,
-            last_write_id: self.local_log_index,
+            last_commit_id: self.local_commit_index,
+            last_write_id: self.local_write_index,
         });
     }
 
@@ -825,10 +954,11 @@ impl<P: Persistence> RaftNode<P> {
         let max_entries = self.cfg.max_entries_per_append;
 
         let (prev_log_tx_id, prev_log_term, entries) = {
-            let (progress, last_written) = match &self.state {
-                NodeState::Leader(l) => (l.peers.get(&peer).cloned(), l.last_written),
+            let progress = match &self.state {
+                NodeState::Leader(l) => l.peers.get(&peer).cloned(),
                 _ => return,
             };
+            let last_written = self.local_write_index;
             let progress = match progress {
                 Some(p) => p,
                 None => return,
@@ -845,15 +975,14 @@ impl<P: Persistence> RaftNode<P> {
             // next_index. The range stops at the next term boundary
             // or at `max_entries`, whichever comes first; multi-term
             // catch-up takes multiple AEs. Heartbeat (next_index >
-            // last_written) → empty range.
+            // local_write_index) → empty range.
             //
-            // The upper bound is `last_written` — the leader's
-            // raft-log durability watermark, advanced by
-            // `Event::LocalWriteAdvanced`. Replication is gated on
-            // raft-log durability, NOT on the ledger-commit signal
-            // (`local_log_index` / `LocalCommitAdvanced`); shipping
-            // an entry to followers as soon as it is on disk is
-            // safe and correct.
+            // The upper bound is `local_write_index` — the leader's
+            // raft-log durability watermark, advanced by `advance`.
+            // Replication is gated on raft-log durability, NOT on
+            // the ledger-commit signal (`local_commit_index`);
+            // shipping an entry to followers as soon as it is on
+            // disk is safe and correct.
             //
             // Inside the `else` branch `next_index <= last_written`,
             // so `next_index` indexes a real entry. Every in-log
@@ -929,7 +1058,6 @@ impl<P: Persistence> RaftNode<P> {
         last_commit_id: TxId,
         last_write_id: TxId,
         reject_reason: Option<RejectReason>,
-        out: &mut Vec<Action>,
     ) {
         let current_term = self.current_term();
         if term > current_term {
@@ -999,8 +1127,11 @@ impl<P: Persistence> RaftNode<P> {
         };
         match outcome {
             Ok(advanced_to) => {
-                if let Some(new_cluster) = self.quorum.advance(peer_slot_index, advanced_to) {
-                    self.publish_cluster_commit(new_cluster, out);
+                if let Some(new_cluster) = self.quorum.advance(peer_slot_index, advanced_to)
+                    && !(self.peers.len() > 1 && new_cluster < self.current_term_first_tx)
+                    && new_cluster > self.cluster_commit_index
+                {
+                    self.cluster_commit_index = new_cluster;
                 }
             }
             Err(Some(peer_last_commit)) => {
@@ -1017,65 +1148,58 @@ impl<P: Persistence> RaftNode<P> {
         }
     }
 
-    // ─── LocalCommitAdvanced (leader) ────────────────────────────────────
-
-    fn on_local_commit_advanced(&mut self, tx_id: TxId, out: &mut Vec<Action>) {
-        if tx_id > self.local_log_index {
-            self.local_log_index = tx_id;
-        }
-        if matches!(self.state, NodeState::Leader(_))
-            && let Some(new_cluster) = self.quorum.advance(self.self_slot, tx_id)
-        {
-            self.publish_cluster_commit(new_cluster, out);
-        }
-    }
-
-    // ─── LocalWriteAdvanced (leader) ─────────────────────────────────────
-
-    /// Driver acks that the leader's raft log is durable up to
-    /// `tx_id`. Bounds the AE replication window only — does not
-    /// touch `local_log_index`, the quorum self-slot, or
-    /// `cluster_commit_index`. No-op outside the leader role: the
-    /// driver may legitimately fire this around a role transition.
-    fn on_local_write_advanced(&mut self, tx_id: TxId) {
-        if let NodeState::Leader(l) = &mut self.state
-            && tx_id > l.last_written
-        {
-            l.last_written = tx_id;
-        }
-    }
-
-    fn on_log_append_complete(&mut self, tx_id: TxId, out: &mut Vec<Action>) {
-        if tx_id > self.local_log_index {
-            self.local_log_index = tx_id;
-        }
-        // If a follower had a deferred AppendEntries success reply
-        // waiting on this durability ack, drain it now and apply
-        // `leader_commit` (Raft §5.3 commit advance). Heartbeats and
-        // rejections never park anything here.
+    /// Drains a follower's parked AE-success reply if its entries
+    /// have become durable (`local_write_index` covers the parked
+    /// tx_id) and emits the reply with up-to-date watermarks. Also
+    /// applies `leader_commit` to advance `cluster_commit_index`,
+    /// clamped to the follower's `local_commit_index` per ADR-0017
+    /// §"Two Commit Indexes".
+    ///
+    /// Called from `on_tick` after the driver's `advance` + `Tick`
+    /// sequence flushes the parked reply.
+    fn drain_follower_pending_reply_if_ready(&mut self, out: &mut Vec<Action>) {
+        let write_index = self.local_write_index;
         let drained = if let NodeState::Follower(f) = &mut self.state {
-            f.take_ready_reply(tx_id)
+            f.take_ready_reply(write_index)
         } else {
             None
         };
         if let Some(pending) = drained {
-            let new_cluster = pending.leader_commit.min(self.local_log_index);
-            if new_cluster > self.cluster_commit_index {
-                self.publish_cluster_commit(new_cluster, out);
+            // Brief lag (ledger trails raft-log durability by ~one
+            // tick) catches up on the next heartbeat after the
+            // driver's next `advance` call. The §5.4.2 gate is a
+            // no-op on followers (current_term_first_tx == 0 after
+            // transition_to_follower).
+            let new_cluster = pending.leader_commit.min(self.local_commit_index);
+            if !(self.peers.len() > 1 && new_cluster < self.current_term_first_tx)
+                && new_cluster > self.cluster_commit_index
+            {
+                self.cluster_commit_index = new_cluster;
             }
             out.push(Action::SendAppendEntriesReply {
                 to: pending.to,
                 term: pending.term,
                 success: true,
-                last_commit_id: pending.last_commit_id,
-                last_write_id: pending.last_write_id,
+                // Read both watermarks at drain time so the reply
+                // reflects the follower's actual state when it goes
+                // on the wire — the parked struct's snapshot may be
+                // stale if `advance` arrived between park and drain.
+                last_commit_id: self.local_commit_index,
+                last_write_id: self.local_write_index,
             });
         }
     }
 
     fn on_log_truncate_complete(&mut self, up_to: TxId) {
-        if self.local_log_index > up_to {
-            self.local_log_index = up_to;
+        // Clamp all three watermarks. The invariants
+        // `local_write >= local_commit` and `local_write >=
+        // cluster_commit` survive because all three monotonically
+        // decrease (or stay) here.
+        if self.local_write_index > up_to {
+            self.local_write_index = up_to;
+        }
+        if self.local_commit_index > up_to {
+            self.local_commit_index = up_to;
         }
         if self.cluster_commit_index > up_to {
             self.cluster_commit_index = up_to;
@@ -1103,11 +1227,14 @@ impl<P: Persistence> RaftNode<P> {
         }
     }
 
-    /// Term of the local log entry at `local_log_index`. `0` means
+    /// Term of the local log entry at `local_write_index`. `0` means
     /// the log is empty — required by §5.4.1's up-to-date check,
-    /// which treats the empty log as "term 0".
+    /// which treats the empty log as "term 0". The §5.4.1 candidate-
+    /// vs-voter comparison is against the *write* extent, not the
+    /// commit extent: a voter with durably-written-but-uncommitted
+    /// entries still votes against a candidate whose log is shorter.
     ///
-    /// When `local_log_index > 0` there is, by construction, a
+    /// When `local_write_index > 0` there is, by construction, a
     /// term-log record covering it (every entry's term is recorded
     /// via `observe_term` / `commit_term`, and truncation drops
     /// the entry and its term record together). A `None` from
@@ -1115,12 +1242,12 @@ impl<P: Persistence> RaftNode<P> {
     /// corrupted: returning a default term would silently break
     /// §5.4.1's election safety, so `expect` surfaces it loudly.
     fn local_last_term(&self) -> Term {
-        if self.local_log_index == 0 {
+        if self.local_write_index == 0 {
             return 0;
         }
         self.persistence
-            .term_at_tx(self.local_log_index)
-            .expect("term_at_tx must cover local_log_index when local_log_index > 0")
+            .term_at_tx(self.local_write_index)
+            .expect("term_at_tx must cover local_write_index when local_write_index > 0")
             .term
     }
 
@@ -1135,33 +1262,6 @@ impl<P: Persistence> RaftNode<P> {
         // value does not block this node, now a follower, from
         // accepting the new leader's `leader_commit`.
         self.current_term_first_tx = 0;
-    }
-
-    fn publish_cluster_commit(&mut self, new_value: TxId, out: &mut Vec<Action>) {
-        // Raft §5.4.2 / Figure 8: a leader must not commit
-        // prior-term entries by counting replicas. Block any
-        // advance below this term's first-entry watermark — once
-        // an entry from the current term has been committed by
-        // replica count, the Log Matching Property carries prior
-        // entries along.
-        //
-        // Single-node clusters skip the gate: there are no peers
-        // to disagree, so no future leader can overwrite. The
-        // gate would otherwise leave a single-node leader unable
-        // to commit recovered prior-term entries until the next
-        // client write.
-        //
-        // Followers also bypass the gate via `current_term_first_tx
-        // == 0` (cleared in `transition_to_follower`); they trust
-        // the leader's `leader_commit`, which the leader has
-        // already gated on its end.
-        if self.peers.len() > 1 && new_value < self.current_term_first_tx {
-            return;
-        }
-        if new_value > self.cluster_commit_index {
-            self.cluster_commit_index = new_value;
-            out.push(Action::AdvanceClusterCommit { tx_id: new_value });
-        }
     }
 
     fn next_pending_wakeup(&self) -> Option<Instant> {
@@ -1410,7 +1510,7 @@ mod tests {
             .collect();
         assert_eq!(appended_range, vec![LogEntryRange::new(1, 2, 1)]);
         // Per the durability-before-reply rule the success reply is
-        // parked until the driver acks via `LogAppendComplete`. The
+        // parked until the driver acks via `advance` + `Tick`. The
         // first step must NOT contain a success reply.
         let early_success = actions.iter().any(|a| {
             matches!(
@@ -1420,12 +1520,10 @@ mod tests {
         });
         assert!(!early_success);
 
-        // After the driver confirms durability, the parked success
-        // reply fires.
-        let after_ack = node.step(
-            Instant::now(),
-            Event::LogAppendComplete { tx_id: 2 },
-        );
+        // Driver confirms durability via `advance(write, commit)`,
+        // then `Tick` flushes the parked success reply.
+        node.advance(2, 2);
+        let after_ack = node.step(Instant::now(), Event::Tick);
         let success = after_ack.iter().any(|a| {
             matches!(
                 a,
@@ -1438,9 +1536,11 @@ mod tests {
     #[test]
     fn append_entries_with_log_mismatch_truncates_and_rejects() {
         let mut node = fresh(1, vec![1, 2, 3]);
-        // Pretend we accepted entries 1-5 at term 1.
+        // Pretend we accepted entries 1-5 at term 1 — durably written
+        // but not yet locally committed (the truncation invariant
+        // forbids truncating below `local_commit_index`).
         node.persistence.commit_term(1, 0).unwrap();
-        node.local_log_index = 5;
+        node.local_write_index = 5;
 
         let actions = node.step(
             Instant::now(),
@@ -1466,23 +1566,18 @@ mod tests {
     }
 
     #[test]
-    fn local_commit_advanced_advances_local_log_only_off_leader() {
+    fn advance_on_single_node_leader_lifts_cluster_commit() {
         let mut node = fresh(1, vec![1]);
         let t0 = Instant::now();
         let _ = node.step(t0, Event::Tick);
         let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
         assert!(node.role().is_leader());
-        let actions = node.step(
-            t0 + Duration::from_secs(61),
-            Event::LocalCommitAdvanced { tx_id: 7 },
-        );
+        node.advance(7, 7);
+        // `advance` is silent; observe via getters per ADR-0017
+        // §"Driver call pattern".
         assert_eq!(node.commit_index(), 7);
+        assert_eq!(node.write_index(), 7);
         assert_eq!(node.cluster_commit_index(), 7);
-        let advances = actions
-            .iter()
-            .filter(|a| matches!(a, Action::AdvanceClusterCommit { tx_id: 7 }))
-            .count();
-        assert_eq!(advances, 1);
     }
 
     #[test]

@@ -11,9 +11,9 @@
 //!   `step()` calls must be no-ops (finding #1/#2 follow-on).
 //! - T4: `SendAppendEntriesReply { success: true }` must not be
 //!   emitted in the same `step()` as the `AppendLog` action — it
-//!   must wait for `Event::LogAppendComplete` so the leader cannot
-//!   count an entry as durable on the follower before the driver
-//!   has actually persisted it (finding #3).
+//!   must wait for the driver's `advance` + `Tick` so the leader
+//!   cannot count an entry as durable on the follower before the
+//!   driver has actually persisted it (finding #3).
 //! - T5: a follower-side truncation that would drop
 //!   `cluster_commit_index` is a Raft invariant violation; the
 //!   library must `debug_assert!` instead of silently clamping
@@ -47,9 +47,11 @@ fn truncate_term_after_io_error_emits_fatal_error() {
     let mut node = make_follower(persistence);
     let now = Instant::now();
 
-    // Hydrate `local_log_index` to 5 without touching persistence.
-    let _ = node.step(now, Event::LogAppendComplete { tx_id: 5 });
-    assert_eq!(node.commit_index(), 5);
+    // Hydrate `local_write_index` to 5 (entries durably written but
+    // not yet locally committed — required by the §5.4 truncation
+    // invariant `after >= local_commit_index`).
+    node.advance(5, 0);
+    assert_eq!(node.write_index(), 5);
 
     // Phantom AppendEntries from peer 2 at term 2 with a deliberately
     // bogus prev_log_term so the follower takes the §5.3 truncation
@@ -94,8 +96,9 @@ fn truncate_term_after_io_error_emits_fatal_error() {
         "must not reply success after a fatal: {:?}",
         actions
     );
-    // local_log_index must not have moved.
-    assert_eq!(node.commit_index(), 5);
+    // The watermarks must not have moved — the failed truncation
+    // aborts before any in-memory clamp.
+    assert_eq!(node.write_index(), 5);
 }
 
 // ─── T2: observe_term I/O failure → FatalError ────────────────────────────
@@ -164,7 +167,9 @@ fn step_after_fatal_error_yields_no_actions() {
     let mut node = make_follower(persistence);
     let now = Instant::now();
 
-    let _ = node.step(now, Event::LogAppendComplete { tx_id: 5 });
+    // Written but not committed — the §5.4 truncation guard forbids
+    // truncating below the local commit watermark.
+    node.advance(5, 0);
     let first = node.step(
         now,
         Event::AppendEntriesRequest {
@@ -208,7 +213,7 @@ fn step_after_fatal_error_yields_no_actions() {
     );
 }
 
-// ─── T4: success reply must wait for LogAppendComplete ───────────────────
+// ─── T4: success reply must wait for advance + Tick ─────────────────────
 
 #[test]
 fn success_reply_waits_for_log_append_complete() {
@@ -232,7 +237,7 @@ fn success_reply_waits_for_log_append_complete() {
 
     // The library must have asked the driver to append, but must NOT
     // yet have replied success — the entries are not durable until
-    // the driver acks via `Event::LogAppendComplete`.
+    // the driver acks via `advance` + `Tick`.
     assert!(
         first.iter().any(|a| matches!(a, Action::AppendLog { .. })),
         "AppendLog must be emitted, got {:?}",
@@ -243,12 +248,14 @@ fn success_reply_waits_for_log_append_complete() {
             a,
             Action::SendAppendEntriesReply { success: true, .. }
         )),
-        "success reply must not be emitted before LogAppendComplete: {:?}",
+        "success reply must not be emitted before durability ack: {:?}",
         first
     );
 
-    // Driver acknowledges durability — NOW the success reply fires.
-    let second = node.step(now, Event::LogAppendComplete { tx_id: 3 });
+    // Driver acknowledges durability via `advance` + `Tick` — the
+    // success reply fires on the Tick drain.
+    node.advance(3, 3);
+    let second = node.step(now, Event::Tick);
     let success_reply = second.iter().find(|a| {
         matches!(
             a,
@@ -257,7 +264,7 @@ fn success_reply_waits_for_log_append_complete() {
     });
     let reply = success_reply.unwrap_or_else(|| {
         panic!(
-            "success reply must be emitted after LogAppendComplete, got {:?}",
+            "success reply must be emitted after advance + Tick, got {:?}",
             second
         )
     });
@@ -296,8 +303,8 @@ fn truncation_below_cluster_commit_index_panics_in_debug() {
     let mut node = make_follower(persistence);
     let now = Instant::now();
 
-    // Hydrate local_log_index to 10.
-    let _ = node.step(now, Event::LogAppendComplete { tx_id: 10 });
+    // Hydrate watermarks to 10.
+    node.advance(10, 10);
 
     // First AE: matching prev_log to advance cluster_commit_index to 5.
     let _ = node.step(
@@ -356,11 +363,11 @@ fn raftnode_new_panics_on_misconfigured_heartbeat_interval() {
 // ─── pending_reply lifecycle (audit gaps) ─────────────────────────────────
 
 /// A `Follower → Candidate` transition (election timeout fires while
-/// the follower has a parked AppendEntries success reply waiting on
-/// `LogAppendComplete`) discards the parked reply along with the rest
-/// of the follower state. The leader will time out its in-flight RPC
-/// and retry; nothing in the library leaks the stale reply into the
-/// candidate role.
+/// the follower has a parked AppendEntries success reply waiting on a
+/// driver `advance` + `Tick`) discards the parked reply along with the
+/// rest of the follower state. The leader will time out its in-flight
+/// RPC and retry; nothing in the library leaks the stale reply into
+/// the candidate role.
 #[test]
 fn pending_reply_lost_on_follower_to_candidate_transition() {
     let mut node = make_follower(MemPersistence::new());
@@ -385,15 +392,13 @@ fn pending_reply_lost_on_follower_to_candidate_transition() {
     )));
 
     // Election timeout fires → transition_to_follower replaces the
-    // FollowerState (drops the pending). LogAppendComplete arrives
+    // FollowerState (drops the pending). The advance + Tick arrives
     // *after* — the now-Candidate has nowhere to send the reply.
     let _ = node.step(now + Duration::from_secs(60), Event::Tick);
     assert_eq!(node.role(), raft::Role::Candidate);
 
-    let after_ack = node.step(
-        now + Duration::from_secs(60),
-        Event::LogAppendComplete { tx_id: 3 },
-    );
+    node.advance(3, 3);
+    let after_ack = node.step(now + Duration::from_secs(60), Event::Tick);
     assert!(
         !after_ack.iter().any(|a| matches!(
             a,
@@ -405,12 +410,12 @@ fn pending_reply_lost_on_follower_to_candidate_transition() {
 }
 
 /// Two AppendEntries arrive in rapid succession before the driver
-/// acks the first via `LogAppendComplete`. The follower must
-/// overwrite the parked reply with the second one. Replying for the
-/// older `last_tx_id` would tell the leader less than what was
-/// already shipped to the entry log; the leader's quorum logic is
-/// monotonic on success, so the single success reply at the higher
-/// `last_tx_id` is correct.
+/// acks the first via `advance` + `Tick`. The follower must overwrite
+/// the parked reply with the second one. Replying for the older
+/// `last_tx_id` would tell the leader less than what was already
+/// shipped to the entry log; the leader's quorum logic is monotonic
+/// on success, so the single success reply at the higher `last_tx_id`
+/// is correct.
 ///
 /// We model the "leader retransmits with an extended batch before
 /// the first ack lands" case: both AEs share `prev_log_tx_id=0`
@@ -451,7 +456,8 @@ fn pending_reply_overwritten_when_second_ae_arrives_before_ack() {
 
     // Driver finally acks durability up to 5 (covers the second
     // batch, which subsumes the first).
-    let after = node.step(now, Event::LogAppendComplete { tx_id: 5 });
+    node.advance(5, 5);
+    let after = node.step(now, Event::Tick);
     let replies: Vec<u64> = after
         .iter()
         .filter_map(|a| match a {
@@ -627,7 +633,8 @@ fn failed_flag_is_volatile_across_into_persistence_rebuild() {
     let mut node = make_follower(persistence);
     let now = Instant::now();
 
-    let _ = node.step(now, Event::LogAppendComplete { tx_id: 5 });
+    // Written but not committed — see the §5.4 truncation guard.
+    node.advance(5, 0);
     let actions = node.step(
         now,
         Event::AppendEntriesRequest {
@@ -665,4 +672,89 @@ fn failed_flag_is_volatile_across_into_persistence_rebuild() {
         "restarted node must not be in failed state: {:?}",
         actions
     );
+}
+
+// ── Index-split refactor regressions ──────────────────────────────────────
+
+/// `LogTruncateComplete` clamps all three watermarks — write,
+/// commit, and cluster_commit — so the post-split invariants
+/// `local_write >= local_commit` and `local_write >= cluster_commit`
+/// hold after a truncation.
+#[test]
+fn truncation_clamps_both_indexes() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 1,
+            start_tx_id: 1,
+        }],
+        1,
+        0,
+    );
+    let mut node = make_follower(persistence);
+    let now = Instant::now();
+
+    node.advance(10, 10);
+    // Bump cluster_commit via a heartbeat with leader_commit covering
+    // the local commit (followers bypass the §5.4.2 gate).
+    let _ = node.step(
+        now,
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 10,
+            prev_log_term: 1,
+            entries: LogEntryRange::empty(),
+            leader_commit: 10,
+        },
+    );
+    assert_eq!(node.write_index(), 10);
+    assert_eq!(node.commit_index(), 10);
+    assert_eq!(node.cluster_commit_index(), 10);
+
+    // Truncate to 5: all three watermarks clamp.
+    let _ = node.step(now, Event::LogTruncateComplete { up_to: 5 });
+    assert_eq!(node.write_index(), 5);
+    assert_eq!(node.commit_index(), 5);
+    assert_eq!(node.cluster_commit_index(), 5);
+}
+
+/// After a fatal failure the node is frozen — `advance` must not
+/// mutate state, mirroring the `step`-no-op-after-fatal contract.
+#[test]
+fn advance_no_op_on_failed_node() {
+    let mut persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 2,
+            start_tx_id: 1,
+        }],
+        2,
+        0,
+    );
+    persistence.fail_truncate = true;
+    let mut node = make_follower(persistence);
+    let now = Instant::now();
+
+    // Force a fatal via the truncate-fault path. (Written-but-not-
+    // committed setup so the §5.4 truncation guard allows the
+    // attempt to reach the persistence call.)
+    node.advance(5, 0);
+    let actions = node.step(
+        now,
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 2,
+            prev_log_tx_id: 3,
+            prev_log_term: 99,
+            entries: LogEntryRange::empty(),
+            leader_commit: 0,
+        },
+    );
+    assert!(actions.iter().any(|a| matches!(a, Action::FatalError { .. })));
+
+    // Node is frozen — advance must be a no-op.
+    let write_before = node.write_index();
+    let commit_before = node.commit_index();
+    node.advance(100, 100);
+    assert_eq!(node.write_index(), write_before);
+    assert_eq!(node.commit_index(), commit_before);
 }

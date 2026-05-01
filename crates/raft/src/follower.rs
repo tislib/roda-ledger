@@ -10,8 +10,10 @@
 //! while the driver is still durably persisting the entries it just
 //! got handed. Raft's write-ahead invariant requires the follower to
 //! have the entries on disk before telling the leader it accepted
-//! them; the library expresses that by deferring the reply until
-//! `Event::LogAppendComplete` arrives.
+//! them; the library expresses that by deferring the reply until the
+//! driver advances `local_write_index` past the parked tx_id (via
+//! `RaftNode::advance(write, commit)`) and then issues `step(Tick)`,
+//! which drains the parked reply.
 
 use crate::types::{NodeId, Term, TxId};
 
@@ -23,14 +25,13 @@ use crate::types::{NodeId, Term, TxId};
 /// last_new_entry_index)` rule at the moment the entries actually
 /// land on disk, not before.
 ///
-/// Carries the two-watermark pair that goes back to the leader (see
-/// ADR-0017 §"AE reply: write vs commit watermark"). Today the
-/// driver waits for full durability before posting
-/// `Event::LogAppendComplete`, so when the parked reply fires both
-/// fields equal the same `parked_tx_id`. A future split-ack
-/// architecture would let `last_write_id` drain ahead of
-/// `last_commit_id`, and `take_ready_reply` would gate solely on the
-/// commit ack.
+/// `last_commit_id` is used as the drain threshold (set at park
+/// time to the AE's last tx_id, which is the watermark the parked
+/// reply needs to clear). The actual wire watermarks shipped on the
+/// reply are read at drain time from `local_commit_index` and
+/// `local_write_index` so the reply reflects the follower's actual
+/// state when it goes on the wire — see ADR-0017 §"AE reply: write
+/// vs commit watermark".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingReply {
     pub to: NodeId,
@@ -47,8 +48,9 @@ pub struct FollowerState {
     /// — until the next leader speaks, the previous leader id
     /// remains the best guess for routing client redirects.
     pub leader_id: Option<NodeId>,
-    /// Deferred AppendEntries success reply waiting on a
-    /// `LogAppendComplete` durability ack from the driver. At most
+    /// Deferred AppendEntries success reply waiting on the driver's
+    /// `advance(write, …)` to push `local_write_index` past the
+    /// parked tx_id (followed by a `Tick` that drains it). At most
     /// one in flight per follower because the leader serialises one
     /// AE per peer at a time and the follower processes them
     /// in arrival order.
@@ -76,7 +78,7 @@ impl FollowerState {
 
     /// Park a success reply waiting for durability ack at `last_tx_id`.
     /// If a previous reply was already parked it is overwritten — the
-    /// newer AE supersedes it (the next `LogAppendComplete` will be
+    /// newer AE supersedes it (the next driver-side `advance` will be
     /// at least as far along).
     pub fn park_reply(&mut self, reply: PendingReply) {
         self.pending_reply = Some(reply);

@@ -100,7 +100,9 @@ struct NodeBox {
     /// `entries[tx_id - 1]` (1-based). Truncation drops the suffix.
     /// Survives crash/restart (models on-disk WAL).
     entries: Vec<MirrorEntry>,
-    /// Cluster commit watermark observed via `Action::AdvanceClusterCommit`.
+    /// Cluster commit watermark observed by polling
+    /// `node.cluster_commit_index()` after each step (ADR-0017
+    /// §"Driver call pattern" — there is no dedicated action).
     cluster_commit: TxId,
     /// (term, tx_id) pairs the node has been told to apply; used
     /// for state-machine safety checks.
@@ -210,6 +212,7 @@ impl Sim {
             None => return,
         };
         self.process_actions(id, now, actions);
+        self.observe_cluster_commit(id);
     }
 
     /// Configure the (uniform) network delay applied to outbound RPCs.
@@ -294,17 +297,21 @@ impl Sim {
             }
             let p = b.saved_persistence.take().expect("not crashed");
             let mut n = RaftNode::new(id, self.peer_list.clone(), p, self.cfg, b.seed);
-            // Restore local_log_index from the durable WAL extent
-            // before the first Tick so the election-timeout path
-            // sees the correct last_term.
+            // Hydrate both watermarks from the durable WAL extent
+            // before the first Tick. The harness pretends the ledger
+            // tracks raft-log durability synchronously, so write and
+            // commit collapse at restore time. (ADR-0017 §"Required
+            // Invariants" notes the implicit recovery invariant
+            // `ledger.last_commit_id <= raft_wal.last_tx_id`.)
             if last_tx > 0 {
-                let _ = n.step(now, Event::LogAppendComplete { tx_id: last_tx });
+                n.advance(last_tx, last_tx);
             }
             let acts = n.step(now, Event::Tick);
             b.node = Some(n);
             acts
         };
         self.process_actions(id, now, actions);
+        self.observe_cluster_commit(id);
     }
 
     pub fn role_of(&self, id: NodeId) -> Role {
@@ -348,10 +355,11 @@ impl Sim {
     }
 
     /// Inject a "client write" on `leader_id`: simulates the leader's
-    /// ledger appending the next tx_id, notifying raft of raft-log
-    /// durability via `LocalWriteAdvanced` and of ledger-commit via
-    /// `LocalCommitAdvanced`. Skips silently if the named node is
-    /// not (or no longer) a leader.
+    /// ledger appending the next tx_id, notifying raft via the
+    /// `advance(write, commit)` direct method, and flushing deferred
+    /// outputs via a `Tick` (per ADR-0017 §"Driver call pattern":
+    /// always Tick after advance). Skips silently if the named node
+    /// is not (or no longer) a leader.
     pub fn client_write(&mut self, leader_id: NodeId, count: usize) {
         let term = self.current_term_of(leader_id);
         if !self.role_of(leader_id).is_leader() {
@@ -366,22 +374,20 @@ impl Sim {
             for i in 0..count {
                 let tx = start + 1 + i as u64;
                 b.entries.push(MirrorEntry::new(tx, term));
-                // Raft-log durability first: bounds the AE
-                // replication window so the leader can immediately
-                // ship this entry to followers.
-                let write_acts = node.step(now, Event::LocalWriteAdvanced { tx_id: tx });
-                actions_acc.push((leader_id, write_acts));
-                // Ledger-commit second: advances `local_log_index`
-                // and the leader's quorum self-slot, which is what
-                // lets `cluster_commit_index` move once a majority
-                // has acked.
-                let commit_acts = node.step(now, Event::LocalCommitAdvanced { tx_id: tx });
-                actions_acc.push((leader_id, commit_acts));
+                // Single direct call advances both watermarks. Write
+                // bounds the AE replication window, commit feeds the
+                // leader's quorum self-slot.
+                node.advance(tx, tx);
+                // Tick flushes any deferred outputs (heartbeat fires,
+                // SetWakeup re-arming) — `advance` itself is silent.
+                let tick_acts = node.step(now, Event::Tick);
+                actions_acc.push((leader_id, tick_acts));
             }
         }
         for (id, acts) in actions_acc {
             self.process_actions(id, now, acts);
         }
+        self.observe_cluster_commit(leader_id);
     }
 
     /// Drive the simulator until `deadline`. Returns the number of
@@ -453,6 +459,35 @@ impl Sim {
             None => return,
         };
         self.process_actions(s.target, now, actions);
+        self.observe_cluster_commit(s.target);
+    }
+
+    /// Poll the node's `cluster_commit_index()` and apply any
+    /// advance to the harness mirror. Replaces the former
+    /// `Action::AdvanceClusterCommit` consumer (ADR-0017 §"Driver
+    /// call pattern": drivers poll the getter; no dedicated
+    /// action). Call after every `step` that may have changed
+    /// state.
+    fn observe_cluster_commit(&mut self, src: NodeId) {
+        let new_value = self
+            .nodes
+            .get(&src)
+            .and_then(|b| b.node.as_ref())
+            .map(|n| n.cluster_commit_index())
+            .unwrap_or(0);
+        if let Some(b) = self.nodes.get_mut(&src) {
+            if new_value > b.cluster_commit {
+                b.cluster_commit = new_value;
+            }
+            // Apply (state-machine safety): the harness captures
+            // the apply order to assert determinism across nodes.
+            for i in 0..b.cluster_commit {
+                let idx = i as usize;
+                if idx < b.entries.len() && b.applied.len() < (i + 1) as usize {
+                    b.applied.push(b.entries[idx]);
+                }
+            }
+        }
     }
 
     fn process_actions(&mut self, src: NodeId, now: Instant, actions: Vec<Action>) {
@@ -571,14 +606,26 @@ impl Sim {
                             }
                         }
                     }
+                    // Synchronous-apply harness model: ledger applies
+                    // the AE entries the moment they're durable, so
+                    // both watermarks move together. `advance` is
+                    // followed by `Tick` (per ADR-0017 §"Driver call
+                    // pattern") — `Tick` drains the parked AE reply
+                    // the leader is waiting on.
+                    if let Some(node) =
+                        self.nodes.get_mut(&src).and_then(|b| b.node.as_mut())
+                    {
+                        node.advance(last_tx, last_tx);
+                    }
                     let actions = self
                         .nodes
                         .get_mut(&src)
                         .and_then(|b| b.node.as_mut())
-                        .map(|n| n.step(now, Event::LogAppendComplete { tx_id: last_tx }));
+                        .map(|n| n.step(now, Event::Tick));
                     if let Some(a) = actions {
                         self.process_actions(src, now, a);
                     }
+                    self.observe_cluster_commit(src);
                 }
                 Action::TruncateLog { after_tx_id } => {
                     if let Some(b) = self.nodes.get_mut(&src) {
@@ -591,22 +638,6 @@ impl Sim {
                         .map(|n| n.step(now, Event::LogTruncateComplete { up_to: after_tx_id }));
                     if let Some(a) = actions {
                         self.process_actions(src, now, a);
-                    }
-                }
-                Action::AdvanceClusterCommit { tx_id } => {
-                    if let Some(b) = self.nodes.get_mut(&src) {
-                        if tx_id > b.cluster_commit {
-                            b.cluster_commit = tx_id;
-                        }
-                        // Apply (state-machine safety): the harness
-                        // captures the apply order to assert
-                        // determinism across nodes.
-                        for i in 0..tx_id {
-                            let idx = i as usize;
-                            if idx < b.entries.len() && b.applied.len() < (i + 1) as usize {
-                                b.applied.push(b.entries[idx]);
-                            }
-                        }
                     }
                 }
                 Action::BecomeRole { role, term } => {

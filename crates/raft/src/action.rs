@@ -65,15 +65,11 @@ pub enum Action {
     /// Append the entries described by `range` to the entry log.
     /// The driver already has the payloads (they came in on the
     /// inbound RPC); this action tells it to commit metadata +
-    /// payloads durably and ack via `Event::LogAppendComplete` with
-    /// the highest tx_id in the range.
+    /// payloads durably. The driver acks durability by calling
+    /// `RaftNode::advance(write, commit)` (advancing the write
+    /// watermark past the range's last tx_id) and then `step(Tick)`,
+    /// which drains the parked AE-success reply.
     AppendLog { range: LogEntryRange },
-
-    // ── apply pipeline gate ─────────────────────────────────────────────
-    /// The cluster commit watermark advanced to `tx_id`. The driver
-    /// gates the ledger's apply pipeline on this signal — ADR-0017
-    /// §"Apply-on-commit, not apply-on-durable".
-    AdvanceClusterCommit { tx_id: TxId },
 
     // ── role observability ──────────────────────────────────────────────
     /// Notify the driver of a role transition. Mirrors the public

@@ -97,10 +97,8 @@ fn log_mismatch_decrements_next_index() {
     //
     // Simulate the leader having committed 3 entries:
     for tx in 1..=3 {
-        let _ = node.step(
-            t0 + Duration::from_secs(60 + tx),
-            Event::LocalCommitAdvanced { tx_id: tx },
-        );
+        node.advance(tx, tx);
+        let _ = node.step(t0 + Duration::from_secs(60 + tx), Event::Tick);
     }
 
     // Inject 3 successive LogMismatch rejects from peer 2 — each
@@ -149,8 +147,8 @@ fn term_log_truncates_with_entry_log() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
 
     // Drive entries 1..5 at term 1 into the follower. The driver
-    // acks durability via LogAppendComplete, which is what advances
-    // `local_log_index` (and drains the parked success reply).
+    // acks durability via `advance` + `Tick`, which is what advances
+    // both watermarks and drains the parked success reply.
     let _ = node.step(
         Instant::now(),
         Event::AppendEntriesRequest {
@@ -162,8 +160,12 @@ fn term_log_truncates_with_entry_log() {
             leader_commit: 0,
         },
     );
-    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 5 });
-    assert_eq!(node.commit_index(), 5);
+    // Written but not committed — the §5.4 truncation guard forbids
+    // truncating below `local_commit_index`, and this test then
+    // truncates to 4. Set commit=0 so the truncation is allowed.
+    node.advance(5, 0);
+    let _ = node.step(Instant::now(), Event::Tick);
+    assert_eq!(node.write_index(), 5);
 
     // Now arrive an AppendEntries from a leader at term 2 with
     // prev_log_tx_id=5, prev_log_term=2 — mismatch. Follower must
@@ -262,11 +264,12 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
             leader_commit: 0,
         },
     );
-    let _ = node.step(
-        t0 + Duration::from_millis(11),
-        Event::LogAppendComplete { tx_id: 5 },
-    );
-    assert_eq!(node.commit_index(), 5, "local_log_index reflects entries");
+    // Driver acks raft-log durability; ledger has not yet applied
+    // (leader_commit was 0). Models the §5.4.2 scenario faithfully:
+    // entries durably written but not locally committed.
+    node.advance(5, 0);
+    let _ = node.step(t0 + Duration::from_millis(11), Event::Tick);
+    assert_eq!(node.write_index(), 5, "entries durable on disk");
     assert_eq!(
         node.cluster_commit_index(),
         0,
@@ -375,8 +378,8 @@ fn leader_with_entries(entries: TxId, t0: Instant) -> (RaftNode<MemPersistence>,
 
     let after = t0 + Duration::from_secs(61);
     if entries > 0 {
-        let _ = node.step(after, Event::LocalCommitAdvanced { tx_id: entries });
-        let _ = node.step(after, Event::LocalWriteAdvanced { tx_id: entries });
+        node.advance(entries, entries);
+        let _ = node.step(after, Event::Tick);
     }
     // Drain the initial AE round so peers have an in-flight set;
     // subsequent replies clear it cleanly.
@@ -639,4 +642,50 @@ fn three_node_failover_preserves_all_safety_properties() {
     sim.assert_election_safety();
     sim.assert_log_matching();
     sim.assert_state_machine_safety();
+}
+
+// ── §5.4.1 reads write_index, not commit_index (split-watermark refactor) ──
+
+/// A node with `local_write_index = 5` and `local_commit_index = 3`
+/// (durably written but not yet locally committed) must still deny a
+/// vote to a candidate claiming `last_tx_id = 4` at the same term.
+/// §5.4.1's up-to-date check reads the write extent — using the
+/// commit extent would let a candidate with a strictly older durable
+/// log win a vote it shouldn't, breaking Election Safety.
+///
+/// This test is the highest-value regression for the index split:
+/// pre-refactor `local_log_index` conflated write and commit, so the
+/// scenario was inexpressible.
+#[test]
+fn vote_denial_uses_write_index_not_commit_index() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 5,
+            start_tx_id: 1,
+        }],
+        5,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    // Five entries durably written, only three locally committed.
+    node.advance(5, 3);
+
+    let actions = node.step(
+        Instant::now(),
+        Event::RequestVoteRequest {
+            from: 2,
+            term: 6,
+            last_tx_id: 4, // strictly less than our write extent
+            last_term: 5,  // same term as ours
+        },
+    );
+    let granted = actions.iter().any(|a| matches!(
+        a,
+        Action::SendRequestVoteReply { granted: true, .. }
+    ));
+    assert!(
+        !granted,
+        "vote must use write_index (5), not commit_index (3): {:?}",
+        actions
+    );
 }

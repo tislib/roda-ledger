@@ -174,14 +174,17 @@ impl ClusterNode {
 
         // Inform raft of any durable log entries so §5.4.1's
         // up-to-date check is accurate before the first inbound RPC.
+        // The ledger only surfaces a single watermark today (its
+        // committed end) — pre-refactor this was conflated with the
+        // raft-log write extent. ADR-0017 §"Required Invariants"
+        // notes the implicit recovery invariant
+        // `ledger.last_commit_id <= raft_wal.last_tx_id`; until the
+        // production ledger surfaces the WAL extent separately we
+        // collapse write and commit at boot.
         let durable_last_tx_id = self.ledger_slot.ledger().last_commit_id();
         if durable_last_tx_id > 0 {
-            let _ = node.step(
-                Instant::now(),
-                raft::Event::LogAppendComplete {
-                    tx_id: durable_last_tx_id,
-                },
-            );
+            node.advance(durable_last_tx_id, durable_last_tx_id);
+            let _ = node.step(Instant::now(), raft::Event::Tick);
         }
         // Snapshot initial state so consumers see post-construction values.
         mirror.snapshot_from(&node);

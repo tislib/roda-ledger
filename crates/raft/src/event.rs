@@ -69,26 +69,6 @@ pub enum Event {
         granted: bool,
     },
 
-    /// Leader-only: ledger reports it durably committed an entry
-    /// locally. Bridge from the ledger's on-commit hook into raft.
-    /// Advances the leader's own slot in match_index, feeding into
-    /// cluster_commit_index.
-    LocalCommitAdvanced { tx_id: TxId },
-
-    /// Leader-only: driver acknowledges that entries up to `tx_id`
-    /// are durably written to the leader's raft log and may be
-    /// replicated. Distinct from `LocalCommitAdvanced` — that one
-    /// fires when the ledger commits an entry locally and feeds the
-    /// leader's quorum self-slot. `LocalWriteAdvanced` only bounds
-    /// the AE replication window via `last_written`; it does not
-    /// touch `local_log_index`, the quorum, or `cluster_commit_index`.
-    LocalWriteAdvanced { tx_id: TxId },
-
-    /// Driver acknowledges the most recent `Action::AppendLog` for
-    /// the follower path. `tx_id` is the highest tx_id in the
-    /// just-appended range.
-    LogAppendComplete { tx_id: TxId },
-
     /// Driver acknowledges the most recent `Action::TruncateLog`.
     LogTruncateComplete { up_to: TxId },
 }

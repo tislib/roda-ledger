@@ -7,8 +7,9 @@
 //! is just a `Vec<u64>` plus a sort each time `advance` is called.
 //!
 //! Slot 0 is conventionally the leader's own progress, fed by
-//! `Event::LocalCommitAdvanced`. Slots `1..=N` are the peers in the
-//! same order as `RaftNode::new`'s `peers: Vec<NodeId>`.
+//! `RaftNode::advance(write, commit)` (the `commit` argument lifts
+//! the self-slot). Slots `1..=N` are the peers in the same order as
+//! `RaftNode::new`'s `peers: Vec<NodeId>`.
 //!
 //! `match_index[node]` is monotonically non-decreasing — once a peer
 //! reports `K`, that report stays put. `cluster_commit_index` itself
@@ -69,8 +70,8 @@ impl Quorum {
     /// peer) cannot drop the watermark.
     ///
     /// Returns `Some(new_value)` if the watermark advanced, `None`
-    /// otherwise — the caller uses this to decide whether to emit
-    /// `Action::AdvanceClusterCommit`.
+    /// otherwise — the caller pairs this with the §5.4.2 Figure-8
+    /// gate before bumping `cluster_commit_index` in place.
     pub fn advance(&mut self, node_index: usize, index: u64) -> Option<u64> {
         debug_assert!(node_index < self.match_index.len());
         if index > self.match_index[node_index] {

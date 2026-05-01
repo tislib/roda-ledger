@@ -321,10 +321,8 @@ fn leader_log_is_append_only() {
     // Drive a few client writes and verify no TruncateLog actions.
     let mut all_actions: Vec<Action> = Vec::new();
     for tx in 1..=5 {
-        let acts = node.step(
-            t0 + Duration::from_secs(60 + tx),
-            Event::LocalCommitAdvanced { tx_id: tx },
-        );
+        node.advance(tx, tx);
+        let acts = node.step(t0 + Duration::from_secs(60 + tx), Event::Tick);
         all_actions.extend(acts);
     }
     let truncates = all_actions
@@ -341,7 +339,7 @@ fn leader_log_is_append_only() {
 /// AppendEntries with `prev_log_tx_id=0` (start of log) is accepted
 /// without a §5.3 check — that's the convention for the empty-log
 /// boundary. The success reply is parked until the driver
-/// acknowledges the durable append via `LogAppendComplete`.
+/// acknowledges durability via `advance` + `Tick`.
 #[test]
 fn prev_log_tx_id_zero_skips_term_match_check() {
     let mut node = fresh_node(1, vec![1, 2]);
@@ -363,8 +361,9 @@ fn prev_log_tx_id_zero_skips_term_match_check() {
         a,
         Action::SendAppendEntriesReply { success: true, .. }
     )));
-    // Driver acks durability; success reply now fires.
-    let after = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 1 });
+    // Driver acks durability; success reply fires on the Tick drain.
+    node.advance(1, 1);
+    let after = node.step(Instant::now(), Event::Tick);
     let success = after.iter().any(|a| matches!(
         a,
         Action::SendAppendEntriesReply { success: true, .. }
@@ -392,19 +391,14 @@ fn leader_commit_clamp_to_local_log() {
         },
     );
     // Cluster commit cannot advance before the entries are durable.
-    assert!(!first
-        .iter()
-        .any(|a| matches!(a, Action::AdvanceClusterCommit { .. })));
+    let _ = first;
     assert_eq!(node.cluster_commit_index(), 0);
 
-    // Driver acks durability — `leader_commit` is now applied,
-    // clamped at the new `local_log_index = 3`.
-    let after = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 3 });
-    let advance: Option<u64> = after.iter().find_map(|a| match a {
-        Action::AdvanceClusterCommit { tx_id } => Some(*tx_id),
-        _ => None,
-    });
-    assert_eq!(advance, Some(3));
+    // Driver acks durability via `advance` + `Tick`. `leader_commit`
+    // is now applied, clamped at the new `local_commit_index = 3`.
+    // Drivers poll the getter — there is no dedicated action.
+    node.advance(3, 3);
+    let _ = node.step(Instant::now(), Event::Tick);
     assert_eq!(node.cluster_commit_index(), 3);
 }
 
@@ -520,23 +514,19 @@ fn become_role_leader_matches_immediate_query() {
     assert!(node.current_term() >= 1);
 }
 
-/// `cluster_commit_index()` after a step matches any
-/// `Action::AdvanceClusterCommit` emitted by that step.
+/// `cluster_commit_index()` reflects the in-place advance from
+/// `advance(write, commit)` — there is no dedicated action.
 #[test]
-fn cluster_commit_query_matches_advance_action() {
+fn cluster_commit_query_reflects_advance() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
     let _ = node.step(t0, Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
-    let actions = node.step(
-        t0 + Duration::from_secs(61),
-        Event::LocalCommitAdvanced { tx_id: 7 },
-    );
-    let advanced: Option<u64> = actions.iter().find_map(|a| match a {
-        Action::AdvanceClusterCommit { tx_id } => Some(*tx_id),
-        _ => None,
-    });
-    assert_eq!(advanced, Some(7));
+    // Single-node leader: `advance(7, 7)` lifts cluster_commit
+    // immediately. The driver polls `cluster_commit_index()` to
+    // observe the change (no dedicated action; ADR-0017 §"Driver
+    // call pattern").
+    node.advance(7, 7);
     assert!(node.cluster_commit_index() >= 7);
 }
 
@@ -562,7 +552,7 @@ fn vote_denied_when_candidate_last_term_below_ours() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 3 });
+    node.advance(3, 3);
 
     let actions = node.step(
         Instant::now(),
@@ -594,7 +584,7 @@ fn vote_denied_when_same_last_term_but_lower_last_tx_id() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 10 });
+    node.advance(10, 10);
 
     let actions = node.step(
         Instant::now(),
@@ -626,7 +616,7 @@ fn vote_granted_when_candidate_last_term_above_ours() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 10 });
+    node.advance(10, 10);
 
     let actions = node.step(
         Instant::now(),
@@ -729,7 +719,7 @@ fn heartbeat_propagates_leader_commit_advance() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 3 });
+    node.advance(3, 3);
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Heartbeat at term 1 with leader_commit=2.
@@ -745,14 +735,98 @@ fn heartbeat_propagates_leader_commit_advance() {
         },
     );
 
+    // The advance is observable via the getter (no dedicated
+    // action — ADR-0017 §"Driver call pattern").
     assert_eq!(node.cluster_commit_index(), 2);
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        Action::AdvanceClusterCommit { tx_id: 2 }
-    )));
     // Heartbeats also reply success synchronously (no parking).
     assert!(actions.iter().any(|a| matches!(
         a,
         Action::SendAppendEntriesReply { success: true, .. }
     )));
+}
+
+// ── Index-split refactor regressions ──────────────────────────────────────
+
+/// On a follower, the heartbeat path clamps `leader_commit` to
+/// `local_commit_index` (not `local_write_index`) — the cluster
+/// commit watermark on a follower is bounded by what the local
+/// ledger has applied. Pre-refactor the single conflated field
+/// served both roles; this test pins the new semantics.
+#[test]
+fn heartbeat_leader_commit_clamps_to_local_commit() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 1,
+            start_tx_id: 1,
+        }],
+        1,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    // Five entries durably written, only three committed locally.
+    node.advance(5, 3);
+
+    // Heartbeat with leader_commit=10 (intentionally above our
+    // commit). Cluster commit advances only to local_commit_index=3.
+    let _ = node.step(
+        Instant::now(),
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: 1,
+            prev_log_tx_id: 5,
+            prev_log_term: 1,
+            entries: LogEntryRange::empty(),
+            leader_commit: 10,
+        },
+    );
+    assert_eq!(
+        node.cluster_commit_index(),
+        3,
+        "cluster_commit must clamp to local_commit_index, not write_index"
+    );
+}
+
+/// A Candidate's `local_write_index` survives the role transition
+/// to Follower (when an AE at a higher term arrives). Pre-refactor,
+/// `LeaderState.last_written` would have been dropped if the node
+/// had been leader; the node-scoped field is preserved on every
+/// transition.
+#[test]
+fn local_write_index_survives_election_loss() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 1,
+            start_tx_id: 1,
+        }],
+        1,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2, 3], persistence, RaftConfig::default(), 42);
+    let t0 = Instant::now();
+    // Hydrate the write extent before any election runs.
+    node.advance(3, 3);
+    // First Tick lazy-arms; second Tick expires → Candidate.
+    let _ = node.step(t0, Event::Tick);
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    assert_eq!(node.role(), Role::Candidate);
+    let term_now = node.current_term();
+    assert_eq!(node.write_index(), 3);
+
+    // Receive AE at a strictly higher term (a different node won
+    // the election). prev_log_tx_id = 0 sentinels the start-of-log
+    // check so we don't tangle with the §5.3 path here.
+    let _ = node.step(
+        t0 + Duration::from_secs(60),
+        Event::AppendEntriesRequest {
+            from: 2,
+            term: term_now + 1,
+            prev_log_tx_id: 0,
+            prev_log_term: 0,
+            entries: LogEntryRange::empty(),
+            leader_commit: 0,
+        },
+    );
+    assert!(matches!(node.role(), Role::Follower));
+    // Survives the Candidate → Follower transition.
+    assert_eq!(node.write_index(), 3);
 }

@@ -50,10 +50,14 @@ fn role_from_u8(v: u8) -> Role {
 pub struct ClusterMirror {
     role: AtomicU8,
     current_term: AtomicU64,
-    /// Local commit index (this node's durable log). May be ahead of
-    /// `cluster_commit_index` on the leader (locally durable but not
-    /// quorum-acked yet).
+    /// Local commit index (this node's durable ledger commit). May
+    /// be ahead of `cluster_commit_index` on the leader (locally
+    /// durable but not quorum-acked yet).
     commit_index: AtomicU64,
+    /// Local raft-log write extent — the upper bound of what is on
+    /// disk. Bounds AE replication on the leader and feeds §5.4.1's
+    /// up-to-date check. Mirrors `RaftNode::write_index()`.
+    write_index: AtomicU64,
     /// Quorum-committed cluster watermark — the apply gate for
     /// `LedgerHandler::wait_for_transaction_level`.
     cluster_commit_index: AtomicU64,
@@ -72,6 +76,7 @@ impl ClusterMirror {
             role: AtomicU8::new(ROLE_INITIALIZING),
             current_term: AtomicU64::new(0),
             commit_index: AtomicU64::new(0),
+            write_index: AtomicU64::new(0),
             cluster_commit_index: AtomicU64::new(0),
             current_leader: AtomicU64::new(0),
             voted_for: AtomicU64::new(0),
@@ -117,6 +122,11 @@ impl ClusterMirror {
     }
 
     #[inline]
+    pub fn write_index(&self) -> u64 {
+        self.write_index.load(Ordering::Acquire)
+    }
+
+    #[inline]
     pub fn cluster_commit_index(&self) -> u64 {
         self.cluster_commit_index.load(Ordering::Acquire)
     }
@@ -153,6 +163,8 @@ impl ClusterMirror {
             .store(node.current_term(), Ordering::Release);
         self.commit_index
             .store(node.commit_index(), Ordering::Release);
+        self.write_index
+            .store(node.write_index(), Ordering::Release);
         self.cluster_commit_index
             .store(node.cluster_commit_index(), Ordering::Release);
         self.current_leader
@@ -185,6 +197,7 @@ mod tests {
         assert_eq!(m.role(), Role::Initializing);
         assert_eq!(m.current_term(), 0);
         assert_eq!(m.commit_index(), 0);
+        assert_eq!(m.write_index(), 0);
         assert_eq!(m.cluster_commit_index(), 0);
         assert_eq!(m.current_leader(), None);
         assert_eq!(m.voted_for(), None);

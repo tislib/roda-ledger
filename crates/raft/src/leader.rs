@@ -9,7 +9,10 @@
 //!
 //! The reply's two watermarks (`last_write_id`, `last_commit_id`) drive
 //! `next_index` and `match_index` independently — see ADR-0017 §"AE
-//! reply: write vs commit watermark".
+//! reply: write vs commit watermark". The leader's own write-extent
+//! watermark lives on `RaftNode.local_write_index` (advanced via the
+//! `advance(write, commit)` driver method); `leader_send_to` reads it
+//! directly to bound replication.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -72,27 +75,19 @@ pub struct LeaderState {
     /// RPC fired late in a heartbeat window can still time out
     /// before the next one is queued.
     pub rpc_timeout: Duration,
-    /// Highest tx_id durably written to the leader's raft log.
-    /// Bounds the replication window in `leader_send_to`. Advanced
-    /// by `Event::LocalWriteAdvanced`. Initialised at leader-win to
-    /// the leader's `local_log_index` so a fresh leader can
-    /// immediately replicate whatever it already has on disk.
-    /// Independent of `local_log_index` and `cluster_commit_index`
-    /// — see the event doc for the separation of concerns.
-    pub last_written: TxId,
 }
 
 impl LeaderState {
     /// Construct from the leader's view at bring-up. `last_local_tx`
-    /// is the leader's own commit progress; new peers start at
-    /// `next_index = last_local_tx + 1`. `last_written` seeds the
-    /// replication-window watermark — pass the leader's
-    /// `local_log_index` at win time so already-on-disk entries are
-    /// shippable from the first `Action::SendAppendEntries`.
+    /// is the leader's own write extent; new peers start at
+    /// `next_index = last_local_tx + 1` so the leader can immediately
+    /// ship already-on-disk entries from the first
+    /// `Action::SendAppendEntries`. The replication-window upper
+    /// bound is the node-level `local_write_index`, read directly in
+    /// `leader_send_to` (no longer mirrored on `LeaderState`).
     pub fn new(
         peer_ids: &[NodeId],
         last_local_tx: TxId,
-        last_written: TxId,
         now: Instant,
         heartbeat_interval: Duration,
         rpc_timeout: Duration,
@@ -107,7 +102,6 @@ impl LeaderState {
             peers,
             heartbeat_interval,
             rpc_timeout,
-            last_written,
         }
     }
 
@@ -146,13 +140,11 @@ mod tests {
         let state = LeaderState::new(
             &[2, 3],
             10,
-            10,
             now,
             Duration::from_millis(50),
             Duration::from_millis(200),
         );
         assert_eq!(state.peers.len(), 2);
-        assert_eq!(state.last_written, 10);
         for p in state.peers.values() {
             assert_eq!(p.next_index, 11);
             assert_eq!(p.match_index, 0);
@@ -166,7 +158,6 @@ mod tests {
         let now = t0();
         let mut state = LeaderState::new(
             &[2, 3, 4],
-            0,
             0,
             now,
             Duration::from_millis(50),

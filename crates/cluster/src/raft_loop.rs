@@ -60,11 +60,13 @@ pub struct RaftLoop {
     pending_ae_replies: BTreeMap<TxId, Vec<ParkedReply>>,
 
     /// Last `last_wal_write_id()` observed from the ledger. Used to
-    /// detect changes between iterations and to feed
-    /// `Event::LogWriteComplete` (TODO once raft exposes the event).
+    /// detect changes between iterations and to feed the new write
+    /// watermark into `RaftNode::advance(write, commit)` (TODO once
+    /// the production poll loop is wired in).
     last_seen_write: TxId,
-    /// Last `last_commit_id()` observed. Feeds `LocalCommitAdvanced`
-    /// to the leader's quorum slot.
+    /// Last `last_commit_id()` observed. Feeds the commit watermark
+    /// into `RaftNode::advance(write, commit)` so the leader's
+    /// quorum self-slot picks it up (TODO).
     last_seen_commit: TxId,
 
     /// Most recent `Action::SetWakeup` deadline — drives the `select!`
@@ -108,8 +110,12 @@ impl RaftLoop {
         self.step(Event::Tick);
 
         loop {
-            // TODO: poll ledger watermarks → feed LogWriteComplete /
-            //       LocalCommitAdvanced into raft.
+            // TODO: poll ledger watermarks → call
+            //       `node.advance(write, commit)` then `step(Tick)`
+            //       (ADR-0017 §"Driver call pattern"). The cluster
+            //       commit advance is observed by re-snapshotting
+            //       the mirror after each step — there is no
+            //       dedicated `Action::AdvanceClusterCommit`.
             // TODO: drain pending_ae_replies up to last_seen_write.
 
             let sleep_until = self
@@ -186,7 +192,7 @@ impl RaftLoop {
             // TODO: SendRequestVoteReply   → reply via current request's oneshot
             // TODO: AppendLog       → kick ledger.append_wal_entries (non-blocking)
             // TODO: TruncateLog     → spawn reseed task
-            // TODO: AdvanceClusterCommit / BecomeRole → already in mirror, no-op
+            // TODO: BecomeRole → already in mirror, no-op
             _ => {}
         }
     }

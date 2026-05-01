@@ -22,10 +22,10 @@ The library exposes one entry point — a synchronous `step(now, event) -> Vec<A
 
 **Asymmetric write paths:**
 
-- **Leader.** Ledger assigns tx_id and writes to its store, then notifies raft via a `LocalCommitAdvanced` event. Raft replicates by emitting `SendAppendEntries` actions.
-- **Follower.** Raft receives AppendEntries, validates §5.3 prev_log_term match, and directs the storage layer via `AppendLog` and `TruncateLog` actions. The follower's ledger is passive — apply only.
+- **Leader.** Ledger assigns tx_id and writes to its store, then notifies raft via the `advance(local_write_index, local_commit_index)` direct method. Raft replicates by emitting `SendAppendEntries` actions.
+- **Follower.** Raft receives AppendEntries, validates §5.3 prev_log_term match, and directs the storage layer via `AppendLog` and `TruncateLog` actions. The follower's ledger is passive — apply only. After WAL fsync and ledger apply, the driver calls `advance(write, commit)` and follows it with `step(Tick)` to flush the parked AE-success reply.
 
-**Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal (the `AdvanceClusterCommit` action), not on raw storage durability. This eliminates the rollback-after-truncation problem.
+**Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal — drivers poll `cluster_commit_index()` after every `step` / `advance` (there is no dedicated action; see §"Driver call pattern"), not on raw storage durability. This eliminates the rollback-after-truncation problem.
 
 ## One Range Per AppendEntries
 
@@ -35,16 +35,19 @@ When a leader's log spans multiple terms, it ships one AE per same-term chunk, i
 
 This shape lets the follower update its durable term-log with one `observe_term` call per AE, lets one `(prev_log_tx_id, prev_log_term)` pair carry the full §5.3 contract, and keeps payload bytes out of the library entirely (the driver moves bytes between storage and the wire on its own, indexed by tx_id).
 
-## Two Commit Indexes
+## Three Indexes
 
 The library distinguishes them explicitly:
 
-- **`commit_index`** (local). The largest tx_id this node has durably committed in its own log. On the leader, advanced when the ledger's on-commit hook fires. On followers, advanced when an AppendEntries write durably lands.
-- **`cluster_commit_index`** (cluster-wide). The largest tx_id known to be quorum-committed across the cluster. On the leader, recomputed from per-peer `match_index` whenever an AppendEntries reply arrives. On a follower, the leader's `leader_commit` clamped to local `commit_index`.
+- **`local_write_index`** (local). The largest tx_id durably written to this node's raft log. Advanced by the driver via `advance(write, commit)` (the `write` argument). Bounds the AE replication window in `leader_send_to`, gates §5.4.1's up-to-date check (the candidate's last-tx claim is compared against this watermark, not the commit watermark — written-but-uncommitted entries still count for vote-denial), and feeds the §5.3 prev_log coverage check.
+- **`local_commit_index`** (local). The largest tx_id this node has durably committed in its own ledger. Advanced by the driver via `advance(write, commit)` (the `commit` argument). On the leader, feeds the quorum self-slot — only locally-committed entries count toward `cluster_commit_index`. On followers, set after the ledger applies entries up to whatever the leader's `leader_commit` says.
+- **`cluster_commit_index`** (cluster-wide). The largest tx_id known to be quorum-committed across the cluster. On the leader, recomputed from per-peer `match_index` whenever an AppendEntries reply arrives. On a follower, the leader's `leader_commit` clamped to local `local_commit_index`. Updated **in place** when the conditions are met — the driver polls the getter to detect changes (see §"Driver call pattern").
 
-These are different facts. The leader's `commit_index` can be ahead of `cluster_commit_index` (persisted locally but not yet quorum-acked). A follower's `commit_index` can be ahead of its `cluster_commit_index` (persisted entries the leader hasn't yet told it are committed cluster-wide).
+Invariant: `local_write_index >= local_commit_index >= 0`. Debug builds panic via `debug_assert!` on violation; release builds clamp `commit` to `write` defensively (same posture as the AE-reply guard at §"AE reply: write vs commit watermark").
 
-Cluster-level reads (e.g. `wait_for_transaction_level`) and the apply pipeline use `cluster_commit_index`. The local `commit_index` is for raft's own bookkeeping and per-node introspection.
+These are different facts. The leader's `local_commit_index` can be ahead of `cluster_commit_index` (committed locally but not yet quorum-acked). A follower's `local_commit_index` can be ahead of its `cluster_commit_index` (entries applied to the local ledger but the leader's last `leader_commit` still trails). Both can be ahead of one another in the brief window between raft-log fsync and ledger apply on a follower.
+
+Cluster-level reads (e.g. `wait_for_transaction_level`) and the apply pipeline use `cluster_commit_index`. `local_commit_index` is for raft's own bookkeeping and per-node introspection. `local_write_index` is for the §5.4.1 / §5.3 / replication-window decisions.
 
 ### AE reply: write vs commit watermark
 
@@ -69,13 +72,15 @@ The design must enforce these under all schedules:
 
 4. **No boot-time term bumping.** A node coming back up sits at its persisted term; only candidates running an actual election bump term. The constructor never advances state.
 
-5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and any `cluster_commit` advance derived from `leader_commit` wait for the driver's `LogAppendComplete` ack before being emitted; the leader cannot count an entry as durably replicated on a peer until the peer has actually written it. The reply carries `last_commit_id` (durable) and `last_write_id` (accepted) separately — see §"AE reply: write vs commit watermark" — so that future split-ack architectures can decouple the two without breaking the durability-gates-quorum invariant.
+5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and any `cluster_commit` advance derived from `leader_commit` wait for the driver to call `advance(write, commit)` advancing the write watermark past the parked tx_id, followed by `step(Tick)` which drains the parked reply; the leader cannot count an entry as durably replicated on a peer until the peer has actually written it. The reply carries `last_commit_id` (durable) and `last_write_id` (accepted) separately — see §"AE reply: write vs commit watermark" — so that future split-ack architectures can decouple the two without breaking the durability-gates-quorum invariant.
 
 6. **Fatal-on-unrecoverable-persistence-failure.** If the persistence trait returns `Err` from a write that, if the library proceeded, would diverge in-memory state from on-disk state (term-log truncate, term observation), the library emits a fatal-error action, freezes the node, and refuses further forward progress. The driver must shut the node down on receipt — partial state recovery from this point is not safe. (Errors that leave the on-disk state untouched, like a refused vote or a refused `commit_term`, are recoverable and the library reacts in-band.)
 
 7. **Term log allows non-contiguous forward jumps.** The term log can validly skip terms — a node that observed a higher term via RPC (vote-log advance) but did not receive entries from that term will not have a term-log record for it, and a later election win at an even higher term commits a non-adjacent record. `commit_term` is gated on `current < expected`, not `current + 1 == expected`. Ranged term-log records mean each record covers the inclusive interval starting at `start_tx_id` until the next record (or open-ended if no next record exists).
 
 8. **Quorum monotonicity.** Per-peer `match_index` is monotonically non-decreasing on success. `cluster_commit_index` itself is monotonic — out-of-order, late, or duplicated peer acks cannot lower it. A defensive `regress` lowers a peer's slot when a partially-recovered peer resurfaces with a shorter durable log, but the watermark holds.
+
+9. **Indexes are not persisted by the raft library.** Only the term log and vote log are durable through the `Persistence` trait. `local_write_index`, `local_commit_index`, and `cluster_commit_index` are in-memory; the driver hydrates them on boot via `advance(write, commit)` reading from whatever durable state it owns (today the ledger's commit watermark, which collapses write and commit). Implicit recovery invariant: `ledger.last_commit_id <= raft_wal.last_tx_id` post-recovery, otherwise the leader's quorum self-slot bumps past entries that aren't on disk. This is a hidden coupling between the cluster-side ledger and the raft library's correctness — write-ahead-of-commit divergence is collapsed back to the surfaced watermark on restart, by design.
 
 ## What raft Owns
 
@@ -108,9 +113,20 @@ The vote log carries its own per-term `voted_for` slot, kept in sync with the te
 
 ## Read-only query API
 
-The driver consumes a small, fixed set of queries: current role, current term, local commit index, cluster commit index, voted-for. The role is enough for gRPC handlers to gate writes (Leader accepts, others reject) and to stamp wire responses; the cluster commit index is what `wait_for_transaction_level` and similar consumers query.
+The driver consumes a small, fixed set of queries: current role, current term, local write index, local commit index, cluster commit index, voted-for. The role is enough for gRPC handlers to gate writes (Leader accepts, others reject) and to stamp wire responses; the cluster commit index is what `wait_for_transaction_level` and similar consumers query. The driver polls `cluster_commit_index()` after every `step` / `advance` to detect cluster-commit advances — there is no dedicated action for that signal.
 
-Queries are cheap and side-effect-free. No peer state, election deadlines, log extents, or per-peer introspection are exposed in v1 — they are observability concerns, not decision inputs. Add when there is a concrete consumer.
+Queries are cheap and side-effect-free. No peer state, election deadlines, or per-peer introspection are exposed in v1 — they are observability concerns, not decision inputs. Add when there is a concrete consumer.
+
+## Driver call pattern
+
+The library exposes two state-changing entry points:
+
+- `step(now, event) -> Vec<Action>` — processes wire RPCs and `LogTruncateComplete` durability acks. Returns the actions the driver must execute (outbound RPCs, log directives, wakeup deadlines, fatal signals).
+- `advance(local_write_index, local_commit_index)` — pure state mutator for driver-side watermark progress (raft-log fsync, ledger apply). Returns nothing and queues no actions. By convention the driver always follows `advance` with `step(Event::Tick)` to flush deferred outputs (heartbeats, `SetWakeup` re-arming, parked AE-success drains).
+
+`Action::AdvanceClusterCommit` does not exist. When the leader's quorum advances or a follower's `leader_commit` propagates past the local watermark, `cluster_commit_index` is updated **in place**; the driver detects the change by polling `cluster_commit_index()` after each `step` / `advance`.
+
+The follower's parked AE-success reply is drained on `Tick` (canonical), once `local_write_index` covers the parked tx_id. The wire watermarks (`last_commit_id` / `last_write_id`) are read at drain time from `local_commit_index` / `local_write_index` so they reflect the follower's actual state — the parked struct's snapshot at park time is treated as a stale hint.
 
 ## Timeout Handling
 

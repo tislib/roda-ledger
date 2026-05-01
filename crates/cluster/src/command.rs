@@ -12,7 +12,6 @@
 //! request/response pairing.
 
 use ::proto::node as proto;
-use raft::Event;
 use tokio::sync::oneshot;
 
 /// One message into the raft loop. Variants split by reply shape:

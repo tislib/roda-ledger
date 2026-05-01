@@ -62,20 +62,12 @@ fn single_node_leader_commits_own_writes_immediately() {
     let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
     assert!(node.role().is_leader());
 
-    let actions = node.step(
-        t0 + Duration::from_secs(61),
-        Event::LocalCommitAdvanced { tx_id: 5 },
-    );
+    // `advance` is silent; observe the cluster_commit advance via
+    // the getter (ADR-0017 §"Driver call pattern").
+    node.advance(5, 5);
     assert_eq!(node.commit_index(), 5);
+    assert_eq!(node.write_index(), 5);
     assert_eq!(node.cluster_commit_index(), 5);
-    let advances: Vec<u64> = actions
-        .iter()
-        .filter_map(|a| match a {
-            Action::AdvanceClusterCommit { tx_id } => Some(*tx_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(advances, vec![5]);
 }
 
 /// Without any events, a node makes no transitions — the library
@@ -114,4 +106,100 @@ fn two_node_cluster_without_peer_replies_keeps_bumping_term() {
         term_after_second
     );
     assert!(!node.role().is_leader());
+}
+
+// ── advance() behavior tests (split-watermark refactor) ────────────────
+
+/// `advance` is monotonic — a regressed argument is silently
+/// ignored. Mirrors `Quorum`'s monotonicity invariant for
+/// `cluster_commit_index`.
+#[test]
+fn advance_is_monotonic() {
+    let mut node = fresh(1, vec![1]);
+    let t0 = Instant::now();
+    let _ = node.step(t0, Event::Tick);
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    assert!(node.role().is_leader());
+
+    node.advance(5, 3);
+    assert_eq!(node.write_index(), 5);
+    assert_eq!(node.commit_index(), 3);
+
+    node.advance(2, 1);
+    assert_eq!(node.write_index(), 5, "write must not regress");
+    assert_eq!(node.commit_index(), 3, "commit must not regress");
+}
+
+/// Release-build `advance` clamps `commit > write` defensively (the
+/// debug build panics via `debug_assert!`). This test exercises the
+/// release-build branch by running with debug assertions disabled
+/// — same posture as the AE-reply guard.
+#[test]
+#[cfg(not(debug_assertions))]
+fn advance_clamps_commit_above_write_in_release() {
+    let mut node = fresh(1, vec![1]);
+    let t0 = Instant::now();
+    let _ = node.step(t0, Event::Tick);
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    assert!(node.role().is_leader());
+    node.advance(3, 5);
+    // commit clamped to write.
+    assert_eq!(node.write_index(), 3);
+    assert_eq!(node.commit_index(), 3);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "advance: commit_index=5 > write_index=3")]
+fn advance_panics_on_commit_above_write_in_debug() {
+    let mut node = fresh(1, vec![1]);
+    let t0 = Instant::now();
+    let _ = node.step(t0, Event::Tick);
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    node.advance(3, 5);
+}
+
+/// `advance` only updates `cluster_commit_index` on a leader. On a
+/// non-leader (Initializing / Follower / Candidate) the watermark
+/// stays put — only the local fields move.
+#[test]
+fn advance_updates_cluster_commit_on_leader_only() {
+    // Initializing follower: cluster_commit must NOT advance.
+    let mut follower = fresh(1, vec![1, 2, 3]);
+    follower.advance(5, 5);
+    assert_eq!(follower.write_index(), 5);
+    assert_eq!(follower.commit_index(), 5);
+    assert_eq!(
+        follower.cluster_commit_index(),
+        0,
+        "non-leader advance must not lift cluster_commit"
+    );
+
+    // Single-node leader: cluster_commit lifts to local_commit
+    // immediately (quorum=1, no peers to wait on).
+    let mut leader = fresh(1, vec![1]);
+    let t0 = Instant::now();
+    let _ = leader.step(t0, Event::Tick);
+    let _ = leader.step(t0 + Duration::from_secs(60), Event::Tick);
+    assert!(leader.role().is_leader());
+    leader.advance(5, 5);
+    assert_eq!(leader.cluster_commit_index(), 5);
+}
+
+/// `advance` is a pure state mutator — it returns nothing and queues
+/// no actions in the next `Tick`'s output beyond what timers/role
+/// already require. The cluster_commit advance is observed via the
+/// getter (no dedicated action; ADR-0017 §"Driver call pattern").
+#[test]
+fn advance_emits_no_actions_directly() {
+    let mut node = fresh(1, vec![1]);
+    let t0 = Instant::now();
+    let _ = node.step(t0, Event::Tick);
+    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    assert!(node.role().is_leader());
+
+    // The method is `() -> ()` — no actions returned. We assert on
+    // the post-condition observable via getters.
+    node.advance(5, 5);
+    assert_eq!(node.cluster_commit_index(), 5);
 }
