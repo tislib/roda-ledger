@@ -11,13 +11,13 @@
 //! `Event::*Persisted` ack. When a trait write returns `Ok(_)`, the
 //! library treats the change as durable and proceeds.
 //!
-//! Payload bytes do not flow through this enum (or through
-//! `Action`). The driver moves payloads between storage and the wire
-//! on its own; `LogEntryRange` carries only `(start_tx_id, count,
-//! term)` — the meta needed for §5.3 prev_log_term matching and
-//! durable term-log updates.
+//! Inbound `AppendEntries` does **not** flow through this enum: the
+//! follower path uses the direct-method
+//! `RaftNode::validate_append_entries_request` (with the cluster
+//! driver performing WAL I/O and `advance(write, commit)` itself).
+//! The leader's reply observation lives here as
+//! `Event::AppendEntriesReply`.
 
-use crate::log_entry::LogEntryRange;
 use crate::types::{NodeId, RejectReason, Term, TxId};
 
 #[derive(Clone, Debug)]
@@ -25,17 +25,6 @@ pub enum Event {
     /// Wake up and re-check timers. The driver fires `Tick` when an
     /// `Action::SetWakeup` deadline arrives.
     Tick,
-
-    /// Inbound `AppendEntries` from a peer. `entries` is a single
-    /// same-term contiguous range — heartbeat is `LogEntryRange::empty()`.
-    AppendEntriesRequest {
-        from: NodeId,
-        term: Term,
-        prev_log_tx_id: TxId,
-        prev_log_term: Term,
-        entries: LogEntryRange,
-        leader_commit: TxId,
-    },
 
     /// Reply to an `AppendEntries` we sent.
     ///
@@ -68,7 +57,4 @@ pub enum Event {
         term: Term,
         granted: bool,
     },
-
-    /// Driver acknowledges the most recent `Action::TruncateLog`.
-    LogTruncateComplete { up_to: TxId },
 }

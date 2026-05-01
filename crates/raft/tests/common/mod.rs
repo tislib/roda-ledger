@@ -34,7 +34,28 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use raft::{Action, ElectionTimerConfig, Event, NodeId, RaftConfig, RaftNode, Role, Term, TxId};
+use raft::{
+    Action, AppendEntriesDecision, ElectionTimerConfig, Event, LogEntryRange, NodeId, RaftConfig,
+    RaftNode, RejectReason, Role, Term, TxId,
+};
+
+/// Per-target delivery in the simulator queue. AE arrivals call the
+/// `validate_append_entries_request` direct method (with the cluster
+/// driver's responsibilities — WAL apply, `advance`, reply
+/// synthesis — performed by `Sim::deliver_append_entries`); every
+/// other input runs through `node.step(now, event)`.
+#[derive(Clone, Debug)]
+enum Delivery {
+    Step(Event),
+    AppendEntries {
+        from: NodeId,
+        term: Term,
+        prev_log_tx_id: TxId,
+        prev_log_term: Term,
+        entries: LogEntryRange,
+        leader_commit: TxId,
+    },
+}
 
 use mem_persistence::MemPersistence;
 
@@ -59,7 +80,7 @@ impl MirrorEntry {
 struct Scheduled {
     at: Instant,
     target: NodeId,
-    event: Event,
+    delivery: Delivery,
     /// Tie-breaker: if two events sit at exactly the same `at`, lower
     /// seq fires first. The harness assigns this monotonically so
     /// schedules stay deterministic across runs with the same seed.
@@ -442,7 +463,7 @@ impl Sim {
             .filter_map(|(id, b)| b.pending_wakeup.map(|w| (*id, w)))
             .collect();
         for (id, w) in pending {
-            self.schedule(w, id, Event::Tick);
+            self.schedule_event(w, id, Event::Tick);
         }
     }
 
@@ -454,12 +475,162 @@ impl Sim {
             return;
         }
         let now = s.at;
-        let actions = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut()) {
-            Some(n) => n.step(now, s.event),
+        match s.delivery {
+            // ADR-0017 §"Driver call pattern" follower path: the
+            // simulator plays the role of the cluster driver — calls
+            // `validate_append_entries_request`, applies the WAL
+            // changes to the harness mirror, calls `advance` on
+            // durability, synthesizes the wire reply.
+            Delivery::AppendEntries {
+                from,
+                term,
+                prev_log_tx_id,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
+                self.deliver_append_entries(
+                    s.target,
+                    now,
+                    from,
+                    term,
+                    prev_log_tx_id,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                );
+            }
+            Delivery::Step(event) => {
+                let actions = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
+                {
+                    Some(n) => n.step(now, event),
+                    None => return,
+                };
+                self.process_actions(s.target, now, actions);
+                self.observe_cluster_commit(s.target);
+            }
+        }
+    }
+
+    /// Cluster-driver-side handling of an inbound `AppendEntries` for
+    /// `target`. Mirrors the new follower flow: validate → mirror
+    /// truncation/append → `advance` on durability → `step(Tick)` to
+    /// flush wakeups → synthesize and ship the wire reply.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_append_entries(
+        &mut self,
+        target: NodeId,
+        now: Instant,
+        from: NodeId,
+        term: Term,
+        prev_log_tx_id: TxId,
+        prev_log_term: Term,
+        entries: LogEntryRange,
+        leader_commit: TxId,
+    ) {
+        let decision = match self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
+            Some(n) => n.validate_append_entries_request(
+                now,
+                from,
+                term,
+                prev_log_tx_id,
+                prev_log_term,
+                entries,
+                leader_commit,
+            ),
             None => return,
         };
-        self.process_actions(s.target, now, actions);
-        self.observe_cluster_commit(s.target);
+
+        let (success, reject_reason): (bool, Option<RejectReason>) = match decision {
+            AppendEntriesDecision::Reject {
+                reason,
+                truncate_after,
+            } => {
+                if let Some(t) = truncate_after
+                    && let Some(b) = self.nodes.get_mut(&target)
+                {
+                    b.entries.truncate(t as usize);
+                }
+                (false, Some(reason))
+            }
+            AppendEntriesDecision::Accept { append: None } => (true, None),
+            AppendEntriesDecision::Accept {
+                append: Some(range),
+            } => {
+                if !range.is_empty() {
+                    if let Some(b) = self.nodes.get_mut(&target) {
+                        for i in 0..range.count {
+                            let tx = range.start_tx_id + i;
+                            while b.entries.len() < (tx as usize).saturating_sub(1) {
+                                b.entries.push(MirrorEntry::new(0, 0));
+                            }
+                            let entry = MirrorEntry::new(tx, range.term);
+                            if (tx as usize) <= b.entries.len() {
+                                b.entries[(tx - 1) as usize] = entry;
+                            } else {
+                                b.entries.push(entry);
+                            }
+                        }
+                    }
+                    let last_tx = range.last_tx_id().unwrap();
+                    // Synchronous-apply harness model: ledger applies
+                    // AE entries the moment they're durable, so write
+                    // and commit watermarks move together.
+                    if let Some(node) =
+                        self.nodes.get_mut(&target).and_then(|b| b.node.as_mut())
+                    {
+                        node.advance(last_tx, last_tx);
+                    }
+                }
+                (true, None)
+            }
+            AppendEntriesDecision::Fatal { reason } => {
+                self.fatal_errors.push((target, reason));
+                return;
+            }
+        };
+
+        // Tick after validate (+ optional advance) so any wakeup
+        // re-arming or election-timer changes get re-emitted as
+        // `Action::SetWakeup`. ADR-0017 §"Driver call pattern": the
+        // driver always follows `advance` with `step(Tick)`.
+        let tick_actions = match self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
+            Some(n) => n.step(now, Event::Tick),
+            None => return,
+        };
+        self.process_actions(target, now, tick_actions);
+        self.observe_cluster_commit(target);
+
+        // Synthesize the reply from getters (ADR-0017 §"AE reply:
+        // write vs commit watermark" — the reply ships
+        // `last_commit_id` / `last_write_id` separately) and ship
+        // it back through the simulated network, subject to the
+        // drop / duplicate model.
+        if self.is_dropped(target, from) || self.rolled_drop() {
+            return;
+        }
+        let (reply_term, last_commit_id, last_write_id) = match self
+            .nodes
+            .get(&target)
+            .and_then(|b| b.node.as_ref())
+        {
+            Some(n) => (n.current_term(), n.commit_index(), n.write_index()),
+            None => return,
+        };
+        let when = now + self.network_delay;
+        let event = Event::AppendEntriesReply {
+            from: target,
+            term: reply_term,
+            success,
+            last_commit_id,
+            last_write_id,
+            reject_reason,
+        };
+        let dup = self.rolled_duplicate();
+        self.schedule_event(when, from, event.clone());
+        if dup {
+            self.schedule_event(when, from, event);
+        }
     }
 
     /// Poll the node's `cluster_commit_index()` and apply any
@@ -505,7 +676,8 @@ impl Sim {
                         continue;
                     }
                     let when = now + self.network_delay;
-                    let event = Event::AppendEntriesRequest {
+                    let dup = self.rolled_duplicate();
+                    let delivery = Delivery::AppendEntries {
                         from: src,
                         term,
                         prev_log_tx_id,
@@ -513,35 +685,9 @@ impl Sim {
                         entries,
                         leader_commit,
                     };
-                    let dup = self.rolled_duplicate();
-                    self.schedule(when, to, event.clone());
+                    self.schedule(when, to, delivery.clone());
                     if dup {
-                        self.schedule(when, to, event);
-                    }
-                }
-                Action::SendAppendEntriesReply {
-                    to,
-                    term,
-                    success,
-                    last_commit_id,
-                    last_write_id,
-                } => {
-                    if self.is_dropped(src, to) || self.rolled_drop() {
-                        continue;
-                    }
-                    let when = now + self.network_delay;
-                    let event = Event::AppendEntriesReply {
-                        from: src,
-                        term,
-                        success,
-                        last_commit_id,
-                        last_write_id,
-                        reject_reason: None,
-                    };
-                    let dup = self.rolled_duplicate();
-                    self.schedule(when, to, event.clone());
-                    if dup {
-                        self.schedule(when, to, event);
+                        self.schedule(when, to, delivery);
                     }
                 }
                 Action::SendRequestVote {
@@ -561,9 +707,9 @@ impl Sim {
                         last_term,
                     };
                     let dup = self.rolled_duplicate();
-                    self.schedule(when, to, event.clone());
+                    self.schedule_event(when, to, event.clone());
                     if dup {
-                        self.schedule(when, to, event);
+                        self.schedule_event(when, to, event);
                     }
                 }
                 Action::SendRequestVoteReply { to, term, granted } => {
@@ -577,67 +723,9 @@ impl Sim {
                         granted,
                     };
                     let dup = self.rolled_duplicate();
-                    self.schedule(when, to, event.clone());
+                    self.schedule_event(when, to, event.clone());
                     if dup {
-                        self.schedule(when, to, event);
-                    }
-                }
-                Action::AppendLog { range } => {
-                    if range.is_empty() {
-                        continue;
-                    }
-                    let last_tx = range.last_tx_id().unwrap();
-                    if let Some(b) = self.nodes.get_mut(&src) {
-                        // Expand the range into individual mirror
-                        // entries. Pad with sentinel zeros if we'd
-                        // skip indices (shouldn't happen with a
-                        // correct §5.3 prev-log-term match — but be
-                        // defensive).
-                        for i in 0..range.count {
-                            let tx = range.start_tx_id + i;
-                            while b.entries.len() < (tx as usize).saturating_sub(1) {
-                                b.entries.push(MirrorEntry::new(0, 0));
-                            }
-                            let entry = MirrorEntry::new(tx, range.term);
-                            if (tx as usize) <= b.entries.len() {
-                                b.entries[(tx - 1) as usize] = entry;
-                            } else {
-                                b.entries.push(entry);
-                            }
-                        }
-                    }
-                    // Synchronous-apply harness model: ledger applies
-                    // the AE entries the moment they're durable, so
-                    // both watermarks move together. `advance` is
-                    // followed by `Tick` (per ADR-0017 §"Driver call
-                    // pattern") — `Tick` drains the parked AE reply
-                    // the leader is waiting on.
-                    if let Some(node) =
-                        self.nodes.get_mut(&src).and_then(|b| b.node.as_mut())
-                    {
-                        node.advance(last_tx, last_tx);
-                    }
-                    let actions = self
-                        .nodes
-                        .get_mut(&src)
-                        .and_then(|b| b.node.as_mut())
-                        .map(|n| n.step(now, Event::Tick));
-                    if let Some(a) = actions {
-                        self.process_actions(src, now, a);
-                    }
-                    self.observe_cluster_commit(src);
-                }
-                Action::TruncateLog { after_tx_id } => {
-                    if let Some(b) = self.nodes.get_mut(&src) {
-                        b.entries.truncate(after_tx_id as usize);
-                    }
-                    let actions = self
-                        .nodes
-                        .get_mut(&src)
-                        .and_then(|b| b.node.as_mut())
-                        .map(|n| n.step(now, Event::LogTruncateComplete { up_to: after_tx_id }));
-                    if let Some(a) = actions {
-                        self.process_actions(src, now, a);
+                        self.schedule_event(when, to, event);
                     }
                 }
                 Action::BecomeRole { role, term } => {
@@ -650,7 +738,7 @@ impl Sim {
                     if let Some(b) = self.nodes.get_mut(&src) {
                         b.pending_wakeup = Some(at);
                     }
-                    self.schedule(at, src, Event::Tick);
+                    self.schedule_event(at, src, Event::Tick);
                 }
                 Action::FatalError { reason } => {
                     // The library has frozen — record it for the
@@ -664,14 +752,18 @@ impl Sim {
         }
     }
 
-    fn schedule(&mut self, at: Instant, target: NodeId, event: Event) {
+    fn schedule(&mut self, at: Instant, target: NodeId, delivery: Delivery) {
         self.seq += 1;
         self.queue.push(Reverse(Scheduled {
             at,
             target,
-            event,
+            delivery,
             seq: self.seq,
         }));
+    }
+
+    fn schedule_event(&mut self, at: Instant, target: NodeId, event: Event) {
+        self.schedule(at, target, Delivery::Step(event));
     }
 
     /// Probabilistic drop check. Tossed once per outbound message;

@@ -2,9 +2,17 @@
 //! roda-ledger. Implements ADR-0017.
 //!
 //! The library has no internal threads, no async runtime, **no I/O**
-//! of its own. Every transition is driven by feeding [`Event`]s into
-//! [`RaftNode::step`] and applying the returned [`Action`]s in the
-//! driver.
+//! of its own. Three driver-facing entry points:
+//!
+//! - [`RaftNode::step`] — leader-side events (`Tick`,
+//!   `AppendEntriesReply`, `RequestVoteRequest`, `RequestVoteReply`).
+//!   Returns the [`Action`]s the driver must execute.
+//! - [`RaftNode::validate_append_entries_request`] — follower-side
+//!   inbound `AppendEntries`. Returns an [`AppendEntriesDecision`]
+//!   describing what the cluster driver must do with its WAL.
+//! - [`RaftNode::advance`] — driver-side durability ack. Updates the
+//!   local write/commit watermarks and (on followers) drains any
+//!   deferred `leader_commit` into `cluster_commit_index`.
 //!
 //! Durable state lives behind the synchronous [`Persistence`] trait.
 //! Production wires a disk-backed implementation (term log + vote
@@ -14,19 +22,22 @@
 //!
 //! ADR-0017 §"Architectural Boundary":
 //!
-//! > The library transitions state and returns actions describing
-//! > what the driver must do. The driver (cluster crate) executes
-//! > actions and feeds results back as new events.
+//! > The library transitions state and returns actions (or
+//! > decisions) describing what the driver must do. The driver
+//! > (cluster crate) executes them and feeds results back via the
+//! > next entry-point call.
 //!
 //! ## Public surface
 //!
 //! - [`RaftNode`] / [`RaftConfig`] — single-node decision system.
 //!   Generic over `P: Persistence`.
+//! - [`AppendEntriesDecision`] — the follower-path return shape from
+//!   `validate_append_entries_request`.
 //! - [`Persistence`] / [`TermRecord`] — durable-state contract.
-//! - [`Event`] — every input the state machine reacts to.
-//! - [`Action`] — every output the driver applies (wire sends, log
-//!   directives, role notifications, wakeup scheduling).
-//! - [`Role`], [`RejectReason`], [`LogEntryMeta`], [`NodeId`] —
+//! - [`Event`] — every input the state machine reacts to via `step`.
+//! - [`Action`] — every output the driver applies (outbound wire
+//!   sends, role notifications, wakeup scheduling).
+//! - [`Role`], [`RejectReason`], [`LogEntryRange`], [`NodeId`] —
 //!   small value types the API returns.
 //!
 //! Anything not re-exported here is internal.
@@ -43,11 +54,12 @@ pub mod quorum;
 pub mod role;
 pub mod timer;
 pub mod types;
+mod replication;
 
 pub use action::Action;
 pub use event::Event;
 pub use log_entry::LogEntryRange;
-pub use node::{RaftConfig, RaftNode};
+pub use node::{AppendEntriesDecision, RaftConfig, RaftNode};
 pub use persistence::{Persistence, TermRecord};
 pub use role::Role;
 pub use timer::ElectionTimerConfig;

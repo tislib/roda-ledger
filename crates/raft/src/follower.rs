@@ -6,40 +6,16 @@
 //! leader's late RPCs. The election timer lives on `RaftNode`
 //! directly because Initializing also runs one.
 //!
-//! `pending_reply` parks an in-flight AppendEntries success reply
-//! while the driver is still durably persisting the entries it just
-//! got handed. Raft's write-ahead invariant requires the follower to
-//! have the entries on disk before telling the leader it accepted
-//! them; the library expresses that by deferring the reply until the
-//! driver advances `local_write_index` past the parked tx_id (via
-//! `RaftNode::advance(write, commit)`) and then issues `step(Tick)`,
-//! which drains the parked reply.
+//! `pending_leader_commit` holds the most recent `leader_commit`
+//! observed by `validate_append_entries_request` whose entries the
+//! cluster driver is still durably persisting. It is consumed inside
+//! `RaftNode::advance(write, commit)` once the cluster reports
+//! durability — clamped to the freshly-updated `local_commit_index`
+//! and propagated into `cluster_commit_index` (Raft §5.3 follower
+//! commit rule). Cleared along with the rest of the FollowerState on
+//! transition out of Follower.
 
-use crate::types::{NodeId, Term, TxId};
-
-/// A `SendAppendEntriesReply { success: true, .. }` parked on the
-/// follower while the driver is durably persisting the freshly-
-/// appended entries. Drained by `take_ready_reply` once the durability
-/// ack reaches `last_commit_id`. `leader_commit` rides along so the
-/// follower can apply Raft §5.3's `commit_index = min(leader_commit,
-/// last_new_entry_index)` rule at the moment the entries actually
-/// land on disk, not before.
-///
-/// `last_commit_id` is used as the drain threshold (set at park
-/// time to the AE's last tx_id, which is the watermark the parked
-/// reply needs to clear). The actual wire watermarks shipped on the
-/// reply are read at drain time from `local_commit_index` and
-/// `local_write_index` so the reply reflects the follower's actual
-/// state when it goes on the wire — see ADR-0017 §"AE reply: write
-/// vs commit watermark".
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PendingReply {
-    pub to: NodeId,
-    pub term: Term,
-    pub last_commit_id: TxId,
-    pub last_write_id: TxId,
-    pub leader_commit: TxId,
-}
+use crate::types::{NodeId, TxId};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FollowerState {
@@ -48,50 +24,34 @@ pub struct FollowerState {
     /// — until the next leader speaks, the previous leader id
     /// remains the best guess for routing client redirects.
     pub leader_id: Option<NodeId>,
-    /// Deferred AppendEntries success reply waiting on the driver's
-    /// `advance(write, …)` to push `local_write_index` past the
-    /// parked tx_id (followed by a `Tick` that drains it). At most
-    /// one in flight per follower because the leader serialises one
-    /// AE per peer at a time and the follower processes them
-    /// in arrival order.
-    pub pending_reply: Option<PendingReply>,
+    /// `leader_commit` carried by the most recent
+    /// `validate_append_entries_request` whose entries the cluster is
+    /// still durably persisting. Drained inside `RaftNode::advance`
+    /// after `local_commit_index` updates, where it is clamped to the
+    /// new `local_commit_index` and propagated into
+    /// `cluster_commit_index` (Raft §5.3 follower commit rule).
+    /// Last-writer-wins on overwrite — a second validate before the
+    /// first's durability ack supersedes the earlier value.
+    pub pending_leader_commit: Option<TxId>,
 }
 
 impl FollowerState {
     pub fn new() -> Self {
         Self {
             leader_id: None,
-            pending_reply: None,
+            pending_leader_commit: None,
         }
     }
 
     pub fn with_leader(leader_id: NodeId) -> Self {
         Self {
             leader_id: Some(leader_id),
-            pending_reply: None,
+            pending_leader_commit: None,
         }
     }
 
     pub fn observe_leader(&mut self, leader_id: NodeId) {
         self.leader_id = Some(leader_id);
-    }
-
-    /// Park a success reply waiting for durability ack at `last_tx_id`.
-    /// If a previous reply was already parked it is overwritten — the
-    /// newer AE supersedes it (the next driver-side `advance` will be
-    /// at least as far along).
-    pub fn park_reply(&mut self, reply: PendingReply) {
-        self.pending_reply = Some(reply);
-    }
-
-    /// If a parked reply's `last_commit_id` has been durably persisted
-    /// (i.e. `acked_tx_id >= last_commit_id`), take it; otherwise leave
-    /// it in place. Returns the reply ready to send.
-    pub fn take_ready_reply(&mut self, acked_tx_id: TxId) -> Option<PendingReply> {
-        match self.pending_reply {
-            Some(p) if p.last_commit_id <= acked_tx_id => self.pending_reply.take(),
-            _ => None,
-        }
     }
 }
 
@@ -107,69 +67,5 @@ mod tests {
         assert_eq!(s.leader_id, Some(7));
         s.observe_leader(11);
         assert_eq!(s.leader_id, Some(11));
-    }
-
-    #[test]
-    fn take_ready_reply_returns_none_when_unacked() {
-        let mut s = FollowerState::new();
-        s.park_reply(PendingReply {
-            to: 2,
-            term: 3,
-            last_commit_id: 5,
-            last_write_id: 5,
-            leader_commit: 0,
-        });
-        assert_eq!(s.take_ready_reply(4), None);
-        assert!(s.pending_reply.is_some());
-    }
-
-    #[test]
-    fn take_ready_reply_drains_when_acked() {
-        let mut s = FollowerState::new();
-        let parked = PendingReply {
-            to: 2,
-            term: 3,
-            last_commit_id: 5,
-            last_write_id: 5,
-            leader_commit: 0,
-        };
-        s.park_reply(parked);
-        let drained = s.take_ready_reply(5);
-        assert_eq!(drained, Some(parked));
-        assert!(s.pending_reply.is_none());
-    }
-
-    #[test]
-    fn take_ready_reply_drains_when_ack_passes_target() {
-        let mut s = FollowerState::new();
-        s.park_reply(PendingReply {
-            to: 2,
-            term: 3,
-            last_commit_id: 5,
-            last_write_id: 5,
-            leader_commit: 0,
-        });
-        let drained = s.take_ready_reply(7);
-        assert!(drained.is_some());
-    }
-
-    #[test]
-    fn park_reply_overwrites_previous() {
-        let mut s = FollowerState::new();
-        s.park_reply(PendingReply {
-            to: 2,
-            term: 3,
-            last_commit_id: 5,
-            last_write_id: 5,
-            leader_commit: 0,
-        });
-        s.park_reply(PendingReply {
-            to: 2,
-            term: 3,
-            last_commit_id: 8,
-            last_write_id: 8,
-            leader_commit: 0,
-        });
-        assert_eq!(s.pending_reply.unwrap().last_commit_id, 8);
     }
 }

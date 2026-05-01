@@ -23,7 +23,7 @@ The library exposes one entry point — a synchronous `step(now, event) -> Vec<A
 **Asymmetric write paths:**
 
 - **Leader.** Ledger assigns tx_id and writes to its store, then notifies raft via the `advance(local_write_index, local_commit_index)` direct method. Raft replicates by emitting `SendAppendEntries` actions.
-- **Follower.** Raft receives AppendEntries, validates §5.3 prev_log_term match, and directs the storage layer via `AppendLog` and `TruncateLog` actions. The follower's ledger is passive — apply only. After WAL fsync and ledger apply, the driver calls `advance(write, commit)` and follows it with `step(Tick)` to flush the parked AE-success reply.
+- **Follower.** Raft receives AppendEntries via the direct-method `validate_append_entries_request`, which performs the §5.1/§5.3/§5.4 protocol checks, term-log mirror updates, and watermark clamping synchronously, then returns an `AppendEntriesDecision` describing what the cluster driver must do (truncate WAL after a §5.3 mismatch, append a same-term range, or nothing for a heartbeat / reject). The driver applies the decision to its ledger, awaits durability, and calls `advance(write, commit)` — that call drains the deferred `leader_commit` into `cluster_commit_index`. The wire reply is built from the post-advance `current_term()` / `commit_index()` / `write_index()` getters; raft itself emits no actions for the follower path.
 
 **Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal — drivers poll `cluster_commit_index()` after every `step` / `advance` (there is no dedicated action; see §"Driver call pattern"), not on raw storage durability. This eliminates the rollback-after-truncation problem.
 
@@ -72,7 +72,7 @@ The design must enforce these under all schedules:
 
 4. **No boot-time term bumping.** A node coming back up sits at its persisted term; only candidates running an actual election bump term. The constructor never advances state.
 
-5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and any `cluster_commit` advance derived from `leader_commit` wait for the driver to call `advance(write, commit)` advancing the write watermark past the parked tx_id, followed by `step(Tick)` which drains the parked reply; the leader cannot count an entry as durably replicated on a peer until the peer has actually written it. The reply carries `last_commit_id` (durable) and `last_write_id` (accepted) separately — see §"AE reply: write vs commit watermark" — so that future split-ack architectures can decouple the two without breaking the durability-gates-quorum invariant.
+5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and the `cluster_commit` advance derived from `leader_commit` are gated by the cluster driver's WAL durability ack: validate stores the observed `leader_commit` in `FollowerState::pending_leader_commit`; the next `advance(write, commit)` (which the driver only issues after fsync) drains that value into `cluster_commit_index` (clamped to the freshly-updated `local_commit_index`). The success reply itself is constructed from the post-advance getters, so the leader cannot count an entry as durably replicated until the peer has actually written it. The reply carries `last_commit_id` (durable) and `last_write_id` (accepted) separately — see §"AE reply: write vs commit watermark" — so that future split-ack architectures can decouple the two without breaking the durability-gates-quorum invariant.
 
 6. **Fatal-on-unrecoverable-persistence-failure.** If the persistence trait returns `Err` from a write that, if the library proceeded, would diverge in-memory state from on-disk state (term-log truncate, term observation), the library emits a fatal-error action, freezes the node, and refuses further forward progress. The driver must shut the node down on receipt — partial state recovery from this point is not safe. (Errors that leave the on-disk state untouched, like a refused vote or a refused `commit_term`, are recoverable and the library reacts in-band.)
 
@@ -89,7 +89,7 @@ The design must enforce these under all schedules:
 - Per-peer replication state (next_index, match_index, in-flight tracking) — internal, not exposed.
 - Quorum / cluster_commit_index calculation.
 - The Figure 8 watermark for the leader's current term.
-- The deferred-reply slot on the follower (one outstanding success reply at a time, parked until durability ack).
+- The deferred follower-side `leader_commit` slot (one outstanding value at a time, drained into `cluster_commit_index` on the next `advance(write, commit)`).
 - All policy decisions: when to truncate, when to apply, when to send AppendEntries, when to grant a vote, when to step down, when to declare the node fatally failed.
 
 ## What raft Does NOT Own
@@ -119,14 +119,17 @@ Queries are cheap and side-effect-free. No peer state, election deadlines, or pe
 
 ## Driver call pattern
 
-The library exposes two state-changing entry points:
+The library exposes three state-changing entry points:
 
-- `step(now, event) -> Vec<Action>` — processes wire RPCs and `LogTruncateComplete` durability acks. Returns the actions the driver must execute (outbound RPCs, log directives, wakeup deadlines, fatal signals).
-- `advance(local_write_index, local_commit_index)` — pure state mutator for driver-side watermark progress (raft-log fsync, ledger apply). Returns nothing and queues no actions. By convention the driver always follows `advance` with `step(Event::Tick)` to flush deferred outputs (heartbeats, `SetWakeup` re-arming, parked AE-success drains).
+- `step(now, event) -> Vec<Action>` — processes leader-side events (`AppendEntriesReply`, `RequestVoteRequest`, `RequestVoteReply`) and the timer `Tick`. Returns the actions the driver must execute (outbound RPCs, wakeup deadlines, fatal signals).
+- `validate_append_entries_request(now, ...) -> AppendEntriesDecision` — the **follower-side** entry point. The library performs §5.1/§5.3/§5.4 protocol checks, term observation, follower transition, election-timer reset, term-log mirror updates, and watermark clamping synchronously, then returns a decision describing what the cluster driver must do with its WAL. Variants:
+  - `Reject { reason, truncate_after }` — the driver builds a reject reply from the getters and (if `truncate_after.is_some()`) drops entry-log records past the truncation point.
+  - `Accept { append: None }` — heartbeat. The library has already advanced `cluster_commit_index = min(leader_commit, local_commit_index)` in place; the driver builds the success reply from getters.
+  - `Accept { append: Some(range) }` — entries to durably persist. The driver appends `wal_bytes` to its ledger, awaits fsync, then calls `advance(write, commit)`. The deferred `leader_commit` (stored in `FollowerState::pending_leader_commit`) is consumed inside that `advance` call. The success reply is built from the post-advance getters.
+  - `Fatal { reason }` — a `Persistence` write failed mid-validate; the node has frozen itself. The driver MUST NOT touch the WAL, MUST NOT call `advance`, and MUST NOT send a success reply.
+- `advance(local_write_index, local_commit_index)` — pure state mutator for driver-side watermark progress (raft-log fsync, ledger apply). Returns nothing and queues no actions. By convention the driver follows `advance` with `step(Event::Tick)` to flush deferred outputs (heartbeats, `SetWakeup` re-arming). On a follower, `advance` also drains any deferred `leader_commit` set by the most recent `validate_append_entries_request` into `cluster_commit_index`.
 
-`Action::AdvanceClusterCommit` does not exist. When the leader's quorum advances or a follower's `leader_commit` propagates past the local watermark, `cluster_commit_index` is updated **in place**; the driver detects the change by polling `cluster_commit_index()` after each `step` / `advance`.
-
-The follower's parked AE-success reply is drained on `Tick` (canonical), once `local_write_index` covers the parked tx_id. The wire watermarks (`last_commit_id` / `last_write_id`) are read at drain time from `local_commit_index` / `local_write_index` so they reflect the follower's actual state — the parked struct's snapshot at park time is treated as a stale hint.
+`Action::AdvanceClusterCommit` does not exist. When the leader's quorum advances or a follower's `leader_commit` propagates past the local watermark, `cluster_commit_index` is updated **in place**; the driver detects the change by polling `cluster_commit_index()` after each `step` / `advance` / `validate_append_entries_request`.
 
 ## Timeout Handling
 

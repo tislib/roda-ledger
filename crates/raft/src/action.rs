@@ -7,13 +7,15 @@
 //! synchronous [`crate::Persistence`] trait that `RaftNode` is
 //! parameterised over — they do **not** appear in this enum.
 //! Everything below is a side effect the *driver* must perform
-//! (sending wire RPCs, appending the entry log, advancing apply
-//! gates, etc.).
+//! (sending wire RPCs, scheduling wakeups, etc.).
 //!
-//! The library only ever talks about *ranges* — never individual
-//! entries — so `SendAppendEntries` and `AppendLog` both carry a
-//! single [`LogEntryRange`] (a contiguous, same-term chunk). The
-//! driver expands the range when reading from / writing to its WAL.
+//! Follower-side AppendEntries handling does **not** flow through
+//! `step` / `Action` — see `RaftNode::validate_append_entries_request`
+//! and the `AppendEntriesDecision` returned by it for the direct-
+//! method path. The driver applies the decision's WAL directives
+//! (truncate / append) itself, then calls
+//! `RaftNode::advance(write, commit)` once the entries are durable.
+//! The wire reply is built from the post-advance getters.
 
 use std::time::Instant;
 
@@ -34,16 +36,6 @@ pub enum Action {
         entries: LogEntryRange,
         leader_commit: TxId,
     },
-    /// Two watermarks — see `Event::AppendEntriesReply` doc and
-    /// ADR-0017 §"AE reply: write vs commit watermark". The driver
-    /// stamps both onto the wire.
-    SendAppendEntriesReply {
-        to: NodeId,
-        term: Term,
-        success: bool,
-        last_commit_id: TxId,
-        last_write_id: TxId,
-    },
     SendRequestVote {
         to: NodeId,
         term: Term,
@@ -55,21 +47,6 @@ pub enum Action {
         term: Term,
         granted: bool,
     },
-
-    // ── follower log directives ─────────────────────────────────────────
-    /// Drop entry-log records with `tx_id > after_tx_id`. The library
-    /// has already truncated its term-log mirror via the
-    /// `Persistence` trait; this action is for the *entry* log the
-    /// driver owns. The driver acks via `Event::LogTruncateComplete`.
-    TruncateLog { after_tx_id: TxId },
-    /// Append the entries described by `range` to the entry log.
-    /// The driver already has the payloads (they came in on the
-    /// inbound RPC); this action tells it to commit metadata +
-    /// payloads durably. The driver acks durability by calling
-    /// `RaftNode::advance(write, commit)` (advancing the write
-    /// watermark past the range's last tx_id) and then `step(Tick)`,
-    /// which drains the parked AE-success reply.
-    AppendLog { range: LogEntryRange },
 
     // ── role observability ──────────────────────────────────────────────
     /// Notify the driver of a role transition. Mirrors the public

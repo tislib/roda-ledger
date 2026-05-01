@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, Role};
+use raft::{
+    Action, AppendEntriesDecision, Event, LogEntryRange, NodeId, Persistence, RaftConfig,
+    RaftNode, RejectReason, Role,
+};
 
 fn pick_leader(sim: &Sim) -> Option<NodeId> {
     [1u64, 2, 3]
@@ -308,34 +311,6 @@ fn empty_follower_rejects_then_accepts_after_walk_back() {
     sim.assert_log_matching();
 }
 
-/// `Action::TruncateLog` is the only way log entries are removed —
-/// a leader never emits it for its own log.
-#[test]
-fn leader_log_is_append_only() {
-    let mut node = fresh_node(1, vec![1]);
-    let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
-    assert!(node.role().is_leader());
-
-    // Drive a few client writes and verify no TruncateLog actions.
-    let mut all_actions: Vec<Action> = Vec::new();
-    for tx in 1..=5 {
-        node.advance(tx, tx);
-        let acts = node.step(t0 + Duration::from_secs(60 + tx), Event::Tick);
-        all_actions.extend(acts);
-    }
-    let truncates = all_actions
-        .iter()
-        .filter(|a| matches!(a, Action::TruncateLog { .. }))
-        .count();
-    assert_eq!(
-        truncates, 0,
-        "leader emitted TruncateLog: {:?}",
-        all_actions
-    );
-}
-
 /// AppendEntries with `prev_log_tx_id=0` (start of log) is accepted
 /// without a §5.3 check — that's the convention for the empty-log
 /// boundary. The success reply is parked until the driver
@@ -343,32 +318,28 @@ fn leader_log_is_append_only() {
 #[test]
 fn prev_log_tx_id_zero_skips_term_match_check() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let first = node.step(
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 5,
-            prev_log_tx_id: 0,
-            // prev_log_term=99 would fail the term check, but tx 0
-            // is the "start of log" sentinel — no check runs.
-            prev_log_term: 99,
-            entries: LogEntryRange::new(1, 1, 5),
-            leader_commit: 0,
-        },
+        2,
+        5,
+        0,
+        // prev_log_term=99 would fail the term check, but tx 0
+        // is the "start of log" sentinel — no check runs.
+        99,
+        LogEntryRange::new(1, 1, 5),
+        0,
     );
-    // No early success reply: it must wait for durability.
-    assert!(!first.iter().any(|a| matches!(
-        a,
-        Action::SendAppendEntriesReply { success: true, .. }
-    )));
-    // Driver acks durability; success reply fires on the Tick drain.
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Accept {
+            append: Some(LogEntryRange::new(1, 1, 5))
+        }
+    );
+    // Cluster acks durability via `advance`. Watermarks now reflect
+    // the new state — what the driver stamps onto the success reply.
     node.advance(1, 1);
-    let after = node.step(Instant::now(), Event::Tick);
-    let success = after.iter().any(|a| matches!(
-        a,
-        Action::SendAppendEntriesReply { success: true, .. }
-    ));
-    assert!(success);
+    assert_eq!(node.write_index(), 1);
+    assert_eq!(node.commit_index(), 1);
 }
 
 /// Follower clamps `leader_commit` to its local log length: a leader
@@ -379,26 +350,29 @@ fn prev_log_tx_id_zero_skips_term_match_check() {
 #[test]
 fn leader_commit_clamp_to_local_log() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let first = node.step(
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 3, 1),
-            leader_commit: 10, // intentionally beyond the batch
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 3, 1),
+        10, // intentionally beyond the batch
     );
-    // Cluster commit cannot advance before the entries are durable.
-    let _ = first;
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Accept {
+            append: Some(LogEntryRange::new(1, 3, 1))
+        }
+    );
+    // Cluster commit cannot advance before the entries are durable;
+    // `leader_commit` is parked in `pending_leader_commit`.
     assert_eq!(node.cluster_commit_index(), 0);
 
-    // Driver acks durability via `advance` + `Tick`. `leader_commit`
-    // is now applied, clamped at the new `local_commit_index = 3`.
-    // Drivers poll the getter — there is no dedicated action.
+    // Cluster acks durability. `advance` drains
+    // `pending_leader_commit`, clamped at the new
+    // `local_commit_index = 3`.
     node.advance(3, 3);
-    let _ = node.step(Instant::now(), Event::Tick);
     assert_eq!(node.cluster_commit_index(), 3);
 }
 
@@ -407,27 +381,18 @@ fn leader_commit_clamp_to_local_log() {
 #[test]
 fn empty_append_entries_is_a_heartbeat() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::empty(),
+        0,
     );
-    let appends = actions
-        .iter()
-        .filter(|a| matches!(a, Action::AppendLog { .. }))
-        .count();
-    assert_eq!(appends, 0);
-    let success = actions.iter().any(|a| match a {
-        Action::SendAppendEntriesReply { success, .. } => *success,
-        _ => false,
-    });
-    assert!(success);
+    // Heartbeat: Accept with no entries to append; cluster builds
+    // the success reply from `current_term()` / watermark getters.
+    assert_eq!(decision, AppendEntriesDecision::Accept { append: None });
 }
 
 /// AppendEntries from an old leader (lower term) is rejected with
@@ -447,26 +412,24 @@ fn append_entries_from_old_leader_is_rejected() {
     );
     assert_eq!(node.current_term(), 5);
     // Now an old leader at term 3 sends AE — must be refused.
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 3,
-            term: 3,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        3,
+        3,
+        0,
+        0,
+        LogEntryRange::empty(),
+        0,
     );
-    let reply = actions
-        .iter()
-        .find_map(|a| match a {
-            Action::SendAppendEntriesReply { term, success, .. } => Some((*term, *success)),
-            _ => None,
-        })
-        .unwrap();
-    assert!(!reply.1);
-    assert_eq!(reply.0, 5);
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Reject {
+            reason: RejectReason::TermBehind,
+            truncate_after: None,
+        }
+    );
+    // The cluster stamps the reply's `term` from `current_term()`.
+    assert_eq!(node.current_term(), 5);
 }
 
 // ── Read-API consistency ─────────────────────────────────────────────────────
@@ -723,26 +686,20 @@ fn heartbeat_propagates_leader_commit_advance() {
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Heartbeat at term 1 with leader_commit=2.
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 3,
-            prev_log_term: 1,
-            entries: LogEntryRange::empty(),
-            leader_commit: 2,
-        },
+        2,
+        1,
+        3,
+        1,
+        LogEntryRange::empty(),
+        2,
     );
-
+    // Heartbeat: Accept with no entries.
+    assert_eq!(decision, AppendEntriesDecision::Accept { append: None });
     // The advance is observable via the getter (no dedicated
     // action — ADR-0017 §"Driver call pattern").
     assert_eq!(node.cluster_commit_index(), 2);
-    // Heartbeats also reply success synchronously (no parking).
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        Action::SendAppendEntriesReply { success: true, .. }
-    )));
 }
 
 // ── Index-split refactor regressions ──────────────────────────────────────
@@ -768,16 +725,14 @@ fn heartbeat_leader_commit_clamps_to_local_commit() {
 
     // Heartbeat with leader_commit=10 (intentionally above our
     // commit). Cluster commit advances only to local_commit_index=3.
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 5,
-            prev_log_term: 1,
-            entries: LogEntryRange::empty(),
-            leader_commit: 10,
-        },
+        2,
+        1,
+        5,
+        1,
+        LogEntryRange::empty(),
+        10,
     );
     assert_eq!(
         node.cluster_commit_index(),
@@ -815,16 +770,14 @@ fn local_write_index_survives_election_loss() {
     // Receive AE at a strictly higher term (a different node won
     // the election). prev_log_tx_id = 0 sentinels the start-of-log
     // check so we don't tangle with the §5.3 path here.
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         t0 + Duration::from_secs(60),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: term_now + 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        term_now + 1,
+        0,
+        0,
+        LogEntryRange::empty(),
+        0,
     );
     assert!(matches!(node.role(), Role::Follower));
     // Survives the Candidate → Follower transition.

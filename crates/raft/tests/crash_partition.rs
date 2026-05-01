@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Event, NodeId, Persistence, RaftConfig, RaftNode, Role};
+use raft::{Event, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, Role};
 
 fn await_leader_in(sim: &mut Sim, ids: &[NodeId]) -> NodeId {
     let deadline = sim.clock() + Duration::from_secs(5);
@@ -376,16 +376,14 @@ fn leader_step_down_preserves_write_index() {
     assert_eq!(node.write_index(), 5);
 
     // Inbound RPC at a strictly higher term forces step-down.
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         t0 + Duration::from_secs(61),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: term_now + 1,
-            prev_log_tx_id: 5,
-            prev_log_term: term_now,
-            entries: raft::LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        term_now + 1,
+        5,
+        term_now,
+        LogEntryRange::empty(),
+        0,
     );
     assert!(matches!(node.role(), Role::Follower));
     // Survives the role transition.

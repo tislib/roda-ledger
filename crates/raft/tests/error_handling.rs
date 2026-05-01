@@ -9,11 +9,14 @@
 //!   promoted to `Action::FatalError` (finding #2).
 //! - T3: once the library has emitted `FatalError`, subsequent
 //!   `step()` calls must be no-ops (finding #1/#2 follow-on).
-//! - T4: `SendAppendEntriesReply { success: true }` must not be
-//!   emitted in the same `step()` as the `AppendLog` action — it
-//!   must wait for the driver's `advance` + `Tick` so the leader
+//! - T4: an entries-bearing AppendEntries must not produce
+//!   externally-visible "success" until the driver has durably
+//!   persisted the entries and acked via `advance` — the leader
 //!   cannot count an entry as durable on the follower before the
-//!   driver has actually persisted it (finding #3).
+//!   driver has actually persisted it (finding #3). In the new
+//!   validate-based flow, validate's `Accept { append: Some(_) }`
+//!   directs the cluster to do the I/O and call `advance`; the
+//!   wire-level success ships only after that.
 //! - T5: a follower-side truncation that would drop
 //!   `cluster_commit_index` is a Raft invariant violation; the
 //!   library must `debug_assert!` instead of silently clamping
@@ -24,7 +27,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryRange, RaftConfig, RaftNode, TermRecord};
+use raft::{Action, AppendEntriesDecision, Event, LogEntryRange, RaftConfig, RaftNode, TermRecord};
 
 fn make_follower(persistence: MemPersistence) -> RaftNode<MemPersistence> {
     RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42)
@@ -57,45 +60,31 @@ fn truncate_term_after_io_error_emits_fatal_error() {
     // bogus prev_log_term so the follower takes the §5.3 truncation
     // path. The injected fault makes `truncate_term_after` return
     // `Err`.
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 2,
-            prev_log_tx_id: 3,
-            prev_log_term: 99, // mismatched with our term-2 record
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        2,
+        3,
+        99, // mismatched with our term-2 record
+        LogEntryRange::empty(),
+        0,
     );
 
-    // FatalError must be emitted.
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::FatalError { .. })),
-        "expected Action::FatalError, got {:?}",
-        actions
+        matches!(decision, AppendEntriesDecision::Fatal { .. }),
+        "expected AppendEntriesDecision::Fatal, got {:?}",
+        decision
     );
-    // Driver must not be told to truncate the entry log — the term
-    // log truncation failed, so doing the entry-log truncation
-    // anyway would leave the two out of sync.
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::TruncateLog { .. })),
-        "TruncateLog must not be emitted when term-log truncation failed: {:?}",
-        actions
-    );
-    // No success reply: we did not durably accept anything.
-    assert!(
-        !actions.iter().any(|a| matches!(
-            a,
-            Action::SendAppendEntriesReply { success: true, .. }
-        )),
-        "must not reply success after a fatal: {:?}",
-        actions
-    );
+    // The driver must learn from `Fatal` that it must NOT truncate
+    // the entry log — the term log truncation failed, so doing the
+    // entry-log truncation anyway would leave the two out of sync.
+    if let AppendEntriesDecision::Reject { truncate_after, .. } = decision {
+        assert!(
+            truncate_after.is_none(),
+            "Fatal must not surface a truncate_after: {:?}",
+            decision
+        );
+    }
     // The watermarks must not have moved — the failed truncation
     // aborts before any in-memory clamp.
     assert_eq!(node.write_index(), 5);
@@ -118,38 +107,29 @@ fn observe_term_io_error_emits_fatal_error() {
     // Inbound AppendEntries at a brand-new term 5 with non-empty
     // entries — this is exactly the path that calls
     // `observe_term(5, ...)`.
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 5,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 3, 5),
-            leader_commit: 0,
-        },
+        2,
+        5,
+        0,
+        0,
+        LogEntryRange::new(1, 3, 5),
+        0,
     );
 
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::FatalError { .. })),
-        "expected Action::FatalError, got {:?}",
-        actions
+        matches!(decision, AppendEntriesDecision::Fatal { .. }),
+        "expected AppendEntriesDecision::Fatal, got {:?}",
+        decision
     );
-    assert!(
-        !actions.iter().any(|a| matches!(a, Action::AppendLog { .. })),
-        "AppendLog must not be emitted when observe_term failed: {:?}",
-        actions
-    );
-    assert!(
-        !actions.iter().any(|a| matches!(
-            a,
-            Action::SendAppendEntriesReply { success: true, .. }
-        )),
-        "must not reply success after a fatal: {:?}",
-        actions
-    );
+    // No append decision means the driver must NOT touch its WAL.
+    if let AppendEntriesDecision::Accept { append } = decision {
+        assert!(
+            append.is_none(),
+            "Fatal must not surface an Accept with append: {:?}",
+            decision
+        );
+    }
     assert_eq!(node.commit_index(), 0);
 }
 
@@ -170,20 +150,18 @@ fn step_after_fatal_error_yields_no_actions() {
     // Written but not committed — the §5.4 truncation guard forbids
     // truncating below the local commit watermark.
     node.advance(5, 0);
-    let first = node.step(
+    let first = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 2,
-            prev_log_tx_id: 3,
-            prev_log_term: 99,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        2,
+        3,
+        99,
+        LogEntryRange::empty(),
+        0,
     );
     assert!(
-        first.iter().any(|a| matches!(a, Action::FatalError { .. })),
-        "precondition: first step must fatal-out, got {:?}",
+        matches!(first, AppendEntriesDecision::Fatal { .. }),
+        "precondition: first validate must return Fatal, got {:?}",
         first
     );
 
@@ -195,20 +173,18 @@ fn step_after_fatal_error_yields_no_actions() {
         after_tick
     );
 
-    let after_rpc = node.step(
+    let after_rpc = node.validate_append_entries_request(
         now + Duration::from_secs(120),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 9,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        9,
+        0,
+        0,
+        LogEntryRange::empty(),
+        0,
     );
     assert!(
-        after_rpc.is_empty(),
-        "step after fatal must be a no-op, got {:?}",
+        matches!(after_rpc, AppendEntriesDecision::Fatal { .. }),
+        "validate after fatal must short-circuit to Fatal, got {:?}",
         after_rpc
     );
 }
@@ -223,64 +199,34 @@ fn success_reply_waits_for_log_append_complete() {
 
     // Inbound AppendEntries from a fresh leader at term 1, three new
     // entries 1..=3.
-    let first = node.step(
+    let decision = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 3, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 3, 1),
+        0,
     );
 
-    // The library must have asked the driver to append, but must NOT
-    // yet have replied success — the entries are not durable until
-    // the driver acks via `advance` + `Tick`.
-    assert!(
-        first.iter().any(|a| matches!(a, Action::AppendLog { .. })),
-        "AppendLog must be emitted, got {:?}",
-        first
+    // Validate decides "Accept these entries"; the cluster must
+    // durably append them before claiming success.
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Accept {
+            append: Some(LogEntryRange::new(1, 3, 1))
+        }
     );
-    assert!(
-        !first.iter().any(|a| matches!(
-            a,
-            Action::SendAppendEntriesReply { success: true, .. }
-        )),
-        "success reply must not be emitted before durability ack: {:?}",
-        first
-    );
+    // Watermarks have not advanced yet — the driver hasn't written.
+    assert_eq!(node.write_index(), 0);
+    assert_eq!(node.commit_index(), 0);
 
-    // Driver acknowledges durability via `advance` + `Tick` — the
-    // success reply fires on the Tick drain.
+    // Driver acknowledges durability via `advance`. The success
+    // reply the cluster ships is built from the post-advance
+    // watermark getters.
     node.advance(3, 3);
-    let second = node.step(now, Event::Tick);
-    let success_reply = second.iter().find(|a| {
-        matches!(
-            a,
-            Action::SendAppendEntriesReply { success: true, .. }
-        )
-    });
-    let reply = success_reply.unwrap_or_else(|| {
-        panic!(
-            "success reply must be emitted after advance + Tick, got {:?}",
-            second
-        )
-    });
-    if let Action::SendAppendEntriesReply {
-        to,
-        success,
-        last_commit_id,
-        last_write_id,
-        ..
-    } = reply
-    {
-        assert_eq!(*to, 2);
-        assert!(*success);
-        assert_eq!(*last_commit_id, 3);
-        assert_eq!(*last_write_id, 3);
-    }
+    assert_eq!(node.write_index(), 3);
+    assert_eq!(node.commit_index(), 3);
 }
 
 // ─── T5: truncation below cluster_commit_index must panic in debug ───────
@@ -307,32 +253,28 @@ fn truncation_below_cluster_commit_index_panics_in_debug() {
     node.advance(10, 10);
 
     // First AE: matching prev_log to advance cluster_commit_index to 5.
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 10,
-            prev_log_term: 1,
-            entries: LogEntryRange::empty(),
-            leader_commit: 5,
-        },
+        2,
+        1,
+        10,
+        1,
+        LogEntryRange::empty(),
+        5,
     );
     assert_eq!(node.cluster_commit_index(), 5);
 
     // Second AE: deliberately mismatched prev_log_term, forcing
     // truncation to tx_id 1 — strictly below cluster_commit_index=5.
     // Triggers the debug_assert.
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 2,
-            prev_log_term: 99,
-            entries: LogEntryRange::empty(),
-            leader_commit: 5,
-        },
+        2,
+        1,
+        2,
+        99,
+        LogEntryRange::empty(),
+        5,
     );
 }
 
@@ -360,120 +302,99 @@ fn raftnode_new_panics_on_misconfigured_heartbeat_interval() {
     let _ = RaftNode::new(1, vec![1, 2], MemPersistence::new(), cfg, 42);
 }
 
-// ─── pending_reply lifecycle (audit gaps) ─────────────────────────────────
+// ─── pending_leader_commit lifecycle (audit gaps) ─────────────────────────
 
 /// A `Follower → Candidate` transition (election timeout fires while
-/// the follower has a parked AppendEntries success reply waiting on a
-/// driver `advance` + `Tick`) discards the parked reply along with the
-/// rest of the follower state. The leader will time out its in-flight
-/// RPC and retry; nothing in the library leaks the stale reply into
-/// the candidate role.
+/// the follower's last-validated AE still holds a `pending_leader_commit`
+/// awaiting durability) discards the staged value along with the rest
+/// of the FollowerState. The cluster's eventual `advance` MUST NOT
+/// bump `cluster_commit_index` from the stale leader_commit — there is
+/// no follower state to consult anymore.
 #[test]
-fn pending_reply_lost_on_follower_to_candidate_transition() {
+fn pending_leader_commit_lost_on_follower_to_candidate_transition() {
     let mut node = make_follower(MemPersistence::new());
     let now = Instant::now();
 
-    // Park a reply by sending non-empty entries.
-    let first = node.step(
+    // First validate stages `leader_commit=3` waiting on durability.
+    let decision = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 3, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 3, 1),
+        3,
     );
-    assert!(first.iter().any(|a| matches!(a, Action::AppendLog { .. })));
-    assert!(!first.iter().any(|a| matches!(
-        a,
-        Action::SendAppendEntriesReply { success: true, .. }
-    )));
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Accept {
+            append: Some(LogEntryRange::new(1, 3, 1)),
+        }
+    );
+    assert_eq!(node.cluster_commit_index(), 0);
 
-    // Election timeout fires → transition_to_follower replaces the
-    // FollowerState (drops the pending). The advance + Tick arrives
-    // *after* — the now-Candidate has nowhere to send the reply.
+    // Election timeout fires → Follower → Candidate. The transition
+    // discards FollowerState including `pending_leader_commit`.
     let _ = node.step(now + Duration::from_secs(60), Event::Tick);
     assert_eq!(node.role(), raft::Role::Candidate);
 
+    // Cluster (which does not know about the role change) finally
+    // reports durability. cluster_commit must stay put — no stale
+    // follower state to drain.
     node.advance(3, 3);
-    let after_ack = node.step(now + Duration::from_secs(60), Event::Tick);
-    assert!(
-        !after_ack.iter().any(|a| matches!(
-            a,
-            Action::SendAppendEntriesReply { success: true, .. }
-        )),
-        "candidate must not emit the parked follower reply: {:?}",
-        after_ack
+    assert_eq!(
+        node.cluster_commit_index(),
+        0,
+        "candidate must not pick up the stale leader_commit"
     );
 }
 
-/// Two AppendEntries arrive in rapid succession before the driver
-/// acks the first via `advance` + `Tick`. The follower must overwrite
-/// the parked reply with the second one. Replying for the older
-/// `last_tx_id` would tell the leader less than what was already
-/// shipped to the entry log; the leader's quorum logic is monotonic
-/// on success, so the single success reply at the higher `last_tx_id`
-/// is correct.
+/// Two `validate_append_entries_request` calls arrive in rapid
+/// succession before the cluster acks durability via `advance`. The
+/// second `leader_commit` overwrites the first. Replying with the
+/// older `last_tx_id` would tell the leader less than what was already
+/// shipped to the entry log; the leader's quorum logic is monotonic on
+/// success, so only the higher `last_tx_id` matters.
 ///
-/// We model the "leader retransmits with an extended batch before
-/// the first ack lands" case: both AEs share `prev_log_tx_id=0`
-/// (start of log), so the §5.3 check passes for both even though
-/// the follower's `local_log_index` has not yet advanced.
+/// We model the "leader retransmits with an extended batch before the
+/// first ack lands" case: both validates share `prev_log_tx_id=0`
+/// (start of log) so the §5.3 check passes for both even though the
+/// follower's `local_write_index` has not yet advanced.
 #[test]
-fn pending_reply_overwritten_when_second_ae_arrives_before_ack() {
+fn pending_leader_commit_overwritten_when_second_ae_arrives_before_advance() {
     let mut node = make_follower(MemPersistence::new());
     let now = Instant::now();
 
-    // First AE: prev=0, entries 1..3.
-    let _ = node.step(
+    // First AE: prev=0, entries 1..3, leader_commit=2.
+    let _ = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 3, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 3, 1),
+        2,
     );
 
-    // Second AE before any ack: same prev=0, but an extended range
-    // 1..5. (Models a leader retransmission with one more entry
-    // tacked on.)
-    let _ = node.step(
+    // Second AE before any advance: same prev=0 but an extended
+    // range 1..5, leader_commit=5.
+    let _ = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 5, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 5, 1),
+        5,
     );
 
-    // Driver finally acks durability up to 5 (covers the second
-    // batch, which subsumes the first).
+    // Cluster acks durability up to 5. Drain inside `advance` picks
+    // up the second AE's leader_commit (5), not the first's (2).
     node.advance(5, 5);
-    let after = node.step(now, Event::Tick);
-    let replies: Vec<u64> = after
-        .iter()
-        .filter_map(|a| match a {
-            Action::SendAppendEntriesReply {
-                success: true,
-                last_commit_id,
-                ..
-            } => Some(*last_commit_id),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        replies,
-        vec![5],
-        "only the most recent batch's reply should fire: {:?}",
-        after
+        node.cluster_commit_index(),
+        5,
+        "second AE's leader_commit must overwrite the first"
     );
 }
 
@@ -635,25 +556,18 @@ fn failed_flag_is_volatile_across_into_persistence_rebuild() {
 
     // Written but not committed — see the §5.4 truncation guard.
     node.advance(5, 0);
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 2,
-            prev_log_tx_id: 3,
-            prev_log_term: 99,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        2,
+        3,
+        99,
+        LogEntryRange::empty(),
+        0,
     );
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        Action::FatalError { .. }
-    )));
+    assert!(matches!(decision, AppendEntriesDecision::Fatal { .. }));
     // Now the node is frozen.
-    assert!(node
-        .step(now, Event::Tick)
-        .is_empty());
+    assert!(node.step(now, Event::Tick).is_empty());
 
     // Recover the persistence (clear the injected fault before we
     // hand it to the new node — restart implies the underlying I/O
@@ -676,48 +590,6 @@ fn failed_flag_is_volatile_across_into_persistence_rebuild() {
 
 // ── Index-split refactor regressions ──────────────────────────────────────
 
-/// `LogTruncateComplete` clamps all three watermarks — write,
-/// commit, and cluster_commit — so the post-split invariants
-/// `local_write >= local_commit` and `local_write >= cluster_commit`
-/// hold after a truncation.
-#[test]
-fn truncation_clamps_both_indexes() {
-    let persistence = MemPersistence::with_state(
-        vec![raft::TermRecord {
-            term: 1,
-            start_tx_id: 1,
-        }],
-        1,
-        0,
-    );
-    let mut node = make_follower(persistence);
-    let now = Instant::now();
-
-    node.advance(10, 10);
-    // Bump cluster_commit via a heartbeat with leader_commit covering
-    // the local commit (followers bypass the §5.4.2 gate).
-    let _ = node.step(
-        now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 10,
-            prev_log_term: 1,
-            entries: LogEntryRange::empty(),
-            leader_commit: 10,
-        },
-    );
-    assert_eq!(node.write_index(), 10);
-    assert_eq!(node.commit_index(), 10);
-    assert_eq!(node.cluster_commit_index(), 10);
-
-    // Truncate to 5: all three watermarks clamp.
-    let _ = node.step(now, Event::LogTruncateComplete { up_to: 5 });
-    assert_eq!(node.write_index(), 5);
-    assert_eq!(node.commit_index(), 5);
-    assert_eq!(node.cluster_commit_index(), 5);
-}
-
 /// After a fatal failure the node is frozen — `advance` must not
 /// mutate state, mirroring the `step`-no-op-after-fatal contract.
 #[test]
@@ -738,18 +610,16 @@ fn advance_no_op_on_failed_node() {
     // committed setup so the §5.4 truncation guard allows the
     // attempt to reach the persistence call.)
     node.advance(5, 0);
-    let actions = node.step(
+    let decision = node.validate_append_entries_request(
         now,
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 2,
-            prev_log_tx_id: 3,
-            prev_log_term: 99,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        2,
+        3,
+        99,
+        LogEntryRange::empty(),
+        0,
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::FatalError { .. })));
+    assert!(matches!(decision, AppendEntriesDecision::Fatal { .. }));
 
     // Node is frozen — advance must be a no-op.
     let write_before = node.write_index();

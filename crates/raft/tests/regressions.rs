@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, Role, TxId};
+use raft::{
+    Action, AppendEntriesDecision, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, RejectReason,
+    Role, TxId,
+};
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
     RaftNode::new(
@@ -146,47 +149,46 @@ fn log_mismatch_decrements_next_index() {
 fn term_log_truncates_with_entry_log() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
 
-    // Drive entries 1..5 at term 1 into the follower. The driver
-    // acks durability via `advance` + `Tick`, which is what advances
-    // both watermarks and drains the parked success reply.
-    let _ = node.step(
+    // Drive entries 1..5 at term 1 into the follower. The cluster
+    // acks durability via `advance`, which is what advances both
+    // watermarks.
+    let _ = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 5, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 5, 1),
+        0,
     );
     // Written but not committed — the §5.4 truncation guard forbids
     // truncating below `local_commit_index`, and this test then
     // truncates to 4. Set commit=0 so the truncation is allowed.
     node.advance(5, 0);
-    let _ = node.step(Instant::now(), Event::Tick);
     assert_eq!(node.write_index(), 5);
 
     // Now arrive an AppendEntries from a leader at term 2 with
-    // prev_log_tx_id=5, prev_log_term=2 — mismatch. Follower must
-    // truncate to 4 in BOTH the entry log (Action::TruncateLog)
-    // and the term log (synchronous through the trait).
-    let actions = node.step(
+    // prev_log_tx_id=5, prev_log_term=2 — mismatch. The validate
+    // decision must surface `truncate_after = Some(4)` so the
+    // cluster knows to drop entries past 4 in BOTH the entry log
+    // (driver-side I/O) and the term log (synchronous through the
+    // trait, already done inside validate).
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 2,
-            prev_log_tx_id: 5,
-            prev_log_term: 2,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        2,
+        5,
+        2,
+        LogEntryRange::empty(),
+        0,
     );
-    let truncate = actions.iter().find_map(|a| match a {
-        Action::TruncateLog { after_tx_id } => Some(*after_tx_id),
-        _ => None,
-    });
-    assert_eq!(truncate, Some(4));
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Reject {
+            reason: RejectReason::LogMismatch,
+            truncate_after: Some(4),
+        }
+    );
 
     // Confirm the term log mirror is consistent: term_at_tx beyond
     // the truncation point should not return a record from a
@@ -253,22 +255,19 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     // Phase 1 — receive entries 1..=5 at term 1 from a leader
     // whose own commit watermark is still 0 (it crashed before
     // achieving majority on these entries).
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         t0 + Duration::from_millis(10),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 5, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 5, 1),
+        0,
     );
-    // Driver acks raft-log durability; ledger has not yet applied
+    // Cluster acks raft-log durability; ledger has not yet applied
     // (leader_commit was 0). Models the §5.4.2 scenario faithfully:
     // entries durably written but not locally committed.
     node.advance(5, 0);
-    let _ = node.step(t0 + Duration::from_millis(11), Event::Tick);
     assert_eq!(node.write_index(), 5, "entries durable on disk");
     assert_eq!(
         node.cluster_commit_index(),
