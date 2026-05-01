@@ -10,18 +10,18 @@
 //! incrementally.
 
 use crate::cluster_mirror::ClusterMirror;
+use crate::command::Command;
 use crate::config::Config;
 use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
-use raft::{Event, RaftNode, TxId};
+use raft::{AppendEntriesDecision, Event, LogEntryRange, RaftNode, RejectReason, TxId};
 use spdlog::info;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use crate::command::Command;
 
 /// Bound on the inbound command channel. Picked to absorb a burst of
 /// in-flight RPCs without blocking gRPC handlers, while still giving
@@ -34,6 +34,11 @@ const COMMAND_CHANNEL_DEPTH: usize = 1024;
 const FALLBACK_WAKEUP: Duration = Duration::from_millis(50);
 
 /// Reply parked until follower-side WAL durability covers `tx_id`.
+/// The cluster owns the gRPC `oneshot` while the ledger pipeline is
+/// fsyncing the entries that arrived on this AppendEntries; the main
+/// loop drains the parked reply once the ledger's commit watermark
+/// (which collapses with the WAL durability watermark in the current
+/// design — see ADR-0017) covers the parked `last_tx_id`.
 struct ParkedReply {
     /// The oneshot the gRPC handler is awaiting.
     reply: oneshot::Sender<proto::AppendEntriesResponse>,
@@ -149,16 +154,133 @@ impl RaftLoop {
     /// outbound replies straight into `step`.
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
-            Command::AppendEntries { req: _, reply: _ } => {
-                // TODO: build Event::AppendEntriesRequest, step, walk
-                //       actions, either reply immediately or park the
-                //       oneshot in pending_ae_replies.
+            Command::AppendEntries { req, reply } => {
+                self.handle_append_entries(req, reply);
             }
             Command::RequestVote { req: _, reply: _ } => {
                 // TODO: build Event::RequestVoteRequest, step, send
                 //       the reply synchronously from the resulting
                 //       SendRequestVoteReply action.
             }
+        }
+    }
+
+    /// Follower-side `AppendEntries` handling. Implements the
+    /// validate → I/O → advance → reply pattern (ADR-0017 §"Driver
+    /// call pattern"):
+    ///
+    /// 1. Convert the proto request into raft's parameter shape and
+    ///    call `node.validate_append_entries_request(...)`. The
+    ///    library updates its internal state machine (term
+    ///    observation, follower transition, election timer reset,
+    ///    synchronous term-log truncation, watermark clamping,
+    ///    heartbeat-path `cluster_commit` advance) and returns an
+    ///    `AppendEntriesDecision` describing what the cluster must
+    ///    do.
+    /// 2. On `Reject`: optionally truncate the entry log, build the
+    ///    response from raft's getters, send synchronously.
+    /// 3. On `Accept { append: None }` (heartbeat): build the
+    ///    response from raft's getters, send synchronously.
+    /// 4. On `Accept { append: Some(range) }`: kick the ledger to
+    ///    durably append `req.wal_bytes`, park the oneshot in
+    ///    `pending_ae_replies` keyed by `range.last_tx_id()`. The
+    ///    main loop will observe the ledger's commit watermark
+    ///    advancing past that key, call `node.advance(...)` to
+    ///    update raft's watermarks, and drain the parked reply with
+    ///    the post-advance getters.
+    /// 5. On `Fatal`: surface to the supervisor and drop the
+    ///    oneshot (the gRPC handler sees channel-closed).
+    fn handle_append_entries(
+        &mut self,
+        req: proto::AppendEntriesRequest,
+        reply: oneshot::Sender<proto::AppendEntriesResponse>,
+    ) {
+        let now = Instant::now();
+        let entries = if req.from_tx_id == 0 || req.to_tx_id < req.from_tx_id {
+            LogEntryRange::empty()
+        } else {
+            LogEntryRange::new(
+                req.from_tx_id,
+                req.to_tx_id - req.from_tx_id + 1,
+                req.term,
+            )
+        };
+        let decision = self.node.validate_append_entries_request(
+            now,
+            req.leader_id,
+            req.term,
+            req.prev_tx_id,
+            req.prev_term,
+            entries,
+            req.leader_commit_tx_id,
+        );
+        self.mirror.snapshot_from(&self.node);
+
+        match decision {
+            AppendEntriesDecision::Reject {
+                reason,
+                truncate_after,
+            } => {
+                if let Some(_after) = truncate_after {
+                    // TODO: truncate the ledger's entry log past
+                    // `_after`. The term-log mirror is already
+                    // truncated synchronously inside validate. The
+                    // ledger today does not expose a public
+                    // `truncate_wal_after` — wire one up alongside
+                    // the rest of the WAL-replication scaffolding.
+                }
+                let _ = reply.send(self.build_ae_response(false, Some(reason)));
+            }
+            AppendEntriesDecision::Accept { append: None } => {
+                // Heartbeat: cluster_commit was already updated
+                // inline inside validate.
+                let _ = reply.send(self.build_ae_response(true, None));
+            }
+            AppendEntriesDecision::Accept { append: Some(_range) } => {
+                // TODO: parse `req.wal_bytes` into `Vec<WalEntry>`,
+                // call `self.ledger.ledger().append_wal_entries(...)`,
+                // park `reply` in `pending_ae_replies` keyed by
+                // `_range.last_tx_id().unwrap()`. The main loop's
+                // ledger-watermark polling drains the parked reply
+                // (after `node.advance(write, commit)`) using
+                // `build_ae_response(true, None)` from getters at
+                // drain time.
+                drop(reply);
+            }
+            AppendEntriesDecision::Fatal { reason } => {
+                self.mirror.set_fatal();
+                spdlog::error!(
+                    "raft_loop: validate_append_entries_request returned Fatal: {}",
+                    reason
+                );
+                drop(reply);
+            }
+        }
+    }
+
+    /// Build the proto response from raft's getters. The cluster
+    /// stamps `term` / `last_commit_id` / `last_write_id` from the
+    /// post-validate (and post-advance, for the entries case)
+    /// state — see ADR-0017 §"AE reply: write vs commit watermark".
+    fn build_ae_response(
+        &self,
+        success: bool,
+        reject_reason: Option<RejectReason>,
+    ) -> proto::AppendEntriesResponse {
+        let reject_code = match reject_reason {
+            None => proto::RejectReason::RejectNone as u32,
+            Some(RejectReason::TermBehind) => proto::RejectReason::RejectTermStale as u32,
+            Some(RejectReason::LogMismatch) => proto::RejectReason::RejectPrevMismatch as u32,
+            // RpcTimeout is a leader-side bookkeeping signal; never
+            // surfaces on a follower's reply path.
+            Some(RejectReason::RpcTimeout) => proto::RejectReason::RejectNone as u32,
+        };
+        proto::AppendEntriesResponse {
+            term: self.node.current_term(),
+            success,
+            last_commit_id: self.node.commit_index(),
+            last_write_id: self.node.write_index(),
+            reject_reason: reject_code,
         }
     }
 
@@ -186,12 +308,13 @@ impl RaftLoop {
                 // supervisor observes via mirror.is_fatal() and tears
                 // down the process.
             }
+            // Follower-side AE handling lives in `handle_append_entries`
+            // (validate → I/O → advance → reply); raft no longer
+            // emits `SendAppendEntriesReply` / `AppendLog` /
+            // `TruncateLog`.
             // TODO: SendAppendEntries → spawn outbound dispatch task
             // TODO: SendRequestVote   → spawn outbound dispatch task
-            // TODO: SendAppendEntriesReply → drain matching parked oneshot
             // TODO: SendRequestVoteReply   → reply via current request's oneshot
-            // TODO: AppendLog       → kick ledger.append_wal_entries (non-blocking)
-            // TODO: TruncateLog     → spawn reseed task
             // TODO: BecomeRole → already in mirror, no-op
             _ => {}
         }

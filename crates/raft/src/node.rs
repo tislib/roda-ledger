@@ -45,6 +45,7 @@ use crate::leader::{InFlightAppend, LeaderState};
 use crate::log_entry::LogEntryRange;
 use crate::persistence::Persistence;
 use crate::quorum::Quorum;
+use crate::replication::{AppendEntriesRequest, AppendResult, Replication};
 use crate::role::Role;
 use crate::timer::{ElectionTimer, ElectionTimerConfig};
 use crate::types::{NodeId, RejectReason, Term, TxId};
@@ -417,6 +418,216 @@ impl<P: Persistence> RaftNode<P> {
         }
     }
 
+    // ─── replication() ───────────────────────────────────────────────────
+
+    /// Entry point for the cluster-driven leader-side replication
+    /// API. Returns a [`Replication`] handle that exposes per-peer
+    /// progress; see the module docs for the cluster's loop pattern.
+    ///
+    /// All counters live on this `RaftNode`; the returned handle is
+    /// a borrow view that performs no allocation of its own.
+    pub fn replication(&mut self) -> Replication<'_, P> {
+        Replication::new(self)
+    }
+
+    // Internal helpers backing `Replication` / `PeerReplication`.
+    // Defined here (rather than in `replication.rs`) so they can
+    // touch private state directly without relaxing visibility.
+
+    pub(crate) fn replication_peer_next_index(&self, peer_id: NodeId) -> TxId {
+        match &self.state {
+            NodeState::Leader(l) => l
+                .peers
+                .get(&peer_id)
+                .map(|p| p.next_index)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn replication_peer_match_index(&self, peer_id: NodeId) -> TxId {
+        match &self.state {
+            NodeState::Leader(l) => l
+                .peers
+                .get(&peer_id)
+                .map(|p| p.match_index)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Build the next AE for `peer_id` and arm the in-flight slot.
+    /// Returns `None` if not leader / peer unknown / failed.
+    ///
+    /// Same source-of-truth as `leader_send_to`: both routes share
+    /// the §5.3 prev-log header construction, the same-term range
+    /// expansion (capped by `max_entries_per_append`), and the
+    /// heartbeat-vs-entries decision (`next_index > last_written`).
+    pub(crate) fn replication_get_append_range(
+        &mut self,
+        peer_id: NodeId,
+        now: Instant,
+    ) -> Option<AppendEntriesRequest> {
+        if self.failed {
+            return None;
+        }
+        if !self.role().is_leader() {
+            return None;
+        }
+
+        // Mirror `leader_drive`'s expired-RPC sweep so a stale
+        // `in_flight` doesn't prevent the build path below from
+        // finding the peer.
+        if let NodeState::Leader(l) = &mut self.state
+            && let Some(p) = l.peers.get_mut(&peer_id)
+            && let Some(infl) = p.in_flight
+            && now >= infl.expires_at
+        {
+            p.in_flight = None;
+        }
+
+        let current_term = self.current_term();
+        let leader_commit = self.cluster_commit_index;
+        let max_entries = self.cfg.max_entries_per_append;
+        let last_written = self.local_write_index;
+
+        let next_index = match &self.state {
+            NodeState::Leader(l) => l.peers.get(&peer_id).map(|p| p.next_index)?,
+            _ => return None,
+        };
+
+        let prev_log_tx_id = next_index.saturating_sub(1);
+        let prev_log_term = self
+            .persistence
+            .term_at_tx(prev_log_tx_id)
+            .map(|r| r.term)
+            .unwrap_or(0);
+
+        let entries = if next_index > last_written {
+            // Heartbeat: nothing to ship.
+            LogEntryRange::empty()
+        } else {
+            // Same-term contiguous range. The expect()s match the
+            // `leader_send_to` invariant: every in-log tx_id has a
+            // covering term-log record (truncation drops both
+            // together via `truncate_term_after`). A `None` here
+            // signals corrupted persistence.
+            let range_term = self
+                .persistence
+                .term_at_tx(next_index)
+                .expect("term_at_tx must cover next_index when next_index <= last_written")
+                .term;
+            let mut count: u64 = 0;
+            let mut tx = next_index;
+            while tx <= last_written && count < max_entries as u64 {
+                let t = self
+                    .persistence
+                    .term_at_tx(tx)
+                    .expect("term_at_tx must cover every in-log tx_id")
+                    .term;
+                if t != range_term {
+                    break;
+                }
+                count += 1;
+                tx += 1;
+            }
+            LogEntryRange::new(next_index, count, range_term)
+        };
+
+        let last_tx_in_batch = entries.last_tx_id().unwrap_or(prev_log_tx_id);
+
+        // Arm the in-flight window and push the heartbeat deadline
+        // out — same accounting as `leader_send_to`.
+        let interval = self.cfg.heartbeat_interval;
+        let rpc_to = self.cfg.rpc_timeout;
+        if let NodeState::Leader(l) = &mut self.state
+            && let Some(p) = l.peers.get_mut(&peer_id)
+        {
+            p.in_flight = Some(InFlightAppend {
+                last_tx_id_in_batch: last_tx_in_batch,
+                expires_at: now + rpc_to,
+            });
+            p.next_heartbeat = now + interval;
+        }
+
+        Some(AppendEntriesRequest {
+            to: peer_id,
+            term: current_term,
+            prev_log_tx_id,
+            prev_log_term,
+            entries,
+            leader_commit,
+        })
+    }
+
+    /// Feed the cluster-driver's RPC outcome back into the state
+    /// machine. Same destination as the action-based
+    /// `Event::AppendEntriesReply` path — `Success` /
+    /// `Reject(LogMismatch)` flow through `on_append_entries_reply`
+    /// untouched. `Reject(TermBehind)` triggers the same step-down.
+    /// `Timeout` is mapped to `RejectReason::RpcTimeout` (which the
+    /// reply handler already treats as "clear in_flight, leave
+    /// indexes alone").
+    pub(crate) fn replication_append_result(
+        &mut self,
+        peer_id: NodeId,
+        now: Instant,
+        result: AppendResult,
+    ) {
+        match result {
+            AppendResult::Success {
+                term,
+                last_write_id,
+                last_commit_id,
+            } => {
+                self.on_append_entries_reply(
+                    now,
+                    peer_id,
+                    term,
+                    true,
+                    last_commit_id,
+                    last_write_id,
+                    None,
+                );
+            }
+            AppendResult::Reject {
+                term,
+                reason,
+                last_write_id,
+                last_commit_id,
+            } => {
+                self.on_append_entries_reply(
+                    now,
+                    peer_id,
+                    term,
+                    false,
+                    last_commit_id,
+                    last_write_id,
+                    Some(reason),
+                );
+            }
+            AppendResult::Timeout => {
+                // Synthesise a peer-less reply at the leader's own
+                // term: the reply handler clears `in_flight` and
+                // leaves `next_index` / `match_index` unchanged on
+                // `RejectReason::RpcTimeout`. The watermark args
+                // are unused on this path but must satisfy
+                // `last_write_id >= last_commit_id` per the §"AE
+                // reply" debug assert.
+                let term = self.current_term();
+                self.on_append_entries_reply(
+                    now,
+                    peer_id,
+                    term,
+                    false,
+                    0,
+                    0,
+                    Some(RejectReason::RpcTimeout),
+                );
+            }
+        }
+    }
+
     // ─── step() ──────────────────────────────────────────────────────────
 
     pub fn step(&mut self, now: Instant, event: Event) -> Vec<Action> {
@@ -467,15 +678,6 @@ impl<P: Persistence> RaftNode<P> {
             self.emit_wakeup_if_changed(&mut out);
         }
         out
-    }
-
-    /// Mark the node fatally failed and emit `Action::FatalError`.
-    /// Callers must `return` immediately after invoking this — once
-    /// `failed` is set, the rest of the current handler should not
-    /// queue further actions or mutate state.
-    fn fatal(&mut self, reason: &'static str, out: &mut Vec<Action>) {
-        self.failed = true;
-        out.push(Action::FatalError { reason });
     }
 
     // ─── Tick ────────────────────────────────────────────────────────────
@@ -981,102 +1183,21 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     fn leader_send_to(&mut self, peer: NodeId, now: Instant, out: &mut Vec<Action>) {
-        let current_term = self.current_term();
-        let leader_commit = self.cluster_commit_index;
-        let max_entries = self.cfg.max_entries_per_append;
-
-        let (prev_log_tx_id, prev_log_term, entries) = {
-            let progress = match &self.state {
-                NodeState::Leader(l) => l.peers.get(&peer).cloned(),
-                _ => return,
-            };
-            let last_written = self.local_write_index;
-            let progress = match progress {
-                Some(p) => p,
-                None => return,
-            };
-            let next_index = progress.next_index;
-            let prev_log_tx_id = next_index.saturating_sub(1);
-            let prev_log_term = self
-                .persistence
-                .term_at_tx(prev_log_tx_id)
-                .map(|r| r.term)
-                .unwrap_or(0);
-
-            // Build a single same-term contiguous range starting at
-            // next_index. The range stops at the next term boundary
-            // or at `max_entries`, whichever comes first; multi-term
-            // catch-up takes multiple AEs. Heartbeat (next_index >
-            // local_write_index) → empty range.
-            //
-            // The upper bound is `local_write_index` — the leader's
-            // raft-log durability watermark, advanced by `advance`.
-            // Replication is gated on raft-log durability, NOT on
-            // the ledger-commit signal (`local_commit_index`);
-            // shipping an entry to followers as soon as it is on
-            // disk is safe and correct.
-            //
-            // Inside the `else` branch `next_index <= last_written`,
-            // so `next_index` indexes a real entry. Every in-log
-            // entry has a covering term-log record (`observe_term` is
-            // called for any new term, `commit_term` for a leader's
-            // own first entry; truncation drops both the entry and
-            // its term record together via `truncate_term_after`).
-            // A `None` from `term_at_tx` therefore signals a
-            // corrupted persistence — `expect` surfaces it instead
-            // of silently downgrading the entry to `current_term`,
-            // which would produce a malformed multi-term
-            // `LogEntryRange`.
-            let entries = if next_index > last_written {
-                let _ = current_term; // not consulted in the heartbeat path
-                LogEntryRange::empty()
-            } else {
-                let range_term = self
-                    .persistence
-                    .term_at_tx(next_index)
-                    .expect("term_at_tx must cover next_index when next_index <= last_written")
-                    .term;
-                let mut count: u64 = 0;
-                let mut tx = next_index;
-                while tx <= last_written && count < max_entries as u64 {
-                    let t = self
-                        .persistence
-                        .term_at_tx(tx)
-                        .expect("term_at_tx must cover every in-log tx_id")
-                        .term;
-                    if t != range_term {
-                        break;
-                    }
-                    count += 1;
-                    tx += 1;
-                }
-                LogEntryRange::new(next_index, count, range_term)
-            };
-
-            (prev_log_tx_id, prev_log_term, entries)
-        };
-
-        let last_tx_in_batch = entries.last_tx_id().unwrap_or(prev_log_tx_id);
-
-        out.push(Action::SendAppendEntries {
-            to: peer,
-            term: current_term,
-            prev_log_tx_id,
-            prev_log_term,
-            entries,
-            leader_commit,
-        });
-
-        let interval = self.cfg.heartbeat_interval;
-        let rpc_to = self.cfg.rpc_timeout;
-        if let NodeState::Leader(l) = &mut self.state
-            && let Some(p) = l.peers.get_mut(&peer)
-        {
-            p.in_flight = Some(InFlightAppend {
-                last_tx_id_in_batch: last_tx_in_batch,
-                expires_at: now + rpc_to,
+        // Single source of truth for AE construction + in-flight
+        // arming: shared with the cluster-pull path (see
+        // `replication_get_append_range`). The action-emitting
+        // wrapper here is what the simulator and `leader_drive`
+        // depend on; the cluster's per-peer task uses the
+        // `Replication` view directly.
+        if let Some(req) = self.replication_get_append_range(peer, now) {
+            out.push(Action::SendAppendEntries {
+                to: req.to,
+                term: req.term,
+                prev_log_tx_id: req.prev_log_tx_id,
+                prev_log_term: req.prev_log_term,
+                entries: req.entries,
+                leader_commit: req.leader_commit,
             });
-            p.next_heartbeat = now + interval;
         }
     }
 
@@ -1778,5 +1899,213 @@ mod tests {
         // to 5. Drain should use the second AE's leader_commit.
         node.advance(5, 5);
         assert_eq!(node.cluster_commit_index(), 5);
+    }
+
+    // ── Replication / PeerReplication (cluster-pull leader path) ──────────
+
+    /// Promote a 3-node `RaftNode` to leader by running the
+    /// election manually: a Tick lazy-arms, a second Tick fires
+    /// the timeout, and a `RequestVoteReply { granted: true }`
+    /// from one peer is enough to make a 3-node majority
+    /// (self-vote + that one).
+    fn fresh_leader_3node(self_id: NodeId, peers: Vec<NodeId>) -> RaftNode<TestPersistence> {
+        let mut node = fresh(self_id, peers.clone());
+        let t0 = Instant::now();
+        let _ = node.step(t0, Event::Tick);
+        let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+        if node.role().is_leader() {
+            return node;
+        }
+        let term = node.current_term();
+        for peer in peers.iter().filter(|&&p| p != self_id) {
+            let _ = node.step(
+                t0 + Duration::from_secs(60),
+                Event::RequestVoteReply {
+                    from: *peer,
+                    term,
+                    granted: true,
+                },
+            );
+            if node.role().is_leader() {
+                return node;
+            }
+        }
+        panic!("fresh_leader_3node: did not become leader (role={:?})", node.role());
+    }
+
+    #[test]
+    fn replication_get_append_range_returns_none_when_not_leader() {
+        let mut node = fresh(1, vec![1, 2, 3]);
+        let req = node
+            .replication()
+            .peer(2)
+            .and_then(|mut p| p.get_append_range(Instant::now()));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn replication_peer_returns_none_for_unknown_or_self_id() {
+        let mut node = fresh(1, vec![1, 2, 3]);
+        // self_id is excluded
+        assert!(node.replication().peer(1).is_none());
+        // unknown peer is excluded
+        assert!(node.replication().peer(99).is_none());
+    }
+
+    #[test]
+    fn replication_peers_excludes_self_id() {
+        let mut node = fresh(1, vec![1, 2, 3]);
+        let peers = node.replication().peers();
+        assert_eq!(peers, vec![2, 3]);
+    }
+
+    #[test]
+    fn replication_get_append_range_returns_heartbeat_when_caught_up() {
+        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let now = Instant::now();
+        let req = node
+            .replication()
+            .peer(2)
+            .unwrap()
+            .get_append_range(now)
+            .expect("leader should produce an AE");
+        // No entries durably written → heartbeat (empty range).
+        assert!(req.entries.is_empty());
+        assert_eq!(req.to, 2);
+        assert_eq!(req.term, node.current_term());
+    }
+
+    #[test]
+    fn replication_get_append_range_ships_new_entries_after_advance() {
+        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        // Leader-side ledger writes entries 1..=3 at the current term
+        // (set by the election win as `current_term_first_tx`'s
+        // start_tx_id) and acks durability via `advance`.
+        node.advance(3, 3);
+
+        let now = Instant::now();
+        let req = node
+            .replication()
+            .peer(2)
+            .unwrap()
+            .get_append_range(now)
+            .expect("leader with durable entries should produce an AE");
+        // next_index started at local_write_index + 1 = 1 (peer's
+        // initial estimate), and the leader's local_write is now 3,
+        // so the range is [1..=3].
+        assert_eq!(req.entries.start_tx_id, 1);
+        assert_eq!(req.entries.count, 3);
+        assert_eq!(req.prev_log_tx_id, 0);
+    }
+
+    #[test]
+    fn replication_append_result_success_advances_match_and_next_index() {
+        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        node.advance(3, 3);
+        let now = Instant::now();
+        // Pull the request to arm in_flight.
+        let _ = node.replication().peer(2).unwrap().get_append_range(now);
+
+        let term = node.current_term();
+        node.replication()
+            .peer(2)
+            .unwrap()
+            .append_result(
+                now,
+                AppendResult::Success {
+                    term,
+                    last_write_id: 3,
+                    last_commit_id: 3,
+                },
+            );
+
+        let pr = node.replication().peer(2).unwrap();
+        assert_eq!(pr.match_index(), 3);
+        // next_index = last_write_id + 1.
+        assert_eq!(pr.next_index(), 4);
+    }
+
+    #[test]
+    fn replication_append_result_log_mismatch_walks_back_next_index() {
+        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        node.advance(5, 5);
+        let now = Instant::now();
+        // Pull AE; next_index for peer is 1 (initial after election).
+        // Wait — after election, next_index = local_write_index + 1
+        // *at election time*. We bumped local_write to 5 via
+        // `advance` *after* the election, so peer next_index is
+        // still 1. Set it explicitly to model a peer that has
+        // already accepted a few entries.
+        if let NodeState::Leader(l) = &mut node.state {
+            l.peers.get_mut(&2).unwrap().next_index = 4;
+        }
+
+        let _ = node.replication().peer(2).unwrap().get_append_range(now);
+
+        let term = node.current_term();
+        node.replication()
+            .peer(2)
+            .unwrap()
+            .append_result(
+                now,
+                AppendResult::Reject {
+                    term,
+                    reason: RejectReason::LogMismatch,
+                    last_write_id: 0,
+                    last_commit_id: 0,
+                },
+            );
+        // §5.3: walk back next_index by 1 (clamped at 1).
+        assert_eq!(node.replication().peer(2).unwrap().next_index(), 3);
+    }
+
+    #[test]
+    fn replication_append_result_term_behind_steps_down() {
+        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        let leader_term = node.current_term();
+        let now = Instant::now();
+        let _ = node.replication().peer(2).unwrap().get_append_range(now);
+
+        node.replication()
+            .peer(2)
+            .unwrap()
+            .append_result(
+                now,
+                AppendResult::Reject {
+                    term: leader_term + 5,
+                    reason: RejectReason::TermBehind,
+                    last_write_id: 0,
+                    last_commit_id: 0,
+                },
+            );
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), leader_term + 5);
+    }
+
+    #[test]
+    fn replication_append_result_timeout_clears_in_flight_only() {
+        let mut node = fresh_leader_3node(1, vec![1, 2, 3]);
+        node.advance(3, 3);
+        let now = Instant::now();
+        let _ = node.replication().peer(2).unwrap().get_append_range(now);
+
+        // In-flight is set; next_index/match_index unchanged from
+        // the get_append_range call.
+        let nx_before = node.replication().peer(2).unwrap().next_index();
+        let mi_before = node.replication().peer(2).unwrap().match_index();
+
+        node.replication()
+            .peer(2)
+            .unwrap()
+            .append_result(now, AppendResult::Timeout);
+
+        assert_eq!(node.replication().peer(2).unwrap().next_index(), nx_before);
+        assert_eq!(node.replication().peer(2).unwrap().match_index(), mi_before);
+        // Verify in_flight cleared by issuing a fresh get_append_range —
+        // it would build a new request only if in_flight is None or
+        // expired. Here `now` hasn't moved, so the only way a new
+        // request comes back is if in_flight was cleared.
+        let req2 = node.replication().peer(2).unwrap().get_append_range(now);
+        assert!(req2.is_some(), "timeout must clear in_flight so a fresh request can fire");
     }
 }

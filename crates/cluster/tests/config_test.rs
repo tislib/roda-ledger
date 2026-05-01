@@ -2,7 +2,6 @@
 //! membership sizing.
 
 use ::proto::ledger::WaitLevel;
-use client::RetryConfig;
 use cluster::Config;
 use cluster::config::ConfigError;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};

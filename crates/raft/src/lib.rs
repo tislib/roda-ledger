@@ -51,16 +51,17 @@ pub mod log_entry;
 pub mod node;
 pub mod persistence;
 pub mod quorum;
+pub mod replication;
 pub mod role;
 pub mod timer;
 pub mod types;
-mod replication;
 
 pub use action::Action;
 pub use event::Event;
 pub use log_entry::LogEntryRange;
 pub use node::{AppendEntriesDecision, RaftConfig, RaftNode};
 pub use persistence::{Persistence, TermRecord};
+pub use replication::{AppendEntriesRequest, AppendResult, PeerReplication, Replication};
 pub use role::Role;
 pub use timer::ElectionTimerConfig;
 pub use types::{NodeId, RejectReason, Term, TxId};
