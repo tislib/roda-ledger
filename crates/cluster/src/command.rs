@@ -3,20 +3,21 @@
 //! The loop is the single owner of `RaftNode`. Every mutating interaction
 //! arrives here as a `Command`. Inbound RPCs from peers carry a
 //! `oneshot::Sender` for their reply; outbound RPC results from spawned
-//! dispatch tasks come back as `OutboundReply(Event)` with no reply
-//! channel (raft just absorbs the event).
+//! dispatch tasks come back as `AppendEntriesOutbound { peer_id, result }`
+//! and feed straight into `Replication::peer(peer_id).append_result(...)`.
 //!
 //! Adding a new RPC means adding a variant here, a match arm in the
 //! loop's `handle_command`, and a sender call site in the gRPC handler.
-//! No correlation IDs, no shared state — the `oneshot` is the
-//! request/response pairing.
+//! No correlation IDs, no shared state — the `oneshot` (or `peer_id`,
+//! for outbound replication) is the request/response pairing.
 
 use ::proto::node as proto;
+use raft::{AppendResult, NodeId};
 use tokio::sync::oneshot;
 
 /// One message into the raft loop. Variants split by reply shape:
 /// inbound RPCs need a typed reply channel, outbound RPC results just
-/// feed an `Event` back into the state machine.
+/// feed an `AppendResult` back into the state machine.
 pub enum Command {
     /// Inbound `AppendEntries` from a peer leader. The reply may be sent
     /// synchronously (heartbeat, reject) or deferred (parked until the

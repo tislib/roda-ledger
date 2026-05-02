@@ -15,6 +15,7 @@ pub mod node_handler;
 pub mod server;
 mod raft_loop;
 mod command;
+mod replication;
 
 pub use cluster_mirror::ClusterMirror;
 pub use config::Config;

@@ -46,6 +46,7 @@ use crate::log_entry::LogEntryRange;
 use crate::persistence::Persistence;
 use crate::quorum::Quorum;
 use crate::replication::{AppendEntriesRequest, AppendResult, Replication};
+use crate::request_vote::{RequestVoteReply, RequestVoteRequest};
 use crate::role::Role;
 use crate::timer::{ElectionTimer, ElectionTimerConfig};
 use crate::types::{NodeId, RejectReason, Term, TxId};
@@ -637,6 +638,108 @@ impl<P: Persistence> RaftNode<P> {
                     Some(RejectReason::RpcTimeout),
                 );
             }
+        }
+    }
+
+    // ─── request_vote (direct-method voter side) ─────────────────────────
+
+    /// Voter-side handler for an inbound `RequestVote`, mirroring the
+    /// §5.1 / §5.4.1 protocol checks of the legacy
+    /// `Event::RequestVoteRequest` path but returning the reply
+    /// directly instead of through `Action::SendRequestVoteReply`.
+    /// The legacy event/action path is unchanged — this method is an
+    /// alternative entry point for drivers that prefer a synchronous
+    /// call/return shape (cluster's gRPC handler, RPC bridges, etc.).
+    ///
+    /// Internal state mutations performed before returning:
+    ///
+    /// - On `term > current_term`: `observe_higher_term` (vote-log
+    ///   bump) and `transition_to_follower` (state reset, including
+    ///   `pending_leader_commit` and `current_term_first_tx`).
+    /// - On grant: durable `Persistence::vote(term, from)` and
+    ///   `election_timer.reset(now)` — don't start a competing
+    ///   election while we've committed to someone else's.
+    ///
+    /// Frozen-after-fatal: if the node has already emitted
+    /// `Action::FatalError`, every call returns
+    /// `RequestVoteReply { term: current_term(), granted: false }`
+    /// without touching persistence — same posture as `step()`.
+    pub fn request_vote(
+        &mut self,
+        now: Instant,
+        req: RequestVoteRequest,
+    ) -> RequestVoteReply {
+        if self.failed {
+            return RequestVoteReply {
+                term: self.current_term(),
+                granted: false,
+            };
+        }
+
+        let RequestVoteRequest {
+            from,
+            term,
+            last_tx_id,
+            last_term,
+        } = req;
+
+        let current_term = self.current_term();
+
+        if term < current_term {
+            return RequestVoteReply {
+                term: current_term,
+                granted: false,
+            };
+        }
+
+        // Higher term observed — persist the vote-log bump first,
+        // then step down. The helper `observe_higher_term` uses
+        // `local_write_index + 1` as the term-log boundary so we
+        // never shadow our own entries (using the candidate's
+        // `last_tx_id` would record the new term at a tx that
+        // already has a term assigned, breaking §5.3 prev_log_term
+        // lookups for our existing entries).
+        if term > current_term {
+            self.observe_higher_term(term);
+            self.transition_to_follower(now, None);
+        }
+
+        // §5.4.1 up-to-date check. The voter compares its own
+        // durable log extent (`local_write_index`) — not its commit
+        // watermark — to the candidate's claim. Using commit would
+        // let a candidate with strictly older on-disk state win
+        // votes from a node whose ledger had merely fallen behind
+        // its own raft-log.
+        let our_last_tx = self.local_write_index;
+        let our_last_term = self.local_last_term();
+        let candidate_up_to_date = (last_term > our_last_term)
+            || (last_term == our_last_term && last_tx_id >= our_last_tx);
+        if !candidate_up_to_date {
+            return RequestVoteReply {
+                term: self.current_term(),
+                granted: false,
+            };
+        }
+
+        // Try to grant — durable write through the trait.
+        let granted = match self.persistence.vote(term, from) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "raft: node_id={} vote durable write failed: {}",
+                    self.self_id, e
+                );
+                false
+            }
+        };
+
+        if granted {
+            self.election_timer.reset(now);
+        }
+
+        RequestVoteReply {
+            term: self.current_term(),
+            granted,
         }
     }
 

@@ -320,6 +320,24 @@ impl Handles {
     pub fn has_node_handle(&self) -> bool {
         matches!(self, Handles::Cluster(_))
     }
+
+    /// Borrow the clustered handles, or `None` for a standalone
+    /// bring-up. Symmetric with [`Self::as_standalone`].
+    pub fn as_cluster(&self) -> Option<&ClusterHandles> {
+        match self {
+            Handles::Cluster(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Borrow the standalone handles, or `None` for a clustered
+    /// bring-up. Symmetric with [`Self::as_cluster`].
+    pub fn as_standalone(&self) -> Option<&StandaloneHandles> {
+        match self {
+            Handles::Standalone(h) => Some(h),
+            _ => None,
+        }
+    }
 }
 
 // ── Standalone handles ──────────────────────────────────────────────────
