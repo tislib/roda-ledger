@@ -21,6 +21,40 @@
 // ///    channel as [`Command::AppendEntriesOutbound`], which the
 // ///    command loop routes into
 // ///    `Replication::peer(p).append_result(...)`.
+// 
+// use tokio::sync::oneshot;
+// use raft::TxId;
+// use storage::WalTailer;
+// 
+// /// Reply parked until follower-side WAL durability covers `tx_id`.
+// /// The cluster owns the gRPC `oneshot` while the ledger pipeline is
+// /// fsyncing the entries that arrived on this AppendEntries; the main
+// /// loop drains the parked reply once the ledger's commit watermark
+// /// (which collapses with the WAL durability watermark in the current
+// /// design — see ADR-0017) covers the parked `last_tx_id`.
+// struct ParkedReply {
+//     /// The oneshot the gRPC handler is awaiting.
+//     reply: oneshot::Sender<proto::AppendEntriesResponse>,
+//     /// Term to stamp into the success response.
+//     term: u64,
+//     /// `last_tx_id` to report — equals the map key.
+//     last_tx_id: TxId,
+// }
+// 
+// /// Per-peer leader-side replication state.
+// ///
+// /// Each peer gets its own `WalTailer` because the tailer cursor is
+// /// stateful per-stream — peers replicate at different `next_index`
+// /// values, so a single shared tailer would thrash.
+// struct PeerReplicator {
+//     /// gRPC URL of the peer's `Node` service. `tonic::Channel`-style
+//     /// scheme + host + port (e.g. `http://10.0.0.2:50061`).
+//     host: String,
+//     /// Bookmarked stream over the leader's WAL. Reads bytes for the
+//     /// `[from_tx_id..]` range on each replication tick that pulls a
+//     /// non-empty `AppendEntriesRequest`.
+//     tailer: WalTailer,
+// }
 // ///
 // /// Lock contention with the command loop is minimal — raft calls
 // /// are sync and brief; tailer reads happen outside the lock.
@@ -175,3 +209,19 @@
 //         }
 //     }
 // }
+
+use std::sync::Arc;
+use crate::LedgerSlot;
+
+pub struct ReplicationLoop {
+    ledger: Arc<LedgerSlot>,
+}
+
+impl ReplicationLoop {
+    pub(crate) fn new(ledger: Arc<LedgerSlot>) -> Self {
+        Self { ledger }
+    }
+    pub(super) async fn run_replication_loop(&mut self) {
+
+    }
+}

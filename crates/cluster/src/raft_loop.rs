@@ -14,67 +14,34 @@ use crate::command::Command;
 use crate::config::Config;
 use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
+use crate::replication::ReplicationLoop;
 use ::proto::node as proto;
 use ::proto::node::RequestVoteResponse;
 use ::proto::node::node_client::NodeClient;
 use raft::request_vote::RequestVoteRequest;
 use raft::{
-    Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, RaftNode,
-    RejectReason, TxId,
+    AppendEntriesDecision, Event, LogEntryRange, NodeId, RaftNode, RejectReason,
 };
 use spdlog::{error, info};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage::WalTailer;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::task::{JoinHandle, LocalSet};
-use tokio::time::error::Elapsed;
+use tokio::sync::{mpsc, oneshot};
 use tonic::transport::{Channel, Error};
 
 /// Bound on the inbound command channel. Picked to absorb a burst of
 /// in-flight RPCs without blocking gRPC handlers, while still giving
 /// backpressure under sustained overload.
-const COMMAND_CHANNEL_DEPTH: usize = 1024;
+pub(crate) const COMMAND_CHANNEL_DEPTH: usize = 1024;
 
 /// Fallback wakeup cadence when raft has no pending deadline of its own
 /// (single-node leader with no peers, no election timer). Keeps the
 /// ledger-polling loop alive so commit watermarks advance.
 const FALLBACK_WAKEUP: Duration = Duration::from_millis(50);
 
-/// Reply parked until follower-side WAL durability covers `tx_id`.
-/// The cluster owns the gRPC `oneshot` while the ledger pipeline is
-/// fsyncing the entries that arrived on this AppendEntries; the main
-/// loop drains the parked reply once the ledger's commit watermark
-/// (which collapses with the WAL durability watermark in the current
-/// design — see ADR-0017) covers the parked `last_tx_id`.
-struct ParkedReply {
-    /// The oneshot the gRPC handler is awaiting.
-    reply: oneshot::Sender<proto::AppendEntriesResponse>,
-    /// Term to stamp into the success response.
-    term: u64,
-    /// `last_tx_id` to report — equals the map key.
-    last_tx_id: TxId,
-}
-
-/// Per-peer leader-side replication state.
-///
-/// Each peer gets its own `WalTailer` because the tailer cursor is
-/// stateful per-stream — peers replicate at different `next_index`
-/// values, so a single shared tailer would thrash.
-struct PeerReplicator {
-    /// gRPC URL of the peer's `Node` service. `tonic::Channel`-style
-    /// scheme + host + port (e.g. `http://10.0.0.2:50061`).
-    host: String,
-    /// Bookmarked stream over the leader's WAL. Reads bytes for the
-    /// `[from_tx_id..]` range on each replication tick that pulls a
-    /// non-empty `AppendEntriesRequest`.
-    tailer: WalTailer,
-}
-
 pub struct RaftLoop {
-    node: RaftNode<DurablePersistence>,
-    ledger: Arc<LedgerSlot>,
+    node: Rc<RefCell<RaftNode<DurablePersistence>>>,
     mirror: Arc<ClusterMirror>,
     config: Arc<Config>,
 
@@ -83,36 +50,44 @@ pub struct RaftLoop {
     /// Most recent `Action::SetWakeup` deadline — drives the `select!`
     /// sleep arm. `None` ⇒ use `FALLBACK_WAKEUP`.
     next_wakeup: Option<Instant>,
+    pub ledger: Arc<LedgerSlot>,
 }
 
 impl RaftLoop {
-    /// Spawn the loop and return the channel handle for the gRPC
-    /// handlers to clone. The returned `JoinHandle` is owned by the
-    /// supervisor so its `Drop` can await graceful exit.
-    pub fn spawn(
+    /// Build a loop ready to be driven by [`RaftLoop::run`]. The
+    /// caller owns the inbound channel: it creates `(cmd_tx, cmd_rx)`,
+    /// hands `cmd_tx` to the gRPC handlers, and passes `cmd_rx` here.
+    /// The loop must be driven inside a `LocalSet` because it owns
+    /// `Rc<RefCell<RaftNode>>` and is `!Send`.
+    pub fn new(
         node: RaftNode<DurablePersistence>,
         ledger: Arc<LedgerSlot>,
         mirror: Arc<ClusterMirror>,
         config: Arc<Config>,
-    ) -> (mpsc::Sender<Command>, JoinHandle<()>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_DEPTH);
-
-        let raft_loop = Self {
-            node,
+        cmd_rx: mpsc::Receiver<Command>,
+    ) -> Self {
+        Self {
+            node: Rc::new(RefCell::new(node)),
             ledger,
             mirror,
             config,
             cmd_rx,
             next_wakeup: None,
-        };
-
-        let join = tokio::spawn(raft_loop.run());
-
-        (cmd_tx, join)
+        }
     }
 
-    async fn run(mut self) {
-        let self_id = self.node.self_id();
+    pub async fn run(mut self) {
+        let ledger = self.ledger.clone();
+        let command_loop_handle = self.run_command_loop();
+
+        let mut replication_loop = ReplicationLoop::new(ledger);
+
+        let replication_loop_handle = replication_loop.run_replication_loop();
+
+        tokio::join!(command_loop_handle, replication_loop_handle);
+    }
+    async fn run_command_loop(&mut self) {
+        let self_id =  self.node.borrow().self_id();
         info!("raft_loop: started (self_id={})", self_id);
 
         // Kick the election timer by issuing one initial Tick. Raft
@@ -154,7 +129,7 @@ impl RaftLoop {
             }
             Command::RequestVote { req, reply } => {
                 info!("raft_loop: RequestVote: {:?}", req);
-                let result = self.node.request_vote(
+                let result =  self.node.borrow_mut().request_vote(
                     Instant::now(),
                     RequestVoteRequest {
                         from: req.candidate_id,
@@ -185,7 +160,7 @@ impl RaftLoop {
         } else {
             LogEntryRange::new(req.from_tx_id, req.to_tx_id - req.from_tx_id + 1, req.term)
         };
-        let decision = self.node.validate_append_entries_request(
+        let decision =  self.node.borrow_mut().validate_append_entries_request(
             now,
             req.leader_id,
             req.term,
@@ -194,7 +169,7 @@ impl RaftLoop {
             entries,
             req.leader_commit_tx_id,
         );
-        self.mirror.snapshot_from(&self.node);
+        self.mirror.snapshot_from(& self.node.borrow());
 
         match decision {
             AppendEntriesDecision::Reject {
@@ -209,12 +184,12 @@ impl RaftLoop {
                     // `truncate_wal_after` — wire one up alongside
                     // the rest of the WAL-replication scaffolding.
                 }
-                let _ = reply.send(build_ae_response(&self.node, false, Some(reason)));
+                let _ = reply.send(build_ae_response(& self.node.borrow(), false, Some(reason)));
             }
             AppendEntriesDecision::Accept { append: None } => {
                 // Heartbeat: cluster_commit was already updated
                 // inline inside validate.
-                let _ = reply.send(build_ae_response(&self.node, true, None));
+                let _ = reply.send(build_ae_response(& self.node.borrow(), true, None));
             }
             AppendEntriesDecision::Accept {
                 append: Some(_range),
@@ -248,12 +223,11 @@ impl RaftLoop {
     /// would require an unbounded async-future size and won't
     /// compile.
     async fn step(&mut self, event: Event) {
-        let mut pending: std::collections::VecDeque<Event> =
-            std::collections::VecDeque::new();
+        let mut pending: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
         pending.push_back(event);
         while let Some(ev) = pending.pop_front() {
-            let actions = self.node.step(Instant::now(), ev);
-            self.mirror.snapshot_from(&self.node);
+            let actions =  self.node.borrow_mut().step(Instant::now(), ev);
+            self.mirror.snapshot_from(& self.node.borrow());
             for action in actions {
                 if let Some(follow_up) = self.dispatch_action(action).await {
                     pending.push_back(follow_up);
@@ -301,7 +275,7 @@ impl RaftLoop {
                     }
                 };
                 info!("raft_loop: SendRequestVote: {:?}", (to, term, last_tx_id));
-                let candidate_id = self.node.self_id();
+                let candidate_id =  self.node.borrow().self_id();
                 let resp = match client
                     .request_vote(proto::RequestVoteRequest {
                         term,
@@ -339,10 +313,7 @@ impl RaftLoop {
         }
     }
 
-    async fn get_node_client(
-        &self,
-        node_id: NodeId,
-    ) -> Result<NodeClient<Channel>, ConnectError> {
+    async fn get_node_client(&self, node_id: NodeId) -> Result<NodeClient<Channel>, ConnectError> {
         let timeout = Duration::from_millis(100);
         let host = self
             .config
@@ -363,7 +334,6 @@ impl RaftLoop {
         }
     }
 }
-
 
 #[derive(Debug)]
 pub enum ConnectError {

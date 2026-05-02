@@ -1,35 +1,25 @@
-//! Sync-Drop → async-await bridge for cooperative task teardown, plus
-//! a helper that pins a gRPC server onto its own OS thread + dedicated
-//! `current_thread` tokio runtime.
+//! Helpers that pin gRPC servers (and the raft loop) onto dedicated OS
+//! threads with private `current_thread` tokio runtimes.
 //!
-//! The cluster's lifecycle objects (`ClusterHandles`, `StandaloneHandles`)
-//! own task and thread handles that must be driven to completion when the
-//! object is dropped. Drop is sync but the handles are async, so for tokio
-//! tasks we park the current worker (`block_in_place`) and drive the
-//! runtime until the handles finish — bounded by a 5-second timeout to
-//! surface bugs rather than hang indefinitely.
+//! Two flavours:
 //!
-//! Single-thread (`current_thread`) runtimes can't run the cooperative
-//! drain pattern: the runtime needs the calling thread to drive the
-//! awaited tasks, but the calling thread is busy in Drop. We fall back
-//! to `abort` for tokio handles there and log a warning so the test can
-//! be migrated to `flavor = "multi_thread"`.
+//! - [`spawn_grpc_thread`] — a plain `current_thread` runtime. Used for
+//!   the client-facing Ledger gRPC server, which is fully `Send` and
+//!   has no `!Send` co-tenants.
+//! - [`spawn_local_thread`] — adds a `tokio::task::LocalSet` on top of
+//!   the runtime, so the future may `spawn_local` further `!Send`
+//!   tasks. Used for the peer-facing Node gRPC thread, which co-hosts
+//!   the raft loop (`Rc<RefCell<RaftNode>>`, hence `!Send`).
 //!
-//! gRPC servers run on **dedicated** OS threads (one per server), each
-//! with its own `current_thread` tokio runtime. That isolates the
-//! ledger-facing and peer-facing service loops from each other and from
-//! the raft loop's runtime — see [`spawn_grpc_thread`]. Joining those
-//! threads in Drop is plain `std::thread::JoinHandle::join()`; we wrap
-//! it in `block_in_place` when the host runtime is multi-threaded so
-//! the parked worker can be replaced while the join proceeds.
+//! Joining those threads in Drop is plain `std::thread::JoinHandle::join()`;
+//! [`join_grpc_threads`] wraps it in `block_in_place` when the host
+//! runtime is multi-threaded so the parked worker can be replaced while
+//! the join proceeds.
 
 use std::future::Future;
 use std::thread;
-use std::time::Duration;
 use tokio::runtime;
-use tokio::task::JoinHandle;
-
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+use tokio::task::LocalSet;
 
 /// Spawn an OS thread that hosts a private `current_thread` tokio
 /// runtime and drives `fut` to completion. The returned
@@ -53,6 +43,44 @@ where
                 .build()
                 .expect("build dedicated gRPC runtime");
             rt.block_on(fut);
+        })
+}
+
+/// Variant of [`spawn_grpc_thread`] that hosts a `tokio::task::LocalSet`
+/// on the dedicated thread, so the future (and any tasks it
+/// `spawn_local`s) can hold `!Send` state — `Rc<RefCell<…>>`,
+/// `LocalSet`-only typestate, etc.
+///
+/// The future itself is built **inside** the new thread by the
+/// caller-supplied closure, so neither it nor its captures need to be
+/// `Send`. The closure is the only thing that crosses the thread
+/// boundary, and only it must satisfy `Send + 'static`.
+///
+/// Used for the node-grpc thread, which co-hosts the peer-facing gRPC
+/// server and the raft loop. The raft loop owns
+/// `Rc<RefCell<RaftNode<…>>>` and is `!Send`; running it on this same
+/// LocalSet keeps the raft state machine and the inbound gRPC handlers
+/// on the same OS thread without needing any cross-runtime channel
+/// hops between them.
+pub(crate) fn spawn_local_thread<F, Fut>(
+    name: &str,
+    build: F,
+) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let owned_name = name.to_string();
+    thread::Builder::new()
+        .name(owned_name.clone())
+        .spawn(move || {
+            let rt = runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name(&owned_name)
+                .build()
+                .expect("build dedicated thread runtime");
+            let local = LocalSet::new();
+            rt.block_on(local.run_until(build()));
         })
 }
 
@@ -99,60 +127,5 @@ pub(crate) fn join_grpc_threads(
             label
         );
         join_all();
-    }
-}
-
-/// Drain tokio task handles cooperatively in Drop. Used for the raft
-/// loop's `JoinHandle` — the gRPC servers no longer produce these (see
-/// [`spawn_grpc_thread`] / [`join_grpc_threads`]).
-pub(crate) fn drain_in_drop(
-    label: &'static str,
-    handles: impl IntoIterator<Item = Option<JoinHandle<()>>>,
-) {
-    let owned: Vec<JoinHandle<()>> = handles.into_iter().flatten().collect();
-    if owned.is_empty() {
-        return;
-    }
-
-    let runtime = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => {
-            for h in owned {
-                h.abort();
-            }
-            return;
-        }
-    };
-
-    if runtime.metrics().num_workers() <= 1 {
-        spdlog::warn!(
-            "{}: Drop on current_thread runtime — falling back to abort \
-             (test should use #[tokio::test(flavor = \"multi_thread\")])",
-            label
-        );
-        for h in owned {
-            h.abort();
-        }
-        return;
-    }
-
-    let timed_out = tokio::task::block_in_place(|| {
-        runtime.block_on(async {
-            tokio::time::timeout(DRAIN_TIMEOUT, async {
-                for h in owned {
-                    let _ = h.await;
-                }
-            })
-            .await
-            .is_err()
-        })
-    });
-
-    if timed_out {
-        spdlog::warn!(
-            "{}: cooperative drain exceeded {:?}; remaining tasks aborted by runtime",
-            label,
-            DRAIN_TIMEOUT
-        );
     }
 }
