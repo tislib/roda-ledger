@@ -11,7 +11,7 @@ use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
     Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, Persistence,
-    RaftConfig, RaftNode, RejectReason, Role,
+    RaftConfig, RaftNode, RejectReason, RequestVoteRequest, Role,
 };
 
 fn pick_leader(sim: &Sim) -> Option<NodeId> {
@@ -156,9 +156,9 @@ fn higher_term_request_vote_during_candidacy_forces_step_down() {
     let _ = node.step(now, Event::Tick);
     assert_eq!(node.role(), Role::Candidate);
 
-    let _ = node.step(
+    let _ = node.request_vote(
         now,
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 99,
             last_tx_id: 0,
@@ -388,9 +388,9 @@ fn empty_append_entries_is_a_heartbeat() {
 fn append_entries_from_old_leader_is_rejected() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     // Force the node up to term 5 via observing a higher term.
-    let _ = node.step(
+    let _ = node.request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 5,
             last_tx_id: 0,
@@ -504,20 +504,16 @@ fn vote_denied_when_candidate_last_term_below_ours() {
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     node.advance(3, 3);
 
-    let actions = node.step(
+    let reply = node.request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 6,
             last_tx_id: 10, // higher than ours
             last_term: 2,   // but older term — must deny
         },
     );
-    let granted = actions.iter().any(|a| matches!(
-        a,
-        Action::SendRequestVoteReply { granted: true, .. }
-    ));
-    assert!(!granted, "must deny when last_term < ours: {:?}", actions);
+    assert!(!reply.granted, "must deny when last_term < ours: {:?}", reply);
 }
 
 #[test]
@@ -536,20 +532,20 @@ fn vote_denied_when_same_last_term_but_lower_last_tx_id() {
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     node.advance(10, 10);
 
-    let actions = node.step(
+    let reply = node.request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 6,
             last_tx_id: 7, // strictly less than ours
             last_term: 5,  // same as ours
         },
     );
-    let granted = actions.iter().any(|a| matches!(
-        a,
-        Action::SendRequestVoteReply { granted: true, .. }
-    ));
-    assert!(!granted, "must deny on equal term + lower tx_id: {:?}", actions);
+    assert!(
+        !reply.granted,
+        "must deny on equal term + lower tx_id: {:?}",
+        reply
+    );
 }
 
 #[test]
@@ -568,20 +564,20 @@ fn vote_granted_when_candidate_last_term_above_ours() {
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     node.advance(10, 10);
 
-    let actions = node.step(
+    let reply = node.request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 6,
             last_tx_id: 2,
             last_term: 7, // strictly above ours — grant
         },
     );
-    let granted = actions.iter().any(|a| matches!(
-        a,
-        Action::SendRequestVoteReply { granted: true, .. }
-    ));
-    assert!(granted, "must grant on strictly later last_term: {:?}", actions);
+    assert!(
+        reply.granted,
+        "must grant on strictly later last_term: {:?}",
+        reply
+    );
 }
 
 // ── Idempotent re-vote in the same term (audit gap) ────────────────────
@@ -596,25 +592,22 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
     let now = Instant::now();
 
     // First RV from candidate 2 at term 3 — granted.
-    let first = node.step(
+    let first = node.request_vote(
         now,
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 3,
             last_tx_id: 0,
             last_term: 0,
         },
     );
-    assert!(first.iter().any(|a| matches!(
-        a,
-        Action::SendRequestVoteReply { granted: true, .. }
-    )));
+    assert!(first.granted);
 
     // A second RV from the same candidate at the same term — must
     // be granted again (idempotent on duplicate inbound RPCs).
-    let second = node.step(
+    let second = node.request_vote(
         now,
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 3,
             last_tx_id: 0,
@@ -622,18 +615,15 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
         },
     );
     assert!(
-        second.iter().any(|a| matches!(
-            a,
-            Action::SendRequestVoteReply { granted: true, .. }
-        )),
+        second.granted,
         "duplicate RV from same candidate must re-grant: {:?}",
         second
     );
 
     // A different candidate at the same term — refused.
-    let third = node.step(
+    let third = node.request_vote(
         now,
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 3,
             term: 3,
             last_tx_id: 0,
@@ -641,10 +631,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
         },
     );
     assert!(
-        third.iter().any(|a| matches!(
-            a,
-            Action::SendRequestVoteReply { granted: false, .. }
-        )),
+        !third.granted,
         "different candidate same term must be refused: {:?}",
         third
     );

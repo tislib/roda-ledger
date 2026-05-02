@@ -5,8 +5,8 @@
 //! of its own. Driver-facing entry points:
 //!
 //! - [`RaftNode::step`] — election-side events (`Tick`,
-//!   `RequestVoteRequest`, `RequestVoteReply`). Returns the
-//!   [`Action`]s the driver must execute.
+//!   `RequestVoteReply`). Returns the [`Action`]s the driver must
+//!   execute.
 //! - [`RaftNode::validate_append_entries_request`] — follower-side
 //!   inbound `AppendEntries`. Returns an [`AppendEntriesDecision`]
 //!   describing what the cluster driver must do with its WAL.

@@ -27,7 +27,10 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{Action, AppendEntriesDecision, Event, LogEntryRange, RaftConfig, RaftNode, TermRecord};
+use raft::{
+    Action, AppendEntriesDecision, Event, LogEntryRange, RaftConfig, RaftNode, RequestVoteRequest,
+    TermRecord,
+};
 
 fn make_follower(persistence: MemPersistence) -> RaftNode<MemPersistence> {
     RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42)
@@ -414,9 +417,9 @@ fn observe_vote_term_failure_is_recoverable_via_next_vote() {
     let now = Instant::now();
 
     // RV at higher term — observe_vote_term fails inside the handler.
-    let actions = node.step(
+    let reply = node.request_vote(
         now,
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 5,
             last_tx_id: 0,
@@ -424,26 +427,17 @@ fn observe_vote_term_failure_is_recoverable_via_next_vote() {
         },
     );
 
-    // Must not have frozen the node.
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FatalError { .. })),
-        "observe_vote_term failure must not be fatal: {:?}",
-        actions
-    );
     // The vote() call inside the handler still bumps vote_term (its
     // own write does not depend on observe_vote_term having
-    // succeeded), so the reply carries the new term.
-    let granted_at_5 = actions.iter().any(|a| matches!(
-        a,
-        Action::SendRequestVoteReply {
-            term: 5,
-            granted: true,
-            ..
-        }
-    ));
-    assert!(granted_at_5, "vote should still grant at the new term: {:?}", actions);
+    // succeeded), so the reply carries the new term — and the node
+    // is not frozen (`request_vote` never returns "fatal"; the trait
+    // failure is logged + recovered, not promoted).
+    assert_eq!(
+        (reply.term, reply.granted),
+        (5, true),
+        "vote should still grant at the new term: {:?}",
+        reply
+    );
     assert_eq!(node.current_term(), 5);
     assert_eq!(node.voted_for(), Some(2));
 }

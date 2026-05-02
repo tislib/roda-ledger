@@ -11,31 +11,28 @@
 //! `Event::*Persisted` ack. When a trait write returns `Ok(_)`, the
 //! library treats the change as durable and proceeds.
 //!
-//! `AppendEntries` does **not** flow through this enum:
+//! Inbound RPCs do **not** flow through this enum:
 //!
-//! - Follower path: the cluster driver calls
+//! - Follower-side `AppendEntries`: the cluster driver calls
 //!   `RaftNode::validate_append_entries_request` and performs the
 //!   WAL I/O / `advance(write, commit)` itself.
-//! - Leader path: the cluster driver feeds replies into
-//!   `RaftNode::replication().peer(id).append_result(now, result)`.
+//! - Leader-side `AppendEntries` reply: the cluster driver feeds it
+//!   into `RaftNode::replication().peer(id).append_result(now, result)`.
+//! - Voter-side `RequestVote`: the cluster driver calls
+//!   `RaftNode::request_vote` and gets a `RequestVoteReply`
+//!   synchronously.
 //!
-//! Both AE-related paths are direct methods, not events.
+//! All three are direct methods. Only `Tick` and the candidate's
+//! own `RequestVoteReply` (the side waiting for the synchronous
+//! voter response to come back over the wire) flow through `step`.
 
-use crate::types::{NodeId, Term, TxId};
+use crate::types::{NodeId, Term};
 
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Wake up and re-check timers. The driver fires `Tick` when an
     /// `Action::SetWakeup` deadline arrives.
     Tick,
-
-    /// Inbound `RequestVote` from a candidate.
-    RequestVoteRequest {
-        from: NodeId,
-        term: Term,
-        last_tx_id: TxId,
-        last_term: Term,
-    },
 
     /// Reply to a `RequestVote` we sent.
     RequestVoteReply {

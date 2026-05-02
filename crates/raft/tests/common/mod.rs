@@ -39,12 +39,11 @@ use raft::{
     RaftConfig, RaftNode, RejectReason, Role, Term, TxId,
 };
 
-/// Per-target delivery in the simulator queue. AE arrivals call the
-/// `validate_append_entries_request` direct method (with the cluster
-/// driver's responsibilities — WAL apply, `advance`, reply
-/// synthesis — performed by `Sim::deliver_append_entries`); AE replies
-/// route through the `Replication::append_result` direct method on the
-/// leader; every other input runs through `node.step(now, event)`.
+/// Per-target delivery in the simulator queue. Inbound AppendEntries,
+/// AE replies, and RequestVote requests all route through their
+/// respective `RaftNode` direct methods — the simulator plays the
+/// cluster driver. Everything else (Tick wakeups, RequestVote replies)
+/// runs through `node.step(now, event)`.
 #[derive(Clone, Debug)]
 enum Delivery {
     Step(Event),
@@ -63,6 +62,17 @@ enum Delivery {
     AppendEntriesReply {
         from: NodeId,
         result: AppendResult,
+    },
+    /// Inbound `RequestVote` from candidate `from`. The voter
+    /// (this scheduled item's `target`) calls
+    /// `node.request_vote(now, RequestVoteRequest { ... })` and ships
+    /// the synchronously-returned reply back to `from` as
+    /// `Event::RequestVoteReply`.
+    RequestVote {
+        from: NodeId,
+        term: Term,
+        last_tx_id: TxId,
+        last_term: Term,
     },
 }
 
@@ -541,6 +551,60 @@ impl Sim {
                 self.drive_replication(s.target, now);
                 self.observe_cluster_commit(s.target);
             }
+            // Voter-side: drive `RaftNode::request_vote` directly,
+            // synthesise the reply event, ship it back to the
+            // candidate (subject to the drop / duplicate model), and
+            // follow with `step(Tick)` to flush any wakeup re-arming
+            // (the voter resets its election timer on grant).
+            Delivery::RequestVote {
+                from,
+                term,
+                last_tx_id,
+                last_term,
+            } => {
+                let reply = match self
+                    .nodes
+                    .get_mut(&s.target)
+                    .and_then(|b| b.node.as_mut())
+                {
+                    Some(n) => n.request_vote(
+                        now,
+                        raft::RequestVoteRequest {
+                            from,
+                            term,
+                            last_tx_id,
+                            last_term,
+                        },
+                    ),
+                    None => return,
+                };
+                let tick_actions = match self
+                    .nodes
+                    .get_mut(&s.target)
+                    .and_then(|b| b.node.as_mut())
+                {
+                    Some(n) => n.step(now, Event::Tick),
+                    None => return,
+                };
+                self.process_actions(s.target, now, tick_actions);
+
+                // Schedule the synthesised reply back to the
+                // candidate, subject to the drop / duplicate model.
+                if self.is_dropped(s.target, from) || self.rolled_drop() {
+                    return;
+                }
+                let when = now + self.network_delay;
+                let event = Event::RequestVoteReply {
+                    from: s.target,
+                    term: reply.term,
+                    granted: reply.granted,
+                };
+                let dup = self.rolled_duplicate();
+                self.schedule_event(when, from, event.clone());
+                if dup {
+                    self.schedule_event(when, from, event);
+                }
+            }
             Delivery::Step(event) => {
                 let actions = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
                 {
@@ -782,32 +846,16 @@ impl Sim {
                         continue;
                     }
                     let when = now + self.network_delay;
-                    let event = Event::RequestVoteRequest {
+                    let delivery = Delivery::RequestVote {
                         from: src,
                         term,
                         last_tx_id,
                         last_term,
                     };
                     let dup = self.rolled_duplicate();
-                    self.schedule_event(when, to, event.clone());
+                    self.schedule(when, to, delivery.clone());
                     if dup {
-                        self.schedule_event(when, to, event);
-                    }
-                }
-                Action::SendRequestVoteReply { to, term, granted } => {
-                    if self.is_dropped(src, to) || self.rolled_drop() {
-                        continue;
-                    }
-                    let when = now + self.network_delay;
-                    let event = Event::RequestVoteReply {
-                        from: src,
-                        term,
-                        granted,
-                    };
-                    let dup = self.rolled_duplicate();
-                    self.schedule_event(when, to, event.clone());
-                    if dup {
-                        self.schedule_event(when, to, event);
+                        self.schedule(when, to, delivery);
                     }
                 }
                 Action::BecomeRole { role, term } => {

@@ -642,13 +642,10 @@ impl<P: Persistence> RaftNode<P> {
 
     // ─── request_vote (direct-method voter side) ─────────────────────────
 
-    /// Voter-side handler for an inbound `RequestVote`, mirroring the
-    /// §5.1 / §5.4.1 protocol checks of the legacy
-    /// `Event::RequestVoteRequest` path but returning the reply
-    /// directly instead of through `Action::SendRequestVoteReply`.
-    /// The legacy event/action path is unchanged — this method is an
-    /// alternative entry point for drivers that prefer a synchronous
-    /// call/return shape (cluster's gRPC handler, RPC bridges, etc.).
+    /// Voter-side handler for an inbound `RequestVote`. Runs the
+    /// §5.1 / §5.4.1 protocol checks and returns a
+    /// [`RequestVoteReply`] synchronously — there is no action-stream
+    /// equivalent; this is the only voter-side entry-point.
     ///
     /// Internal state mutations performed before returning:
     ///
@@ -757,12 +754,6 @@ impl<P: Persistence> RaftNode<P> {
         let mut out = Vec::new();
         match event {
             Event::Tick => self.on_tick(now, &mut out),
-            Event::RequestVoteRequest {
-                from,
-                term,
-                last_tx_id,
-                last_term,
-            } => self.on_request_vote_request(now, from, term, last_tx_id, last_term, &mut out),
             Event::RequestVoteReply {
                 from,
                 term,
@@ -869,81 +860,6 @@ impl<P: Persistence> RaftNode<P> {
         out.push(Action::BecomeRole {
             role: Role::Candidate,
             term: new_term,
-        });
-    }
-
-    fn on_request_vote_request(
-        &mut self,
-        now: Instant,
-        from: NodeId,
-        term: Term,
-        last_tx_id: TxId,
-        last_term: Term,
-        out: &mut Vec<Action>,
-    ) {
-        let current_term = self.current_term();
-
-        if term < current_term {
-            out.push(Action::SendRequestVoteReply {
-                to: from,
-                term: current_term,
-                granted: false,
-            });
-            return;
-        }
-
-        // Higher term observed — persist FIRST, then step down. The
-        // helper `observe_higher_term` uses `local_write_index + 1` as
-        // the term-log boundary so we never shadow our own entries
-        // (using the candidate's `last_tx_id` would record the new
-        // term at a tx that already has a term assigned, breaking
-        // §5.3 prev_log_term lookups for our existing entries).
-        if term > current_term {
-            self.observe_higher_term(term);
-            self.transition_to_follower(now, None);
-        }
-
-        // §5.4.1 up-to-date check. The voter compares its own durable
-        // log extent (`local_write_index`) — not its commit watermark —
-        // to the candidate's claim. Using commit would let a candidate
-        // with strictly older on-disk state win votes from a node whose
-        // ledger had merely fallen behind its own raft-log.
-        let our_last_tx = self.local_write_index;
-        let our_last_term = self.local_last_term();
-        let candidate_up_to_date = (last_term > our_last_term)
-            || (last_term == our_last_term && last_tx_id >= our_last_tx);
-        if !candidate_up_to_date {
-            out.push(Action::SendRequestVoteReply {
-                to: from,
-                term: self.current_term(),
-                granted: false,
-            });
-            return;
-        }
-
-        // Try to grant — durable write through the trait.
-        let granted = match self.persistence.vote(term, from) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(
-                    "raft: node_id={} vote durable write failed: {}",
-                    self.self_id, e
-                );
-                false
-            }
-        };
-
-        if granted {
-            // Reset election timer on successful vote grant — don't
-            // start a competing election while we've committed to
-            // someone else's.
-            self.election_timer.reset(now);
-        }
-
-        out.push(Action::SendRequestVoteReply {
-            to: from,
-            term: self.current_term(),
-            granted,
         });
     }
 
@@ -1612,9 +1528,9 @@ mod tests {
     #[test]
     fn request_vote_with_higher_term_grants_and_steps_down() {
         let mut node = fresh(1, vec![1, 2, 3]);
-        let actions = node.step(
+        let reply = node.request_vote(
             Instant::now(),
-            Event::RequestVoteRequest {
+            RequestVoteRequest {
                 from: 2,
                 term: 5,
                 last_tx_id: 0,
@@ -1623,10 +1539,7 @@ mod tests {
         );
         assert_eq!(node.current_term(), 5);
         assert_eq!(node.voted_for(), Some(2));
-        let granted = actions
-            .iter()
-            .any(|a| matches!(a, Action::SendRequestVoteReply { granted: true, .. }));
-        assert!(granted);
+        assert!(reply.granted);
     }
 
     #[test]
@@ -1718,9 +1631,9 @@ mod tests {
         let mut node = fresh(1, vec![1, 2, 3]);
         // Bump the node into term 5 by routing an inbound vote at that
         // term (cheapest way to advance current_term in unit tests).
-        let _ = node.step(
+        let _ = node.request_vote(
             Instant::now(),
-            Event::RequestVoteRequest {
+            RequestVoteRequest {
                 from: 2,
                 term: 5,
                 last_tx_id: 0,

@@ -29,11 +29,11 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{Event, NodeId, Persistence, RaftConfig, RaftNode, Role, TermRecord};
+use raft::{Event, NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role, TermRecord};
 
 /// Build a candidate at term `T` with `local_log_index = 0` and
 /// `term_log = []`. The candidate will then observe a higher term
-/// `T+K` from an inbound RequestVoteRequest, leaving the vote log at
+/// `T+K` from an inbound `RequestVote`, leaving the vote log at
 /// `T+K` and the term log empty. When it later wins term `T+K+1`
 /// (after the spuriously-higher candidate fails or steps down), we
 /// inspect the resulting term log.
@@ -79,12 +79,12 @@ fn term_log_has_no_phantom_record_after_vote_log_race() {
     let (t_election, candidate_term) = drive_to_candidate(&mut node);
 
     // Candidate is now at vote_term = candidate_term, term_log = [].
-    // An inbound RequestVoteRequest at a much higher term should
-    // bump vote_log only, not term_log.
+    // An inbound RequestVote at a much higher term should bump
+    // vote_log only, not term_log.
     let bump_to = candidate_term + 4;
-    let _ = node.step(
+    let _ = node.request_vote(
         t_election + Duration::from_millis(1),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: bump_to,
             last_tx_id: 0,
@@ -165,9 +165,9 @@ fn no_synthetic_term_records_for_unobserved_terms() {
     let mut t = t_election;
     for k in 1..=5 {
         t += Duration::from_millis(1);
-        let _ = node.step(
+        let _ = node.request_vote(
             t,
-            Event::RequestVoteRequest {
+            RequestVoteRequest {
                 from: 2,
                 term: candidate_term + k,
                 last_tx_id: 0,
@@ -233,9 +233,9 @@ fn term_log_records_have_unique_start_tx_id() {
 
     // Two-step skew is enough to force the catch-up.
     let mut t = t_election + Duration::from_millis(1);
-    let _ = node.step(
+    let _ = node.request_vote(
         t,
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: candidate_term + 2,
             last_tx_id: 0,
@@ -324,9 +324,9 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     let cand_term = node.current_term();
 
     // Race the vote log forward.
-    let _ = node.step(
+    let _ = node.request_vote(
         t0 + Duration::from_secs(181),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: cand_term + 3,
             last_tx_id: 3,

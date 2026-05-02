@@ -13,7 +13,7 @@ use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
     Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, RaftConfig,
-    RaftNode, RejectReason, Role, TxId,
+    RaftNode, RejectReason, RequestVoteRequest, Role, TxId,
 };
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
@@ -629,22 +629,18 @@ fn vote_denial_uses_write_index_not_commit_index() {
     // Five entries durably written, only three locally committed.
     node.advance(5, 3);
 
-    let actions = node.step(
+    let reply = node.request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term: 6,
             last_tx_id: 4, // strictly less than our write extent
             last_term: 5,  // same term as ours
         },
     );
-    let granted = actions.iter().any(|a| matches!(
-        a,
-        Action::SendRequestVoteReply { granted: true, .. }
-    ));
     assert!(
-        !granted,
+        !reply.granted,
         "vote must use write_index (5), not commit_index (3): {:?}",
-        actions
+        reply
     );
 }

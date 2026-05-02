@@ -22,6 +22,11 @@
 //! [`crate::replication::PeerReplication::get_append_range`] for the
 //! direct-method pull path. The cluster owns the per-peer loop;
 //! raft owns the per-peer state and decides what to ship.
+//!
+//! Voter-side RequestVote handling is also direct-method (see
+//! `RaftNode::request_vote`); the only `Action` involved is the
+//! candidate's outbound [`Action::SendRequestVote`] — the wire reply
+//! comes back through `Event::RequestVoteReply`.
 
 use std::time::Instant;
 
@@ -31,16 +36,17 @@ use crate::types::{NodeId, Term, TxId};
 #[derive(Clone, Debug)]
 pub enum Action {
     // ── outbound RPCs ───────────────────────────────────────────────────
+    /// Outbound `RequestVote` from a candidate. The driver sends it
+    /// over the wire to `to`, awaits the reply, and feeds the result
+    /// back as `Event::RequestVoteReply`. The voter side is direct-
+    /// method (`RaftNode::request_vote`), so there is no
+    /// `SendRequestVoteReply` action — the driver builds the wire
+    /// reply from the synchronous return value.
     SendRequestVote {
         to: NodeId,
         term: Term,
         last_tx_id: TxId,
         last_term: Term,
-    },
-    SendRequestVoteReply {
-        to: NodeId,
-        term: Term,
-        granted: bool,
     },
 
     // ── role observability ──────────────────────────────────────────────

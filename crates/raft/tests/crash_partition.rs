@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Event, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, Role};
+use raft::{
+    Event, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role,
+};
 
 fn await_leader_in(sim: &mut Sim, ids: &[NodeId]) -> NodeId {
     let deadline = sim.clock() + Duration::from_secs(5);
@@ -124,19 +126,19 @@ fn restart_preserves_one_vote_per_term_rule() {
 
     // Restart in a 3-node cluster shape so RV semantics make sense.
     let mut node = RaftNode::new(1, vec![1, 2, 3], p, RaftConfig::default(), 42);
-    let actions = node.step(
+    let reply = node.request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term,
             last_tx_id: 0,
             last_term: 0,
         },
     );
-    let granted = actions
-        .iter()
-        .any(|a| matches!(a, raft::Action::SendRequestVoteReply { granted: true, .. }));
-    assert!(!granted, "vote granted in same term to a different node");
+    assert!(
+        !reply.granted,
+        "vote granted in same term to a different node"
+    );
 }
 
 // ── Network partitions ──────────────────────────────────────────────────────
