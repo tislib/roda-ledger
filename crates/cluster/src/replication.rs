@@ -1,227 +1,282 @@
-// /// Replication loop — runs as its own `tokio::spawn`'d task,
-// /// alongside the command loop. Owns the per-peer
-// /// [`PeerReplicator`] map (one [`WalTailer`] per peer, since cursors
-// /// are stateful and each peer's `next_index` lives at a different
-// /// point in the WAL).
-// ///
-// /// On every tick (`replication_tick_interval`, taken from
-// /// `config.cluster.replication_poll_ms`) the loop:
-// ///
-// /// 1. Locks the shared [`RaftNode`] briefly to enumerate peers.
-// /// 2. For each peer, locks again briefly to call
-// ///    [`Replication::peer(p).get_append_range(now)`]
-// ///    (`raft::PeerReplication::get_append_range`). The gate inside
-// ///    raft returns `None` for peers with no pending update
-// ///    (heartbeat deadline not elapsed, RPC in-flight, or this node
-// ///    isn't the leader) — those peers are skipped.
-// /// 3. For peers that do have an update, the loop reads the WAL byte
-// ///    range from that peer's [`WalTailer`], builds the proto
-// ///    request, and spawns an outbound gRPC task.
-// /// 4. The task's reply (or timeout) feeds back through the command
-// ///    channel as [`Command::AppendEntriesOutbound`], which the
-// ///    command loop routes into
-// ///    `Replication::peer(p).append_result(...)`.
-// 
-// use tokio::sync::oneshot;
-// use raft::TxId;
-// use storage::WalTailer;
-// 
-// /// Reply parked until follower-side WAL durability covers `tx_id`.
-// /// The cluster owns the gRPC `oneshot` while the ledger pipeline is
-// /// fsyncing the entries that arrived on this AppendEntries; the main
-// /// loop drains the parked reply once the ledger's commit watermark
-// /// (which collapses with the WAL durability watermark in the current
-// /// design — see ADR-0017) covers the parked `last_tx_id`.
-// struct ParkedReply {
-//     /// The oneshot the gRPC handler is awaiting.
-//     reply: oneshot::Sender<proto::AppendEntriesResponse>,
-//     /// Term to stamp into the success response.
-//     term: u64,
-//     /// `last_tx_id` to report — equals the map key.
-//     last_tx_id: TxId,
-// }
-// 
-// /// Per-peer leader-side replication state.
-// ///
-// /// Each peer gets its own `WalTailer` because the tailer cursor is
-// /// stateful per-stream — peers replicate at different `next_index`
-// /// values, so a single shared tailer would thrash.
-// struct PeerReplicator {
-//     /// gRPC URL of the peer's `Node` service. `tonic::Channel`-style
-//     /// scheme + host + port (e.g. `http://10.0.0.2:50061`).
-//     host: String,
-//     /// Bookmarked stream over the leader's WAL. Reads bytes for the
-//     /// `[from_tx_id..]` range on each replication tick that pulls a
-//     /// non-empty `AppendEntriesRequest`.
-//     tailer: WalTailer,
-// }
-// ///
-// /// Lock contention with the command loop is minimal — raft calls
-// /// are sync and brief; tailer reads happen outside the lock.
-// async fn replication_loop(
-//     node: Arc<SharedNode>,
-//     cmd_tx: mpsc::Sender<Command>,
-//     mut peer_replicators: BTreeMap<NodeId, PeerReplicator>,
-//     self_id: NodeId,
-//     tick_interval: Duration,
-//     rpc_timeout: Duration,
-//     append_entries_max_bytes: usize,
-// ) {
-//     info!(
-//         "replication_loop: started (self_id={}, peers={}, tick={:?})",
-//         self_id,
-//         peer_replicators.len(),
-//         tick_interval
-//     );
-//     let mut tick = tokio::time::interval(tick_interval);
-//     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-// 
-//     loop {
-//         info!("replication_loop: tick wait");
-//         tick.tick().await;
-//         info!("replication_loop: tick");
-//         let now = Instant::now();
-// 
-//         // Phase 1: enumerate peers (briefly locks the node).
-//         let peers: Vec<NodeId> = {
-//             let mut n = node.lock().await;
-//             if !n.role().is_leader() {
-//                 // Not currently a leader — nothing to replicate.
-//                 // Keep ticking; the next role transition surfaces
-//                 // through `is_leader()` without any explicit
-//                 // notification.
-//                 info!("replication_loop: not leader; skipping");
-//                 return;
-//             }
-//             info!("replication_loop: leader; replicating to {} peers", n.replication().peers().len());
-//             n.replication().peers()
-//         };
-//         info!("replication_loop: peers: {:?}", peers);
-// 
-//         // Phase 2: for each peer, pull the next request and ship it.
-//         for peer_id in peers {
-//             // Pull the request (briefly locks the node). `None` is
-//             // the user-visible "skip nodes with no update" path —
-//             // the gate lives inside raft's `get_append_range`.
-//             let request = {
-//                 let mut n = node.lock().await;
-//                 match n.replication().peer(peer_id) {
-//                     Some(mut p) => p.get_append_range(now),
-//                     None => continue,
-//                 }
-//             };
-//             let Some(request) = request else { continue };
-// 
-//             // Read the WAL byte range. Heartbeats
-//             // (`entries.is_empty()`) ship no bytes.
-//             let mut wal_bytes: Vec<u8> = Vec::new();
-//             let to_tx_id = if request.entries.is_empty() {
-//                 // Empty range: from > to is the proto convention.
-//                 request.entries.start_tx_id.saturating_sub(1)
-//             } else {
-//                 let from_tx_id = request.entries.start_tx_id;
-//                 let last_tx_id = request
-//                     .entries
-//                     .last_tx_id()
-//                     .expect("non-empty range has a last_tx_id");
-//                 let mut buffer = vec![0u8; append_entries_max_bytes];
-//                 let written = match peer_replicators.get_mut(&peer_id) {
-//                     Some(r) => r.tailer.tail(from_tx_id, &mut buffer) as usize,
-//                     None => {
-//                         spdlog::warn!(
-//                             "replication_loop: peer {} has no replicator entry; skipping",
-//                             peer_id
-//                         );
-//                         continue;
-//                     }
-//                 };
-//                 buffer.truncate(written);
-//                 wal_bytes = buffer;
-//                 last_tx_id
-//             };
-// 
-//             let proto_req = proto::AppendEntriesRequest {
-//                 leader_id: self_id,
-//                 term: request.term,
-//                 prev_tx_id: request.prev_log_tx_id,
-//                 prev_term: request.prev_log_term,
-//                 from_tx_id: request.entries.start_tx_id,
-//                 to_tx_id,
-//                 wal_bytes,
-//                 leader_commit_tx_id: request.leader_commit,
-//             };
-// 
-//             // Spawn the outbound RPC. Posts the result back through
-//             // the command channel so raft state mutations happen on
-//             // the command loop side (single-writer over `RaftNode`'s
-//             // mutating APIs from the command-loop task; the
-//             // replication loop only ever holds the lock for the
-//             // brief read-and-arm via `get_append_range`).
-//             let host = match peer_replicators.get(&peer_id) {
-//                 Some(r) => r.host.clone(),
-//                 None => continue,
-//             };
-//             let cmd_tx = cmd_tx.clone();
-//             tokio::spawn(async move {
-//                 let result = send_append_entries_rpc(host, proto_req, rpc_timeout).await;
-//                 let _ = cmd_tx
-//                     .send(Command::AppendEntriesOutbound { peer_id, result })
-//                     .await;
-//             });
-//         }
-//     }
-// }
+//! Role-gated leader-side replication.
+//!
+//! Architecture:
+//!
+//! - [`ReplicationGate`] is the watcher. It wraps a
+//!   [`tokio::sync::watch::Sender<bool>`]; the command loop owns it
+//!   and toggles it from the `Action::BecomeRole` dispatch arm. `true`
+//!   means "play" (this node is leader); `false` means "pause".
+//! - [`ReplicationLoop::run`] spawns one [`peer_replication_loop`]
+//!   task per peer at startup and awaits all of them. Each task owns
+//!   its own [`WalTailer`] (cursors are stateful per-peer), an
+//!   [`Rc<RefCell<RaftNode>>`] clone, and a `watch::Receiver<bool>`
+//!   clone.
+//! - While the gate is `true`, each peer task ticks at
+//!   `cluster.replication_poll_ms`: it pulls the next `AppendEntries`
+//!   via [`raft::PeerReplication::get_append_range`], reads WAL bytes
+//!   from its tailer, sends the gRPC, and feeds the
+//!   [`raft::AppendResult`] back via
+//!   [`raft::PeerReplication::append_result`] directly. No
+//!   [`crate::Command`] variant is involved — the per-peer task talks
+//!   to raft via the shared `RefCell` on the same `LocalSet`.
+//! - Lifecycle: when the command loop exits, it drops the
+//!   [`ReplicationGate`] (and with it the underlying `watch::Sender`).
+//!   Every peer task's `gate_rx.changed().await` returns `Err`; each
+//!   task returns; [`ReplicationLoop::run`] joins the handles so
+//!   in-flight gRPCs complete before the `LocalSet` tears down. There
+//!   is no explicit `shutdown()` method.
 
-// use std::time::Duration;
-// use proto::node::node_client::NodeClient;
-// use raft::AppendResult;
-// 
-// /// Outbound `AppendEntries` over gRPC. Connects to `host`, sends the
-// /// proto request with `timeout`, and translates the response into the
-// /// raft `AppendResult` shape. Connection errors and tonic timeouts
-// /// both map to [`AppendResult::Timeout`] — the leader treats them as
-// /// "no information; clear in-flight, leave indexes alone".
-// async fn send_append_entries_rpc(
-//     host: String,
-//     req: proto::AppendEntriesRequest,
-//     timeout: Duration,
-// ) -> AppendResult {
-//     let mut client = match tokio::time::timeout(timeout, NodeClient::connect(host)).await {
-//         Ok(Ok(c)) => c,
-//         Ok(Err(_)) | Err(_) => return AppendResult::Timeout,
-//     };
-//     let resp = match tokio::time::timeout(timeout, client.append_entries(req)).await {
-//         Ok(Ok(r)) => r.into_inner(),
-//         Ok(Err(_)) | Err(_) => return AppendResult::Timeout,
-//     };
-//     if resp.success {
-//         AppendResult::Success {
-//             term: resp.term,
-//             last_write_id: resp.last_write_id,
-//             last_commit_id: resp.last_commit_id,
-//         }
-//     } else {
-//         AppendResult::Reject {
-//             term: resp.term,
-//             reason: crate::raft_loop::proto_reject_to_raft(resp.reject_reason),
-//             last_write_id: resp.last_write_id,
-//             last_commit_id: resp.last_commit_id,
-//         }
-//     }
-// }
-
+use crate::cluster_mirror::ClusterMirror;
+use crate::config::Config;
+use crate::durable::DurablePersistence;
+use crate::ledger_slot::LedgerSlot;
+use ::proto::node as proto;
+use ::proto::node::node_client::NodeClient;
+use raft::{AppendResult, NodeId, RaftNode, RejectReason as RaftRejectReason};
+use spdlog::{error, info};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
-use crate::LedgerSlot;
+use std::time::{Duration, Instant};
+use storage::WalTailer;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::sleep_until;
 
-pub struct ReplicationLoop {
+/// RPC timeout for outbound `AppendEntries`. Hardcoded for now;
+/// promote to [`crate::config::ClusterSection`] if heartbeat-cadence
+/// and per-RPC deadline ever need to diverge.
+// TODO: promote to config alongside replication_poll_ms.
+const REPLICATION_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Pause/play signal source. Owned by the command loop; toggled in
+/// the `Action::BecomeRole` dispatch arm. Receivers exit when this
+/// drops — that is the replication loop's shutdown trigger.
+pub(crate) struct ReplicationGate {
+    tx: watch::Sender<bool>,
+}
+
+impl ReplicationGate {
+    pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self { tx }, rx)
+    }
+
+    /// Set the gate to `playing`. Idempotent.
+    pub(crate) fn set_playing(&self, playing: bool) {
+        let _ = self.tx.send(playing);
+    }
+}
+
+/// Per-peer task spawner. Built in `RaftLoop::run`; consumed by
+/// [`Self::run`].
+pub(crate) struct ReplicationLoop {
+    node: Rc<RefCell<RaftNode<DurablePersistence>>>,
     ledger: Arc<LedgerSlot>,
+    mirror: Arc<ClusterMirror>,
+    config: Arc<Config>,
+    gate_rx: watch::Receiver<bool>,
+    self_id: NodeId,
 }
 
 impl ReplicationLoop {
-    pub(crate) fn new(ledger: Arc<LedgerSlot>) -> Self {
-        Self { ledger }
+    pub(crate) fn new(
+        node: Rc<RefCell<RaftNode<DurablePersistence>>>,
+        ledger: Arc<LedgerSlot>,
+        mirror: Arc<ClusterMirror>,
+        config: Arc<Config>,
+        gate_rx: watch::Receiver<bool>,
+        self_id: NodeId,
+    ) -> Self {
+        Self {
+            node,
+            ledger,
+            mirror,
+            config,
+            gate_rx,
+            self_id,
+        }
     }
-    pub(super) async fn run_replication_loop(&mut self) {
 
+    pub(crate) async fn run(self) {
+        let cluster = match self.config.cluster.as_ref() {
+            Some(c) => c,
+            None => {
+                info!("replication_loop: no cluster section; exiting");
+                return;
+            }
+        };
+        let tick_interval = Duration::from_millis(cluster.replication_poll_ms);
+        let append_max_bytes = cluster.append_entries_max_bytes;
+
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        for peer in self.config.other_peers() {
+            let replicator = PeerReplicator {
+                node: self.node.clone(),
+                mirror: self.mirror.clone(),
+                peer_id: peer.peer_id,
+                self_id: self.self_id,
+                host: peer.host.clone(),
+                tailer: self.ledger.ledger().wal_tailer(),
+                gate_rx: self.gate_rx.clone(),
+                tick_interval,
+                rpc_timeout: REPLICATION_RPC_TIMEOUT,
+                append_max_bytes,
+            };
+            handles.push(tokio::task::spawn_local(peer_replication_loop(replicator)));
+        }
+        info!(
+            "replication_loop: spawned {} peer task(s) (self_id={})",
+            handles.len(),
+            self.self_id
+        );
+
+        for h in handles {
+            let _ = h.await;
+        }
+        info!("replication_loop: all peer tasks drained; exiting");
+    }
+}
+
+struct PeerReplicator {
+    node: Rc<RefCell<RaftNode<DurablePersistence>>>,
+    mirror: Arc<ClusterMirror>,
+    peer_id: NodeId,
+    self_id: NodeId,
+    host: String,
+    tailer: WalTailer,
+    gate_rx: watch::Receiver<bool>,
+    tick_interval: Duration,
+    rpc_timeout: Duration,
+    append_max_bytes: usize,
+}
+
+async fn peer_replication_loop(mut r: PeerReplicator) {
+    info!(
+        "replication_loop: peer {} task started (host={})",
+        r.peer_id, r.host
+    );
+    loop {
+        if !*r.gate_rx.borrow_and_update() {
+            // Cursor is stale across pause windows: we may rejoin at a
+            // different `next_index` if the leader regressed peers
+            // before we get to play again.
+            r.tailer.reset();
+            match r.gate_rx.changed().await {
+                Ok(()) => continue,
+                Err(_) => break,
+            }
+        }
+        replicate_once(&mut r).await;
+        let next = Instant::now() + r.tick_interval;
+        tokio::select! {
+            _ = sleep_until(next.into()) => {}
+            result = r.gate_rx.changed() => {
+                if result.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    info!("replication_loop: peer {} task exiting", r.peer_id);
+}
+
+async fn replicate_once(r: &mut PeerReplicator) {
+    let now = Instant::now();
+    let request = {
+        let mut node = r.node.borrow_mut();
+        match node.replication().peer(r.peer_id) {
+            Some(mut p) => p.get_append_range(now),
+            None => return,
+        }
+    };
+    let Some(req) = request else { return };
+
+    let to_tx_id;
+    let wal_bytes: Vec<u8>;
+    if req.entries.is_empty() {
+        to_tx_id = req.entries.start_tx_id.saturating_sub(1);
+        wal_bytes = Vec::new();
+    } else {
+        let from_tx_id = req.entries.start_tx_id;
+        let last_tx_id = req
+            .entries
+            .last_tx_id()
+            .expect("non-empty range has a last_tx_id");
+        let mut buffer = vec![0u8; r.append_max_bytes];
+        let written = r.tailer.tail(from_tx_id, &mut buffer) as usize;
+        if written == 0 {
+            // Tailer didn't surface bytes (segment rotation, transient
+            // race). Skip; next tick re-pulls a fresh request.
+            return;
+        }
+        buffer.truncate(written);
+        wal_bytes = buffer;
+        to_tx_id = last_tx_id;
+    }
+
+    let proto_req = proto::AppendEntriesRequest {
+        leader_id: r.self_id,
+        term: req.term,
+        prev_tx_id: req.prev_log_tx_id,
+        prev_term: req.prev_log_term,
+        from_tx_id: req.entries.start_tx_id,
+        to_tx_id,
+        wal_bytes,
+        leader_commit_tx_id: req.leader_commit,
+    };
+
+    let result = send_append_entries_rpc(r.host.clone(), proto_req, r.rpc_timeout).await;
+
+    let mut node = r.node.borrow_mut();
+    if let Some(mut p) = node.replication().peer(r.peer_id) {
+        p.append_result(now, result);
+    }
+    r.mirror.snapshot_from(&node);
+}
+
+async fn send_append_entries_rpc(
+    host: String,
+    req: proto::AppendEntriesRequest,
+    timeout: Duration,
+) -> AppendResult {
+    let mut client = match tokio::time::timeout(timeout, NodeClient::connect(host.clone())).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            error!("replication_loop: connect to {} failed: {}", host, e);
+            return AppendResult::Timeout;
+        }
+        Err(_) => return AppendResult::Timeout,
+    };
+    let resp = match tokio::time::timeout(timeout, client.append_entries(req)).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(_)) | Err(_) => return AppendResult::Timeout,
+    };
+    if resp.success {
+        AppendResult::Success {
+            term: resp.term,
+            last_write_id: resp.last_write_id,
+            last_commit_id: resp.last_commit_id,
+        }
+    } else {
+        AppendResult::Reject {
+            term: resp.term,
+            reason: proto_reject_to_raft(resp.reject_reason),
+            last_write_id: resp.last_write_id,
+            last_commit_id: resp.last_commit_id,
+        }
+    }
+}
+
+fn proto_reject_to_raft(code: u32) -> RaftRejectReason {
+    if code == proto::RejectReason::RejectTermStale as u32 {
+        RaftRejectReason::TermBehind
+    } else {
+        // RejectPrevMismatch and the legacy reject codes (CRC,
+        // sequence, WAL append, not-follower) all collapse into
+        // LogMismatch — they tell the leader to walk `next_index`
+        // back. The §5.3 catch-up path will discover the agreement
+        // point on subsequent RPCs.
+        RaftRejectReason::LogMismatch
     }
 }

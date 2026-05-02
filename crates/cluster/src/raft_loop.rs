@@ -14,20 +14,20 @@ use crate::command::Command;
 use crate::config::Config;
 use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
-use crate::replication::ReplicationLoop;
+use crate::replication::{ReplicationGate, ReplicationLoop};
 use ::proto::node as proto;
 use ::proto::node::RequestVoteResponse;
 use ::proto::node::node_client::NodeClient;
 use raft::request_vote::RequestVoteRequest;
 use raft::{
-    AppendEntriesDecision, Event, LogEntryRange, NodeId, RaftNode, RejectReason,
+    AppendEntriesDecision, Event, LogEntryRange, NodeId, RaftNode, RejectReason, Role,
 };
 use spdlog::{error, info};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::{Channel, Error};
 
 /// Bound on the inbound command channel. Picked to absorb a burst of
@@ -51,6 +51,15 @@ pub struct RaftLoop {
     /// sleep arm. `None` ⇒ use `FALLBACK_WAKEUP`.
     next_wakeup: Option<Instant>,
     pub ledger: Arc<LedgerSlot>,
+
+    /// Pause/play signal source for the replication loop. Held in an
+    /// `Option` so the command loop can drop it (`= None`) on exit —
+    /// dropping the underlying `watch::Sender` is the cooperative
+    /// shutdown signal that lets per-peer replication tasks return.
+    gate: Option<ReplicationGate>,
+    /// Initial receiver paired with `gate`. Taken in `run` to hand
+    /// off to the replication loop.
+    gate_rx: Option<watch::Receiver<bool>>,
 }
 
 impl RaftLoop {
@@ -66,6 +75,7 @@ impl RaftLoop {
         config: Arc<Config>,
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
+        let (gate, gate_rx) = ReplicationGate::new();
         Self {
             node: Rc::new(RefCell::new(node)),
             ledger,
@@ -73,16 +83,24 @@ impl RaftLoop {
             config,
             cmd_rx,
             next_wakeup: None,
+            gate: Some(gate),
+            gate_rx: Some(gate_rx),
         }
     }
 
     pub async fn run(mut self) {
-        let ledger = self.ledger.clone();
+        let gate_rx = self.gate_rx.take().expect("gate_rx initialized in new");
+        let self_id = self.node.borrow().self_id();
+        let replication = ReplicationLoop::new(
+            self.node.clone(),
+            self.ledger.clone(),
+            self.mirror.clone(),
+            self.config.clone(),
+            gate_rx,
+            self_id,
+        );
+        let replication_loop_handle = replication.run();
         let command_loop_handle = self.run_command_loop();
-
-        let mut replication_loop = ReplicationLoop::new(ledger);
-
-        let replication_loop_handle = replication_loop.run_replication_loop();
 
         tokio::join!(command_loop_handle, replication_loop_handle);
     }
@@ -118,6 +136,23 @@ impl RaftLoop {
         }
 
         info!("raft_loop: exiting (self_id={})", self_id);
+        // Drop the replication gate's `watch::Sender` so per-peer
+        // replication tasks see `gate_rx.changed()` return Err and
+        // exit cooperatively. RAII shutdown — no explicit notify.
+        self.gate = None;
+    }
+
+    /// Mirror the current raft role into the gate. Covers the paths
+    /// where `transition_to_follower` is invoked from a direct method
+    /// (`request_vote`, `validate_append_entries_request`,
+    /// `replication_append_result`) without surfacing an
+    /// `Action::BecomeRole`. Idempotent — `watch::Sender::send` is a
+    /// no-op when the value is unchanged.
+    fn sync_gate_from_role(&self) {
+        if let Some(gate) = self.gate.as_ref() {
+            let role = self.node.borrow().role();
+            gate.set_playing(matches!(role, Role::Leader));
+        }
     }
 
     /// Apply a command to raft. Routes inbound RPCs to typed handlers,
@@ -138,6 +173,11 @@ impl RaftLoop {
                         last_term: req.last_term,
                     },
                 );
+                self.mirror.snapshot_from(&self.node.borrow());
+                // `request_vote` may have stepped us down internally
+                // (higher term observed). Sync the gate so replication
+                // pauses immediately rather than next command-loop tick.
+                self.sync_gate_from_role();
                 info!("raft_loop: RequestVote result: {:?}", result);
                 reply
                     .send(RequestVoteResponse {
@@ -170,6 +210,10 @@ impl RaftLoop {
             req.leader_commit_tx_id,
         );
         self.mirror.snapshot_from(& self.node.borrow());
+        // Inbound AE always lands a `transition_to_follower` (when
+        // `term >= current_term`); pause replication immediately if we
+        // were the leader.
+        self.sync_gate_from_role();
 
         match decision {
             AppendEntriesDecision::Reject {
@@ -307,9 +351,13 @@ impl RaftLoop {
             }
             BecomeRole { role, term } => {
                 info!("raft_loop: BecomeRole: {:?} {:?}", role, term);
+                // The control point: replication plays only while we
+                // are leader. Any other role transition pauses it.
+                if let Some(gate) = self.gate.as_ref() {
+                    gate.set_playing(matches!(role, Role::Leader));
+                }
                 None
             }
-            _ => None,
         }
     }
 

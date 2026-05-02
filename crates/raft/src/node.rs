@@ -697,7 +697,10 @@ impl<P: Persistence> RaftNode<P> {
         // lookups for our existing entries).
         if term > current_term {
             self.observe_higher_term(term);
-            self.transition_to_follower(now, None);
+            // `request_vote` is a direct method without an action stream;
+            // the cluster driver polls `node.role()` after the call to
+            // detect step-down and signal its replication gate.
+            self.transition_to_follower(now, None, &mut Vec::new());
         }
 
         // §5.4.1 up-to-date check. The voter compares its own
@@ -875,7 +878,7 @@ impl<P: Persistence> RaftNode<P> {
             NodeState::Candidate(c) => {
                 if term > c.election_term {
                     self.observe_higher_term(term);
-                    self.transition_to_follower(now, None);
+                    self.transition_to_follower(now, None, out);
                     return;
                 }
                 if term < c.election_term {
@@ -923,7 +926,7 @@ impl<P: Persistence> RaftNode<P> {
                     new_term,
                     self.persistence.current_term()
                 );
-                self.transition_to_follower(now, None);
+                self.transition_to_follower(now, None, out);
                 return;
             }
             Err(e) => {
@@ -931,7 +934,7 @@ impl<P: Persistence> RaftNode<P> {
                     "raft: node_id={} commit_term({}) failed: {}; stepping down",
                     self.self_id, new_term, e
                 );
-                self.transition_to_follower(now, None);
+                self.transition_to_follower(now, None, out);
                 return;
             }
         }
@@ -1054,7 +1057,10 @@ impl<P: Persistence> RaftNode<P> {
         if term > current_term {
             self.observe_higher_term(term);
         }
-        self.transition_to_follower(now, Some(from));
+        // `validate_append_entries_request` is a direct method without
+        // an action stream; the driver polls `node.role()` after the
+        // call to detect step-down.
+        self.transition_to_follower(now, Some(from), &mut Vec::new());
         self.election_timer.reset(now);
 
         // §5.3 prev_log_term match. `local_write_index` is the §5.3
@@ -1180,7 +1186,11 @@ impl<P: Persistence> RaftNode<P> {
         let current_term = self.current_term();
         if term > current_term {
             self.observe_higher_term(term);
-            self.transition_to_follower(now, None);
+            // `on_append_entries_reply` is reachable only via
+            // `replication_append_result` (a direct method without an
+            // action stream); the driver polls `node.role()` after the
+            // call to detect step-down.
+            self.transition_to_follower(now, None, &mut Vec::new());
             return;
         }
 
@@ -1311,7 +1321,13 @@ impl<P: Persistence> RaftNode<P> {
             .term
     }
 
-    fn transition_to_follower(&mut self, now: Instant, leader_id: Option<NodeId>) {
+    fn transition_to_follower(
+        &mut self,
+        now: Instant,
+        leader_id: Option<NodeId>,
+        out: &mut Vec<Action>,
+    ) {
+        let was_follower = matches!(self.state, NodeState::Follower(_));
         let mut state = match leader_id {
             Some(id) => NodeState::Follower(FollowerState::with_leader(id)),
             None => NodeState::Follower(FollowerState::new()),
@@ -1322,6 +1338,16 @@ impl<P: Persistence> RaftNode<P> {
         // value does not block this node, now a follower, from
         // accepting the new leader's `leader_commit`.
         self.current_term_first_tx = 0;
+        // Surface the role change so drivers can react (gate
+        // replication, swap gRPC handlers). Skip emission if we were
+        // already a Follower — refreshing leader_id on inbound AE is
+        // not a transition.
+        if !was_follower {
+            out.push(Action::BecomeRole {
+                role: Role::Follower,
+                term: self.current_term(),
+            });
+        }
     }
 
     fn next_pending_wakeup(&self) -> Option<Instant> {
