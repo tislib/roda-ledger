@@ -240,35 +240,49 @@ impl RaftLoop {
         }
     }
 
-    /// Step raft, snapshot the mirror, dispatch any actions. The single
-    /// path through which `node.step()` is called from the command
-    /// loop.
+    /// Step raft, snapshot the mirror, dispatch each emitted action.
+    /// `dispatch_action` may produce a follow-up [`Event`] (e.g. an
+    /// `Event::RequestVoteReply` after the outbound `RequestVote`
+    /// RPC completes); we drain those follow-ups in a loop instead
+    /// of recursing — `dispatch_action` calling `step` recursively
+    /// would require an unbounded async-future size and won't
+    /// compile.
     async fn step(&mut self, event: Event) {
-        let actions = {
-            let actions = self.node.step(Instant::now(), event);
+        let mut pending: std::collections::VecDeque<Event> =
+            std::collections::VecDeque::new();
+        pending.push_back(event);
+        while let Some(ev) = pending.pop_front() {
+            let actions = self.node.step(Instant::now(), ev);
             self.mirror.snapshot_from(&self.node);
-            actions
-        };
-        for action in actions {
-            self.dispatch_action(action).await;
+            for action in actions {
+                if let Some(follow_up) = self.dispatch_action(action).await {
+                    pending.push_back(follow_up);
+                }
+            }
         }
     }
 
-    async fn dispatch_action(&mut self, action: raft::Action) {
+    /// Process one action emitted by `node.step()`. Returns a
+    /// follow-up [`Event`] that the surrounding `step` loop should
+    /// feed back into the state machine — typically the
+    /// `Event::RequestVoteReply` synthesised from an outbound
+    /// `RequestVote` RPC's response. `None` means "no follow-up".
+    async fn dispatch_action(&mut self, action: raft::Action) -> Option<Event> {
         use raft::Action::*;
         match action {
             SetWakeup { at } => {
                 info!("raft_loop: SetWakeup: {:?}", at);
                 self.next_wakeup = Some(at);
+                None
             }
             FatalError { reason } => {
                 error!("raft_loop: FatalError: {}", reason);
                 self.mirror.set_fatal();
-                spdlog::error!("raft_loop: FatalError: {}", reason);
                 // Loop continues running but raft itself is now frozen
                 // — every subsequent step() returns no actions. The
                 // supervisor observes via mirror.is_fatal() and tears
                 // down the process.
+                None
             }
             SendRequestVote {
                 to,
@@ -276,34 +290,52 @@ impl RaftLoop {
                 last_tx_id,
                 last_term,
             } => {
-                let mut client = self.get_node_client(to).await;
-
-                match client {
+                let mut client = match self.get_node_client(to).await {
+                    Ok(c) => c,
                     Err(err) => {
-                        error!("raft_loop: SendRequestVote: failed to get client: {}", err);
-                        return;
+                        error!(
+                            "raft_loop: SendRequestVote: connect to peer {} failed: {}",
+                            to, err
+                        );
+                        return None;
                     }
-                    Ok(mut client) => {
-                        info!("raft_loop: SendRequestVote: {:?}", (to, term, last_tx_id));
-                        let result = client.request_vote(proto::RequestVoteRequest {
-                            term,
-                            candidate_id: self.node.self_id(),
-                            last_tx_id,
-                            last_term,
-                        }).await.unwrap().into_inner();
-                        info!("raft_loop: SendRequestVote result: {:?}", result);
-                        self.step(Event::RequestVoteReply {
-                            from: to,
-                            term: result.term,
-                            granted: result.vote_granted,
-                        }).await;
+                };
+                info!("raft_loop: SendRequestVote: {:?}", (to, term, last_tx_id));
+                let candidate_id = self.node.self_id();
+                let resp = match client
+                    .request_vote(proto::RequestVoteRequest {
+                        term,
+                        candidate_id,
+                        last_tx_id,
+                        last_term,
+                    })
+                    .await
+                {
+                    Ok(r) => r.into_inner(),
+                    Err(e) => {
+                        error!(
+                            "raft_loop: SendRequestVote: rpc to peer {} failed: {}",
+                            to, e
+                        );
+                        return None;
                     }
-                }
+                };
+                info!("raft_loop: SendRequestVote result: {:?}", resp);
+                // Surface the reply as a follow-up event; the outer
+                // `step` loop will feed it through `node.step()`,
+                // dispatch the resulting `BecomeRole(Leader)` /
+                // `SetWakeup` actions, and snapshot the mirror.
+                Some(Event::RequestVoteReply {
+                    from: to,
+                    term: resp.term,
+                    granted: resp.vote_granted,
+                })
             }
             BecomeRole { role, term } => {
                 info!("raft_loop: BecomeRole: {:?} {:?}", role, term);
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
