@@ -29,7 +29,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{Event, NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role, TermRecord};
+use raft::{NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role, TermRecord};
 
 /// Build a candidate at term `T` with `local_log_index = 0` and
 /// `term_log = []`. The candidate will then observe a higher term
@@ -51,10 +51,11 @@ fn fresh_node(self_id: NodeId, peers: Vec<NodeId>) -> RaftNode<MemPersistence> {
 /// Returns the term it's now campaigning at.
 fn drive_to_candidate(node: &mut RaftNode<impl Persistence>) -> (Instant, u64) {
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
+    let _ = node.election().tick(t0);
     // Election timer is now armed for ~150–300ms. Advance past it.
     let t_after_timeout = t0 + Duration::from_secs(60);
-    let _ = node.step(t_after_timeout, Event::Tick);
+    let _ = node.election().tick(t_after_timeout);
+    let _ = node.election().start(t_after_timeout);
     assert_eq!(node.role(), Role::Candidate, "should be candidate");
     (t_after_timeout, node.current_term())
 }
@@ -82,7 +83,7 @@ fn term_log_has_no_phantom_record_after_vote_log_race() {
     // An inbound RequestVote at a much higher term should bump
     // vote_log only, not term_log.
     let bump_to = candidate_term + 4;
-    let _ = node.request_vote(
+    let _ = node.election().handle_request_vote(
         t_election + Duration::from_millis(1),
         RequestVoteRequest {
             from: 2,
@@ -107,8 +108,8 @@ fn term_log_has_no_phantom_record_after_vote_log_race() {
 
     // Roll the timer once to arm, once to expire.
     let t = t_election + Duration::from_millis(2);
-    let _ = node.step(t, Event::Tick);
-    let _ = node.step(t + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t);
+    common::drive_tick(&mut node, t + Duration::from_secs(60));
 
     assert_eq!(
         node.role(),
@@ -165,7 +166,7 @@ fn no_synthetic_term_records_for_unobserved_terms() {
     let mut t = t_election;
     for k in 1..=5 {
         t += Duration::from_millis(1);
-        let _ = node.request_vote(
+        let _ = node.election().handle_request_vote(
             t,
             RequestVoteRequest {
                 from: 2,
@@ -182,8 +183,8 @@ fn no_synthetic_term_records_for_unobserved_terms() {
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
 
-    let _ = node.step(t + Duration::from_millis(1), Event::Tick);
-    let _ = node.step(t + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t + Duration::from_millis(1));
+    common::drive_tick(&mut node, t + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Leader);
     let won_term = node.current_term();
 
@@ -233,7 +234,7 @@ fn term_log_records_have_unique_start_tx_id() {
 
     // Two-step skew is enough to force the catch-up.
     let mut t = t_election + Duration::from_millis(1);
-    let _ = node.request_vote(
+    let _ = node.election().handle_request_vote(
         t,
         RequestVoteRequest {
             from: 2,
@@ -246,8 +247,8 @@ fn term_log_records_have_unique_start_tx_id() {
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
     t += Duration::from_millis(1);
-    let _ = node.step(t, Event::Tick);
-    let _ = node.step(t + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t);
+    common::drive_tick(&mut node, t + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Leader);
 
     let p = node.into_persistence();
@@ -289,17 +290,17 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // Phase 1: drive node to Leader at term 1, append entries 1..3.
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), 1);
 
     node.advance(1, 1);
-    let _ = node.step(t0 + Duration::from_secs(61), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(61));
     node.advance(2, 2);
-    let _ = node.step(t0 + Duration::from_secs(61), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(61));
     node.advance(3, 3);
-    let _ = node.step(t0 + Duration::from_secs(61), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(61));
     assert_eq!(node.commit_index(), 3);
 
     // Phase 2: rebuild as multi-node and force a vote-log race.
@@ -317,14 +318,14 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // post-election term boundary lands at 1 and shadows the
     // existing entries on `term_at_tx` lookups.
     node.advance(3, 3);
-    let _ = node.step(t0 + Duration::from_secs(119), Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(120), Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(180), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(119));
+    common::drive_tick(&mut node, t0 + Duration::from_secs(120));
+    common::drive_tick(&mut node, t0 + Duration::from_secs(180));
     assert_eq!(node.role(), Role::Candidate);
     let cand_term = node.current_term();
 
     // Race the vote log forward.
-    let _ = node.request_vote(
+    let _ = node.election().handle_request_vote(
         t0 + Duration::from_secs(181),
         RequestVoteRequest {
             from: 2,
@@ -340,9 +341,9 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
     node.advance(3, 3);
-    let _ = node.step(t0 + Duration::from_secs(181), Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(182), Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(240), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(181));
+    common::drive_tick(&mut node, t0 + Duration::from_secs(182));
+    common::drive_tick(&mut node, t0 + Duration::from_secs(240));
     assert_eq!(node.role(), Role::Leader);
     let won = node.current_term();
 

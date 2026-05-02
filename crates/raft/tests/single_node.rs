@@ -7,7 +7,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, RaftConfig, RaftNode, Role};
+use raft::{RaftConfig, RaftNode, Role};
 
 fn fresh(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
     RaftNode::new(
@@ -39,18 +39,11 @@ fn construction_with_empty_peer_list_panics() {
 fn single_node_self_elects_on_first_timeout_tick() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
+    common::drive_tick(&mut node, t0);
     assert_eq!(node.role(), Role::Initializing);
-    let actions = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Leader);
     assert_eq!(node.current_term(), 1);
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        Action::BecomeRole {
-            role: Role::Leader,
-            ..
-        }
-    )));
 }
 
 /// Single-node leader commits its own writes immediately — quorum is 1.
@@ -58,8 +51,8 @@ fn single_node_self_elects_on_first_timeout_tick() {
 fn single_node_leader_commits_own_writes_immediately() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
     // `advance` is silent; observe the cluster_commit advance via
@@ -88,16 +81,16 @@ fn no_events_means_no_transitions() {
 fn two_node_cluster_without_peer_replies_keeps_bumping_term() {
     let mut node = fresh(1, vec![1, 2]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
 
     now += Duration::from_secs(60);
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     assert_eq!(node.role(), Role::Candidate);
     let term_after_first = node.current_term();
     assert!(term_after_first >= 1);
 
     now += Duration::from_secs(60);
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     let term_after_second = node.current_term();
     assert!(
         term_after_second > term_after_first,
@@ -117,8 +110,8 @@ fn two_node_cluster_without_peer_replies_keeps_bumping_term() {
 fn advance_is_monotonic() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
     node.advance(5, 3);
@@ -139,8 +132,8 @@ fn advance_is_monotonic() {
 fn advance_clamps_commit_above_write_in_release() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     node.advance(3, 5);
     // commit clamped to write.
@@ -154,8 +147,8 @@ fn advance_clamps_commit_above_write_in_release() {
 fn advance_panics_on_commit_above_write_in_debug() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     node.advance(3, 5);
 }
 
@@ -179,23 +172,23 @@ fn advance_updates_cluster_commit_on_leader_only() {
     // immediately (quorum=1, no peers to wait on).
     let mut leader = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = leader.step(t0, Event::Tick);
-    let _ = leader.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut leader, t0);
+    common::drive_tick(&mut leader, t0 + Duration::from_secs(60));
     assert!(leader.role().is_leader());
     leader.advance(5, 5);
     assert_eq!(leader.cluster_commit_index(), 5);
 }
 
-/// `advance` is a pure state mutator — it returns nothing and queues
-/// no actions in the next `Tick`'s output beyond what timers/role
-/// already require. The cluster_commit advance is observed via the
-/// getter (no dedicated action; ADR-0017 §"Driver call pattern").
+/// `advance` is a pure state mutator — it returns nothing and changes
+/// no future timer behaviour beyond what role/quorum already require.
+/// The cluster_commit advance is observed via the getter (no
+/// dedicated action; ADR-0017 §"Driver call pattern").
 #[test]
-fn advance_emits_no_actions_directly() {
+fn advance_returns_unit() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
     // The method is `() -> ()` — no actions returned. We assert on

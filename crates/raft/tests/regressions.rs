@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
-    Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, RaftConfig,
-    RaftNode, RejectReason, RequestVoteRequest, Role, TxId,
+    AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftConfig, RaftNode, RejectReason,
+    RequestVoteRequest, Role, TxId,
 };
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
@@ -46,10 +46,10 @@ fn await_leader(sim: &mut Sim) -> NodeId {
 fn lost_elections_do_not_pollute_term_log() {
     let mut node = fresh_node(1, vec![1, 2]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     for _ in 0..5 {
         now += Duration::from_secs(60);
-        let _ = node.step(now, Event::Tick);
+        common::drive_tick(&mut node, now);
     }
     let p = node.into_persistence();
     use raft::Persistence;
@@ -69,8 +69,8 @@ fn lost_elections_do_not_pollute_term_log() {
 fn restart_does_not_bump_term() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     let term_before = node.current_term();
 
@@ -90,8 +90,8 @@ fn log_mismatch_decrements_next_index() {
     // Construct a leader (single-node so we don't depend on peers).
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
     // Pretend it has 5 entries in flight to a phantom peer 2 with
@@ -101,7 +101,7 @@ fn log_mismatch_decrements_next_index() {
     // Simulate the leader having committed 3 entries:
     for tx in 1..=3 {
         node.advance(tx, tx);
-        let _ = node.step(t0 + Duration::from_secs(60 + tx), Event::Tick);
+        common::drive_tick(&mut node, t0 + Duration::from_secs(60 + tx));
     }
 
     // Inject 3 successive LogMismatch rejects from peer 2 — each
@@ -215,18 +215,18 @@ fn term_log_truncates_with_entry_log() {
 ///
 /// We can't directly script the race in the simulator (it's
 /// deterministic) but we can verify the underlying invariant:
-/// `commit_term(expected)` returns `Ok(false)` when current has
-/// already advanced past `expected`.
+/// `commit_term(expected)` returns `false` when current has already
+/// advanced past `expected`.
 #[test]
 fn commit_term_refuses_when_already_advanced() {
     use raft::Persistence;
     let mut p = MemPersistence::new();
-    p.observe_term(5, 0).unwrap();
+    p.observe_term(5, 0);
     // Two concurrent winners of term 5 would both call commit_term(5).
-    // The first to land on a particular replica gets Ok(false) here
+    // The first to land on a particular replica gets `false` here
     // because current=5 already; only the actual term-5 winner wrote
     // it — the loser steps down on this signal.
-    assert!(!p.commit_term(5, 0).unwrap());
+    assert!(!p.commit_term(5, 0));
 }
 
 /// **Raft §5.4.2 / Figure 8** — a new leader must not commit
@@ -255,7 +255,7 @@ fn commit_term_refuses_when_already_advanced() {
 fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     let mut node = fresh_node(1, vec![1, 2, 3, 4, 5]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
+    common::drive_tick(&mut node, t0);
 
     // Phase 1 — receive entries 1..=5 at term 1 from a leader
     // whose own commit watermark is still 0 (it crashed before
@@ -283,28 +283,14 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     // Phase 2 — silence past the election timeout, become
     // candidate at term 2, then collect votes from 2 peers (with
     // self-vote that is 3/5, a majority) and become leader.
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Candidate);
     let cand_term = node.current_term();
     assert_eq!(cand_term, 2);
 
     let now = t0 + Duration::from_secs(60) + Duration::from_millis(1);
-    let _ = node.step(
-        now,
-        Event::RequestVoteReply {
-            from: 3,
-            term: cand_term,
-            granted: true,
-        },
-    );
-    let _ = node.step(
-        now,
-        Event::RequestVoteReply {
-            from: 4,
-            term: cand_term,
-            granted: true,
-        },
-    );
+    common::deliver_vote_reply(&mut node, now, 3, cand_term, true);
+    common::deliver_vote_reply(&mut node, now, 4, cand_term, true);
     assert!(
         node.role().is_leader(),
         "should be leader at term {cand_term} after 3-of-5 votes"
@@ -365,20 +351,17 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
 /// stepping with consistent timestamps.
 fn leader_with_entries(entries: TxId, t0: Instant) -> (RaftNode<MemPersistence>, u64, Instant) {
     let mut node = fresh_node(1, vec![1, 2, 3]);
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     let term = node.current_term();
     // 3-node cluster majority = 2 (self-vote + 1 peer = win).
-    let _ = node.step(
-        t0 + Duration::from_secs(60),
-        Event::RequestVoteReply { from: 2, term, granted: true },
-    );
+    common::deliver_vote_reply(&mut node, t0 + Duration::from_secs(60), 2, term, true);
     assert!(node.role().is_leader(), "test setup: did not become leader");
 
     let after = t0 + Duration::from_secs(61);
     if entries > 0 {
         node.advance(entries, entries);
-        let _ = node.step(after, Event::Tick);
+        common::drive_tick(&mut node, after);
     }
     (node, term, after + Duration::from_millis(1))
 }
@@ -629,7 +612,7 @@ fn vote_denial_uses_write_index_not_commit_index() {
     // Five entries durably written, only three locally committed.
     node.advance(5, 3);
 
-    let reply = node.request_vote(
+    let reply = node.election().handle_request_vote(
         Instant::now(),
         RequestVoteRequest {
             from: 2,

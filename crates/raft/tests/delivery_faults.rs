@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{AppendResult, Event, NodeId, RaftConfig, RaftNode, RejectReason, Role};
+use raft::{AppendResult, NodeId, RaftConfig, RaftNode, RejectReason, Role};
 
 fn await_leader(sim: &mut Sim) -> NodeId {
     let dl = sim.clock() + Duration::from_secs(5);
@@ -137,8 +137,8 @@ fn cluster_makes_progress_under_moderate_delay() {
 fn unsolicited_append_entries_reply_is_unreachable_via_replication() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     let term_before = node.current_term();
 
@@ -161,17 +161,10 @@ fn late_reply_after_rpc_timeout_does_not_crash() {
     // via a single peer vote.
     let mut node = fresh_node(1, vec![1, 2]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     let term = node.current_term();
-    let _ = node.step(
-        t0 + Duration::from_secs(60),
-        Event::RequestVoteReply {
-            from: 2,
-            term,
-            granted: true,
-        },
-    );
+    common::deliver_vote_reply(&mut node, t0 + Duration::from_secs(60), 2, term, true);
     assert!(node.role().is_leader());
 
     // Synthesize the cluster-driver-side timeout: clears the leader's

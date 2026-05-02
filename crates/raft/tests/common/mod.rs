@@ -13,11 +13,10 @@
 //!   when the harness explicitly advances it.
 //! - A min-heap of `Scheduled` items combines (a) inbound RPC events
 //!   queued at a future delivery time and (b) per-node wakeup
-//!   deadlines requested via `Action::SetWakeup`.
+//!   deadlines pulled from `Election::tick(now)`.
 //! - `run_until` repeatedly: pops the soonest `Scheduled`, sets the
-//!   clock, dispatches the event to the target node via
-//!   `step(now, event)`, and processes returned `Action`s back into
-//!   `Scheduled`s.
+//!   clock, dispatches the delivery, and re-schedules the node's
+//!   next wakeup from the post-event `tick` deadline.
 //! - Fault injection: configurable network delay, message drop,
 //!   crash via `into_persistence` (drops the volatile RaftNode while
 //!   retaining the durable persistence), partition sets.
@@ -35,18 +34,25 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use raft::{
-    Action, AppendEntriesDecision, AppendResult, ElectionTimerConfig, Event, LogEntryRange, NodeId,
-    RaftConfig, RaftNode, RejectReason, Role, Term, TxId,
+    AppendEntriesDecision, AppendResult, ElectionTimerConfig, LogEntryRange, NodeId, RaftConfig,
+    RaftNode, RejectReason, RequestVoteRequest, Role, Term, TxId, VoteOutcome,
 };
+// `Wakeup` is the return type of `Election::tick`; harness re-polls it
+// after every event to schedule the next `Delivery::Tick`.
 
 /// Per-target delivery in the simulator queue. Inbound AppendEntries,
 /// AE replies, and RequestVote requests all route through their
 /// respective `RaftNode` direct methods — the simulator plays the
-/// cluster driver. Everything else (Tick wakeups, RequestVote replies)
-/// runs through `node.step(now, event)`.
+/// cluster driver. `Tick` is a scheduled wakeup pulled from
+/// `Election::tick(now)`.
 #[derive(Clone, Debug)]
 enum Delivery {
-    Step(Event),
+    /// Scheduled wakeup. The harness calls `election().tick(now)` and
+    /// then `election().start(now)`; if `start` returns true the
+    /// outbound `RequestVote`s are pulled via `get_requests` and
+    /// scheduled for delivery to each peer (subject to the network
+    /// drop / duplicate model).
+    Tick,
     AppendEntries {
         from: NodeId,
         term: Term,
@@ -65,14 +71,21 @@ enum Delivery {
     },
     /// Inbound `RequestVote` from candidate `from`. The voter
     /// (this scheduled item's `target`) calls
-    /// `node.request_vote(now, RequestVoteRequest { ... })` and ships
-    /// the synchronously-returned reply back to `from` as
-    /// `Event::RequestVoteReply`.
+    /// `node.election().handle_request_vote(now, RequestVoteRequest { ... })`
+    /// and ships the synchronously-returned reply back to `from` as
+    /// `Delivery::RequestVoteReply`.
     RequestVote {
         from: NodeId,
         term: Term,
         last_tx_id: TxId,
         last_term: Term,
+    },
+    /// Outcome of a `RequestVote` arriving back at the candidate.
+    /// The candidate (this scheduled item's `target`) feeds it into
+    /// `node.election().handle_votes(now, vec![(from, outcome)])`.
+    RequestVoteReply {
+        from: NodeId,
+        outcome: VoteOutcome,
     },
 }
 
@@ -147,8 +160,17 @@ struct NodeBox {
     /// (term, tx_id) pairs the node has been told to apply; used
     /// for state-machine safety checks.
     applied: Vec<MirrorEntry>,
-    /// Most recent `SetWakeup` requested by this node.
+    /// Most recent wakeup deadline returned by
+    /// `Election::tick`. The harness re-schedules a `Delivery::Tick`
+    /// at this instant and remembers the value so duplicate schedules
+    /// can be skipped (avoids runaway loops where every observation
+    /// re-queues the same wakeup).
     pending_wakeup: Option<Instant>,
+    /// Last `(role, term)` pair we observed for this node. Diffed
+    /// after every event to populate `transitions` /
+    /// `leaders_per_term` without an action stream.
+    last_observed_role: Role,
+    last_observed_term: Term,
     /// Stable seed used to recreate the node on restart.
     seed: u64,
 }
@@ -190,12 +212,6 @@ pub struct Sim {
     leaders_per_term: HashMap<u64, HashSet<NodeId>>,
     /// Recorded so callers can inspect after the run.
     transitions: Vec<(NodeId, Role, u64)>,
-    /// `Action::FatalError` emissions captured during the run. Test
-    /// assertions can check this to spot a Raft node that froze
-    /// itself due to a persistence I/O failure or invariant
-    /// violation. Most simulator scenarios should expect this to be
-    /// empty.
-    fatal_errors: Vec<(NodeId, &'static str)>,
 }
 
 impl Sim {
@@ -215,6 +231,8 @@ impl Sim {
                     cluster_commit: 0,
                     applied: Vec::new(),
                     pending_wakeup: None,
+                    last_observed_role: Role::Initializing,
+                    last_observed_term: 0,
                     seed,
                 },
             );
@@ -234,26 +252,15 @@ impl Sim {
             fault_rng: rand::rngs::StdRng::seed_from_u64(seed_base ^ 0xDEAD_BEEF),
             leaders_per_term: HashMap::new(),
             transitions: Vec::new(),
-            fatal_errors: Vec::new(),
         };
-        // Bootstrap each node with an initial Tick — primes the
-        // election timer per the lazy-arm convention in `node.rs`.
+        // Bootstrap each node by driving an initial Tick — primes the
+        // election timer per the lazy-arm convention in
+        // `RaftNode::election().tick(now)`.
         let bootstrap: Vec<NodeId> = sim.nodes.keys().copied().collect();
         for id in bootstrap {
-            sim.deliver_bootstrap_tick(id);
+            sim.dispatch_tick(id, sim.clock);
         }
         sim
-    }
-
-    fn deliver_bootstrap_tick(&mut self, id: NodeId) {
-        let now = self.clock;
-        let actions = match self.nodes.get_mut(&id).and_then(|b| b.node.as_mut()) {
-            Some(n) => n.step(now, Event::Tick),
-            None => return,
-        };
-        self.process_actions(id, now, actions);
-        self.drive_replication(id, now);
-        self.observe_cluster_commit(id);
     }
 
     /// Configure the (uniform) network delay applied to outbound RPCs.
@@ -300,21 +307,17 @@ impl Sim {
 
     /// Restart a previously-crashed node. Constructs a fresh
     /// `RaftNode` over the preserved `MemPersistence`, replays the
-    /// durable entry-log high-water mark via `LogAppendComplete`
-    /// (modelling a real driver's on-boot WAL recovery), and
-    /// re-bootstraps with a Tick.
+    /// durable entry-log high-water mark via `advance` (modelling a
+    /// real driver's on-boot WAL recovery), and re-bootstraps with a
+    /// `Tick`.
     ///
     /// Replaying `local_log_index` is **required** for §5.4.1
     /// correctness on restart — otherwise the node's `last_term` /
     /// `last_tx_id` advertise as 0, the up-to-date check passes
     /// for every candidate, and a candidate with strictly older log
-    /// state can be granted votes it shouldn't get. That produces
-    /// the kind of divergent log this simulator is meant to catch.
+    /// state can be granted votes it shouldn't get.
     pub fn restart(&mut self, id: NodeId) {
         let now = self.clock;
-        // Snapshot the durable WAL extent (harness mirror models
-        // disk; survives the crash). The trailing trim drops any
-        // padding sentinels so we report the highest *real* tx_id.
         let last_tx = self
             .nodes
             .get(&id)
@@ -328,7 +331,7 @@ impl Sim {
             })
             .unwrap_or(0);
 
-        let actions = {
+        {
             let b = match self.nodes.get_mut(&id) {
                 Some(b) => b,
                 None => return,
@@ -339,7 +342,7 @@ impl Sim {
             let p = b.saved_persistence.take().expect("not crashed");
             let mut n = RaftNode::new(id, self.peer_list.clone(), p, self.cfg, b.seed);
             // Hydrate both watermarks from the durable WAL extent
-            // before the first Tick. The harness pretends the ledger
+            // before the first tick. The harness pretends the ledger
             // tracks raft-log durability synchronously, so write and
             // commit collapse at restore time. (ADR-0017 §"Required
             // Invariants" notes the implicit recovery invariant
@@ -347,13 +350,11 @@ impl Sim {
             if last_tx > 0 {
                 n.advance(last_tx, last_tx);
             }
-            let acts = n.step(now, Event::Tick);
             b.node = Some(n);
-            acts
-        };
-        self.process_actions(id, now, actions);
-        self.drive_replication(id, now);
-        self.observe_cluster_commit(id);
+            b.last_observed_role = Role::Initializing;
+            b.last_observed_term = 0;
+        }
+        self.dispatch_tick(id, now);
     }
 
     pub fn role_of(&self, id: NodeId) -> Role {
@@ -398,17 +399,15 @@ impl Sim {
 
     /// Inject a "client write" on `leader_id`: simulates the leader's
     /// ledger appending the next tx_id, notifying raft via the
-    /// `advance(write, commit)` direct method, and flushing deferred
-    /// outputs via a `Tick` (per ADR-0017 §"Driver call pattern":
-    /// always Tick after advance). Skips silently if the named node
-    /// is not (or no longer) a leader.
+    /// `advance(write, commit)` direct method, and refreshing
+    /// replication / wakeups. Skips silently if the named node is not
+    /// (or no longer) a leader.
     pub fn client_write(&mut self, leader_id: NodeId, count: usize) {
         let term = self.current_term_of(leader_id);
         if !self.role_of(leader_id).is_leader() {
             return;
         }
         let now = self.clock;
-        let mut actions_acc: Vec<(NodeId, Vec<Action>)> = Vec::new();
         if let Some(b) = self.nodes.get_mut(&leader_id)
             && let Some(node) = b.node.as_mut()
         {
@@ -420,17 +419,9 @@ impl Sim {
                 // bounds the AE replication window, commit feeds the
                 // leader's quorum self-slot.
                 node.advance(tx, tx);
-                // Tick flushes any deferred outputs (heartbeat fires,
-                // SetWakeup re-arming) — `advance` itself is silent.
-                let tick_acts = node.step(now, Event::Tick);
-                actions_acc.push((leader_id, tick_acts));
             }
         }
-        for (id, acts) in actions_acc {
-            self.process_actions(id, now, acts);
-        }
-        self.drive_replication(leader_id, now);
-        self.observe_cluster_commit(leader_id);
+        self.observe_after_event(leader_id, now);
     }
 
     /// Drive the simulator until `deadline`. Returns the number of
@@ -485,8 +476,20 @@ impl Sim {
             .filter_map(|(id, b)| b.pending_wakeup.map(|w| (*id, w)))
             .collect();
         for (id, w) in pending {
-            self.schedule_event(w, id, Event::Tick);
+            self.schedule(w, id, Delivery::Tick);
         }
+    }
+
+    /// Return the soonest wakeup currently in `self.queue` for `target`,
+    /// or `None` if none are pending. Lets `observe_after_event`
+    /// dedupe — a node already has a Tick at the next deadline; no
+    /// need to enqueue another at the same instant.
+    fn earliest_queued_tick_for(&self, target: NodeId) -> Option<Instant> {
+        self.queue
+            .iter()
+            .filter(|s| s.0.target == target && matches!(s.0.delivery, Delivery::Tick))
+            .map(|s| s.0.at)
+            .min()
     }
 
     fn dispatch(&mut self, s: Scheduled) {
@@ -498,6 +501,7 @@ impl Sim {
         }
         let now = s.at;
         match s.delivery {
+            Delivery::Tick => self.dispatch_tick(s.target, now),
             // ADR-0017 §"Driver call pattern" follower path: the
             // simulator plays the role of the cluster driver — calls
             // `validate_append_entries_request`, applies the WAL
@@ -526,50 +530,28 @@ impl Sim {
             // `Replication` API. `peer(from)` returns `None` if the
             // sender is not a configured peer of this node — that
             // matches the legacy event path's "ignore unsolicited
-            // replies" semantics. ADR-0017 §"Driver call pattern":
-            // follow the direct-method call with `step(Tick)` so any
-            // wakeup re-arming on the leader (peer's
-            // `next_heartbeat`, in-flight expiry clearing) gets
-            // emitted as `Action::SetWakeup` for the simulator to
-            // schedule.
+            // replies" semantics.
             Delivery::AppendEntriesReply { from, result } => {
-                if let Some(node) =
-                    self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
+                if let Some(node) = self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
                     && let Some(mut peer) = node.replication().peer(from)
                 {
                     peer.append_result(now, result);
                 }
-                let tick_actions = match self
-                    .nodes
-                    .get_mut(&s.target)
-                    .and_then(|b| b.node.as_mut())
-                {
-                    Some(n) => n.step(now, Event::Tick),
-                    None => return,
-                };
-                self.process_actions(s.target, now, tick_actions);
-                self.drive_replication(s.target, now);
-                self.observe_cluster_commit(s.target);
+                self.observe_after_event(s.target, now);
             }
-            // Voter-side: drive `RaftNode::request_vote` directly,
-            // synthesise the reply event, ship it back to the
-            // candidate (subject to the drop / duplicate model), and
-            // follow with `step(Tick)` to flush any wakeup re-arming
-            // (the voter resets its election timer on grant).
+            // Voter-side: drive `election().handle_request_vote`,
+            // synthesise the reply outcome, ship it back to the
+            // candidate (subject to the drop / duplicate model).
             Delivery::RequestVote {
                 from,
                 term,
                 last_tx_id,
                 last_term,
             } => {
-                let reply = match self
-                    .nodes
-                    .get_mut(&s.target)
-                    .and_then(|b| b.node.as_mut())
-                {
-                    Some(n) => n.request_vote(
+                let reply = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut()) {
+                    Some(n) => n.election().handle_request_vote(
                         now,
-                        raft::RequestVoteRequest {
+                        RequestVoteRequest {
                             from,
                             term,
                             last_tx_id,
@@ -578,50 +560,124 @@ impl Sim {
                     ),
                     None => return,
                 };
-                let tick_actions = match self
-                    .nodes
-                    .get_mut(&s.target)
-                    .and_then(|b| b.node.as_mut())
-                {
-                    Some(n) => n.step(now, Event::Tick),
-                    None => return,
-                };
-                self.process_actions(s.target, now, tick_actions);
+                self.observe_after_event(s.target, now);
 
-                // Schedule the synthesised reply back to the
-                // candidate, subject to the drop / duplicate model.
                 if self.is_dropped(s.target, from) || self.rolled_drop() {
                     return;
                 }
+                let outcome = if reply.granted {
+                    VoteOutcome::Granted { term: reply.term }
+                } else {
+                    VoteOutcome::Denied { term: reply.term }
+                };
                 let when = now + self.network_delay;
-                let event = Event::RequestVoteReply {
+                let delivery = Delivery::RequestVoteReply {
                     from: s.target,
-                    term: reply.term,
-                    granted: reply.granted,
+                    outcome,
                 };
                 let dup = self.rolled_duplicate();
-                self.schedule_event(when, from, event.clone());
+                self.schedule(when, from, delivery.clone());
                 if dup {
-                    self.schedule_event(when, from, event);
+                    self.schedule(when, from, delivery);
                 }
             }
-            Delivery::Step(event) => {
-                let actions = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
-                {
-                    Some(n) => n.step(now, event),
-                    None => return,
-                };
-                self.process_actions(s.target, now, actions);
-                self.drive_replication(s.target, now);
-                self.observe_cluster_commit(s.target);
+            // Candidate-side: feed the outcome batch (single entry per
+            // arrival) into `election().handle_votes`. May transition
+            // to Leader (on majority) or Follower (on higher-term).
+            Delivery::RequestVoteReply { from, outcome } => {
+                if let Some(node) = self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut()) {
+                    node.election().handle_votes(now, vec![(from, outcome)]);
+                }
+                self.observe_after_event(s.target, now);
             }
+        }
+    }
+
+    /// Tick dispatch: tick-then-start. If `start` returns true, pull
+    /// `get_requests` and ship each `RequestVote` to its peer via
+    /// the simulated network. Then run post-event observation.
+    fn dispatch_tick(&mut self, src: NodeId, now: Instant) {
+        let started = self
+            .nodes
+            .get_mut(&src)
+            .and_then(|b| b.node.as_mut())
+            .map(|n| {
+                let _ = n.election().tick(now);
+                n.election().start(now)
+            })
+            .unwrap_or(false);
+
+        if started {
+            let requests: Vec<(NodeId, RequestVoteRequest)> = self
+                .nodes
+                .get_mut(&src)
+                .and_then(|b| b.node.as_mut())
+                .map(|n| n.election().get_requests())
+                .unwrap_or_default();
+            for (peer, req) in requests {
+                if self.is_dropped(src, peer) || self.rolled_drop() {
+                    continue;
+                }
+                let when = now + self.network_delay;
+                let delivery = Delivery::RequestVote {
+                    from: src,
+                    term: req.term,
+                    last_tx_id: req.last_tx_id,
+                    last_term: req.last_term,
+                };
+                let dup = self.rolled_duplicate();
+                self.schedule(when, peer, delivery.clone());
+                if dup {
+                    self.schedule(when, peer, delivery);
+                }
+            }
+        }
+        self.observe_after_event(src, now);
+    }
+
+    /// `Election::tick` always returns a `Wakeup` with a populated
+    /// `deadline`; the harness re-polls and only re-schedules a Tick
+    /// when the deadline has *moved* (and no Tick is already queued
+    /// at or before the new deadline). The two-layer dedupe keeps
+    /// stale-from-here Ticks from piling up, which was the runaway
+    /// loop in the v1 harness.
+    fn refresh_wakeup(&mut self, src: NodeId, now: Instant) -> Option<Instant> {
+        let deadline = self
+            .nodes
+            .get_mut(&src)
+            .and_then(|b| b.node.as_mut())
+            .map(|n| n.election().tick(now).deadline);
+        let prev = self.nodes.get(&src).and_then(|b| b.pending_wakeup);
+        match (deadline, prev) {
+            (Some(d), Some(p)) if p == d => Some(d), // no change, no re-queue
+            (Some(d), _) => {
+                if let Some(b) = self.nodes.get_mut(&src) {
+                    b.pending_wakeup = Some(d);
+                }
+                // Skip the schedule if a Tick is already queued for the
+                // exact same deadline — duplicates pile up otherwise.
+                // (Strictly-earlier queued Ticks are kept and a NEW one
+                // at `d` is *also* added, so a node that finished an
+                // election round still gets its post-round wakeup
+                // scheduled even when the candidate-round Tick is
+                // sitting in the queue at an earlier — now-stale —
+                // deadline.)
+                let already = self
+                    .earliest_queued_tick_for(src)
+                    .is_some_and(|q| q == d);
+                if !already {
+                    self.schedule(d, src, Delivery::Tick);
+                }
+                Some(d)
+            }
+            (None, _) => None,
         }
     }
 
     /// Cluster-driver-side handling of an inbound `AppendEntries` for
     /// `target`. Mirrors the new follower flow: validate → mirror
-    /// truncation/append → `advance` on durability → `step(Tick)` to
-    /// flush wakeups → synthesize and ship the wire reply.
+    /// truncation/append → `advance` on durability → re-poll wakeup
+    /// → synthesize and ship the wire reply.
     #[allow(clippy::too_many_arguments)]
     fn deliver_append_entries(
         &mut self,
@@ -690,23 +746,10 @@ impl Sim {
                 }
                 (true, None)
             }
-            AppendEntriesDecision::Fatal { reason } => {
-                self.fatal_errors.push((target, reason));
-                return;
-            }
         };
 
-        // Tick after validate (+ optional advance) so any wakeup
-        // re-arming or election-timer changes get re-emitted as
-        // `Action::SetWakeup`. ADR-0017 §"Driver call pattern": the
-        // driver always follows `advance` with `step(Tick)`.
-        let tick_actions = match self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
-            Some(n) => n.step(now, Event::Tick),
-            None => return,
-        };
-        self.process_actions(target, now, tick_actions);
-        self.drive_replication(target, now);
-        self.observe_cluster_commit(target);
+        // Re-poll wakeup, drive replication, observe transitions.
+        self.observe_after_event(target, now);
 
         // Synthesize the reply from getters (ADR-0017 §"AE reply:
         // write vs commit watermark" — the reply ships
@@ -756,16 +799,15 @@ impl Sim {
     /// `src` and pull the next `AppendEntries` via the
     /// `Replication` API, scheduling the result as a
     /// `Delivery::AppendEntries` (subject to the network drop /
-    /// duplicate model). This replaces the legacy
-    /// `Action::SendAppendEntries` push path.
+    /// duplicate model).
     ///
-    /// Called after every `step` on a node so that:
+    /// Called after every event so that:
     ///
-    /// - new entries shipped via `client_write` (advance + Tick)
-    ///   get fanned out immediately;
+    /// - new entries shipped via `client_write` (advance) get fanned
+    ///   out immediately;
     /// - heartbeat deadlines firing on `Tick` get serviced;
     /// - newly-elected leaders' first round of AEs goes out as
-    ///   soon as `BecomeRole { Leader, .. }` is observed.
+    ///   soon as they transition.
     ///
     /// `get_append_range` itself gates on `next_heartbeat` and
     /// in-flight, so calling it on every step is idempotent — a
@@ -833,53 +875,44 @@ impl Sim {
         }
     }
 
-    fn process_actions(&mut self, src: NodeId, now: Instant, actions: Vec<Action>) {
-        for a in actions {
-            match a {
-                Action::SendRequestVote {
-                    to,
-                    term,
-                    last_tx_id,
-                    last_term,
-                } => {
-                    if self.is_dropped(src, to) || self.rolled_drop() {
-                        continue;
-                    }
-                    let when = now + self.network_delay;
-                    let delivery = Delivery::RequestVote {
-                        from: src,
-                        term,
-                        last_tx_id,
-                        last_term,
-                    };
-                    let dup = self.rolled_duplicate();
-                    self.schedule(when, to, delivery.clone());
-                    if dup {
-                        self.schedule(when, to, delivery);
-                    }
+    /// Post-event housekeeping: detect role/term transitions, refresh
+    /// the next wakeup deadline from `Election::tick`, and drive
+    /// leader-side replication. Must be called after every state-
+    /// machine call so the simulator stays in sync with the node.
+    fn observe_after_event(&mut self, src: NodeId, now: Instant) {
+        // Detect role/term transitions by polling `node.role()` —
+        // no action stream now. Multiple changes inside a single
+        // event collapse into the final state; only the (Candidate
+        // → Leader) transition matters for `leaders_per_term` and
+        // it is always observable post-call.
+        let observed = self
+            .nodes
+            .get(&src)
+            .and_then(|b| b.node.as_ref())
+            .map(|n| (n.role(), n.current_term()));
+        if let Some((role, term)) = observed
+            && let Some(b) = self.nodes.get_mut(&src)
+        {
+            if role != b.last_observed_role || term != b.last_observed_term {
+                self.transitions.push((src, role, term));
+                if matches!(role, Role::Leader) {
+                    self.leaders_per_term.entry(term).or_default().insert(src);
                 }
-                Action::BecomeRole { role, term } => {
-                    self.transitions.push((src, role, term));
-                    if matches!(role, Role::Leader) {
-                        self.leaders_per_term.entry(term).or_default().insert(src);
-                    }
-                }
-                Action::SetWakeup { at } => {
-                    if let Some(b) = self.nodes.get_mut(&src) {
-                        b.pending_wakeup = Some(at);
-                    }
-                    self.schedule_event(at, src, Event::Tick);
-                }
-                Action::FatalError { reason } => {
-                    // The library has frozen — record it for the
-                    // assertion helpers. In simulator runs that don't
-                    // expect a fatal, this surfaces via
-                    // `Sim::fatal_errors()` (panic-on-unexpected is the
-                    // caller's responsibility).
-                    self.fatal_errors.push((src, reason));
-                }
+                b.last_observed_role = role;
+                b.last_observed_term = term;
             }
         }
+
+        // Re-poll the next wakeup, only re-scheduling a Tick if the
+        // deadline has advanced. Calling `Election::tick` is cheap and
+        // idempotent; the dedupe is for the simulator queue (avoids
+        // runaway loops where each observation re-enqueues the same
+        // wakeup).
+        let _ = self.refresh_wakeup(src, now);
+
+        // Leader-side fan-out and commit observation.
+        self.drive_replication(src, now);
+        self.observe_cluster_commit(src);
     }
 
     fn schedule(&mut self, at: Instant, target: NodeId, delivery: Delivery) {
@@ -890,10 +923,6 @@ impl Sim {
             delivery,
             seq: self.seq,
         }));
-    }
-
-    fn schedule_event(&mut self, at: Instant, target: NodeId, event: Event) {
-        self.schedule(at, target, Delivery::Step(event));
     }
 
     /// Probabilistic drop check. Tossed once per outbound message;
@@ -1054,4 +1083,45 @@ impl Sim {
 
 fn canon_pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
     if a < b { (a, b) } else { (b, a) }
+}
+
+// ─── Test helpers for direct `RaftNode` drives ──────────────────────────────
+//
+// Tests that don't use the `Sim` harness still need to drive a single
+// `RaftNode` through ticks and vote replies. These wrap the new
+// `RaftNode::election()` API in tight-cycle helpers that match the
+// shape of the old `step(Event::*)` calls — keeps tests readable.
+
+/// Tick the election timer once (drains expired RPCs, lazy-arms on
+/// first call) and try to start an election. Equivalent in intent to
+/// the historic `let _ = node.step(now, Event::Tick);` plus the
+/// step-time election-start trigger.
+pub fn drive_tick<P: raft::Persistence>(node: &mut RaftNode<P>, now: Instant) {
+    let _ = node.election().tick(now);
+    let _ = node.election().start(now);
+}
+
+/// Feed a single `RequestVote` reply into the candidate. Equivalent
+/// in intent to the historic
+/// `let _ = node.step(now, Event::RequestVoteReply { from, term, granted });`.
+pub fn deliver_vote_reply<P: raft::Persistence>(
+    node: &mut RaftNode<P>,
+    now: Instant,
+    from: NodeId,
+    term: Term,
+    granted: bool,
+) {
+    let outcome = if granted {
+        VoteOutcome::Granted { term }
+    } else {
+        VoteOutcome::Denied { term }
+    };
+    node.election().handle_votes(now, vec![(from, outcome)]);
+}
+
+/// Count outbound `RequestVote` requests for the current candidacy.
+/// Equivalent in intent to counting `Action::SendRequestVote` items
+/// in the old `step` action vec.
+pub fn outbound_vote_count<P: raft::Persistence>(node: &mut RaftNode<P>) -> usize {
+    node.election().get_requests().len()
 }

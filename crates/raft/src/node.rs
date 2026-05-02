@@ -35,18 +35,13 @@
 
 use std::time::{Duration, Instant};
 
-use spdlog::{debug, error, info, warn};
-
-use crate::action::Action;
-use crate::candidate::CandidateState;
-use crate::event::Event;
+use crate::consensus::{CandidateState, Election};
 use crate::follower::FollowerState;
 use crate::leader::{InFlightAppend, LeaderState};
 use crate::log_entry::LogEntryRange;
 use crate::persistence::Persistence;
 use crate::quorum::Quorum;
 use crate::replication::{AppendEntriesRequest, AppendResult, Replication};
-use crate::request_vote::{RequestVoteReply, RequestVoteRequest};
 use crate::role::Role;
 use crate::timer::{ElectionTimer, ElectionTimerConfig};
 use crate::types::{NodeId, RejectReason, Term, TxId};
@@ -138,18 +133,11 @@ pub enum AppendEntriesDecision {
     Accept {
         append: Option<LogEntryRange>,
     },
-    /// A `Persistence` write failed mid-validate. The node has
-    /// frozen itself (`step` and `advance` are now no-ops). The
-    /// driver MUST NOT touch the WAL, MUST NOT call `advance`, and
-    /// MUST NOT send a success reply. Tear the node down.
-    Fatal {
-        reason: &'static str,
-    },
 }
 
 /// Role-specific state held inline so the type system enforces
 /// "you can only access leader state if you are the leader".
-enum NodeState {
+pub(crate) enum NodeState {
     Initializing,
     Follower(FollowerState),
     Candidate(CandidateState),
@@ -157,7 +145,7 @@ enum NodeState {
 }
 
 impl NodeState {
-    fn role(&self) -> Role {
+    pub(crate) fn role(&self) -> Role {
         match self {
             NodeState::Initializing => Role::Initializing,
             NodeState::Follower(_) => Role::Follower,
@@ -168,22 +156,16 @@ impl NodeState {
 }
 
 pub struct RaftNode<P: Persistence> {
-    self_id: NodeId,
-    peers: Vec<NodeId>,
+    pub(crate) self_id: NodeId,
+    pub(crate) peers: Vec<NodeId>,
 
-    state: NodeState,
-    election_timer: ElectionTimer,
+    pub(crate) state: NodeState,
+    pub(crate) election_timer: ElectionTimer,
 
-    persistence: P,
+    pub(crate) persistence: P,
 
-    quorum: Quorum,
-    self_slot: usize,
-
-    /// Set once the library has emitted `Action::FatalError`. Every
-    /// subsequent `step()` returns an empty action vec — the node is
-    /// frozen and the driver must shut it down. We don't re-emit the
-    /// fatal: the driver already saw it once.
-    failed: bool,
+    pub(crate) quorum: Quorum,
+    pub(crate) self_slot: usize,
 
     /// Highest tx_id durably written to this node's raft log.
     /// Advanced by the driver via `advance(write, commit)`. Bounds
@@ -191,13 +173,13 @@ pub struct RaftNode<P: Persistence> {
     /// up-to-date check, and feeds the §5.3 prev_log coverage check.
     /// Survives role transitions. Invariant:
     /// `local_write_index >= local_commit_index >= 0`.
-    local_write_index: TxId,
+    pub(crate) local_write_index: TxId,
     /// Highest tx_id durably committed to this node's ledger.
     /// Advanced by the driver via `advance(write, commit)`. Feeds
     /// the leader's quorum self-slot (entries committed locally
     /// count toward cluster_commit). Read by `commit_index()`.
-    local_commit_index: TxId,
-    cluster_commit_index: TxId,
+    pub(crate) local_commit_index: TxId,
+    pub(crate) cluster_commit_index: TxId,
 
     /// First `tx_id` of the leader's current term — set on
     /// `become_leader_after_win` to `local_write_index + 1`
@@ -214,11 +196,9 @@ pub struct RaftNode<P: Persistence> {
     /// transition); they trust the leader's `leader_commit`, which
     /// the leader has
     /// already gated on its end.
-    current_term_first_tx: TxId,
+    pub(crate) current_term_first_tx: TxId,
 
-    last_emitted_wakeup: Option<Instant>,
-
-    cfg: RaftConfig,
+    pub(crate) cfg: RaftConfig,
 }
 
 impl<P: Persistence> RaftNode<P> {
@@ -263,12 +243,10 @@ impl<P: Persistence> RaftNode<P> {
             persistence,
             quorum,
             self_slot,
-            failed: false,
             local_write_index: 0,
             local_commit_index: 0,
             cluster_commit_index: 0,
             current_term_first_tx: 0,
-            last_emitted_wakeup: None,
             cfg,
         }
     }
@@ -355,19 +333,17 @@ impl<P: Persistence> RaftNode<P> {
     /// (clamped to the freshly-updated `local_commit_index`,
     /// satisfying Raft §5.3's follower commit rule).
     ///
-    /// Returns `()` and queues no actions. Convention: the driver
-    /// follows `advance` with `step(Event::Tick)` to flush deferred
-    /// outputs (heartbeats, `SetWakeup` re-arming). After a fatal
-    /// failure the call is a no-op, mirroring `step`.
+    /// Returns `()` and emits no driver-visible signal. The driver
+    /// re-polls `Election::tick` after each `advance` if a fresh
+    /// wakeup deadline is needed (heartbeats, election timer
+    /// re-arming). After a fatal failure the call is a no-op,
+    /// mirroring the rest of the public surface.
     ///
     /// Invariant: `local_commit_index <= local_write_index`. Debug
     /// builds panic on violation; release builds clamp the commit
     /// argument down to the write argument (same posture as the
     /// AE-reply guard).
     pub fn advance(&mut self, local_write_index: TxId, local_commit_index: TxId) {
-        if self.failed {
-            return;
-        }
         debug_assert!(
             local_commit_index <= local_write_index,
             "advance: commit_index={} > write_index={}",
@@ -458,7 +434,7 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     /// Build the next AE for `peer_id` and arm the in-flight slot.
-    /// Returns `None` if not leader / peer unknown / failed.
+    /// Returns `None` if not leader / peer unknown.
     ///
     /// Same source-of-truth as `leader_send_to`: both routes share
     /// the §5.3 prev-log header construction, the same-term range
@@ -469,9 +445,6 @@ impl<P: Persistence> RaftNode<P> {
         peer_id: NodeId,
         now: Instant,
     ) -> Option<AppendEntriesRequest> {
-        if self.failed {
-            return None;
-        }
         if !self.role().is_leader() {
             return None;
         }
@@ -640,362 +613,16 @@ impl<P: Persistence> RaftNode<P> {
         }
     }
 
-    // ─── request_vote (direct-method voter side) ─────────────────────────
+    // ─── election() ──────────────────────────────────────────────────────
 
-    /// Voter-side handler for an inbound `RequestVote`. Runs the
-    /// §5.1 / §5.4.1 protocol checks and returns a
-    /// [`RequestVoteReply`] synchronously — there is no action-stream
-    /// equivalent; this is the only voter-side entry-point.
+    /// Entry point for the consensus / election sub-primitive. Returns
+    /// an [`Election`] borrow view; see the [`crate::consensus`]
+    /// module for the cluster's loop pattern.
     ///
-    /// Internal state mutations performed before returning:
-    ///
-    /// - On `term > current_term`: `observe_higher_term` (vote-log
-    ///   bump) and `transition_to_follower` (state reset, including
-    ///   `pending_leader_commit` and `current_term_first_tx`).
-    /// - On grant: durable `Persistence::vote(term, from)` and
-    ///   `election_timer.reset(now)` — don't start a competing
-    ///   election while we've committed to someone else's.
-    ///
-    /// Frozen-after-fatal: if the node has already emitted
-    /// `Action::FatalError`, every call returns
-    /// `RequestVoteReply { term: current_term(), granted: false }`
-    /// without touching persistence — same posture as `step()`.
-    pub fn request_vote(
-        &mut self,
-        now: Instant,
-        req: RequestVoteRequest,
-    ) -> RequestVoteReply {
-        if self.failed {
-            return RequestVoteReply {
-                term: self.current_term(),
-                granted: false,
-            };
-        }
-
-        let RequestVoteRequest {
-            from,
-            term,
-            last_tx_id,
-            last_term,
-        } = req;
-
-        let current_term = self.current_term();
-
-        if term < current_term {
-            return RequestVoteReply {
-                term: current_term,
-                granted: false,
-            };
-        }
-
-        // Higher term observed — persist the vote-log bump first,
-        // then step down. The helper `observe_higher_term` uses
-        // `local_write_index + 1` as the term-log boundary so we
-        // never shadow our own entries (using the candidate's
-        // `last_tx_id` would record the new term at a tx that
-        // already has a term assigned, breaking §5.3 prev_log_term
-        // lookups for our existing entries).
-        if term > current_term {
-            self.observe_higher_term(term);
-            // `request_vote` is a direct method without an action stream;
-            // the cluster driver polls `node.role()` after the call to
-            // detect step-down and signal its replication gate.
-            self.transition_to_follower(now, None, &mut Vec::new());
-        }
-
-        // §5.4.1 up-to-date check. The voter compares its own
-        // durable log extent (`local_write_index`) — not its commit
-        // watermark — to the candidate's claim. Using commit would
-        // let a candidate with strictly older on-disk state win
-        // votes from a node whose ledger had merely fallen behind
-        // its own raft-log.
-        let our_last_tx = self.local_write_index;
-        let our_last_term = self.local_last_term();
-        let candidate_up_to_date = (last_term > our_last_term)
-            || (last_term == our_last_term && last_tx_id >= our_last_tx);
-        if !candidate_up_to_date {
-            return RequestVoteReply {
-                term: self.current_term(),
-                granted: false,
-            };
-        }
-
-        // Try to grant — durable write through the trait.
-        let granted = match self.persistence.vote(term, from) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(
-                    "raft: node_id={} vote durable write failed: {}",
-                    self.self_id, e
-                );
-                false
-            }
-        };
-
-        if granted {
-            self.election_timer.reset(now);
-        }
-
-        RequestVoteReply {
-            term: self.current_term(),
-            granted,
-        }
-    }
-
-    // ─── step() ──────────────────────────────────────────────────────────
-
-    pub fn step(&mut self, now: Instant, event: Event) -> Vec<Action> {
-        // Once the library has emitted a `FatalError`, every
-        // subsequent step is a no-op. The driver already received the
-        // signal and must shut the node down; continuing would risk
-        // committing non-durable entries or violating §5.3 / §5.4
-        // because in-memory state and on-disk state may have diverged.
-        if self.failed {
-            error!("raft_loop: step() failed: node is in failed state");
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        match event {
-            Event::Tick => self.on_tick(now, &mut out),
-            Event::RequestVoteReply {
-                from,
-                term,
-                granted,
-            } => self.on_request_vote_reply(now, from, term, granted, &mut out),
-        }
-        // Skip wakeup emission if a fatal happened in this step —
-        // there is no future work for the timer to wake up to.
-        if !self.failed {
-            self.emit_wakeup_if_changed(&mut out);
-        }
-        out
-    }
-
-    // ─── Tick ────────────────────────────────────────────────────────────
-
-    fn on_tick(&mut self, now: Instant, out: &mut Vec<Action>) {
-        // First-Tick lazy arm. The library cannot call `Instant::now()`
-        // (ADR-0017); the constructor leaves the election timer
-        // disarmed and we prime it on the first time-bearing event.
-        if !self.role().is_leader() && self.election_timer.deadline().is_none() {
-            self.election_timer.arm(now);
-        }
-
-        if self.election_timer.is_expired(now) && !self.role().is_leader() {
-            self.start_election(now, out);
-        }
-
-        // Drain expired in-flight RequestVote RPCs (treat as no-vote).
-        if let NodeState::Candidate(c) = &mut self.state {
-            let _expired = c.drain_expired(now);
-        }
-    }
-
-    // ─── Election machinery ──────────────────────────────────────────────
-
-    fn start_election(&mut self, now: Instant, out: &mut Vec<Action>) {
-        // Use max-of-(term-log, vote-log) so a candidate that fails
-        // round N still bumps to N+1 next round — the term log
-        // doesn't advance on a lost election, only the vote log does.
-        let new_term = self.current_term().saturating_add(1);
-
-        // Self-vote (durable, synchronous through the trait).
-        match self.persistence.vote(new_term, self.self_id) {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    "raft: node_id={} could not self-vote in term {}; arming next round",
-                    self.self_id, new_term
-                );
-                self.election_timer.reset(now);
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "raft: node_id={} self-vote durable write failed: {}",
-                    self.self_id, e
-                );
-                self.election_timer.reset(now);
-                return;
-            }
-        }
-
-        let mut candidate = CandidateState::new(new_term, self.self_id);
-        let majority = self.quorum.majority();
-
-        info!(
-            "raft: node_id={} starting election for term {} (peers={}, majority={})",
-            self.self_id,
-            new_term,
-            self.peers.len(),
-            majority
-        );
-
-        let other_peers: Vec<NodeId> = self
-            .peers
-            .iter()
-            .copied()
-            .filter(|p| *p != self.self_id)
-            .collect();
-
-        // Single-node cluster: self-vote is already a majority.
-        if other_peers.is_empty() {
-            self.become_leader_after_win(new_term, now, out);
-            return;
-        }
-
-        let last_tx_id = self.local_write_index;
-        let last_term = self.local_last_term();
-
-        let expires_at = now + self.cfg.rpc_timeout;
-        for peer in other_peers {
-            candidate.record_in_flight(peer, expires_at);
-            out.push(Action::SendRequestVote {
-                to: peer,
-                term: new_term,
-                last_tx_id,
-                last_term,
-            });
-        }
-
-        self.election_timer.reset(now);
-        self.state = NodeState::Candidate(candidate);
-        out.push(Action::BecomeRole {
-            role: Role::Candidate,
-            term: new_term,
-        });
-    }
-
-    fn on_request_vote_reply(
-        &mut self,
-        now: Instant,
-        from: NodeId,
-        term: Term,
-        granted: bool,
-        out: &mut Vec<Action>,
-    ) {
-        let (election_term, majority_reached) = match &mut self.state {
-            NodeState::Candidate(c) => {
-                if term > c.election_term {
-                    self.observe_higher_term(term);
-                    self.transition_to_follower(now, None, out);
-                    return;
-                }
-                if term < c.election_term {
-                    return;
-                }
-                c.complete_in_flight(from);
-                if !granted {
-                    return;
-                }
-                let majority = self.quorum.majority();
-                (c.election_term, c.record_grant(from, majority))
-            }
-            _ => return,
-        };
-
-        if majority_reached {
-            self.become_leader_after_win(election_term, now, out);
-        }
-    }
-
-    fn become_leader_after_win(&mut self, new_term: Term, now: Instant, out: &mut Vec<Action>) {
-        // The new term's first entry will live at `local_write_index +
-        // 1`; existing entries belong to whatever earlier term they
-        // were committed under, so the new boundary must not be
-        // recorded at or before `local_write_index` or it would
-        // shadow them in `term_at_tx` lookups. We anchor on the
-        // *write* extent (not the commit extent) because the new
-        // leader's first entry sits after the last on-disk one,
-        // regardless of which entries the local ledger has applied.
-        //
-        // No catch-up record. The vote log can validly race ahead of
-        // the term log (observed-higher-term-via-RPC), and Raft does
-        // not require term-log records to be contiguous. The
-        // `Persistence::commit_term` contract permits any
-        // `current < expected` jump.
-        let start_tx_id = self.local_write_index + 1;
-
-        // Atomic election-win commit. ADR-0017 §"Required Invariants" #5.
-        match self.persistence.commit_term(new_term, start_tx_id) {
-            Ok(true) => {}
-            Ok(false) => {
-                debug!(
-                    "raft: node_id={} commit_term({}) refused (current={}); stepping down",
-                    self.self_id,
-                    new_term,
-                    self.persistence.current_term()
-                );
-                self.transition_to_follower(now, None, out);
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "raft: node_id={} commit_term({}) failed: {}; stepping down",
-                    self.self_id, new_term, e
-                );
-                self.transition_to_follower(now, None, out);
-                return;
-            }
-        }
-
-        info!(
-            "raft: node_id={} won election at term {} (start_tx_id={})",
-            self.self_id, new_term, start_tx_id
-        );
-
-        self.election_timer.disarm();
-        self.quorum.reset_peers(self.self_slot);
-        // Record this term's first-entry watermark *before* the
-        // first cluster_commit advance can fire — the §5.4.2 / Figure
-        // 8 gate is inlined at every advance site.
-        self.current_term_first_tx = start_tx_id;
-        // Quorum self-slot is seeded from the new leader's *commit*
-        // watermark, not the write watermark. The cluster_commit
-        // quorum advances on durably-committed-locally entries; a
-        // written-but-uncommitted entry must not contribute its
-        // replica count to cluster_commit (Figure-8 §5.4.2 gate
-        // below blocks any advance below `current_term_first_tx`).
-        if let Some(adv) = self.quorum.advance(self.self_slot, self.local_commit_index)
-            && !(self.peers.len() > 1 && adv < self.current_term_first_tx)
-            && adv > self.cluster_commit_index
-        {
-            self.cluster_commit_index = adv;
-        }
-
-        let other_peers: Vec<NodeId> = self
-            .peers
-            .iter()
-            .copied()
-            .filter(|p| *p != self.self_id)
-            .collect();
-        // `last_local_tx` is the write extent — replication's initial
-        // `next_index = last_local_tx + 1` must include any entries
-        // that are written-but-not-yet-locally-committed so the leader
-        // can ship them to followers without first re-fsyncing. The
-        // replication-window upper bound itself is read directly from
-        // `self.local_write_index` in `leader_send_to`.
-        let leader = LeaderState::new(
-            &other_peers,
-            self.local_write_index,
-            now,
-            self.cfg.heartbeat_interval,
-            self.cfg.rpc_timeout,
-        );
-
-        self.state = NodeState::Leader(leader);
-        out.push(Action::BecomeRole {
-            role: Role::Leader,
-            term: new_term,
-        });
-
-        // The cluster's per-peer replication loop (driven via
-        // `RaftNode::replication`) picks up from here. Each peer's
-        // `next_heartbeat` is initialised to `now` in
-        // `LeaderState::new`, so the very first
-        // `PeerReplication::get_append_range` after this `BecomeRole`
-        // returns Some — that's the immediate first-round AE that
-        // suppresses peer election timers.
+    /// All consensus state lives on this `RaftNode`; the returned
+    /// handle is a borrow view that performs no allocation of its own.
+    pub fn election(&mut self) -> Election<'_, P> {
+        Election { node: self }
     }
 
     // ─── AppendEntries (follower path) ───────────────────────────────────
@@ -1039,12 +666,6 @@ impl<P: Persistence> RaftNode<P> {
         entries: LogEntryRange,
         leader_commit: TxId,
     ) -> AppendEntriesDecision {
-        if self.failed {
-            return AppendEntriesDecision::Fatal {
-                reason: "node already failed",
-            };
-        }
-
         let current_term = self.current_term();
 
         if term < current_term {
@@ -1057,10 +678,10 @@ impl<P: Persistence> RaftNode<P> {
         if term > current_term {
             self.observe_higher_term(term);
         }
-        // `validate_append_entries_request` is a direct method without
-        // an action stream; the driver polls `node.role()` after the
-        // call to detect step-down.
-        self.transition_to_follower(now, Some(from), &mut Vec::new());
+        // `validate_append_entries_request` is a direct method;
+        // the driver polls `node.role()` after the call to detect
+        // step-down.
+        self.transition_to_follower(now, Some(from));
         self.election_timer.reset(now);
 
         // §5.3 prev_log_term match. `local_write_index` is the §5.3
@@ -1096,16 +717,7 @@ impl<P: Persistence> RaftNode<P> {
                         after,
                         self.local_commit_index
                     );
-                    if let Err(e) = self.persistence.truncate_term_after(after) {
-                        warn!(
-                            "raft: node_id={} truncate_term_after({}) failed: {}",
-                            self.self_id, after, e
-                        );
-                        self.failed = true;
-                        return AppendEntriesDecision::Fatal {
-                            reason: "truncate_term_after failed",
-                        };
-                    }
+                    self.persistence.truncate_term_after(after);
                     self.local_write_index = after;
                     if self.local_commit_index > after {
                         self.local_commit_index = after;
@@ -1126,19 +738,9 @@ impl<P: Persistence> RaftNode<P> {
         }
 
         if !entries.is_empty() {
-            if entries.term > self.persistence.current_term()
-                && let Err(err) = self
-                    .persistence
-                    .observe_term(entries.term, entries.start_tx_id)
-            {
-                warn!(
-                    "raft: node_id={} observe_term({},{}) failed: {}",
-                    self.self_id, entries.term, entries.start_tx_id, err
-                );
-                self.failed = true;
-                return AppendEntriesDecision::Fatal {
-                    reason: "observe_term failed",
-                };
+            if entries.term > self.persistence.current_term() {
+                self.persistence
+                    .observe_term(entries.term, entries.start_tx_id);
             }
             // Defer `leader_commit` until the driver durably persists
             // the entries and calls `advance(write, …)`. The §5.3
@@ -1187,10 +789,9 @@ impl<P: Persistence> RaftNode<P> {
         if term > current_term {
             self.observe_higher_term(term);
             // `on_append_entries_reply` is reachable only via
-            // `replication_append_result` (a direct method without an
-            // action stream); the driver polls `node.role()` after the
-            // call to detect step-down.
-            self.transition_to_follower(now, None, &mut Vec::new());
+            // `replication_append_result` (a direct method); the driver
+            // polls `node.role()` after the call to detect step-down.
+            self.transition_to_follower(now, None);
             return;
         }
 
@@ -1276,112 +877,12 @@ impl<P: Persistence> RaftNode<P> {
         }
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────
-
-    /// Observe a higher term via inbound RPC (request OR reply).
-    /// **Only the vote log is updated.** The term log records actual
-    /// entry-term boundaries — observing a higher term via an RPC
-    /// without receiving entries from that term does not establish
-    /// a boundary, and writing one would pollute `term_at_tx` for
-    /// existing entries: the §5.3 prev-log-term check would later
-    /// match against the phantom record, so a leader's AE could
-    /// graft new entries onto a stale prefix without truncation.
-    /// (`current_term()` is `max(term-log, vote-log)`, so the read
-    /// API still reflects the higher term.)
-    fn observe_higher_term(&mut self, term: Term) {
-        if let Err(e) = self.persistence.observe_vote_term(term) {
-            warn!(
-                "raft: node_id={} observe_vote_term({}) failed: {}",
-                self.self_id, term, e
-            );
-        }
-    }
-
-    /// Term of the local log entry at `local_write_index`. `0` means
-    /// the log is empty — required by §5.4.1's up-to-date check,
-    /// which treats the empty log as "term 0". The §5.4.1 candidate-
-    /// vs-voter comparison is against the *write* extent, not the
-    /// commit extent: a voter with durably-written-but-uncommitted
-    /// entries still votes against a candidate whose log is shorter.
-    ///
-    /// When `local_write_index > 0` there is, by construction, a
-    /// term-log record covering it (every entry's term is recorded
-    /// via `observe_term` / `commit_term`, and truncation drops
-    /// the entry and its term record together). A `None` from
-    /// `term_at_tx` here therefore means the persistence layer is
-    /// corrupted: returning a default term would silently break
-    /// §5.4.1's election safety, so `expect` surfaces it loudly.
-    fn local_last_term(&self) -> Term {
-        if self.local_write_index == 0 {
-            return 0;
-        }
-        self.persistence
-            .term_at_tx(self.local_write_index)
-            .expect("term_at_tx must cover local_write_index when local_write_index > 0")
-            .term
-    }
-
-    fn transition_to_follower(
-        &mut self,
-        now: Instant,
-        leader_id: Option<NodeId>,
-        out: &mut Vec<Action>,
-    ) {
-        let was_follower = matches!(self.state, NodeState::Follower(_));
-        let mut state = match leader_id {
-            Some(id) => NodeState::Follower(FollowerState::with_leader(id)),
-            None => NodeState::Follower(FollowerState::new()),
-        };
-        std::mem::swap(&mut self.state, &mut state);
-        self.election_timer.arm(now);
-        // The §5.4.2 watermark is leader-only — clear it so a stale
-        // value does not block this node, now a follower, from
-        // accepting the new leader's `leader_commit`.
-        self.current_term_first_tx = 0;
-        // Surface the role change so drivers can react (gate
-        // replication, swap gRPC handlers). Skip emission if we were
-        // already a Follower — refreshing leader_id on inbound AE is
-        // not a transition.
-        if !was_follower {
-            out.push(Action::BecomeRole {
-                role: Role::Follower,
-                term: self.current_term(),
-            });
-        }
-    }
-
-    fn next_pending_wakeup(&self) -> Option<Instant> {
-        let mut best: Option<Instant> = None;
-        if let Some(d) = self.election_timer.deadline() {
-            best = Some(best.map(|b| b.min(d)).unwrap_or(d));
-        }
-        if let NodeState::Candidate(c) = &self.state
-            && let Some(d) = c.next_rpc_expiry()
-        {
-            best = Some(best.map(|b| b.min(d)).unwrap_or(d));
-        }
-        if let NodeState::Leader(l) = &self.state
-            && let Some(d) = l.next_wakeup()
-        {
-            best = Some(best.map(|b| b.min(d)).unwrap_or(d));
-        }
-        best
-    }
-
-    fn emit_wakeup_if_changed(&mut self, out: &mut Vec<Action>) {
-        let next = self.next_pending_wakeup();
-        if next != self.last_emitted_wakeup {
-            if let Some(at) = next {
-                out.push(Action::SetWakeup { at });
-            }
-            self.last_emitted_wakeup = next;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_vote::RequestVoteRequest;
 
     /// Tiny in-test in-memory persistence, mirroring
     /// `tests/common/mem_persistence.rs`. The trait abstraction lets
@@ -1413,34 +914,27 @@ mod tests {
             }
             best
         }
-        fn commit_term(&mut self, expected: Term, start_tx_id: TxId) -> std::io::Result<bool> {
+        fn commit_term(&mut self, expected: Term, start_tx_id: TxId) -> bool {
             let cur = self.current_term();
             if cur >= expected {
-                return Ok(false);
+                return false;
             }
             self.term_log.push(crate::TermRecord {
                 term: expected,
                 start_tx_id,
             });
-            Ok(true)
+            true
         }
-        fn observe_term(&mut self, term: Term, start_tx_id: TxId) -> std::io::Result<()> {
+        fn observe_term(&mut self, term: Term, start_tx_id: TxId) {
             let cur = self.current_term();
             if term == cur {
-                return Ok(());
+                return;
             }
-            if term < cur {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "regression",
-                ));
-            }
+            assert!(term > cur, "observe_term regression: incoming={} current={}", term, cur);
             self.term_log.push(crate::TermRecord { term, start_tx_id });
-            Ok(())
         }
-        fn truncate_term_after(&mut self, tx_id: TxId) -> std::io::Result<()> {
+        fn truncate_term_after(&mut self, tx_id: TxId) {
             self.term_log.retain(|r| r.start_tx_id <= tx_id);
-            Ok(())
         }
         fn vote_term(&self) -> Term {
             self.vote_term
@@ -1451,41 +945,35 @@ mod tests {
                 n => Some(n),
             }
         }
-        fn vote(&mut self, term: Term, candidate_id: NodeId) -> std::io::Result<bool> {
-            if candidate_id == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "zero",
-                ));
-            }
+        fn vote(&mut self, term: Term, candidate_id: NodeId) -> bool {
+            assert!(candidate_id != 0, "candidate_id must be non-zero");
             if term < self.vote_term {
-                return Ok(false);
+                return false;
             }
             if term == self.vote_term {
                 if self.voted_for == candidate_id {
-                    return Ok(true);
+                    return true;
                 }
                 if self.voted_for != 0 {
-                    return Ok(false);
+                    return false;
                 }
             }
             self.vote_term = term;
             self.voted_for = candidate_id;
-            Ok(true)
+            true
         }
-        fn observe_vote_term(&mut self, term: Term) -> std::io::Result<()> {
+        fn observe_vote_term(&mut self, term: Term) {
             if term == self.vote_term {
-                return Ok(());
+                return;
             }
-            if term < self.vote_term {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "regression",
-                ));
-            }
+            assert!(
+                term > self.vote_term,
+                "observe_vote_term regression: incoming={} current={}",
+                term,
+                self.vote_term
+            );
             self.vote_term = term;
             self.voted_for = 0;
-            Ok(())
         }
     }
 
@@ -1513,48 +1001,38 @@ mod tests {
     fn election_timeout_starts_election() {
         let mut node = fresh(1, vec![1, 2, 3]);
         let t0 = Instant::now();
-        let _ = node.step(t0, Event::Tick);
-        let actions = node.step(t0 + Duration::from_secs(60), Event::Tick);
+        // First tick lazy-arms; second tick after the timeout starts
+        // the election round.
+        let _ = node.election().tick(t0);
+        let _ = node.election().tick(t0 + Duration::from_secs(60));
+        assert!(node.election().start(t0 + Duration::from_secs(60)));
         assert_eq!(node.role(), Role::Candidate);
         // `current_term()` = max(term-log, vote-log). The term log
         // stays at 0 until election win, but the candidate's
         // self-vote bumps the vote log to 1, so the public read is 1.
         assert_eq!(node.current_term(), 1);
         assert_eq!(node.voted_for(), Some(1));
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, Action::SendRequestVote { .. }))
-            .count();
-        assert_eq!(send_count, 2);
+        // One outbound `RequestVote` per other peer.
+        assert_eq!(node.election().get_requests().len(), 2);
     }
 
     #[test]
     fn single_node_election_immediately_becomes_leader() {
         let mut node = fresh(1, vec![1]);
         let t0 = Instant::now();
-        let _ = node.step(t0, Event::Tick);
-        let actions = node.step(t0 + Duration::from_secs(60), Event::Tick);
+        let _ = node.election().tick(t0);
+        let _ = node.election().tick(t0 + Duration::from_secs(60));
+        // `start` short-circuits to Leader inside the same call when
+        // the cluster has no other peers (self-vote = majority).
+        assert!(node.election().start(t0 + Duration::from_secs(60)));
         assert_eq!(node.role(), Role::Leader);
         assert_eq!(node.current_term(), 1);
-        let became = actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    Action::BecomeRole {
-                        role: Role::Leader,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(became, 1);
     }
 
     #[test]
     fn request_vote_with_higher_term_grants_and_steps_down() {
         let mut node = fresh(1, vec![1, 2, 3]);
-        let reply = node.request_vote(
+        let reply = node.election().handle_request_vote(
             Instant::now(),
             RequestVoteRequest {
                 from: 2,
@@ -1572,8 +1050,9 @@ mod tests {
     fn advance_on_single_node_leader_lifts_cluster_commit() {
         let mut node = fresh(1, vec![1]);
         let t0 = Instant::now();
-        let _ = node.step(t0, Event::Tick);
-        let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+        let _ = node.election().tick(t0);
+        let _ = node.election().tick(t0 + Duration::from_secs(60));
+        let _ = node.election().start(t0 + Duration::from_secs(60));
         assert!(node.role().is_leader());
         node.advance(7, 7);
         // `advance` is silent; observe via getters per ADR-0017
@@ -1587,8 +1066,9 @@ mod tests {
     fn into_persistence_recovers_durable_state() {
         let mut node = fresh(1, vec![1]);
         let t0 = Instant::now();
-        let _ = node.step(t0, Event::Tick);
-        let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+        let _ = node.election().tick(t0);
+        let _ = node.election().tick(t0 + Duration::from_secs(60));
+        let _ = node.election().start(t0 + Duration::from_secs(60));
         assert!(node.role().is_leader());
         assert_eq!(node.current_term(), 1);
 
@@ -1657,7 +1137,7 @@ mod tests {
         let mut node = fresh(1, vec![1, 2, 3]);
         // Bump the node into term 5 by routing an inbound vote at that
         // term (cheapest way to advance current_term in unit tests).
-        let _ = node.request_vote(
+        let _ = node.election().handle_request_vote(
             Instant::now(),
             RequestVoteRequest {
                 from: 2,
@@ -1717,7 +1197,7 @@ mod tests {
         // Pretend we accepted entries 1..=5 at term 1 (durably written
         // but not yet locally committed; truncation invariant forbids
         // truncating below local_commit_index).
-        node.persistence.commit_term(1, 0).unwrap();
+        node.persistence.commit_term(1, 0);
         node.local_write_index = 5;
 
         let decision = node.validate_append_entries_request(
@@ -1743,7 +1223,7 @@ mod tests {
         let mut node = fresh(1, vec![1, 2, 3]);
         // Set up: persistence has term 1 covering all entries; we
         // pretend the entry log is at tx 5 with cluster_commit at 2.
-        node.persistence.commit_term(1, 0).unwrap();
+        node.persistence.commit_term(1, 0);
         node.local_write_index = 5;
         node.local_commit_index = 2;
         node.cluster_commit_index = 2;
@@ -1847,7 +1327,9 @@ mod tests {
         // Election timeout drives transition to candidate (which
         // discards the FollowerState entirely, including
         // pending_leader_commit).
-        let _ = node.step(Instant::now() + Duration::from_secs(60), Event::Tick);
+        let later = Instant::now() + Duration::from_secs(60);
+        let _ = node.election().tick(later);
+        let _ = node.election().start(later);
         assert_eq!(node.role(), Role::Candidate);
 
         // Now drive the candidate back into a follower term — the new
@@ -1891,44 +1373,44 @@ mod tests {
 
     // ── Replication / PeerReplication (cluster-pull leader path) ──────────
 
-    /// Promote a 3-node `RaftNode` to leader by running the
-    /// election manually: a Tick lazy-arms, a second Tick fires
-    /// the timeout, and a `RequestVoteReply { granted: true }`
-    /// from one peer is enough to make a 3-node majority
-    /// (self-vote + that one).
+    /// Promote a 3-node `RaftNode` to leader by running an election
+    /// manually: a tick lazy-arms, a second tick fires the timeout,
+    /// `start` transitions to Candidate, and a `Granted` outcome from
+    /// one peer is enough to make a 3-node majority (self-vote + 1).
     ///
-    /// Returns `(node, leader_now)` so callers can issue
-    /// subsequent calls with timestamps `>= leader_now` —
-    /// `LeaderState::new` initialises every peer's `next_heartbeat`
-    /// to that instant, so the in-place gate in
-    /// `replication_get_append_range` rejects earlier `now` values.
+    /// Returns `(node, leader_now)` so callers can issue subsequent
+    /// calls with timestamps `>= leader_now` — `LeaderState::new`
+    /// initialises every peer's `next_heartbeat` to that instant, so
+    /// the in-place gate in `replication_get_append_range` rejects
+    /// earlier `now` values.
     fn fresh_leader_3node(
         self_id: NodeId,
         peers: Vec<NodeId>,
     ) -> (RaftNode<TestPersistence>, Instant) {
+        use crate::consensus::VoteOutcome;
         let mut node = fresh(self_id, peers.clone());
         let t0 = Instant::now();
         let leader_now = t0 + Duration::from_secs(60);
-        let _ = node.step(t0, Event::Tick);
-        let _ = node.step(leader_now, Event::Tick);
+        let _ = node.election().tick(t0);
+        let _ = node.election().tick(leader_now);
+        let _ = node.election().start(leader_now);
         if node.role().is_leader() {
             return (node, leader_now);
         }
         let term = node.current_term();
         for peer in peers.iter().filter(|&&p| p != self_id) {
-            let _ = node.step(
+            node.election().handle_votes(
                 leader_now,
-                Event::RequestVoteReply {
-                    from: *peer,
-                    term,
-                    granted: true,
-                },
+                vec![(*peer, VoteOutcome::Granted { term })],
             );
             if node.role().is_leader() {
                 return (node, leader_now);
             }
         }
-        panic!("fresh_leader_3node: did not become leader (role={:?})", node.role());
+        panic!(
+            "fresh_leader_3node: did not become leader (role={:?})",
+            node.role()
+        );
     }
 
     #[test]

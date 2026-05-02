@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
-    Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, Persistence,
-    RaftConfig, RaftNode, RejectReason, RequestVoteRequest, Role,
+    AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode,
+    RejectReason, RequestVoteRequest, Role,
 };
 
 fn pick_leader(sim: &Sim) -> Option<NodeId> {
@@ -121,10 +121,10 @@ fn cluster_commit_index_advances_monotonically() {
 fn lost_election_does_not_pollute_term_log() {
     let mut node = fresh_node(1, vec![1, 2]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     for _ in 0..3 {
         now += Duration::from_secs(60);
-        let _ = node.step(now, Event::Tick);
+        common::drive_tick(&mut node, now);
     }
     assert_eq!(node.role(), Role::Candidate);
     // The candidate self-voted at least once.
@@ -151,12 +151,12 @@ fn lost_election_does_not_pollute_term_log() {
 fn higher_term_request_vote_during_candidacy_forces_step_down() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     now += Duration::from_secs(60);
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     assert_eq!(node.role(), Role::Candidate);
 
-    let _ = node.request_vote(
+    let _ = node.election().handle_request_vote(
         now,
         RequestVoteRequest {
             from: 2,
@@ -176,20 +176,15 @@ fn higher_term_request_vote_during_candidacy_forces_step_down() {
 fn higher_term_seen_in_vote_reply_aborts_candidacy() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     now += Duration::from_secs(60);
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     assert_eq!(node.role(), Role::Candidate);
     let candidate_term = node.current_term();
 
-    let _ = node.step(
-        now,
-        Event::RequestVoteReply {
-            from: 2,
-            term: candidate_term + 2,
-            granted: true, // ignored — higher term wins
-        },
-    );
+    // `granted=true` is ignored — higher term wins via the Granted
+    // variant's term, same as the historic Event::RequestVoteReply.
+    common::deliver_vote_reply(&mut node, now, 2, candidate_term + 2, true);
     assert!(!node.role().is_leader());
     assert!(node.current_term() >= candidate_term + 2);
 }
@@ -200,22 +195,15 @@ fn higher_term_seen_in_vote_reply_aborts_candidacy() {
 fn stale_vote_reply_does_not_count_toward_majority() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     now += Duration::from_secs(60);
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     assert_eq!(node.role(), Role::Candidate);
     let term_now = node.current_term();
     assert!(term_now >= 1);
 
     // A reply at an old term — must be ignored.
-    let _ = node.step(
-        now,
-        Event::RequestVoteReply {
-            from: 2,
-            term: term_now - 1,
-            granted: true,
-        },
-    );
+    common::deliver_vote_reply(&mut node, now, 2, term_now - 1, true);
     // Still a candidate, term unchanged.
     assert_eq!(node.role(), Role::Candidate);
     assert_eq!(node.current_term(), term_now);
@@ -232,17 +220,10 @@ fn higher_term_in_append_reply_demotes_leader() {
     // `Replication` API for the synthetic reply.
     let t0 = Instant::now();
     let mut leader_node = fresh_node(99, vec![99, 1]);
-    let _ = leader_node.step(t0, Event::Tick);
-    let _ = leader_node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut leader_node, t0);
+    common::drive_tick(&mut leader_node, t0 + Duration::from_secs(60));
     let term = leader_node.current_term();
-    let _ = leader_node.step(
-        t0 + Duration::from_secs(60),
-        Event::RequestVoteReply {
-            from: 1,
-            term,
-            granted: true,
-        },
-    );
+    common::deliver_vote_reply(&mut leader_node, t0 + Duration::from_secs(60), 1, term, true);
     assert!(leader_node.role().is_leader());
 
     leader_node.replication().peer(1).unwrap().append_result(
@@ -264,9 +245,9 @@ fn higher_term_in_append_reply_demotes_leader() {
 fn boot_does_not_bump_term() {
     let mut node = fresh_node(1, vec![1]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     now += Duration::from_secs(60);
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     assert!(node.role().is_leader());
     let term_before = node.current_term();
     let voted_for_before = node.voted_for();
@@ -388,7 +369,7 @@ fn empty_append_entries_is_a_heartbeat() {
 fn append_entries_from_old_leader_is_rejected() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     // Force the node up to term 5 via observing a higher term.
-    let _ = node.request_vote(
+    let _ = node.election().handle_request_vote(
         Instant::now(),
         RequestVoteRequest {
             from: 2,
@@ -443,25 +424,17 @@ fn read_methods_are_pure() {
     }
 }
 
-/// After `Action::BecomeRole { Leader, T }`, `role()=Leader` and
-/// `current_term() >= T`. Verified by inspecting the action stream
-/// of an in-process election.
+/// Single-node election win is observable post-call via `role()` and
+/// `current_term()` — the cluster polls these getters after each
+/// `Election::start` (no action stream).
 #[test]
-fn become_role_leader_matches_immediate_query() {
+fn became_leader_matches_immediate_query() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let actions = node.step(t0 + Duration::from_secs(60), Event::Tick);
-    let became_at: Option<u64> = actions.iter().find_map(|a| match a {
-        Action::BecomeRole {
-            role: Role::Leader,
-            term,
-        } => Some(*term),
-        _ => None,
-    });
-    assert_eq!(became_at, Some(1));
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
-    assert!(node.current_term() >= 1);
+    assert_eq!(node.current_term(), 1);
 }
 
 /// `cluster_commit_index()` reflects the in-place advance from
@@ -470,8 +443,8 @@ fn become_role_leader_matches_immediate_query() {
 fn cluster_commit_query_reflects_advance() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     // Single-node leader: `advance(7, 7)` lifts cluster_commit
     // immediately. The driver polls `cluster_commit_index()` to
     // observe the change (no dedicated action; ADR-0017 §"Driver
@@ -504,7 +477,7 @@ fn vote_denied_when_candidate_last_term_below_ours() {
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     node.advance(3, 3);
 
-    let reply = node.request_vote(
+    let reply = node.election().handle_request_vote(
         Instant::now(),
         RequestVoteRequest {
             from: 2,
@@ -532,7 +505,7 @@ fn vote_denied_when_same_last_term_but_lower_last_tx_id() {
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     node.advance(10, 10);
 
-    let reply = node.request_vote(
+    let reply = node.election().handle_request_vote(
         Instant::now(),
         RequestVoteRequest {
             from: 2,
@@ -564,7 +537,7 @@ fn vote_granted_when_candidate_last_term_above_ours() {
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     node.advance(10, 10);
 
-    let reply = node.request_vote(
+    let reply = node.election().handle_request_vote(
         Instant::now(),
         RequestVoteRequest {
             from: 2,
@@ -592,7 +565,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
     let now = Instant::now();
 
     // First RV from candidate 2 at term 3 — granted.
-    let first = node.request_vote(
+    let first = node.election().handle_request_vote(
         now,
         RequestVoteRequest {
             from: 2,
@@ -605,7 +578,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
 
     // A second RV from the same candidate at the same term — must
     // be granted again (idempotent on duplicate inbound RPCs).
-    let second = node.request_vote(
+    let second = node.election().handle_request_vote(
         now,
         RequestVoteRequest {
             from: 2,
@@ -621,7 +594,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
     );
 
     // A different candidate at the same term — refused.
-    let third = node.request_vote(
+    let third = node.election().handle_request_vote(
         now,
         RequestVoteRequest {
             from: 3,
@@ -735,8 +708,8 @@ fn local_write_index_survives_election_loss() {
     // Hydrate the write extent before any election runs.
     node.advance(3, 3);
     // First Tick lazy-arms; second Tick expires → Candidate.
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Candidate);
     let term_now = node.current_term();
     assert_eq!(node.write_index(), 3);
@@ -756,4 +729,137 @@ fn local_write_index_survives_election_loss() {
     assert!(matches!(node.role(), Role::Follower));
     // Survives the Candidate → Follower transition.
     assert_eq!(node.write_index(), 3);
+}
+
+// ── Concurrent-vote API regressions (Election primitive) ─────────────────
+//
+// The whole point of the consensus refactor: a candidate's outbound
+// `RequestVote`s are dispatched concurrently, and the cluster feeds the
+// outcomes back as a batch into `Election::handle_votes`. These tests
+// pin the batch-handling semantics — majority detection, higher-term
+// step-down, stale-term filtering, and the failed-RPC fast-path —
+// against future regressions.
+
+use raft::VoteOutcome;
+
+/// 5-node cluster: candidate emits 4 outbound `RequestVote`s and the
+/// cluster collects all 4 grants concurrently. A single
+/// `handle_votes` call with the batch transitions the candidate to
+/// Leader at the correct term.
+#[test]
+fn concurrent_vote_handling_reaches_quorum() {
+    let mut node = fresh_node(1, vec![1, 2, 3, 4, 5]);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    assert_eq!(node.role(), Role::Candidate);
+    let term = node.current_term();
+    let requests = node.election().get_requests();
+    assert_eq!(requests.len(), 4, "5-node cluster: 4 outbound RVs");
+
+    // All 4 peers grant. Single batch call.
+    let now = t0 + Duration::from_secs(60) + Duration::from_millis(1);
+    node.election().handle_votes(
+        now,
+        vec![
+            (2, VoteOutcome::Granted { term }),
+            (3, VoteOutcome::Granted { term }),
+            (4, VoteOutcome::Granted { term }),
+            (5, VoteOutcome::Granted { term }),
+        ],
+    );
+    assert!(node.role().is_leader());
+    assert_eq!(node.current_term(), term);
+}
+
+/// A batch carrying a higher-term reply forces step-down even when a
+/// majority of grants is also present in the same batch — observing
+/// the higher term wins out.
+#[test]
+fn mixed_grant_deny_batch_steps_down_on_higher_term() {
+    let mut node = fresh_node(1, vec![1, 2, 3, 4, 5]);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    let term = node.current_term();
+    let now = t0 + Duration::from_secs(60) + Duration::from_millis(1);
+    node.election().handle_votes(
+        now,
+        vec![
+            (2, VoteOutcome::Granted { term }),
+            (3, VoteOutcome::Denied { term: term + 5 }),
+            (4, VoteOutcome::Granted { term }),
+            (5, VoteOutcome::Failed),
+        ],
+    );
+    // Higher-term observation steps down to Follower.
+    assert_eq!(node.role(), Role::Follower);
+    assert!(node.current_term() >= term + 5);
+}
+
+/// Single grant + three Failed outcomes (RPCs that timed out / were
+/// dropped) keep the candidate running at the same term — no quorum,
+/// no step-down.
+#[test]
+fn partial_batch_below_quorum_keeps_candidate() {
+    let mut node = fresh_node(1, vec![1, 2, 3, 4, 5]);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    let term_before = node.current_term();
+    let now = t0 + Duration::from_secs(60) + Duration::from_millis(1);
+    node.election().handle_votes(
+        now,
+        vec![
+            (2, VoteOutcome::Granted { term: term_before }),
+            (3, VoteOutcome::Failed),
+            (4, VoteOutcome::Failed),
+            (5, VoteOutcome::Failed),
+        ],
+    );
+    assert_eq!(node.role(), Role::Candidate);
+    assert_eq!(node.current_term(), term_before);
+}
+
+/// `get_requests` is a pure read on `CandidateState`. Calling it
+/// twice returns identical output; the cluster can re-pull on retry
+/// without duplicating term bumps.
+#[test]
+fn get_requests_idempotent_within_candidacy() {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    assert_eq!(node.role(), Role::Candidate);
+    let first = node.election().get_requests();
+    let second = node.election().get_requests();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1.term, b.1.term);
+        assert_eq!(a.1.last_tx_id, b.1.last_tx_id);
+        assert_eq!(a.1.last_term, b.1.last_term);
+    }
+}
+
+/// `get_requests` returns empty when the node is not Candidate
+/// (Initializing, Follower, Leader). The cluster must not generate
+/// outbound RVs from a non-candidate.
+#[test]
+fn get_requests_empty_when_not_candidate() {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    assert_eq!(node.role(), Role::Initializing);
+    assert!(node.election().get_requests().is_empty());
+}
+
+/// `Election::tick` always returns a `Wakeup` with a non-default
+/// `deadline`. After lazy-arming on a fresh follower the deadline is
+/// in the future (within the election-timer window).
+#[test]
+fn tick_returns_wakeup_with_future_deadline_after_lazy_arm() {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    let t0 = Instant::now();
+    let wakeup = node.election().tick(t0);
+    assert!(wakeup.deadline > t0, "deadline must be in the future after lazy-arm");
 }

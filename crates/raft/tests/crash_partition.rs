@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{
-    Event, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role,
-};
+use raft::{LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role};
 
 fn await_leader_in(sim: &mut Sim, ids: &[NodeId]) -> NodeId {
     let deadline = sim.clock() + Duration::from_secs(5);
@@ -92,8 +90,8 @@ fn boot_recovers_term_and_vote() {
     // deterministically without a simulator.
     let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), 1);
     assert_eq!(node.voted_for(), Some(1));
@@ -118,15 +116,15 @@ fn restart_preserves_one_vote_per_term_rule() {
     // multi-node config and replay an RV from a different candidate.
     let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.voted_for(), Some(1));
     let term = node.current_term();
     let p = node.into_persistence();
 
     // Restart in a 3-node cluster shape so RV semantics make sense.
     let mut node = RaftNode::new(1, vec![1, 2, 3], p, RaftConfig::default(), 42);
-    let reply = node.request_vote(
+    let reply = node.election().handle_request_vote(
         Instant::now(),
         RequestVoteRequest {
             from: 2,
@@ -306,8 +304,8 @@ fn symmetric_partition_no_quorum_either_side() {
 fn restart_recovers_local_indexes_via_advance() {
     let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     node.advance(7, 7);
     assert_eq!(node.commit_index(), 7);
@@ -335,8 +333,8 @@ fn restart_recovers_local_indexes_via_advance() {
 fn write_ahead_of_commit_collapses_on_restart() {
     let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     node.advance(5, 3);
     assert_eq!(node.write_index(), 5);
@@ -359,19 +357,12 @@ fn write_ahead_of_commit_collapses_on_restart() {
 fn leader_step_down_preserves_write_index() {
     let mut node = RaftNode::new(1, vec![1, 2, 3], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     // Single-vote majority requires a peer-vote to win; force win
     // via a record_grant by sending a vote reply at the right term.
     let term_now = node.current_term();
-    let _ = node.step(
-        t0 + Duration::from_secs(60),
-        Event::RequestVoteReply {
-            from: 2,
-            term: term_now,
-            granted: true,
-        },
-    );
+    common::deliver_vote_reply(&mut node, t0 + Duration::from_secs(60), 2, term_now, true);
     assert!(node.role().is_leader(), "test setup: must be leader");
 
     node.advance(5, 5);

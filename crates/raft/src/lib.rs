@@ -4,14 +4,14 @@
 //! The library has no internal threads, no async runtime, **no I/O**
 //! of its own. Driver-facing entry points:
 //!
-//! - [`RaftNode::step`] — election-side events (`Tick`,
-//!   `RequestVoteReply`). Returns the [`Action`]s the driver must
-//!   execute.
+//! - [`RaftNode::election`] → [`Election`] — election-side driver:
+//!   `tick` (next deadline), `start` (transition to Candidate),
+//!   `get_requests` (concurrent outbound `RequestVote`s),
+//!   `handle_votes` (drain a batch of replies),
+//!   `handle_request_vote` (voter-side direct method).
 //! - [`RaftNode::validate_append_entries_request`] — follower-side
 //!   inbound `AppendEntries`. Returns an [`AppendEntriesDecision`]
 //!   describing what the cluster driver must do with its WAL.
-//! - [`RaftNode::request_vote`] — voter-side `RequestVote` direct
-//!   method, returning a [`RequestVoteReply`] synchronously.
 //! - [`RaftNode::replication`] → [`Replication`] / [`PeerReplication`]
 //!   — leader-side per-peer driver: `get_append_range(now)` to pull
 //!   the next AE, `append_result(now, AppendResult)` to feed the
@@ -20,37 +20,30 @@
 //!   local write/commit watermarks and (on followers) drains any
 //!   deferred `leader_commit` into `cluster_commit_index`.
 //!
+//! Role transitions are observable via [`RaftNode::role`] polling —
+//! there is no action stream.
+//!
 //! Durable state lives behind the synchronous [`Persistence`] trait.
 //! Production wires a disk-backed implementation (term log + vote
 //! log files); tests wire an in-memory fake. `RaftNode<P>` is
 //! generic over the choice — the library itself never touches
 //! `std::fs`.
 //!
-//! ADR-0017 §"Architectural Boundary":
-//!
-//! > The library transitions state and returns actions (or
-//! > decisions) describing what the driver must do. The driver
-//! > (cluster crate) executes them and feeds results back via the
-//! > next entry-point call.
-//!
 //! ## Public surface
 //!
 //! - [`RaftNode`] / [`RaftConfig`] — single-node decision system.
 //!   Generic over `P: Persistence`.
+//! - [`Election`] / [`VoteOutcome`] / [`CandidateState`] — election
+//!   borrow view and its inputs.
 //! - [`AppendEntriesDecision`] — the follower-path return shape from
 //!   `validate_append_entries_request`.
 //! - [`Persistence`] / [`TermRecord`] — durable-state contract.
-//! - [`Event`] — every input the state machine reacts to via `step`.
-//! - [`Action`] — every output the driver applies (outbound wire
-//!   sends, role notifications, wakeup scheduling).
 //! - [`Role`], [`RejectReason`], [`LogEntryRange`], [`NodeId`] —
 //!   small value types the API returns.
 //!
 //! Anything not re-exported here is internal.
 
-pub mod action;
-pub mod candidate;
-pub mod event;
+pub mod consensus;
 pub mod follower;
 pub mod leader;
 pub mod log_entry;
@@ -63,8 +56,7 @@ pub mod role;
 pub mod timer;
 pub mod types;
 
-pub use action::Action;
-pub use event::Event;
+pub use consensus::{CandidateState, Election, VoteOutcome, Wakeup};
 pub use log_entry::LogEntryRange;
 pub use node::{AppendEntriesDecision, RaftConfig, RaftNode};
 pub use persistence::{Persistence, TermRecord};
