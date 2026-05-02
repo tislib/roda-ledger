@@ -17,13 +17,14 @@
 //! "check latch" and "enter raft body".
 
 use crate::cluster_mirror::ClusterMirror;
+use crate::command::Command;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
 use ::proto::node::node_server::Node;
+use spdlog::error;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
-use crate::command::Command;
 
 /// State shared across the gRPC service handler. Constructed once at
 /// cluster bring-up and kept alive for the process lifetime; the gRPC
@@ -82,6 +83,7 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::AppendEntriesRequest>,
     ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
+        let node_id = self.core.node_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core
             .cmd_tx
@@ -90,10 +92,20 @@ impl Node for NodeHandler {
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("raft loop unavailable"))?;
-        let resp = reply_rx
-            .await
-            .map_err(|_| Status::internal("raft loop dropped reply"))?;
+            .map_err(|e| {
+                error!(
+                    "node_handler[{}]: AppendEntries cmd_tx.send failed (raft loop gone): {}",
+                    node_id, e
+                );
+                Status::unavailable("raft loop unavailable")
+            })?;
+        let resp = reply_rx.await.map_err(|e| {
+            error!(
+                "node_handler[{}]: AppendEntries reply oneshot recv failed (raft loop dropped reply): {}",
+                node_id, e
+            );
+            Status::internal("raft loop dropped reply")
+        })?;
         Ok(Response::new(resp))
     }
 
@@ -101,6 +113,7 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
+        let node_id = self.core.node_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core
             .cmd_tx
@@ -109,10 +122,20 @@ impl Node for NodeHandler {
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("raft loop unavailable"))?;
-        let resp = reply_rx
-            .await
-            .map_err(|_| Status::internal("raft loop dropped reply"))?;
+            .map_err(|e| {
+                error!(
+                    "node_handler[{}]: RequestVote cmd_tx.send failed (raft loop gone): {}",
+                    node_id, e
+                );
+                Status::unavailable("raft loop unavailable")
+            })?;
+        let resp = reply_rx.await.map_err(|e| {
+            error!(
+                "node_handler[{}]: RequestVote reply oneshot recv failed (raft loop dropped reply): {}",
+                node_id, e
+            );
+            Status::internal("raft loop dropped reply")
+        })?;
         Ok(Response::new(resp))
     }
 

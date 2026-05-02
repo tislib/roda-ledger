@@ -23,11 +23,11 @@ use crate::replication::{ReplicationGate, ReplicationLoop};
 use ::proto::node as proto;
 use ::proto::node::RequestVoteResponse;
 use ::proto::node::node_client::NodeClient;
+use raft::request_vote::RequestVoteRequest;
 use raft::{
     AppendEntriesDecision, LogEntryRange, NodeId, RaftNode, RejectReason, Role, Term, TxId,
     VoteOutcome,
 };
-use raft::request_vote::RequestVoteRequest;
 use spdlog::{error, info};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -88,14 +88,9 @@ pub struct RaftLoop {
     /// off to the replication loop.
     gate_rx: Option<watch::Receiver<bool>>,
 
-    /// Last `ledger.last_commit_id()` value we observed and passed
-    /// through `node.advance(...)`. Used to skip redundant calls when
-    /// the watermark hasn't moved.
-    last_seen_commit: TxId,
-    /// Follower-side AE replies parked until the ledger commit
-    /// watermark covers their `last_tx_id`. `BTreeMap` so drain can
-    /// pop in tx_id order without resorting on every poll.
-    pending_ae_replies: BTreeMap<TxId, ParkedReply>,
+    last_sequence_index: TxId,
+    last_write_index: TxId,
+    last_commit_index: TxId,
 }
 
 impl RaftLoop {
@@ -112,18 +107,18 @@ impl RaftLoop {
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
         let (gate, gate_rx) = ReplicationGate::new();
-        let last_seen_commit = ledger.ledger().last_commit_id();
         Self {
             node: Rc::new(RefCell::new(node)),
-            ledger,
+            ledger: ledger.clone(),
             mirror,
             config,
             cmd_rx,
             next_wakeup: None,
             gate: Some(gate),
             gate_rx: Some(gate_rx),
-            last_seen_commit,
-            pending_ae_replies: BTreeMap::new(),
+            last_sequence_index: ledger.ledger().last_compute_id(),
+            last_write_index: ledger.ledger().last_compute_id(),
+            last_commit_index: ledger.ledger().last_commit_id(),
         }
     }
 
@@ -146,9 +141,7 @@ impl RaftLoop {
 
     async fn run_command_loop(&mut self) {
         let self_id = self.node.borrow().self_id();
-        info!("raft_loop: started (self_id={})", self_id);
-
-        self.poll_ledger_watermark();
+        info!("raft_loop[{}]: started", self_id);
 
         loop {
             let now = Instant::now();
@@ -160,20 +153,80 @@ impl RaftLoop {
             let wakeup = self.node.borrow_mut().election().tick(now);
             self.next_wakeup = Some(wakeup.deadline);
 
-            // 2. If the timer has expired (and we're not Leader),
+            // 2. Mirror the ledger watermarks into raft. Logging both
+            //    pre- and post-advance so we can see how the call
+            //    moved `local_write_index` / `local_commit_index` /
+            //    `cluster_commit_index`.
+            let commit_index = self.ledger.ledger().last_commit_id();
+            let write_index = self.ledger.ledger().last_compute_id();
+            let (pre_w, pre_c, pre_cci, role_pre) = {
+                let n = self.node.borrow();
+                (
+                    n.write_index(),
+                    n.commit_index(),
+                    n.cluster_commit_index(),
+                    n.role(),
+                )
+            };
+            if write_index != pre_w || commit_index != pre_c {
+                self.node.borrow_mut().advance(write_index, commit_index);
+                let post_cci = self.node.borrow().cluster_commit_index();
+                info!(
+                    "raft_loop[{}]: advance role={:?} write={}->{} commit={}->{} cluster_commit={}->{}",
+                    self_id, role_pre, pre_w, write_index, pre_c, commit_index, pre_cci, post_cci
+                );
+                self.mirror.snapshot_from(&self.node.borrow());
+            }
+
+            // 3. If the timer has expired (and we're not Leader),
             //    `start` transitions to Candidate. Returns true on
             //    transition; we then run an election round with
             //    concurrently-dispatched `RequestVote` RPCs.
             let started = self.node.borrow_mut().election().start(now);
             if started {
+                let (term_after, role_after) = {
+                    let n = self.node.borrow();
+                    (n.current_term(), n.role())
+                };
+                info!(
+                    "raft_loop[{}]: election.start() = true (term={}, role={:?})",
+                    self_id, term_after, role_after
+                );
                 self.mirror.snapshot_from(&self.node.borrow());
                 self.sync_gate_from_role(); // candidate → gate=false
 
                 let requests = self.node.borrow_mut().election().get_requests();
-                if !requests.is_empty() {
+                if requests.is_empty() {
+                    info!(
+                        "raft_loop[{}]: election.get_requests() empty (single-node short-circuit or no peers)",
+                        self_id
+                    );
+                } else {
+                    info!(
+                        "raft_loop[{}]: election.get_requests() = {} requests at term={}",
+                        self_id,
+                        requests.len(),
+                        term_after
+                    );
                     let responses = self.send_request_votes_concurrent(requests).await;
+                    info!(
+                        "raft_loop[{}]: election round collected {} responses",
+                        self_id,
+                        responses.len()
+                    );
                     let now = Instant::now();
-                    self.node.borrow_mut().election().handle_votes(now, responses);
+                    self.node
+                        .borrow_mut()
+                        .election()
+                        .handle_votes(now, responses);
+                    let (post_term, post_role) = {
+                        let n = self.node.borrow();
+                        (n.current_term(), n.role())
+                    };
+                    info!(
+                        "raft_loop[{}]: election.handle_votes() done — term={} role={:?}",
+                        self_id, post_term, post_role
+                    );
                     self.mirror.snapshot_from(&self.node.borrow());
                     // May have flipped to Leader (won) or Follower
                     // (higher term observed in batch).
@@ -186,7 +239,7 @@ impl RaftLoop {
                 self.next_wakeup = Some(wakeup.deadline);
             }
 
-            // 3. Sleep until wakeup or until an inbound command
+            // 4. Sleep until wakeup or until an inbound command
             //    arrives, whichever fires first.
             let sleep_at = self.next_wakeup.unwrap_or(now + Duration::from_millis(50));
             let sleep = tokio::time::sleep_until(sleep_at.into());
@@ -197,65 +250,27 @@ impl RaftLoop {
                     match maybe_cmd {
                         Some(cmd) => {
                             self.handle_command(cmd).await;
-                            self.poll_ledger_watermark();
                         }
                         // Channel closed — supervisor dropped the last
                         // sender. Graceful shutdown.
-                        None => break,
+                        None => {
+                            info!("raft_loop[{}]: cmd channel closed; shutting down", self_id);
+                            break;
+                        }
                     }
                 }
                 _ = &mut sleep => {
-                    self.poll_ledger_watermark();
-                    // Re-enter the loop to call tick/start again.
+                    // Empty wakeup tick — intentionally not logged
+                    // (would dominate the log at heartbeat cadence).
                 }
             }
         }
 
-        info!("raft_loop: exiting (self_id={})", self_id);
+        info!("raft_loop[{}]: exiting", self_id);
         // Drop the replication gate's `watch::Sender` so per-peer
         // replication tasks see `gate_rx.changed()` return Err and
         // exit cooperatively. RAII shutdown — no explicit notify.
         self.gate = None;
-    }
-
-    /// Bridge between the ledger pipeline and raft. Called on every
-    /// command-loop iteration: read the ledger's durable commit
-    /// watermark, and if it has advanced since last seen, forward it
-    /// into raft via `node.advance(write, commit)` so raft's
-    /// `local_write_index` / `local_commit_index` track the on-disk
-    /// state. Also drains any parked follower-side AE replies whose
-    /// `last_tx_id` is now covered.
-    fn poll_ledger_watermark(&mut self) {
-        let latest = self.ledger.ledger().last_commit_id();
-        if latest > self.last_seen_commit {
-            self.node.borrow_mut().advance(latest, latest);
-            self.last_seen_commit = latest;
-            self.mirror.snapshot_from(&self.node.borrow());
-        }
-        self.drain_parked_replies(latest);
-    }
-
-    /// Drain every parked follower-side AE reply whose `last_tx_id`
-    /// the ledger has now durably committed.
-    fn drain_parked_replies(&mut self, latest_commit: TxId) {
-        loop {
-            let next_key = match self.pending_ae_replies.keys().next().copied() {
-                Some(k) if k <= latest_commit => k,
-                _ => break,
-            };
-            let parked = self
-                .pending_ae_replies
-                .remove(&next_key)
-                .expect("key just observed");
-            let resp = proto::AppendEntriesResponse {
-                term: parked.term,
-                success: true,
-                last_commit_id: latest_commit,
-                last_write_id: latest_commit,
-                reject_reason: proto::RejectReason::RejectNone as u32,
-            };
-            let _ = parked.reply.send(resp);
-        }
     }
 
     /// Mirror the current raft role into the gate. Covers the paths
@@ -266,19 +281,43 @@ impl RaftLoop {
     /// `watch::Sender::send` is a no-op when the value is unchanged.
     fn sync_gate_from_role(&self) {
         if let Some(gate) = self.gate.as_ref() {
-            let role = self.node.borrow().role();
-            gate.set_playing(matches!(role, Role::Leader));
+            let (self_id, role, term) = {
+                let n = self.node.borrow();
+                (n.self_id(), n.role(), n.current_term())
+            };
+            let playing = matches!(role, Role::Leader);
+            gate.set_playing(playing);
+            info!(
+                "raft_loop[{}]: gate={} (role={:?}, term={})",
+                self_id, playing, role, term
+            );
         }
     }
 
     /// Apply a command to raft. Routes inbound RPCs to typed handlers.
     async fn handle_command(&mut self, cmd: Command) {
+        let self_id = self.node.borrow().self_id();
         match cmd {
             Command::AppendEntries { req, reply } => {
+                info!(
+                    "raft_loop[{}]: cmd AppendEntries from={} term={} prev_tx={} prev_term={} from_tx={} to_tx={} leader_commit={} wal_bytes={}",
+                    self_id,
+                    req.leader_id,
+                    req.term,
+                    req.prev_tx_id,
+                    req.prev_term,
+                    req.from_tx_id,
+                    req.to_tx_id,
+                    req.leader_commit_tx_id,
+                    req.wal_bytes.len()
+                );
                 self.handle_append_entries(req, reply).await;
             }
             Command::RequestVote { req, reply } => {
-                info!("raft_loop: RequestVote: {:?}", req);
+                info!(
+                    "raft_loop[{}]: cmd RequestVote candidate={} term={} last_tx_id={} last_term={}",
+                    self_id, req.candidate_id, req.term, req.last_tx_id, req.last_term
+                );
                 let result = self.node.borrow_mut().election().handle_request_vote(
                     Instant::now(),
                     RequestVoteRequest {
@@ -293,15 +332,26 @@ impl RaftLoop {
                 // internally (higher term observed). Sync the gate so
                 // replication pauses immediately.
                 self.sync_gate_from_role();
-                info!("raft_loop: RequestVote result: {:?}", result);
+                info!(
+                    "raft_loop[{}]: RequestVote reply term={} granted={}",
+                    self_id, result.term, result.granted
+                );
                 // The handler may have dropped (client disconnect /
                 // gRPC timeout); in that case the durable vote
                 // already happened — drop the reply silently rather
                 // than crashing the raft loop.
-                let _ = reply.send(RequestVoteResponse {
-                    term: result.term,
-                    vote_granted: result.granted,
-                });
+                if reply
+                    .send(RequestVoteResponse {
+                        term: result.term,
+                        vote_granted: result.granted,
+                    })
+                    .is_err()
+                {
+                    info!(
+                        "raft_loop[{}]: RequestVote reply dropped (handler gone)",
+                        self_id
+                    );
+                }
             }
         }
     }
@@ -311,6 +361,7 @@ impl RaftLoop {
         req: proto::AppendEntriesRequest,
         reply: oneshot::Sender<proto::AppendEntriesResponse>,
     ) {
+        let self_id = self.node.borrow().self_id();
         let now = Instant::now();
         let entries = if req.from_tx_id == 0 || req.to_tx_id < req.from_tx_id {
             LogEntryRange::empty()
@@ -337,55 +388,115 @@ impl RaftLoop {
                 reason,
                 truncate_after,
             } => {
-                if let Some(_after) = truncate_after {
-                    // TODO: truncate the ledger's entry log past
-                    // `_after`. The term-log mirror is already
-                    // truncated synchronously inside validate. The
-                    // ledger today does not expose a public
-                    // `truncate_wal_after` — wire one up alongside
-                    // the rest of the WAL-replication scaffolding.
+                info!(
+                    "raft_loop[{}]: AE Reject reason={:?} truncate_after={:?}",
+                    self_id, reason, truncate_after
+                );
+                if let Some(after) = truncate_after {
+                    // TODO: truncate the ledger's entry log past `after`.
+                    // The term-log mirror is already truncated
+                    // synchronously inside validate; the ledger does not
+                    // yet expose a `truncate_wal_after` — wire one up
+                    // alongside the rest of the WAL-replication
+                    // scaffolding.
+                    info!(
+                        "raft_loop[{}]: AE Reject truncate WAL TODO (after={})",
+                        self_id, after
+                    );
                 }
-                let _ = reply.send(build_ae_response(&self.node.borrow(), false, Some(reason)));
+                let resp = build_ae_response(&self.node.borrow(), false, Some(reason));
+                info!(
+                    "raft_loop[{}]: AE Reject reply term={} last_write_id={} last_commit_id={}",
+                    self_id, resp.term, resp.last_write_id, resp.last_commit_id
+                );
+                let _ = reply.send(resp);
             }
             AppendEntriesDecision::Accept { append: None } => {
+                let commit_index = self.ledger.ledger().last_commit_id();
+                let (pre_w, pre_c, pre_cci) = {
+                    let n = self.node.borrow();
+                    (n.write_index(), n.commit_index(), n.cluster_commit_index())
+                };
+                self.node.borrow_mut().advance(0, commit_index);
+                let post_cci = self.node.borrow().cluster_commit_index();
+                info!(
+                    "raft_loop[{}]: AE Accept(heartbeat) leader_commit={} ledger_commit={} advance write={}->{} commit={}->{} cluster_commit={}->{}",
+                    self_id,
+                    req.leader_commit_tx_id,
+                    commit_index,
+                    pre_w,
+                    pre_w,
+                    pre_c,
+                    commit_index.max(pre_c),
+                    pre_cci,
+                    post_cci
+                );
+                self.mirror.snapshot_from(&self.node.borrow());
+
                 // Heartbeat: cluster_commit was already updated
                 // inline inside validate.
-                let _ = reply.send(build_ae_response(&self.node.borrow(), true, None));
+                let resp = build_ae_response(&self.node.borrow(), true, None);
+                info!(
+                    "raft_loop[{}]: AE Accept(heartbeat) reply term={} last_write_id={} last_commit_id={}",
+                    self_id, resp.term, resp.last_write_id, resp.last_commit_id
+                );
+                let _ = reply.send(resp);
             }
             AppendEntriesDecision::Accept {
                 append: Some(range),
             } => {
-                // Parse the leader's WAL bytes, hand them to the
-                // ledger pipeline, and park the gRPC reply until our
-                // own commit watermark covers `last_tx_id`.
                 let last_tx_id = range
                     .last_tx_id()
                     .expect("Accept{append: Some} carries a non-empty range");
+                info!(
+                    "raft_loop[{}]: AE Accept(entries) range start_tx={} count={} term={} leader_commit={}",
+                    self_id, range.start_tx_id, range.count, range.term, req.leader_commit_tx_id
+                );
                 let entries = decode_records(&req.wal_bytes);
                 if let Err(e) = self.ledger.ledger().append_wal_entries(entries) {
                     error!(
-                        "raft_loop: append_wal_entries failed for range \
-                         start={} last={}: {}",
-                        range.start_tx_id, last_tx_id, e
+                        "raft_loop[{}]: append_wal_entries failed start={} last={}: {}",
+                        self_id, range.start_tx_id, last_tx_id, e
                     );
-                    let _ = reply.send(build_ae_response(
+                    let resp = build_ae_response(
                         &self.node.borrow(),
                         false,
                         Some(RejectReason::LogMismatch),
-                    ));
+                    );
+                    let _ = reply.send(resp);
                     return;
                 }
-                self.pending_ae_replies.insert(
-                    last_tx_id,
-                    ParkedReply {
-                        reply,
-                        term: req.term,
-                    },
+                info!(
+                    "raft_loop[{}]: AE Accept(entries) queued to ledger pipeline last_tx={}",
+                    self_id, last_tx_id
                 );
-                // Try draining immediately in case the ledger is
-                // already past `last_tx_id` (small ranges with very
-                // fast fsync).
-                self.poll_ledger_watermark();
+
+                let commit_index = self.ledger.ledger().last_commit_id();
+                let (pre_w, pre_c, pre_cci) = {
+                    let n = self.node.borrow();
+                    (n.write_index(), n.commit_index(), n.cluster_commit_index())
+                };
+                self.node.borrow_mut().advance(last_tx_id, commit_index);
+                let post_cci = self.node.borrow().cluster_commit_index();
+                info!(
+                    "raft_loop[{}]: AE Accept(entries) advance write={}->{} commit={}->{} cluster_commit={}->{} (ledger_commit={})",
+                    self_id,
+                    pre_w,
+                    last_tx_id.max(pre_w),
+                    pre_c,
+                    commit_index.max(pre_c),
+                    pre_cci,
+                    post_cci,
+                    commit_index
+                );
+                self.mirror.snapshot_from(&self.node.borrow());
+
+                let resp = build_ae_response(&self.node.borrow(), true, None);
+                info!(
+                    "raft_loop[{}]: AE Accept(entries) reply term={} last_write_id={} last_commit_id={}",
+                    self_id, resp.term, resp.last_write_id, resp.last_commit_id
+                );
+                let _ = reply.send(resp);
             }
         }
     }
@@ -410,7 +521,7 @@ impl RaftLoop {
         for (peer, req) in requests {
             let config = self.config.clone();
             let handle = tokio::task::spawn_local(async move {
-                let outcome = send_one_request_vote(peer, candidate_id, req, config).await;
+                let outcome = send_one_request_vote(candidate_id, peer, req, config).await;
                 (peer, outcome)
             });
             handles.push(handle);
@@ -420,7 +531,10 @@ impl RaftLoop {
             match h.await {
                 Ok(pair) => results.push(pair),
                 Err(e) => {
-                    error!("raft_loop: RequestVote task join error: {}", e);
+                    error!(
+                        "raft_loop[{}]: RequestVote task join error: {}",
+                        candidate_id, e
+                    );
                 }
             }
         }
@@ -429,21 +543,24 @@ impl RaftLoop {
 }
 
 async fn send_one_request_vote(
-    peer: NodeId,
     candidate_id: NodeId,
+    peer: NodeId,
     req: RequestVoteRequest,
     config: Arc<Config>,
 ) -> VoteOutcome {
     let mut client = match get_node_client(&config, peer).await {
         Ok(c) => c,
         Err(err) => {
-            error!("raft_loop: RequestVote: connect to peer {} failed: {}", peer, err);
+            error!(
+                "raft_loop[{}]: RequestVote → peer={} connect failed: {}",
+                candidate_id, peer, err
+            );
             return VoteOutcome::Failed;
         }
     };
     info!(
-        "raft_loop: RequestVote → peer={} term={} last_tx_id={}",
-        peer, req.term, req.last_tx_id
+        "raft_loop[{}]: RequestVote → peer={} term={} last_tx_id={} last_term={}",
+        candidate_id, peer, req.term, req.last_tx_id, req.last_term
     );
     let rpc_fut = client.request_vote(proto::RequestVoteRequest {
         term: req.term,
@@ -454,17 +571,23 @@ async fn send_one_request_vote(
     let resp = match tokio::time::timeout(VOTE_RPC_TIMEOUT, rpc_fut).await {
         Ok(Ok(r)) => r.into_inner(),
         Ok(Err(e)) => {
-            error!("raft_loop: RequestVote rpc to peer {} failed: {}", peer, e);
+            error!(
+                "raft_loop[{}]: RequestVote → peer={} rpc failed: {}",
+                candidate_id, peer, e
+            );
             return VoteOutcome::Failed;
         }
         Err(_) => {
-            error!("raft_loop: RequestVote to peer {} timed out", peer);
+            error!(
+                "raft_loop[{}]: RequestVote → peer={} timed out after {:?}",
+                candidate_id, peer, VOTE_RPC_TIMEOUT
+            );
             return VoteOutcome::Failed;
         }
     };
     info!(
-        "raft_loop: RequestVote ← peer={} term={} granted={}",
-        peer, resp.term, resp.vote_granted
+        "raft_loop[{}]: RequestVote ← peer={} term={} granted={}",
+        candidate_id, peer, resp.term, resp.vote_granted
     );
     if resp.vote_granted {
         VoteOutcome::Granted { term: resp.term }

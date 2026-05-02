@@ -99,10 +99,14 @@ impl ReplicationLoop {
     }
 
     pub(crate) async fn run(self) {
+        let self_id = self.self_id;
         let cluster = match self.config.cluster.as_ref() {
             Some(c) => c,
             None => {
-                info!("replication_loop: no cluster section; exiting");
+                info!(
+                    "replication_loop[{}]: no cluster section; exiting",
+                    self_id
+                );
                 return;
             }
         };
@@ -115,7 +119,7 @@ impl ReplicationLoop {
                 node: self.node.clone(),
                 mirror: self.mirror.clone(),
                 peer_id: peer.peer_id,
-                self_id: self.self_id,
+                self_id,
                 host: peer.host.clone(),
                 tailer: self.ledger.ledger().wal_tailer(),
                 gate_rx: self.gate_rx.clone(),
@@ -126,15 +130,16 @@ impl ReplicationLoop {
             handles.push(tokio::task::spawn_local(peer_replication_loop(replicator)));
         }
         info!(
-            "replication_loop: spawned {} peer task(s) (self_id={})",
+            "replication_loop[{}]: spawned {} peer task(s) (tick_interval={:?})",
+            self_id,
             handles.len(),
-            self.self_id
+            tick_interval
         );
 
         for h in handles {
             let _ = h.await;
         }
-        info!("replication_loop: all peer tasks drained; exiting");
+        info!("replication_loop[{}]: all peer tasks drained; exiting", self_id);
     }
 }
 
@@ -153,32 +158,63 @@ struct PeerReplicator {
 
 async fn peer_replication_loop(mut r: PeerReplicator) {
     info!(
-        "replication_loop: peer {} task started (host={})",
-        r.peer_id, r.host
+        "replication_loop[{}]: peer={} task started (host={})",
+        r.self_id, r.peer_id, r.host
     );
     loop {
         if !*r.gate_rx.borrow_and_update() {
             // Cursor is stale across pause windows: we may rejoin at a
             // different `next_index` if the leader regressed peers
             // before we get to play again.
+            info!(
+                "replication_loop[{}]: peer={} gate=false → reset tailer, await flip",
+                r.self_id, r.peer_id
+            );
             r.tailer.reset();
             match r.gate_rx.changed().await {
-                Ok(()) => continue,
-                Err(_) => break,
+                Ok(()) => {
+                    info!(
+                        "replication_loop[{}]: peer={} gate flipped, resuming",
+                        r.self_id, r.peer_id
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    info!(
+                        "replication_loop[{}]: peer={} gate dropped (shutdown)",
+                        r.self_id, r.peer_id
+                    );
+                    break;
+                }
             }
         }
         replicate_once(&mut r).await;
         let next = Instant::now() + r.tick_interval;
         tokio::select! {
-            _ = sleep_until(next.into()) => {}
+            _ = sleep_until(next.into()) => {
+                // Empty wakeup tick — intentionally not logged
+                // (would dominate the log at heartbeat cadence).
+            }
             result = r.gate_rx.changed() => {
-                if result.is_err() {
-                    break;
+                match result {
+                    Ok(()) => {
+                        info!(
+                            "replication_loop[{}]: peer={} gate flipped during sleep",
+                            r.self_id, r.peer_id
+                        );
+                    }
+                    Err(_) => {
+                        info!(
+                            "replication_loop[{}]: peer={} gate dropped during sleep (shutdown)",
+                            r.self_id, r.peer_id
+                        );
+                        break;
+                    }
                 }
             }
         }
     }
-    info!("replication_loop: peer {} task exiting", r.peer_id);
+    info!("replication_loop[{}]: peer={} task exiting", r.self_id, r.peer_id);
 }
 
 async fn replicate_once(r: &mut PeerReplicator) {
@@ -187,16 +223,32 @@ async fn replicate_once(r: &mut PeerReplicator) {
         let mut node = r.node.borrow_mut();
         match node.replication().peer(r.peer_id) {
             Some(mut p) => p.get_append_range(now),
-            None => return,
+            None => {
+                // Not leader for this peer — silent (would log every
+                // tick during follower phase).
+                return;
+            }
         }
     };
-    let Some(req) = request else { return };
+    let Some(req) = request else {
+        // Gated on heartbeat / in_flight — silent (every tick).
+        return;
+    };
 
     let to_tx_id;
     let wal_bytes: Vec<u8>;
     if req.entries.is_empty() {
         to_tx_id = req.entries.start_tx_id.saturating_sub(1);
         wal_bytes = Vec::new();
+        info!(
+            "replication_loop[{}]: peer={} → AE heartbeat term={} prev_tx={} prev_term={} leader_commit={}",
+            r.self_id,
+            r.peer_id,
+            req.term,
+            req.prev_log_tx_id,
+            req.prev_log_term,
+            req.leader_commit
+        );
     } else {
         let from_tx_id = req.entries.start_tx_id;
         let last_tx_id = req
@@ -208,11 +260,28 @@ async fn replicate_once(r: &mut PeerReplicator) {
         if written == 0 {
             // Tailer didn't surface bytes (segment rotation, transient
             // race). Skip; next tick re-pulls a fresh request.
+            info!(
+                "replication_loop[{}]: peer={} tailer empty for from_tx={} (skip; retry next tick)",
+                r.self_id, r.peer_id, from_tx_id
+            );
             return;
         }
         buffer.truncate(written);
         wal_bytes = buffer;
         to_tx_id = last_tx_id;
+        info!(
+            "replication_loop[{}]: peer={} → AE entries term={} prev_tx={} prev_term={} from_tx={} to_tx={} count={} leader_commit={} wal_bytes={}",
+            r.self_id,
+            r.peer_id,
+            req.term,
+            req.prev_log_tx_id,
+            req.prev_log_term,
+            from_tx_id,
+            last_tx_id,
+            req.entries.count,
+            req.leader_commit,
+            written
+        );
     }
 
     let proto_req = proto::AppendEntriesRequest {
@@ -226,16 +295,62 @@ async fn replicate_once(r: &mut PeerReplicator) {
         leader_commit_tx_id: req.leader_commit,
     };
 
-    let result = send_append_entries_rpc(r.host.clone(), proto_req, r.rpc_timeout).await;
+    let result =
+        send_append_entries_rpc(r.self_id, r.peer_id, r.host.clone(), proto_req, r.rpc_timeout)
+            .await;
+
+    match &result {
+        AppendResult::Success {
+            term,
+            last_write_id,
+            last_commit_id,
+        } => {
+            info!(
+                "replication_loop[{}]: peer={} ← AE Success term={} last_write_id={} last_commit_id={}",
+                r.self_id, r.peer_id, term, last_write_id, last_commit_id
+            );
+        }
+        AppendResult::Reject {
+            term,
+            reason,
+            last_write_id,
+            last_commit_id,
+        } => {
+            info!(
+                "replication_loop[{}]: peer={} ← AE Reject term={} reason={:?} last_write_id={} last_commit_id={}",
+                r.self_id, r.peer_id, term, reason, last_write_id, last_commit_id
+            );
+        }
+        AppendResult::Timeout => {
+            info!(
+                "replication_loop[{}]: peer={} ← AE Timeout (treated as no-progress)",
+                r.self_id, r.peer_id
+            );
+        }
+    }
 
     let mut node = r.node.borrow_mut();
     if let Some(mut p) = node.replication().peer(r.peer_id) {
         p.append_result(now, result);
+        info!(
+            "replication_loop[{}]: peer={} append_result fed: next_index={} match_index={}",
+            r.self_id,
+            r.peer_id,
+            p.next_index(),
+            p.match_index()
+        );
+    } else {
+        info!(
+            "replication_loop[{}]: peer={} append_result: no longer leader, dropping result",
+            r.self_id, r.peer_id
+        );
     }
     r.mirror.snapshot_from(&node);
 }
 
 async fn send_append_entries_rpc(
+    self_id: NodeId,
+    peer_id: NodeId,
     host: String,
     req: proto::AppendEntriesRequest,
     timeout: Duration,
@@ -243,14 +358,36 @@ async fn send_append_entries_rpc(
     let mut client = match tokio::time::timeout(timeout, NodeClient::connect(host.clone())).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            error!("replication_loop: connect to {} failed: {}", host, e);
+            error!(
+                "replication_loop[{}]: peer={} connect to {} failed: {}",
+                self_id, peer_id, host, e
+            );
             return AppendResult::Timeout;
         }
-        Err(_) => return AppendResult::Timeout,
+        Err(_) => {
+            error!(
+                "replication_loop[{}]: peer={} connect to {} timed out after {:?}",
+                self_id, peer_id, host, timeout
+            );
+            return AppendResult::Timeout;
+        }
     };
     let resp = match tokio::time::timeout(timeout, client.append_entries(req)).await {
         Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(_)) | Err(_) => return AppendResult::Timeout,
+        Ok(Err(e)) => {
+            error!(
+                "replication_loop[{}]: peer={} append_entries rpc failed: {}",
+                self_id, peer_id, e
+            );
+            return AppendResult::Timeout;
+        }
+        Err(_) => {
+            error!(
+                "replication_loop[{}]: peer={} append_entries timed out after {:?}",
+                self_id, peer_id, timeout
+            );
+            return AppendResult::Timeout;
+        }
     };
     if resp.success {
         AppendResult::Success {
