@@ -35,7 +35,7 @@
 
 use std::time::{Duration, Instant};
 
-use spdlog::{debug, info, warn};
+use spdlog::{debug, error, info, warn};
 
 use crate::action::Action;
 use crate::candidate::CandidateState;
@@ -752,6 +752,7 @@ impl<P: Persistence> RaftNode<P> {
         // committing non-durable entries or violating §5.3 / §5.4
         // because in-memory state and on-disk state may have diverged.
         if self.failed {
+            error!("raft_loop: step() failed: node is in failed state");
             return Vec::new();
         }
         let mut out = Vec::new();

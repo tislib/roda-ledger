@@ -120,13 +120,13 @@ impl RaftLoop {
         // iteration.
         self.step(Event::Tick).await;
 
-        let sleep_until = self
-            .next_wakeup
-            .unwrap_or_else(|| Instant::now() + FALLBACK_WAKEUP);
-        let sleep = tokio::time::sleep_until(sleep_until.into());
-        tokio::pin!(sleep);
-
         loop {
+            let sleep_until = self
+                .next_wakeup
+                .unwrap_or_else(|| Instant::now() + FALLBACK_WAKEUP);
+            let sleep = tokio::time::sleep_until(sleep_until.into());
+            tokio::pin!(sleep);
+
             tokio::select! {
                 maybe_cmd = self.cmd_rx.recv() => {
                     match maybe_cmd {
@@ -284,17 +284,19 @@ impl RaftLoop {
                         return;
                     }
                     Ok(mut client) => {
+                        info!("raft_loop: SendRequestVote: {:?}", (to, term, last_tx_id));
                         let result = client.request_vote(proto::RequestVoteRequest {
                             term,
                             candidate_id: self.node.self_id(),
                             last_tx_id,
                             last_term,
                         }).await.unwrap().into_inner();
-                        self.node.step(Instant::now(), Event::RequestVoteReply {
+                        info!("raft_loop: SendRequestVote result: {:?}", result);
+                        self.step(Event::RequestVoteReply {
                             from: to,
                             term: result.term,
                             granted: result.vote_granted,
-                        });
+                        }).await;
                     }
                 }
             }
