@@ -1,13 +1,18 @@
 //! `RaftLoop` — single-owner driver for `RaftNode`. Replaces the
-//! mutex-based `RaftHandle`. The loop owns `RaftNode` as `&mut self`,
-//! receives commands on an mpsc channel, and is the only thing that
-//! ever calls `node.step()`.
+//! mutex-based `RaftHandle`. The loop owns `RaftNode` as
+//! `Rc<RefCell<...>>` (it's the only writer), receives commands on an
+//! mpsc channel, and drives the state machine through the
+//! [`raft::Election`] borrow view.
 //!
-//! This file is the skeleton: types, fields, `spawn` entry point, and
-//! a minimal `run()` that compiles and idles correctly. Inbound RPC
-//! handling, action dispatch, parked replies, ledger polling, and
-//! outbound RPC dispatch are stubbed with TODOs and filled in
-//! incrementally.
+//! Election rounds dispatch all `RequestVote` RPCs *concurrently*
+//! via `futures::future::join_all` — one slow peer no longer
+//! linearises the whole round.
+//!
+//! Replication is unchanged: per-peer `ReplicationLoop` tasks drive
+//! AE through the [`raft::Replication`] / [`raft::PeerReplication`]
+//! borrow views, gated on a `ReplicationGate` that the command loop
+//! flips on every state transition (cluster polls `node.role()`
+//! after each call — there is no action stream).
 
 use crate::cluster_mirror::ClusterMirror;
 use crate::command::Command;
@@ -18,15 +23,18 @@ use crate::replication::{ReplicationGate, ReplicationLoop};
 use ::proto::node as proto;
 use ::proto::node::RequestVoteResponse;
 use ::proto::node::node_client::NodeClient;
-use raft::request_vote::RequestVoteRequest;
 use raft::{
-    AppendEntriesDecision, Event, LogEntryRange, NodeId, RaftNode, RejectReason, Role,
+    AppendEntriesDecision, LogEntryRange, NodeId, RaftNode, RejectReason, Role, Term, TxId,
+    VoteOutcome,
 };
+use raft::request_vote::RequestVoteRequest;
 use spdlog::{error, info};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage::decode_records;
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::{Channel, Error};
 
@@ -35,10 +43,28 @@ use tonic::transport::{Channel, Error};
 /// backpressure under sustained overload.
 pub(crate) const COMMAND_CHANNEL_DEPTH: usize = 1024;
 
-/// Fallback wakeup cadence when raft has no pending deadline of its own
-/// (single-node leader with no peers, no election timer). Keeps the
-/// ledger-polling loop alive so commit watermarks advance.
-const FALLBACK_WAKEUP: Duration = Duration::from_millis(50);
+/// Per-RPC timeout for outbound `RequestVote` calls inside an
+/// election round. Mirrors `RaftConfig::rpc_timeout`. A peer that
+/// fails to reply within this window is recorded as
+/// `VoteOutcome::Failed`; the round proceeds with the rest.
+const VOTE_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Connect timeout for fresh `NodeClient` dials.
+const VOTE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// AE reply parked until the local ledger's commit watermark covers
+/// `last_tx_id`. The follower's gRPC handler is awaiting `reply`; we
+/// hold it here while the pipeline fsyncs the entries that arrived on
+/// this AE, then drain by sending a successful response built from
+/// raft's getters at drain time.
+struct ParkedReply {
+    reply: oneshot::Sender<proto::AppendEntriesResponse>,
+    /// Term to stamp into the response. The follower's AE handler
+    /// always replies at the leader's term (which is also our current
+    /// term after `validate_append_entries_request` updated it), but
+    /// recording it explicitly avoids re-reading raft state on drain.
+    term: Term,
+}
 
 pub struct RaftLoop {
     node: Rc<RefCell<RaftNode<DurablePersistence>>>,
@@ -47,8 +73,9 @@ pub struct RaftLoop {
 
     cmd_rx: mpsc::Receiver<Command>,
 
-    /// Most recent `Action::SetWakeup` deadline — drives the `select!`
-    /// sleep arm. `None` ⇒ use `FALLBACK_WAKEUP`.
+    /// Soonest pending wakeup pulled from `Election::tick(now).deadline`
+    /// — drives the `select!` sleep arm. Always `Some` after the
+    /// first iteration; the library guarantees a valid `Instant`.
     next_wakeup: Option<Instant>,
     pub ledger: Arc<LedgerSlot>,
 
@@ -60,6 +87,15 @@ pub struct RaftLoop {
     /// Initial receiver paired with `gate`. Taken in `run` to hand
     /// off to the replication loop.
     gate_rx: Option<watch::Receiver<bool>>,
+
+    /// Last `ledger.last_commit_id()` value we observed and passed
+    /// through `node.advance(...)`. Used to skip redundant calls when
+    /// the watermark hasn't moved.
+    last_seen_commit: TxId,
+    /// Follower-side AE replies parked until the ledger commit
+    /// watermark covers their `last_tx_id`. `BTreeMap` so drain can
+    /// pop in tx_id order without resorting on every poll.
+    pending_ae_replies: BTreeMap<TxId, ParkedReply>,
 }
 
 impl RaftLoop {
@@ -76,6 +112,7 @@ impl RaftLoop {
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
         let (gate, gate_rx) = ReplicationGate::new();
+        let last_seen_commit = ledger.ledger().last_commit_id();
         Self {
             node: Rc::new(RefCell::new(node)),
             ledger,
@@ -85,6 +122,8 @@ impl RaftLoop {
             next_wakeup: None,
             gate: Some(gate),
             gate_rx: Some(gate_rx),
+            last_seen_commit,
+            pending_ae_replies: BTreeMap::new(),
         }
     }
 
@@ -104,33 +143,70 @@ impl RaftLoop {
 
         tokio::join!(command_loop_handle, replication_loop_handle);
     }
+
     async fn run_command_loop(&mut self) {
-        let self_id =  self.node.borrow().self_id();
+        let self_id = self.node.borrow().self_id();
         info!("raft_loop: started (self_id={})", self_id);
 
-        // Kick the election timer by issuing one initial Tick. Raft
-        // will emit `SetWakeup` and we'll sleep on that deadline next
-        // iteration.
-        self.step(Event::Tick).await;
+        self.poll_ledger_watermark();
 
         loop {
-            let sleep_until = self
-                .next_wakeup
-                .unwrap_or_else(|| Instant::now() + FALLBACK_WAKEUP);
-            let sleep = tokio::time::sleep_until(sleep_until.into());
+            let now = Instant::now();
+
+            // 1. Drive election-side time forward. `tick` is cheap
+            //    and idempotent; it lazy-arms the election timer on
+            //    the first call and returns the soonest deadline
+            //    among the election timer / leader heartbeats.
+            let wakeup = self.node.borrow_mut().election().tick(now);
+            self.next_wakeup = Some(wakeup.deadline);
+
+            // 2. If the timer has expired (and we're not Leader),
+            //    `start` transitions to Candidate. Returns true on
+            //    transition; we then run an election round with
+            //    concurrently-dispatched `RequestVote` RPCs.
+            let started = self.node.borrow_mut().election().start(now);
+            if started {
+                self.mirror.snapshot_from(&self.node.borrow());
+                self.sync_gate_from_role(); // candidate → gate=false
+
+                let requests = self.node.borrow_mut().election().get_requests();
+                if !requests.is_empty() {
+                    let responses = self.send_request_votes_concurrent(requests).await;
+                    let now = Instant::now();
+                    self.node.borrow_mut().election().handle_votes(now, responses);
+                    self.mirror.snapshot_from(&self.node.borrow());
+                    // May have flipped to Leader (won) or Follower
+                    // (higher term observed in batch).
+                    self.sync_gate_from_role();
+                }
+                // Refresh wakeup after the round — Candidate may have
+                // become Leader (heartbeat schedule) or Follower
+                // (election timer reset).
+                let wakeup = self.node.borrow_mut().election().tick(Instant::now());
+                self.next_wakeup = Some(wakeup.deadline);
+            }
+
+            // 3. Sleep until wakeup or until an inbound command
+            //    arrives, whichever fires first.
+            let sleep_at = self.next_wakeup.unwrap_or(now + Duration::from_millis(50));
+            let sleep = tokio::time::sleep_until(sleep_at.into());
             tokio::pin!(sleep);
 
             tokio::select! {
                 maybe_cmd = self.cmd_rx.recv() => {
                     match maybe_cmd {
-                        Some(cmd) => self.handle_command(cmd).await,
+                        Some(cmd) => {
+                            self.handle_command(cmd).await;
+                            self.poll_ledger_watermark();
+                        }
                         // Channel closed — supervisor dropped the last
                         // sender. Graceful shutdown.
                         None => break,
                     }
                 }
                 _ = &mut sleep => {
-                    self.step(Event::Tick).await;
+                    self.poll_ledger_watermark();
+                    // Re-enter the loop to call tick/start again.
                 }
             }
         }
@@ -142,12 +218,52 @@ impl RaftLoop {
         self.gate = None;
     }
 
+    /// Bridge between the ledger pipeline and raft. Called on every
+    /// command-loop iteration: read the ledger's durable commit
+    /// watermark, and if it has advanced since last seen, forward it
+    /// into raft via `node.advance(write, commit)` so raft's
+    /// `local_write_index` / `local_commit_index` track the on-disk
+    /// state. Also drains any parked follower-side AE replies whose
+    /// `last_tx_id` is now covered.
+    fn poll_ledger_watermark(&mut self) {
+        let latest = self.ledger.ledger().last_commit_id();
+        if latest > self.last_seen_commit {
+            self.node.borrow_mut().advance(latest, latest);
+            self.last_seen_commit = latest;
+            self.mirror.snapshot_from(&self.node.borrow());
+        }
+        self.drain_parked_replies(latest);
+    }
+
+    /// Drain every parked follower-side AE reply whose `last_tx_id`
+    /// the ledger has now durably committed.
+    fn drain_parked_replies(&mut self, latest_commit: TxId) {
+        loop {
+            let next_key = match self.pending_ae_replies.keys().next().copied() {
+                Some(k) if k <= latest_commit => k,
+                _ => break,
+            };
+            let parked = self
+                .pending_ae_replies
+                .remove(&next_key)
+                .expect("key just observed");
+            let resp = proto::AppendEntriesResponse {
+                term: parked.term,
+                success: true,
+                last_commit_id: latest_commit,
+                last_write_id: latest_commit,
+                reject_reason: proto::RejectReason::RejectNone as u32,
+            };
+            let _ = parked.reply.send(resp);
+        }
+    }
+
     /// Mirror the current raft role into the gate. Covers the paths
-    /// where `transition_to_follower` is invoked from a direct method
-    /// (`request_vote`, `validate_append_entries_request`,
-    /// `replication_append_result`) without surfacing an
-    /// `Action::BecomeRole`. Idempotent — `watch::Sender::send` is a
-    /// no-op when the value is unchanged.
+    /// where the role flips inside a direct method
+    /// (`Election::handle_request_vote`, `validate_append_entries_request`,
+    /// `Replication::append_result`, `Election::handle_votes`)
+    /// without surfacing an action. Idempotent —
+    /// `watch::Sender::send` is a no-op when the value is unchanged.
     fn sync_gate_from_role(&self) {
         if let Some(gate) = self.gate.as_ref() {
             let role = self.node.borrow().role();
@@ -155,8 +271,7 @@ impl RaftLoop {
         }
     }
 
-    /// Apply a command to raft. Routes inbound RPCs to typed handlers,
-    /// outbound RPC replies into the `Replication` API.
+    /// Apply a command to raft. Routes inbound RPCs to typed handlers.
     async fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::AppendEntries { req, reply } => {
@@ -164,7 +279,7 @@ impl RaftLoop {
             }
             Command::RequestVote { req, reply } => {
                 info!("raft_loop: RequestVote: {:?}", req);
-                let result =  self.node.borrow_mut().request_vote(
+                let result = self.node.borrow_mut().election().handle_request_vote(
                     Instant::now(),
                     RequestVoteRequest {
                         from: req.candidate_id,
@@ -174,17 +289,19 @@ impl RaftLoop {
                     },
                 );
                 self.mirror.snapshot_from(&self.node.borrow());
-                // `request_vote` may have stepped us down internally
-                // (higher term observed). Sync the gate so replication
-                // pauses immediately rather than next command-loop tick.
+                // `handle_request_vote` may have stepped us down
+                // internally (higher term observed). Sync the gate so
+                // replication pauses immediately.
                 self.sync_gate_from_role();
                 info!("raft_loop: RequestVote result: {:?}", result);
-                reply
-                    .send(RequestVoteResponse {
-                        term: result.term,
-                        vote_granted: result.granted,
-                    })
-                    .unwrap();
+                // The handler may have dropped (client disconnect /
+                // gRPC timeout); in that case the durable vote
+                // already happened — drop the reply silently rather
+                // than crashing the raft loop.
+                let _ = reply.send(RequestVoteResponse {
+                    term: result.term,
+                    vote_granted: result.granted,
+                });
             }
         }
     }
@@ -200,7 +317,7 @@ impl RaftLoop {
         } else {
             LogEntryRange::new(req.from_tx_id, req.to_tx_id - req.from_tx_id + 1, req.term)
         };
-        let decision =  self.node.borrow_mut().validate_append_entries_request(
+        let decision = self.node.borrow_mut().validate_append_entries_request(
             now,
             req.leader_id,
             req.term,
@@ -209,7 +326,7 @@ impl RaftLoop {
             entries,
             req.leader_commit_tx_id,
         );
-        self.mirror.snapshot_from(& self.node.borrow());
+        self.mirror.snapshot_from(&self.node.borrow());
         // Inbound AE always lands a `transition_to_follower` (when
         // `term >= current_term`); pause replication immediately if we
         // were the leader.
@@ -228,158 +345,153 @@ impl RaftLoop {
                     // `truncate_wal_after` — wire one up alongside
                     // the rest of the WAL-replication scaffolding.
                 }
-                let _ = reply.send(build_ae_response(& self.node.borrow(), false, Some(reason)));
+                let _ = reply.send(build_ae_response(&self.node.borrow(), false, Some(reason)));
             }
             AppendEntriesDecision::Accept { append: None } => {
                 // Heartbeat: cluster_commit was already updated
                 // inline inside validate.
-                let _ = reply.send(build_ae_response(& self.node.borrow(), true, None));
+                let _ = reply.send(build_ae_response(&self.node.borrow(), true, None));
             }
             AppendEntriesDecision::Accept {
-                append: Some(_range),
+                append: Some(range),
             } => {
-                // TODO: parse `req.wal_bytes` into `Vec<WalEntry>`,
-                // call `self.ledger.ledger().append_wal_entries(...)`,
-                // park `reply` in `pending_ae_replies` keyed by
-                // `_range.last_tx_id().unwrap()`. The main loop's
-                // ledger-watermark polling drains the parked reply
-                // (after `node.advance(write, commit)`) using
-                // `build_ae_response(true, None)` from getters at
-                // drain time.
-                drop(reply);
-            }
-            AppendEntriesDecision::Fatal { reason } => {
-                self.mirror.set_fatal();
-                spdlog::error!(
-                    "raft_loop: validate_append_entries_request returned Fatal: {}",
-                    reason
+                // Parse the leader's WAL bytes, hand them to the
+                // ledger pipeline, and park the gRPC reply until our
+                // own commit watermark covers `last_tx_id`.
+                let last_tx_id = range
+                    .last_tx_id()
+                    .expect("Accept{append: Some} carries a non-empty range");
+                let entries = decode_records(&req.wal_bytes);
+                if let Err(e) = self.ledger.ledger().append_wal_entries(entries) {
+                    error!(
+                        "raft_loop: append_wal_entries failed for range \
+                         start={} last={}: {}",
+                        range.start_tx_id, last_tx_id, e
+                    );
+                    let _ = reply.send(build_ae_response(
+                        &self.node.borrow(),
+                        false,
+                        Some(RejectReason::LogMismatch),
+                    ));
+                    return;
+                }
+                self.pending_ae_replies.insert(
+                    last_tx_id,
+                    ParkedReply {
+                        reply,
+                        term: req.term,
+                    },
                 );
-                drop(reply);
+                // Try draining immediately in case the ledger is
+                // already past `last_tx_id` (small ranges with very
+                // fast fsync).
+                self.poll_ledger_watermark();
             }
         }
     }
 
-    /// Step raft, snapshot the mirror, dispatch each emitted action.
-    /// `dispatch_action` may produce a follow-up [`Event`] (e.g. an
-    /// `Event::RequestVoteReply` after the outbound `RequestVote`
-    /// RPC completes); we drain those follow-ups in a loop instead
-    /// of recursing — `dispatch_action` calling `step` recursively
-    /// would require an unbounded async-future size and won't
-    /// compile.
-    async fn step(&mut self, event: Event) {
-        let mut pending: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
-        pending.push_back(event);
-        while let Some(ev) = pending.pop_front() {
-            let actions =  self.node.borrow_mut().step(Instant::now(), ev);
-            self.mirror.snapshot_from(& self.node.borrow());
-            for action in actions {
-                if let Some(follow_up) = self.dispatch_action(action).await {
-                    pending.push_back(follow_up);
+    /// Dispatch every outbound `RequestVote` concurrently and collect
+    /// per-peer `VoteOutcome`s. A single slow peer can no longer
+    /// linearise the round — that was the whole point of the
+    /// consensus refactor.
+    ///
+    /// Each RPC runs as a `tokio::task::spawn_local` so they make
+    /// progress in parallel inside the surrounding `LocalSet`. Handles
+    /// are awaited sequentially after spawn — the underlying tasks are
+    /// already running, so the await loop is just a synchronisation
+    /// barrier on the slowest reply (or `VOTE_RPC_TIMEOUT`, whichever
+    /// fires first).
+    async fn send_request_votes_concurrent(
+        &self,
+        requests: Vec<(NodeId, RequestVoteRequest)>,
+    ) -> Vec<(NodeId, VoteOutcome)> {
+        let candidate_id = self.node.borrow().self_id();
+        let mut handles = Vec::with_capacity(requests.len());
+        for (peer, req) in requests {
+            let config = self.config.clone();
+            let handle = tokio::task::spawn_local(async move {
+                let outcome = send_one_request_vote(peer, candidate_id, req, config).await;
+                (peer, outcome)
+            });
+            handles.push(handle);
+        }
+        let mut results = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.await {
+                Ok(pair) => results.push(pair),
+                Err(e) => {
+                    error!("raft_loop: RequestVote task join error: {}", e);
                 }
             }
         }
+        results
     }
+}
 
-    /// Process one action emitted by `node.step()`. Returns a
-    /// follow-up [`Event`] that the surrounding `step` loop should
-    /// feed back into the state machine — typically the
-    /// `Event::RequestVoteReply` synthesised from an outbound
-    /// `RequestVote` RPC's response. `None` means "no follow-up".
-    async fn dispatch_action(&mut self, action: raft::Action) -> Option<Event> {
-        use raft::Action::*;
-        match action {
-            SetWakeup { at } => {
-                info!("raft_loop: SetWakeup: {:?}", at);
-                self.next_wakeup = Some(at);
-                None
-            }
-            FatalError { reason } => {
-                error!("raft_loop: FatalError: {}", reason);
-                self.mirror.set_fatal();
-                // Loop continues running but raft itself is now frozen
-                // — every subsequent step() returns no actions. The
-                // supervisor observes via mirror.is_fatal() and tears
-                // down the process.
-                None
-            }
-            SendRequestVote {
-                to,
-                term,
-                last_tx_id,
-                last_term,
-            } => {
-                let mut client = match self.get_node_client(to).await {
-                    Ok(c) => c,
-                    Err(err) => {
-                        error!(
-                            "raft_loop: SendRequestVote: connect to peer {} failed: {}",
-                            to, err
-                        );
-                        return None;
-                    }
-                };
-                info!("raft_loop: SendRequestVote: {:?}", (to, term, last_tx_id));
-                let candidate_id =  self.node.borrow().self_id();
-                let resp = match client
-                    .request_vote(proto::RequestVoteRequest {
-                        term,
-                        candidate_id,
-                        last_tx_id,
-                        last_term,
-                    })
-                    .await
-                {
-                    Ok(r) => r.into_inner(),
-                    Err(e) => {
-                        error!(
-                            "raft_loop: SendRequestVote: rpc to peer {} failed: {}",
-                            to, e
-                        );
-                        return None;
-                    }
-                };
-                info!("raft_loop: SendRequestVote result: {:?}", resp);
-                // Surface the reply as a follow-up event; the outer
-                // `step` loop will feed it through `node.step()`,
-                // dispatch the resulting `BecomeRole(Leader)` /
-                // `SetWakeup` actions, and snapshot the mirror.
-                Some(Event::RequestVoteReply {
-                    from: to,
-                    term: resp.term,
-                    granted: resp.vote_granted,
-                })
-            }
-            BecomeRole { role, term } => {
-                info!("raft_loop: BecomeRole: {:?} {:?}", role, term);
-                // The control point: replication plays only while we
-                // are leader. Any other role transition pauses it.
-                if let Some(gate) = self.gate.as_ref() {
-                    gate.set_playing(matches!(role, Role::Leader));
-                }
-                None
-            }
+async fn send_one_request_vote(
+    peer: NodeId,
+    candidate_id: NodeId,
+    req: RequestVoteRequest,
+    config: Arc<Config>,
+) -> VoteOutcome {
+    let mut client = match get_node_client(&config, peer).await {
+        Ok(c) => c,
+        Err(err) => {
+            error!("raft_loop: RequestVote: connect to peer {} failed: {}", peer, err);
+            return VoteOutcome::Failed;
         }
+    };
+    info!(
+        "raft_loop: RequestVote → peer={} term={} last_tx_id={}",
+        peer, req.term, req.last_tx_id
+    );
+    let rpc_fut = client.request_vote(proto::RequestVoteRequest {
+        term: req.term,
+        candidate_id,
+        last_tx_id: req.last_tx_id,
+        last_term: req.last_term,
+    });
+    let resp = match tokio::time::timeout(VOTE_RPC_TIMEOUT, rpc_fut).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => {
+            error!("raft_loop: RequestVote rpc to peer {} failed: {}", peer, e);
+            return VoteOutcome::Failed;
+        }
+        Err(_) => {
+            error!("raft_loop: RequestVote to peer {} timed out", peer);
+            return VoteOutcome::Failed;
+        }
+    };
+    info!(
+        "raft_loop: RequestVote ← peer={} term={} granted={}",
+        peer, resp.term, resp.vote_granted
+    );
+    if resp.vote_granted {
+        VoteOutcome::Granted { term: resp.term }
+    } else {
+        VoteOutcome::Denied { term: resp.term }
     }
+}
 
-    async fn get_node_client(&self, node_id: NodeId) -> Result<NodeClient<Channel>, ConnectError> {
-        let timeout = Duration::from_millis(100);
-        let host = self
-            .config
-            .cluster
-            .as_ref()
-            .ok_or(ConnectError::NotClustered)?
-            .peers
-            .iter()
-            .find(|p| p.peer_id == node_id)
-            .ok_or(ConnectError::UnknownPeer(node_id))?
-            .host
-            .clone();
+async fn get_node_client(
+    config: &Config,
+    node_id: NodeId,
+) -> Result<NodeClient<Channel>, ConnectError> {
+    let host = config
+        .cluster
+        .as_ref()
+        .ok_or(ConnectError::NotClustered)?
+        .peers
+        .iter()
+        .find(|p| p.peer_id == node_id)
+        .ok_or(ConnectError::UnknownPeer(node_id))?
+        .host
+        .clone();
 
-        match tokio::time::timeout(timeout, NodeClient::connect(host)).await {
-            Ok(Ok(client)) => Ok(client),
-            Ok(Err(e)) => Err(ConnectError::Transport(e)),
-            Err(_) => Err(ConnectError::Timeout),
-        }
+    match tokio::time::timeout(VOTE_CONNECT_TIMEOUT, NodeClient::connect(host)).await {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(e)) => Err(ConnectError::Transport(e)),
+        Err(_) => Err(ConnectError::Timeout),
     }
 }
 
@@ -402,10 +514,7 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
-/// Build the proto response from raft's getters. Free function so
-/// it can be called with a `MutexGuard<RaftNode>` already held —
-/// avoids needing a second lock just to read `current_term()` /
-/// `commit_index()` / `write_index()`.
+/// Build the proto response from raft's getters.
 fn build_ae_response(
     node: &RaftNode<DurablePersistence>,
     success: bool,

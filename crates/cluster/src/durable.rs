@@ -468,6 +468,12 @@ fn into_raft_record(r: TermRecord) -> RaftTermRecord {
     }
 }
 
+// `raft::Persistence` is infallible: writes either succeed or the
+// process must crash (the supervisor restarts). The internal `Term` /
+// `Vote` wrappers still surface `io::Result` because tests/tooling
+// want the explicit error path; the trait impl panics on any I/O
+// failure. Per ADR-0017 the supervisor (`cluster::lifecycle`) is
+// responsible for the restart.
 impl Persistence for DurablePersistence {
     fn current_term(&self) -> u64 {
         self.term.get_current_term()
@@ -490,16 +496,22 @@ impl Persistence for DurablePersistence {
         }
     }
 
-    fn commit_term(&mut self, expected: u64, start_tx_id: u64) -> io::Result<bool> {
-        self.term.commit_term(expected, start_tx_id)
+    fn commit_term(&mut self, expected: u64, start_tx_id: u64) -> bool {
+        self.term
+            .commit_term(expected, start_tx_id)
+            .unwrap_or_else(|e| panic!("durable: commit_term({expected},{start_tx_id}) failed: {e}"))
     }
 
-    fn observe_term(&mut self, term: u64, start_tx_id: u64) -> io::Result<()> {
-        self.term.observe(term, start_tx_id)
+    fn observe_term(&mut self, term: u64, start_tx_id: u64) {
+        self.term
+            .observe(term, start_tx_id)
+            .unwrap_or_else(|e| panic!("durable: observe_term({term},{start_tx_id}) failed: {e}"));
     }
 
-    fn truncate_term_after(&mut self, tx_id: u64) -> io::Result<()> {
-        self.term.truncate_after(tx_id)
+    fn truncate_term_after(&mut self, tx_id: u64) {
+        self.term
+            .truncate_after(tx_id)
+            .unwrap_or_else(|e| panic!("durable: truncate_term_after({tx_id}) failed: {e}"));
     }
 
     fn vote_term(&self) -> u64 {
@@ -510,12 +522,16 @@ impl Persistence for DurablePersistence {
         self.vote.get_voted_for()
     }
 
-    fn vote(&mut self, term: u64, candidate_id: u64) -> io::Result<bool> {
-        self.vote.vote(term, candidate_id)
+    fn vote(&mut self, term: u64, candidate_id: u64) -> bool {
+        self.vote
+            .vote(term, candidate_id)
+            .unwrap_or_else(|e| panic!("durable: vote({term},{candidate_id}) failed: {e}"))
     }
 
-    fn observe_vote_term(&mut self, term: u64) -> io::Result<()> {
-        self.vote.observe_term(term)
+    fn observe_vote_term(&mut self, term: u64) {
+        self.vote
+            .observe_term(term)
+            .unwrap_or_else(|e| panic!("durable: observe_vote_term({term}) failed: {e}"));
     }
 }
 
@@ -624,7 +640,7 @@ mod tests {
         let mut p = DurablePersistence::open(&dir).unwrap();
         assert_eq!(p.current_term(), 0);
         assert_eq!(p.last_term_record(), None);
-        assert!(p.commit_term(3, 0).unwrap());
+        assert!(p.commit_term(3, 0));
         assert_eq!(p.current_term(), 3);
         assert_eq!(
             p.last_term_record(),
@@ -633,16 +649,16 @@ mod tests {
                 start_tx_id: 0,
             })
         );
-        assert!(p.vote(3, 1).unwrap());
+        assert!(p.vote(3, 1));
         assert_eq!(p.voted_for(), Some(1));
         assert_eq!(p.vote_term(), 3);
 
-        p.truncate_term_after(0).unwrap();
+        p.truncate_term_after(0);
         // start_tx_id=0 record has term=3 — kept (start_tx_id <= 0).
         assert_eq!(p.current_term(), 3);
 
-        p.observe_term(5, 100).unwrap();
-        p.truncate_term_after(50).unwrap();
+        p.observe_term(5, 100);
+        p.truncate_term_after(50);
         // Term 5's record (start_tx_id=100) was truncated; term 3 remains.
         assert_eq!(p.current_term(), 3);
     }

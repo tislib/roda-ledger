@@ -18,7 +18,7 @@
 use ::proto::node as proto;
 use raft::Role;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 const ROLE_INITIALIZING: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
@@ -65,9 +65,6 @@ pub struct ClusterMirror {
     /// Candidate, or freshly stepped-down).
     current_leader: AtomicU64,
     voted_for: AtomicU64,
-    /// Flipped on `Action::FatalError`. Once set, the raft state machine
-    /// is frozen and the supervisor must shut the node down.
-    fatal: AtomicBool,
 }
 
 impl ClusterMirror {
@@ -80,7 +77,6 @@ impl ClusterMirror {
             cluster_commit_index: AtomicU64::new(0),
             current_leader: AtomicU64::new(0),
             voted_for: AtomicU64::new(0),
-            fatal: AtomicBool::new(false),
         })
     }
 
@@ -147,13 +143,8 @@ impl ClusterMirror {
         }
     }
 
-    #[inline]
-    pub fn is_fatal(&self) -> bool {
-        self.fatal.load(Ordering::Acquire)
-    }
-
     /// Snapshot raft state into the mirror. Called by the raft driver
-    /// under the raft mutex, immediately after every `step` returns.
+    /// after every state-machine call.
     /// Public to the cluster crate; external callers go through the
     /// driver.
     pub(crate) fn snapshot_from<P: raft::Persistence>(&self, node: &raft::RaftNode<P>) {
@@ -171,12 +162,6 @@ impl ClusterMirror {
             .store(node.current_leader().unwrap_or(0), Ordering::Release);
         self.voted_for
             .store(node.voted_for().unwrap_or(0), Ordering::Release);
-    }
-
-    /// Flip the fatal latch. Idempotent; only the driver calls this in
-    /// response to `Action::FatalError`.
-    pub(crate) fn set_fatal(&self) {
-        self.fatal.store(true, Ordering::Release);
     }
 
     /// Pin the role for standalone mode (no raft running). The cluster
@@ -201,7 +186,6 @@ mod tests {
         assert_eq!(m.cluster_commit_index(), 0);
         assert_eq!(m.current_leader(), None);
         assert_eq!(m.voted_for(), None);
-        assert!(!m.is_fatal());
         assert!(!m.is_leader());
     }
 
@@ -218,10 +202,4 @@ mod tests {
         assert_eq!(m.role_proto(), proto::NodeRole::Recovering);
     }
 
-    #[test]
-    fn fatal_is_sticky() {
-        let m = ClusterMirror::new();
-        m.set_fatal();
-        assert!(m.is_fatal());
-    }
 }

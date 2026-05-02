@@ -199,7 +199,9 @@ impl ClusterNode {
         let durable_last_tx_id = self.ledger_slot.ledger().last_commit_id();
         if durable_last_tx_id > 0 {
             node.advance(durable_last_tx_id, durable_last_tx_id);
-            let _ = node.step(Instant::now(), raft::Event::Tick);
+            // Lazy-arm the election timer so the raft loop's first
+            // iteration sees a populated wakeup deadline.
+            let _ = node.election().tick(Instant::now());
         }
         // Snapshot initial state so consumers see post-construction values.
         mirror.snapshot_from(&node);
