@@ -2,9 +2,11 @@
 //!
 //! ADR-0017 §"Two Commit Indexes" — `cluster_commit_index` is the
 //! largest tx_id known quorum-committed across the cluster. The
-//! leader recomputes it whenever an `AppendEntriesReply` advances a
-//! peer's `match_index`. Because the library is single-threaded, this
-//! is just a `Vec<u64>` plus a sort each time `advance` is called.
+//! leader recomputes it whenever the cluster driver feeds an AE
+//! reply through `Replication::peer(_).append_result(...)` and that
+//! reply advances a peer's `match_index`. Because the library is
+//! single-threaded, this is just a `Vec<u64>` plus a sort each time
+//! `advance` is called.
 //!
 //! Slot 0 is conventionally the leader's own progress, fed by
 //! `RaftNode::advance(write, commit)` (the `commit` argument lifts

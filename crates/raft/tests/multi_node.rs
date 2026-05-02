@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
-    Action, AppendEntriesDecision, Event, LogEntryRange, NodeId, Persistence, RaftConfig,
-    RaftNode, RejectReason, Role,
+    Action, AppendEntriesDecision, AppendResult, Event, LogEntryRange, NodeId, Persistence,
+    RaftConfig, RaftNode, RejectReason, Role,
 };
 
 fn pick_leader(sim: &Sim) -> Option<NodeId> {
@@ -221,50 +221,37 @@ fn stale_vote_reply_does_not_count_toward_majority() {
     assert_eq!(node.current_term(), term_now);
 }
 
-/// Higher term observed via `AppendEntriesReply` while leader → step
-/// down to Follower at the new term.
+/// Higher term observed in an `AppendEntries` reply while leader →
+/// step down to Follower at the new term. Drives the per-peer
+/// `Replication::append_result` direct-method path with a synthetic
+/// `Reject { reason: TermBehind, term: <much higher> }`.
 #[test]
 fn higher_term_in_append_reply_demotes_leader() {
-    let mut sim = Sim::new(&[1, 2, 3], Sim::standard_cfg(), 13);
-    let leader = await_leader(&mut sim);
-    let leader_term = sim.current_term_of(leader);
-
-    // The simulator drives this end-to-end. Inject an AE reply at
-    // a much higher term directly into the leader.
-    // (Bypass the harness's queue with a direct synthesis.)
-    // We can't reach into `Sim` to step the leader directly, so we
-    // approximate the scenario at the unit level instead.
-    let mut node = fresh_node(1, vec![1, 2, 3]);
-    let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
-    now += Duration::from_secs(60);
-    // single-node loop won't exercise Leader for a 3-node cluster,
-    // so use the simulator to get a Leader, then inject manually.
-    let _ = node;
-    let _ = leader_term;
-
-    // Reset and use the simulator's leader.
-    // The harness doesn't expose direct event injection per node; we
-    // verify via real flow: synthesise it by sending a vote request
-    // at the higher term, which has the same effect (observe higher
-    // term + step down).
-    let dl = sim.clock() + Duration::from_millis(1);
-    sim.run_until(dl);
-    // Create a fresh node and inject a higher-term AE reply directly
-    // to verify the demotion path.
-    let mut leader_node = fresh_node(99, vec![99]);
-    let _ = leader_node.step(Instant::now(), Event::Tick);
-    let _ = leader_node.step(Instant::now() + Duration::from_secs(60), Event::Tick);
-    assert!(leader_node.role().is_leader());
+    // Two-node cluster (self=99, peer=1) so we can win election with a
+    // single peer vote and then have peer 1 reachable via the
+    // `Replication` API for the synthetic reply.
+    let t0 = Instant::now();
+    let mut leader_node = fresh_node(99, vec![99, 1]);
+    let _ = leader_node.step(t0, Event::Tick);
+    let _ = leader_node.step(t0 + Duration::from_secs(60), Event::Tick);
+    let term = leader_node.current_term();
     let _ = leader_node.step(
-        Instant::now() + Duration::from_secs(61),
-        Event::AppendEntriesReply {
+        t0 + Duration::from_secs(60),
+        Event::RequestVoteReply {
             from: 1,
+            term,
+            granted: true,
+        },
+    );
+    assert!(leader_node.role().is_leader());
+
+    leader_node.replication().peer(1).unwrap().append_result(
+        t0 + Duration::from_secs(61),
+        AppendResult::Reject {
             term: 99,
-            success: false,
-            last_commit_id: 0,
+            reason: RejectReason::TermBehind,
             last_write_id: 0,
-            reject_reason: None,
+            last_commit_id: 0,
         },
     );
     assert!(!leader_node.role().is_leader());

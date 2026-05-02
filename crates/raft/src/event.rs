@@ -11,37 +11,23 @@
 //! `Event::*Persisted` ack. When a trait write returns `Ok(_)`, the
 //! library treats the change as durable and proceeds.
 //!
-//! Inbound `AppendEntries` does **not** flow through this enum: the
-//! follower path uses the direct-method
-//! `RaftNode::validate_append_entries_request` (with the cluster
-//! driver performing WAL I/O and `advance(write, commit)` itself).
-//! The leader's reply observation lives here as
-//! `Event::AppendEntriesReply`.
+//! `AppendEntries` does **not** flow through this enum:
+//!
+//! - Follower path: the cluster driver calls
+//!   `RaftNode::validate_append_entries_request` and performs the
+//!   WAL I/O / `advance(write, commit)` itself.
+//! - Leader path: the cluster driver feeds replies into
+//!   `RaftNode::replication().peer(id).append_result(now, result)`.
+//!
+//! Both AE-related paths are direct methods, not events.
 
-use crate::types::{NodeId, RejectReason, Term, TxId};
+use crate::types::{NodeId, Term, TxId};
 
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Wake up and re-check timers. The driver fires `Tick` when an
     /// `Action::SetWakeup` deadline arrives.
     Tick,
-
-    /// Reply to an `AppendEntries` we sent.
-    ///
-    /// Two watermarks: `last_commit_id` is the follower's durably-
-    /// committed end (drives `match_index` and the cluster quorum);
-    /// `last_write_id` is the follower's accepted/written end (drives
-    /// the replication window — `next_index`). Invariant:
-    /// `last_write_id >= last_commit_id`. See ADR-0017 §"AE reply:
-    /// write vs commit watermark".
-    AppendEntriesReply {
-        from: NodeId,
-        term: Term,
-        success: bool,
-        last_commit_id: TxId,
-        last_write_id: TxId,
-        reject_reason: Option<RejectReason>,
-    },
 
     /// Inbound `RequestVote` from a candidate.
     RequestVoteRequest {

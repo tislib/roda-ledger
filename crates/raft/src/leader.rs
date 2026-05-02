@@ -2,10 +2,10 @@
 //!
 //! Owns one `PeerProgress` per follower — `next_index`,
 //! `match_index`, `in_flight` window, and `next_heartbeat` deadline.
-//! The state machine consults it on every `Event::AppendEntriesReply`
-//! to advance/regress `next_index` (Raft §5.3 `next_index -= 1` on
-//! `LogMismatch`) and on every `Tick` to decide which peers need a
-//! fresh AppendEntries.
+//! The state machine consults it on every cluster-driver call into
+//! `Replication::peer(id).append_result(...)` to advance/regress
+//! `next_index` (Raft §5.3 `next_index -= 1` on `LogMismatch`) and on
+//! every `Tick` to decide which peers need a fresh AppendEntries.
 //!
 //! The reply's two watermarks (`last_write_id`, `last_commit_id`) drive
 //! `next_index` and `match_index` independently — see ADR-0017 §"AE

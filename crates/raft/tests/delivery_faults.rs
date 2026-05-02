@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, NodeId, RaftConfig, RaftNode, RejectReason, Role};
+use raft::{AppendResult, Event, NodeId, RaftConfig, RaftNode, RejectReason, Role};
 
 fn await_leader(sim: &mut Sim) -> NodeId {
     let dl = sim.clock() + Duration::from_secs(5);
@@ -128,11 +128,13 @@ fn cluster_makes_progress_under_moderate_delay() {
     );
 }
 
-/// A reply to an `AppendEntries` the leader never sent (synthetic
-/// stress). Must be ignored gracefully. Uses a single-node cluster
-/// so the leader role can be reached without peer cooperation.
+/// A reply from a node that is not in this leader's peer list must be
+/// unreachable through the public `Replication` API — the per-peer
+/// gate refuses to hand out a handle, so there is no way to feed a
+/// non-peer reply into the state machine. Pins this property as part
+/// of the surface contract.
 #[test]
-fn unsolicited_append_entries_reply_is_ignored() {
+fn unsolicited_append_entries_reply_is_unreachable_via_replication() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
     let _ = node.step(t0, Event::Tick);
@@ -140,50 +142,57 @@ fn unsolicited_append_entries_reply_is_ignored() {
     assert!(node.role().is_leader());
     let term_before = node.current_term();
 
-    let actions = node.step(
-        t0 + Duration::from_secs(61),
-        Event::AppendEntriesReply {
-            from: 99, // never a peer
-            term: term_before,
-            success: true,
-            last_commit_id: 99,
-            last_write_id: 99,
-            reject_reason: None,
-        },
-    );
+    // Peer 99 was never configured: `Replication::peer` returns None,
+    // and there is no other entry point that takes a `from` argument.
+    assert!(node.replication().peer(99).is_none());
+
+    // Leader stays leader; nothing observable changed.
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), term_before);
-    let became = actions
-        .iter()
-        .filter(|a| matches!(a, Action::BecomeRole { .. }))
-        .count();
-    assert_eq!(became, 0);
 }
 
 /// Late reply after a simulated RPC-timeout: the leader's in-flight
-/// slot is already cleared, so the late reply just gets processed
-/// normally. Must not panic or step down.
+/// slot is already cleared by the timeout, so a subsequent reply that
+/// arrives at the same peer slot just gets processed normally. Must
+/// not panic or step down.
 #[test]
 fn late_reply_after_rpc_timeout_does_not_crash() {
-    let mut node = fresh_node(1, vec![1]);
+    // Two-node cluster so peer 2 is real and we can drive it to leader
+    // via a single peer vote.
+    let mut node = fresh_node(1, vec![1, 2]);
     let t0 = Instant::now();
     let _ = node.step(t0, Event::Tick);
     let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
-    assert!(node.role().is_leader());
-
-    let _ = node.step(t0 + Duration::from_secs(100), Event::Tick);
-
-    let actions = node.step(
-        t0 + Duration::from_secs(101),
-        Event::AppendEntriesReply {
-            from: 2, // a phantom peer in this single-node cluster
-            term: node.current_term(),
-            success: true,
-            last_commit_id: 0,
-            last_write_id: 0,
-            reject_reason: Some(RejectReason::RpcTimeout),
+    let term = node.current_term();
+    let _ = node.step(
+        t0 + Duration::from_secs(60),
+        Event::RequestVoteReply {
+            from: 2,
+            term,
+            granted: true,
         },
     );
-    let _ = actions;
+    assert!(node.role().is_leader());
+
+    // Synthesize the cluster-driver-side timeout: clears the leader's
+    // in-flight slot for peer 2 and leaves indexes alone.
+    node.replication()
+        .peer(2)
+        .unwrap()
+        .append_result(t0 + Duration::from_secs(100), AppendResult::Timeout);
+
+    // Now the "late" reply lands. With in_flight already cleared by
+    // the timeout, the leader processes it as an ordinary stale
+    // reject and stays the leader.
+    let term_now = node.current_term();
+    node.replication().peer(2).unwrap().append_result(
+        t0 + Duration::from_secs(101),
+        AppendResult::Reject {
+            term: term_now,
+            reason: RejectReason::RpcTimeout,
+            last_write_id: 0,
+            last_commit_id: 0,
+        },
+    );
     assert!(node.role().is_leader());
 }

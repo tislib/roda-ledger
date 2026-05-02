@@ -574,13 +574,12 @@ impl<P: Persistence> RaftNode<P> {
     }
 
     /// Feed the cluster-driver's RPC outcome back into the state
-    /// machine. Same destination as the action-based
-    /// `Event::AppendEntriesReply` path — `Success` /
-    /// `Reject(LogMismatch)` flow through `on_append_entries_reply`
-    /// untouched. `Reject(TermBehind)` triggers the same step-down.
-    /// `Timeout` is mapped to `RejectReason::RpcTimeout` (which the
-    /// reply handler already treats as "clear in_flight, leave
-    /// indexes alone").
+    /// machine. `Success` / `Reject(LogMismatch)` advance / regress
+    /// the peer's `next_index` and feed the quorum;
+    /// `Reject(TermBehind)` triggers leader step-down via
+    /// `transition_to_follower`; `Timeout` is mapped to
+    /// `RejectReason::RpcTimeout` and clears `in_flight` while
+    /// leaving indexes alone.
     pub(crate) fn replication_append_result(
         &mut self,
         peer_id: NodeId,
@@ -758,24 +757,6 @@ impl<P: Persistence> RaftNode<P> {
         let mut out = Vec::new();
         match event {
             Event::Tick => self.on_tick(now, &mut out),
-            Event::AppendEntriesReply {
-                from,
-                term,
-                success,
-                last_commit_id,
-                last_write_id,
-                reject_reason,
-            } => {
-                self.on_append_entries_reply(
-                    now,
-                    from,
-                    term,
-                    success,
-                    last_commit_id,
-                    last_write_id,
-                    reject_reason,
-                );
-            }
             Event::RequestVoteRequest {
                 from,
                 term,
@@ -1101,12 +1082,10 @@ impl<P: Persistence> RaftNode<P> {
     // ─── AppendEntries (follower path) ───────────────────────────────────
 
     /// Direct-method follower-side handler for an inbound
-    /// `AppendEntries`. Mirrors the §5.1/§5.3/§5.4 protocol checks
-    /// previously inlined in `on_append_entries_request` but, instead
-    /// of emitting `Action::TruncateLog` / `Action::AppendLog` /
-    /// `Action::SendAppendEntriesReply`, returns an
-    /// [`AppendEntriesDecision`] that tells the driver what to do
-    /// with its WAL and how to construct the wire reply.
+    /// `AppendEntries`. Runs the §5.1 / §5.3 / §5.4 protocol checks
+    /// and returns an [`AppendEntriesDecision`] that tells the
+    /// driver what to do with its WAL and how to construct the wire
+    /// reply.
     ///
     /// Internal state mutations performed before returning:
     ///

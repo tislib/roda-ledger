@@ -15,8 +15,10 @@ pub type TxId = u64;
 pub type Term = u64;
 
 /// Reason a peer rejected an `AppendEntries`. Carried back through
-/// `Event::AppendEntriesReply` so the leader can pick the right
-/// recovery strategy (decrement `next_index` vs. step down vs. retry).
+/// [`AppendResult::Reject`](crate::AppendResult::Reject) into
+/// `Replication::peer(_).append_result(...)` so the leader can pick
+/// the right recovery strategy (decrement `next_index` vs. step down
+/// vs. retry).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RejectReason {
     /// `prev_log_term` did not match the follower's record at
@@ -26,9 +28,10 @@ pub enum RejectReason {
     /// Peer's term is strictly higher than the request's. Leader
     /// must step down.
     TermBehind,
-    /// RPC fired and never came back inside its deadline. Synthesised
-    /// internally on `Event::Tick` so the rest of the state machine
-    /// handles timeouts through the normal reply path.
+    /// RPC fired and never came back inside its deadline. Surfaced by
+    /// the cluster driver via
+    /// [`AppendResult::Timeout`](crate::AppendResult::Timeout); the
+    /// reply handler clears `in_flight` and leaves indexes alone.
     RpcTimeout,
 }
 

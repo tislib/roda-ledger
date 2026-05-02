@@ -2,14 +2,20 @@
 //! roda-ledger. Implements ADR-0017.
 //!
 //! The library has no internal threads, no async runtime, **no I/O**
-//! of its own. Three driver-facing entry points:
+//! of its own. Driver-facing entry points:
 //!
-//! - [`RaftNode::step`] — leader-side events (`Tick`,
-//!   `AppendEntriesReply`, `RequestVoteRequest`, `RequestVoteReply`).
-//!   Returns the [`Action`]s the driver must execute.
+//! - [`RaftNode::step`] — election-side events (`Tick`,
+//!   `RequestVoteRequest`, `RequestVoteReply`). Returns the
+//!   [`Action`]s the driver must execute.
 //! - [`RaftNode::validate_append_entries_request`] — follower-side
 //!   inbound `AppendEntries`. Returns an [`AppendEntriesDecision`]
 //!   describing what the cluster driver must do with its WAL.
+//! - [`RaftNode::request_vote`] — voter-side `RequestVote` direct
+//!   method, returning a [`RequestVoteReply`] synchronously.
+//! - [`RaftNode::replication`] → [`Replication`] / [`PeerReplication`]
+//!   — leader-side per-peer driver: `get_append_range(now)` to pull
+//!   the next AE, `append_result(now, AppendResult)` to feed the
+//!   reply back.
 //! - [`RaftNode::advance`] — driver-side durability ack. Updates the
 //!   local write/commit watermarks and (on followers) drains any
 //!   deferred `leader_commit` into `cluster_commit_index`.

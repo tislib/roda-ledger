@@ -315,26 +315,20 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     // bring their logs up to the prior-term high-water mark.
     // Without §5.4.2, this advances `cluster_commit` to 5
     // (committing term-1 entries by current-term replica count).
-    let _ = node.step(
+    node.replication().peer(3).unwrap().append_result(
         now,
-        Event::AppendEntriesReply {
-            from: 3,
+        AppendResult::Success {
             term: cand_term,
-            success: true,
-            last_commit_id: 5,
             last_write_id: 5,
-            reject_reason: None,
+            last_commit_id: 5,
         },
     );
-    let _ = node.step(
+    node.replication().peer(4).unwrap().append_result(
         now,
-        Event::AppendEntriesReply {
-            from: 4,
+        AppendResult::Success {
             term: cand_term,
-            success: true,
-            last_commit_id: 5,
             last_write_id: 5,
-            reject_reason: None,
+            last_commit_id: 5,
         },
     );
 
@@ -362,7 +356,8 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
 // These tests pin the split: the library must treat them as
 // independent inputs even though today's cluster bridge happens to
 // populate both from the same durability ack. They exercise the
-// library by injecting `Event::AppendEntriesReply` directly.
+// library by feeding replies through the per-peer
+// `Replication::append_result` direct method.
 
 /// Drive a fresh node to leader of a 3-node cluster at term 1, with
 /// `local_log_index = last_written = entries` after construction.
@@ -442,26 +437,20 @@ fn ae_reply_quorum_advances_only_to_commit_id() {
     let t0 = Instant::now();
     let (mut node, term, t_setup) = leader_with_entries(5, t0);
 
-    let _ = node.step(
+    node.replication().peer(2).unwrap().append_result(
         t_setup + Duration::from_millis(10),
-        Event::AppendEntriesReply {
-            from: 2,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 3,
             last_write_id: 5,
-            reject_reason: None,
+            last_commit_id: 3,
         },
     );
-    let _ = node.step(
+    node.replication().peer(3).unwrap().append_result(
         t_setup + Duration::from_millis(11),
-        Event::AppendEntriesReply {
-            from: 3,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 3,
             last_write_id: 5,
-            reject_reason: None,
+            last_commit_id: 3,
         },
     );
 
@@ -484,54 +473,42 @@ fn ae_reply_commit_lagging_write_does_not_regress_next_index() {
     let (mut node, term, t_setup) = leader_with_entries(10, t0);
 
     // First reply: peer 2 has accepted all 10 but only durable to 3.
-    let _ = node.step(
+    node.replication().peer(2).unwrap().append_result(
         t_setup + Duration::from_millis(10),
-        Event::AppendEntriesReply {
-            from: 2,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 3,
             last_write_id: 10,
-            reject_reason: None,
+            last_commit_id: 3,
         },
     );
     // Peer 3 too — gives us a 3/3 majority at commit=3 so we can
     // observe further commit progress via `cluster_commit_index`.
-    let _ = node.step(
+    node.replication().peer(3).unwrap().append_result(
         t_setup + Duration::from_millis(11),
-        Event::AppendEntriesReply {
-            from: 3,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 3,
             last_write_id: 10,
-            reject_reason: None,
+            last_commit_id: 3,
         },
     );
     assert_eq!(node.cluster_commit_index(), 3);
 
     // Second reply from peer 2: write watermark unchanged, commit
     // moved up by one. `next_index` must not regress.
-    let _ = node.step(
+    node.replication().peer(2).unwrap().append_result(
         t_setup + Duration::from_millis(20),
-        Event::AppendEntriesReply {
-            from: 2,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 4,
             last_write_id: 10,
-            reject_reason: None,
+            last_commit_id: 4,
         },
     );
-    let _ = node.step(
+    node.replication().peer(3).unwrap().append_result(
         t_setup + Duration::from_millis(21),
-        Event::AppendEntriesReply {
-            from: 3,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 4,
             last_write_id: 10,
-            reject_reason: None,
+            last_commit_id: 4,
         },
     );
     assert_eq!(
@@ -570,15 +547,12 @@ fn ae_reply_clamps_commit_above_write_defensively() {
 
     // Malformed: peer claims commit=5 with write=3. Library either
     // panics (debug) or clamps commit to 3 (release).
-    let _ = node.step(
+    node.replication().peer(2).unwrap().append_result(
         t_setup + Duration::from_millis(10),
-        Event::AppendEntriesReply {
-            from: 2,
+        AppendResult::Success {
             term,
-            success: true,
-            last_commit_id: 5,
             last_write_id: 3,
-            reject_reason: None,
+            last_commit_id: 5,
         },
     );
 

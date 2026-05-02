@@ -35,15 +35,16 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use raft::{
-    Action, AppendEntriesDecision, ElectionTimerConfig, Event, LogEntryRange, NodeId, RaftConfig,
-    RaftNode, RejectReason, Role, Term, TxId,
+    Action, AppendEntriesDecision, AppendResult, ElectionTimerConfig, Event, LogEntryRange, NodeId,
+    RaftConfig, RaftNode, RejectReason, Role, Term, TxId,
 };
 
 /// Per-target delivery in the simulator queue. AE arrivals call the
 /// `validate_append_entries_request` direct method (with the cluster
 /// driver's responsibilities — WAL apply, `advance`, reply
-/// synthesis — performed by `Sim::deliver_append_entries`); every
-/// other input runs through `node.step(now, event)`.
+/// synthesis — performed by `Sim::deliver_append_entries`); AE replies
+/// route through the `Replication::append_result` direct method on the
+/// leader; every other input runs through `node.step(now, event)`.
 #[derive(Clone, Debug)]
 enum Delivery {
     Step(Event),
@@ -54,6 +55,14 @@ enum Delivery {
         prev_log_term: Term,
         entries: LogEntryRange,
         leader_commit: TxId,
+    },
+    /// Reply from `from` (the follower that processed the AE) back to
+    /// the leader (this scheduled item's `target`). The leader feeds
+    /// the result through
+    /// `node.replication().peer(from).unwrap().append_result(now, result)`.
+    AppendEntriesReply {
+        from: NodeId,
+        result: AppendResult,
     },
 }
 
@@ -503,6 +512,35 @@ impl Sim {
                     leader_commit,
                 );
             }
+            // Leader-side: feed an AE reply into the per-peer
+            // `Replication` API. `peer(from)` returns `None` if the
+            // sender is not a configured peer of this node — that
+            // matches the legacy event path's "ignore unsolicited
+            // replies" semantics. ADR-0017 §"Driver call pattern":
+            // follow the direct-method call with `step(Tick)` so any
+            // wakeup re-arming on the leader (peer's
+            // `next_heartbeat`, in-flight expiry clearing) gets
+            // emitted as `Action::SetWakeup` for the simulator to
+            // schedule.
+            Delivery::AppendEntriesReply { from, result } => {
+                if let Some(node) =
+                    self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
+                    && let Some(mut peer) = node.replication().peer(from)
+                {
+                    peer.append_result(now, result);
+                }
+                let tick_actions = match self
+                    .nodes
+                    .get_mut(&s.target)
+                    .and_then(|b| b.node.as_mut())
+                {
+                    Some(n) => n.step(now, Event::Tick),
+                    None => return,
+                };
+                self.process_actions(s.target, now, tick_actions);
+                self.drive_replication(s.target, now);
+                self.observe_cluster_commit(s.target);
+            }
             Delivery::Step(event) => {
                 let actions = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut())
                 {
@@ -610,7 +648,9 @@ impl Sim {
         // write vs commit watermark" — the reply ships
         // `last_commit_id` / `last_write_id` separately) and ship
         // it back through the simulated network, subject to the
-        // drop / duplicate model.
+        // drop / duplicate model. Translates the (success,
+        // reject_reason) pair into the `AppendResult` enum the
+        // leader's `Replication::append_result` expects.
         if self.is_dropped(target, from) || self.rolled_drop() {
             return;
         }
@@ -622,19 +662,29 @@ impl Sim {
             Some(n) => (n.current_term(), n.commit_index(), n.write_index()),
             None => return,
         };
+        let result = if success {
+            AppendResult::Success {
+                term: reply_term,
+                last_write_id,
+                last_commit_id,
+            }
+        } else {
+            AppendResult::Reject {
+                term: reply_term,
+                reason: reject_reason.unwrap_or(RejectReason::LogMismatch),
+                last_write_id,
+                last_commit_id,
+            }
+        };
         let when = now + self.network_delay;
-        let event = Event::AppendEntriesReply {
+        let delivery = Delivery::AppendEntriesReply {
             from: target,
-            term: reply_term,
-            success,
-            last_commit_id,
-            last_write_id,
-            reject_reason,
+            result,
         };
         let dup = self.rolled_duplicate();
-        self.schedule_event(when, from, event.clone());
+        self.schedule(when, from, delivery.clone());
         if dup {
-            self.schedule_event(when, from, event);
+            self.schedule(when, from, delivery);
         }
     }
 
