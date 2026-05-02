@@ -6,6 +6,7 @@ use cluster::Config;
 use cluster::config::ConfigError;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
+use spdlog::error;
 
 const ACCOUNT: u64 = 1;
 const AMOUNT: u64 = 100;
@@ -180,6 +181,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
         result
     );
 
+    error!("cluster commit wait timed out as expected");
     ctl.stop_all().await;
 }
 

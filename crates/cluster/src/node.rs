@@ -41,7 +41,7 @@
 
 use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
-use crate::command::Command;
+use crate::command::{AppendEntriesMsg, RequestVoteMsg};
 use crate::config::Config;
 use crate::durable::DurablePersistence;
 use crate::lifecycle::{join_grpc_threads, spawn_grpc_thread, spawn_local_thread};
@@ -206,11 +206,15 @@ impl ClusterNode {
         // Snapshot initial state so consumers see post-construction values.
         mirror.snapshot_from(&node);
 
-        // Single inbound channel into raft. The supervisor keeps a
-        // clone (held in `ClusterHandles::cmd_tx` so Drop can release
-        // it explicitly), gRPC handlers clone for each request, and
-        // `cmd_rx` moves into the raft loop on the node-grpc thread.
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_DEPTH);
+        // Two inbound channels: AE → raft command loop, RV →
+        // consensus loop. The supervisor keeps a clone of each
+        // (held in `ClusterHandles` so Drop can release them
+        // explicitly), gRPC handlers clone per request, and the
+        // receivers move into the raft loop on the node-grpc thread
+        // (where `RaftLoop::run` spawns `ConsensusLoop` and gives it
+        // `rv_rx`).
+        let (ae_tx, ae_rx) = mpsc::channel::<AppendEntriesMsg>(COMMAND_CHANNEL_DEPTH);
+        let (rv_tx, rv_rx) = mpsc::channel::<RequestVoteMsg>(COMMAND_CHANNEL_DEPTH);
 
         // Client-facing Ledger gRPC server (writable on leader,
         // read-only on follower; consults mirror for routing). Runs on
@@ -243,7 +247,8 @@ impl ClusterNode {
             self.ledger_slot.clone(),
             self_id,
             mirror.clone(),
-            cmd_tx.clone(),
+            ae_tx.clone(),
+            rv_tx.clone(),
         ));
         let node_handler = NodeHandler::new(node_core);
         let node_max_bytes = cluster.append_entries_max_bytes * 2 + 4 * 1024;
@@ -260,11 +265,12 @@ impl ClusterNode {
             self.ledger_slot.clone(),
             mirror.clone(),
             Arc::new(self.config.clone()),
-            cmd_rx,
+            ae_rx,
+            rv_rx,
         );
         let node_grpc_thread = spawn_local_thread("node-grpc", move || async move {
-            let (node, ledger_slot, mirror, config, cmd_rx) = raft_inputs;
-            let raft_loop = RaftLoop::new(node, ledger_slot, mirror, config, cmd_rx);
+            let (node, ledger_slot, mirror, config, ae_rx, rv_rx) = raft_inputs;
+            let raft_loop = RaftLoop::new(node, ledger_slot, mirror, config, ae_rx, rv_rx);
             // Drive both the gRPC server and the raft loop on the
             // same LocalSet. The raft loop exits when the last
             // `cmd_tx` clone drops; we await its handle after the
@@ -272,9 +278,18 @@ impl ClusterNode {
             // pending raft work mid-step.
             let raft_local = tokio::task::spawn_local(raft_loop.run());
             if let Err(e) = node_runtime.run().await {
-                error!("node gRPC server exited: {}", e);
+                panic!("node gRPC server exited: {}", e);
             }
-            let _ = raft_local.await;
+            // Top-end of the raft loop's spawn: a panic anywhere
+            // inside `RaftLoop::run` (or any task it spawns and joins)
+            // surfaces here as `JoinError::is_panic()`. Re-raise it so
+            // the LocalSet thread aborts and the supervisor sees the
+            // failure — silent loop death has corrupted-state risk.
+            match raft_local.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => panic!("raft_local task cancelled: {}", e),
+            }
         })?;
 
         info!(
@@ -290,7 +305,8 @@ impl ClusterNode {
             client_thread: Some(client_thread),
             node_grpc_thread: Some(node_grpc_thread),
             mirror,
-            cmd_tx: Some(cmd_tx),
+            ae_tx: Some(ae_tx),
+            rv_tx: Some(rv_tx),
             client_shutdown,
             node_shutdown,
         })
@@ -399,12 +415,15 @@ pub struct ClusterHandles {
     pub node_grpc_thread: Option<thread::JoinHandle<()>>,
     /// Lock-free read surface for raft state.
     pub mirror: Arc<ClusterMirror>,
-    /// Sender into the raft loop. Held here only so `Drop` can drop
-    /// it explicitly (the gRPC handlers each hold their own clones).
+    /// AE channel sender, held here only so `Drop` can drop it
+    /// explicitly (the gRPC handlers each hold their own clones).
     /// Wrapped in `Option` so `Drop` can take it before joining the
     /// node-grpc thread — otherwise the raft loop would never see its
     /// channel close and the thread would never exit.
-    cmd_tx: Option<mpsc::Sender<Command>>,
+    ae_tx: Option<mpsc::Sender<AppendEntriesMsg>>,
+    /// RV channel sender, twin of `ae_tx`. Drops to release the
+    /// consensus loop's receiver.
+    rv_tx: Option<mpsc::Sender<RequestVoteMsg>>,
     /// Cooperative shutdown trigger for the client-facing gRPC server.
     pub client_shutdown: Arc<Notify>,
     /// Cooperative shutdown trigger for the peer-facing gRPC server.
@@ -420,13 +439,13 @@ impl Drop for ClusterHandles {
         self.client_shutdown.notify_waiters();
         self.node_shutdown.notify_waiters();
 
-        // Drop our cmd_tx clone before joining the node-grpc thread.
-        // The gRPC handlers still hold their per-request clones, so
-        // the channel won't close yet — it closes when the last
-        // handler completes and the raft loop sees `recv() == None`,
-        // at which point the LocalSet's outer task awaits the raft
-        // future and the thread exits.
-        self.cmd_tx.take();
+        // Drop our channel-sender clones before joining the node-grpc
+        // thread. The gRPC handlers still hold their per-request
+        // clones, so each channel only closes once the last handler
+        // completes — at which point the raft / consensus loops see
+        // `recv() == None` and the LocalSet thread exits.
+        self.ae_tx.take();
+        self.rv_tx.take();
 
         // Drain in dependency order:
         //   gRPC threads → tonic drains in-flight handlers → handlers'

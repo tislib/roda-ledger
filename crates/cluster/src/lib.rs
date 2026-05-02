@@ -13,8 +13,9 @@ pub mod mapping;
 pub mod node;
 pub mod node_handler;
 pub mod server;
-mod raft_loop;
 mod command;
+mod consensus;
+mod raft_loop;
 mod replication;
 
 pub use cluster_mirror::ClusterMirror;

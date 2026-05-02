@@ -1,45 +1,51 @@
-//! Role-gated leader-side replication.
+//! Replication driver — owns both directions of `AppendEntries`:
 //!
-//! Architecture:
+//! - **Leader-side outbound**: per-peer tasks. Each task ticks at
+//!   `cluster.replication_poll_ms`, pulls the next `AppendEntries`
+//!   request from [`raft::PeerReplication::get_append_range`], reads
+//!   WAL bytes from its own [`WalTailer`], sends the gRPC, and feeds
+//!   the [`raft::AppendResult`] back through
+//!   [`raft::PeerReplication::append_result`]. Gated on the shared
+//!   [`ReplicationGate`] (only runs while `playing == true`).
+//! - **Follower-side inbound**: a single main task drains the
+//!   [`AppendEntriesMsg`] mpsc channel that the gRPC `NodeHandler`
+//!   posts to, calls [`raft::RaftNode::validate_append_entries_request`],
+//!   appends accepted entries to the ledger pipeline, and replies
+//!   over the gRPC handler's `oneshot`. Same task also polls the
+//!   ledger watermarks every `LEDGER_POLL_CADENCE` and feeds them
+//!   into raft via `node.advance(write, commit)` so the leader's
+//!   quorum self-slot can move regardless of inbound RPC traffic.
 //!
-//! - [`ReplicationGate`] is the watcher. It wraps a
-//!   [`tokio::sync::watch::Sender<bool>`]; the command loop owns it
-//!   and toggles it from the `Action::BecomeRole` dispatch arm. `true`
-//!   means "play" (this node is leader); `false` means "pause".
-//! - [`ReplicationLoop::run`] spawns one [`peer_replication_loop`]
-//!   task per peer at startup and awaits all of them. Each task owns
-//!   its own [`WalTailer`] (cursors are stateful per-peer), an
-//!   [`Rc<RefCell<RaftNode>>`] clone, and a `watch::Receiver<bool>`
-//!   clone.
-//! - While the gate is `true`, each peer task ticks at
-//!   `cluster.replication_poll_ms`: it pulls the next `AppendEntries`
-//!   via [`raft::PeerReplication::get_append_range`], reads WAL bytes
-//!   from its tailer, sends the gRPC, and feeds the
-//!   [`raft::AppendResult`] back via
-//!   [`raft::PeerReplication::append_result`] directly. No
-//!   [`crate::Command`] variant is involved — the per-peer task talks
-//!   to raft via the shared `RefCell` on the same `LocalSet`.
-//! - Lifecycle: when the command loop exits, it drops the
-//!   [`ReplicationGate`] (and with it the underlying `watch::Sender`).
-//!   Every peer task's `gate_rx.changed().await` returns `Err`; each
-//!   task returns; [`ReplicationLoop::run`] joins the handles so
-//!   in-flight gRPCs complete before the `LocalSet` tears down. There
-//!   is no explicit `shutdown()` method.
+//! Both directions share the [`Rc<RefCell<RaftNode>>`] and a clone
+//! of the [`ReplicationGate`] sender. The gate has multiple owners
+//! ([`crate::consensus::ConsensusLoop`] holds another clone); per-
+//! peer task receivers exit only when **every** clone drops.
+//!
+//! Lifecycle: when the inbound AE channel closes (every `ae_tx`
+//! clone dropped), the main task exits and drops its gate clone.
+//! Per-peer tasks await the consensus loop's gate clone to also drop
+//! before they see `Err` and exit. `run()` joins every per-peer
+//! handle with panic re-raise so any task panic aborts the LocalSet
+//! thread instead of silently dropping a peer's progress.
 
 use crate::cluster_mirror::ClusterMirror;
+use crate::command::AppendEntriesMsg;
 use crate::config::Config;
 use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
 use ::proto::node::node_client::NodeClient;
-use raft::{AppendResult, NodeId, RaftNode, RejectReason as RaftRejectReason};
+use raft::{
+    AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftNode,
+    RejectReason as RaftRejectReason, Role, TxId,
+};
 use spdlog::{error, info};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage::WalTailer;
-use tokio::sync::watch;
+use storage::{WalTailer, decode_records};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep_until;
 
@@ -49,34 +55,62 @@ use tokio::time::sleep_until;
 // TODO: promote to config alongside replication_poll_ms.
 const REPLICATION_RPC_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Pause/play signal source. Owned by the command loop; toggled in
-/// the `Action::BecomeRole` dispatch arm. Receivers exit when this
-/// drops — that is the replication loop's shutdown trigger.
+/// Cadence at which the main task polls the ledger for fresh commit /
+/// write watermarks when no inbound AE arrives. Keeps the leader's
+/// quorum self-slot moving without depending on RPC traffic.
+const LEDGER_POLL_CADENCE: Duration = Duration::from_millis(50);
+
+/// Pause/play signal source. Created in `RaftLoop::run`, cloned into
+/// `ConsensusLoop` (so the election path can flip the gate on every
+/// role transition) and kept here on `ReplicationLoop`'s main task
+/// (for AE-side step-downs). Receivers exit when **every** clone
+/// drops — that is the per-peer shutdown trigger.
 pub(crate) struct ReplicationGate {
-    tx: watch::Sender<bool>,
+    tx: Arc<watch::Sender<bool>>,
 }
 
 impl ReplicationGate {
     pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
         let (tx, rx) = watch::channel(false);
-        (Self { tx }, rx)
+        (Self { tx: Arc::new(tx) }, rx)
     }
 
     /// Set the gate to `playing`. Idempotent.
     pub(crate) fn set_playing(&self, playing: bool) {
         let _ = self.tx.send(playing);
     }
+
+    pub(crate) fn hello(&self) {
+    }
 }
 
-/// Per-peer task spawner. Built in `RaftLoop::run`; consumed by
+impl Drop for ReplicationGate {
+    fn drop(&mut self) {
+        panic!("replication_gate: dropped");
+    }
+}
+
+/// Replication driver. Built in `RaftLoop::run`; consumed by
 /// [`Self::run`].
 pub(crate) struct ReplicationLoop {
     node: Rc<RefCell<RaftNode<DurablePersistence>>>,
     ledger: Arc<LedgerSlot>,
     mirror: Arc<ClusterMirror>,
     config: Arc<Config>,
+    /// Owned by the main task; flipped on AE-side role changes.
+    /// `Option` so the main task can drop it on exit, freeing per-
+    /// peer receivers to see `Err(_)` once `ConsensusLoop`'s clone
+    /// also drops.
+    /// Read-side handed to per-peer tasks at spawn time.
     gate_rx: watch::Receiver<bool>,
+    /// Inbound AE channel posted to by the gRPC `NodeHandler`.
+    ae_rx: mpsc::Receiver<AppendEntriesMsg>,
     self_id: NodeId,
+
+    /// Last `(write, commit)` pair forwarded into raft via
+    /// `node.advance`. Skip the call when neither has moved.
+    last_seen_write: TxId,
+    last_seen_commit: TxId,
 }
 
 impl ReplicationLoop {
@@ -86,33 +120,42 @@ impl ReplicationLoop {
         mirror: Arc<ClusterMirror>,
         config: Arc<Config>,
         gate_rx: watch::Receiver<bool>,
+        ae_rx: mpsc::Receiver<AppendEntriesMsg>,
         self_id: NodeId,
     ) -> Self {
+        let last_w = ledger.ledger().last_compute_id();
+        let last_c = ledger.ledger().last_commit_id();
         Self {
             node,
             ledger,
             mirror,
             config,
             gate_rx,
+            ae_rx,
             self_id,
+            last_seen_write: last_w,
+            last_seen_commit: last_c,
         }
     }
 
-    pub(crate) async fn run(self) {
+    pub(crate) async fn run(mut self) {
         let self_id = self.self_id;
+        info!("replication_loop[{}]: started", self_id);
+
+        // Spawn per-peer outbound AE tasks.
         let cluster = match self.config.cluster.as_ref() {
             Some(c) => c,
             None => {
                 info!(
-                    "replication_loop[{}]: no cluster section; exiting",
+                    "replication_loop[{}]: no cluster section; main task only",
                     self_id
                 );
+                self.run_main_loop().await;
                 return;
             }
         };
         let tick_interval = Duration::from_millis(cluster.replication_poll_ms);
         let append_max_bytes = cluster.append_entries_max_bytes;
-
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         for peer in self.config.other_peers() {
             let replicator = PeerReplicator {
@@ -136,10 +179,235 @@ impl ReplicationLoop {
             tick_interval
         );
 
+        // Run the inbound-AE / ledger-advance loop until the AE
+        // channel closes.
+        self.run_main_loop().await;
+
+        // Drain per-peer handles. Re-raise panics so any task panic
+        // aborts the LocalSet thread; cancellation is benign.
         for h in handles {
-            let _ = h.await;
+            match h.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => error!("replication_loop[{}]: peer task cancelled: {}", self_id, e),
+            }
         }
-        info!("replication_loop[{}]: all peer tasks drained; exiting", self_id);
+        info!(
+            "replication_loop[{}]: all peer tasks drained; exiting",
+            self_id
+        );
+    }
+
+    /// Single-task event loop: poll ledger watermarks, drain inbound
+    /// AE, sleep on `LEDGER_POLL_CADENCE` between empty windows.
+    async fn run_main_loop(&mut self) {
+        let self_id = self.self_id;
+        loop {
+            self.poll_ledger_watermark();
+
+            let sleep_at = Instant::now() + LEDGER_POLL_CADENCE;
+            let sleep = tokio::time::sleep_until(sleep_at.into());
+            tokio::pin!(sleep);
+
+            tokio::select! {
+                maybe_msg = self.ae_rx.recv() => {
+                    match maybe_msg {
+                        Some(msg) => {
+                            self.handle_append_entries(msg).await;
+                        }
+                        None => {
+                            info!("replication_loop[{}]: ae channel closed; main loop exiting", self_id);
+                            break;
+                        }
+                    }
+                }
+                _ = &mut sleep => {
+                    // Empty wakeup tick — intentionally not logged
+                    // (would dominate the log at heartbeat cadence).
+                }
+            }
+        }
+    }
+
+    /// Poll the ledger's `(compute, commit)` watermarks; if either
+    /// has moved since last seen, forward both into raft and snapshot
+    /// the mirror. Logs both pre- and post-advance index triples.
+    fn poll_ledger_watermark(&mut self) {
+        let self_id = self.self_id;
+        let commit_index = self.ledger.ledger().last_commit_id();
+        let write_index = self.ledger.ledger().last_compute_id();
+        if write_index == self.last_seen_write && commit_index == self.last_seen_commit {
+            return;
+        }
+        let (pre_w, pre_c, pre_cci, role_pre) = {
+            let n = self.node.borrow();
+            (
+                n.write_index(),
+                n.commit_index(),
+                n.cluster_commit_index(),
+                n.role(),
+            )
+        };
+        self.node.borrow_mut().advance(write_index, commit_index);
+        let post_cci = self.node.borrow().cluster_commit_index();
+        info!(
+            "replication_loop[{}]: advance role={:?} write={}->{} commit={}->{} cluster_commit={}->{} (ledger compute={} commit={})",
+            self_id,
+            role_pre,
+            pre_w,
+            write_index.max(pre_w),
+            pre_c,
+            commit_index.max(pre_c),
+            pre_cci,
+            post_cci,
+            write_index,
+            commit_index
+        );
+        self.last_seen_write = write_index;
+        self.last_seen_commit = commit_index;
+        self.mirror.snapshot_from(&self.node.borrow());
+    }
+
+    async fn handle_append_entries(&mut self, msg: AppendEntriesMsg) {
+        let AppendEntriesMsg { req, reply } = msg;
+        let self_id = self.self_id;
+        info!(
+            "replication_loop[{}]: cmd AppendEntries from={} term={} prev_tx={} prev_term={} from_tx={} to_tx={} leader_commit={} wal_bytes={}",
+            self_id,
+            req.leader_id,
+            req.term,
+            req.prev_tx_id,
+            req.prev_term,
+            req.from_tx_id,
+            req.to_tx_id,
+            req.leader_commit_tx_id,
+            req.wal_bytes.len()
+        );
+        let now = Instant::now();
+        let entries = if req.from_tx_id == 0 || req.to_tx_id < req.from_tx_id {
+            LogEntryRange::empty()
+        } else {
+            LogEntryRange::new(req.from_tx_id, req.to_tx_id - req.from_tx_id + 1, req.term)
+        };
+        let decision = self.node.borrow_mut().validate_append_entries_request(
+            now,
+            req.leader_id,
+            req.term,
+            req.prev_tx_id,
+            req.prev_term,
+            entries,
+            req.leader_commit_tx_id,
+        );
+        self.mirror.snapshot_from(&self.node.borrow());
+
+        match decision {
+            AppendEntriesDecision::Reject {
+                reason,
+                truncate_after,
+            } => {
+                info!(
+                    "replication_loop[{}]: AE Reject reason={:?} truncate_after={:?}",
+                    self_id, reason, truncate_after
+                );
+                if let Some(after) = truncate_after {
+                    info!(
+                        "replication_loop[{}]: AE Reject truncate WAL TODO (after={})",
+                        self_id, after
+                    );
+                }
+                let resp = build_ae_response(&self.node.borrow(), false, Some(reason));
+                info!(
+                    "replication_loop[{}]: AE Reject reply term={} last_write_id={} last_commit_id={}",
+                    self_id, resp.term, resp.last_write_id, resp.last_commit_id
+                );
+                let _ = reply.send(resp);
+            }
+            AppendEntriesDecision::Accept { append: None } => {
+                let commit_index = self.ledger.ledger().last_commit_id();
+                let (pre_w, pre_c, pre_cci) = {
+                    let n = self.node.borrow();
+                    (n.write_index(), n.commit_index(), n.cluster_commit_index())
+                };
+                self.node.borrow_mut().advance(0, commit_index);
+                let post_cci = self.node.borrow().cluster_commit_index();
+                info!(
+                    "replication_loop[{}]: AE Accept(heartbeat) leader_commit={} ledger_commit={} advance write={}->{} commit={}->{} cluster_commit={}->{}",
+                    self_id,
+                    req.leader_commit_tx_id,
+                    commit_index,
+                    pre_w,
+                    pre_w,
+                    pre_c,
+                    commit_index.max(pre_c),
+                    pre_cci,
+                    post_cci
+                );
+                self.mirror.snapshot_from(&self.node.borrow());
+
+                let resp = build_ae_response(&self.node.borrow(), true, None);
+                info!(
+                    "replication_loop[{}]: AE Accept(heartbeat) reply term={} last_write_id={} last_commit_id={}",
+                    self_id, resp.term, resp.last_write_id, resp.last_commit_id
+                );
+                let _ = reply.send(resp);
+            }
+            AppendEntriesDecision::Accept {
+                append: Some(range),
+            } => {
+                let last_tx_id = range
+                    .last_tx_id()
+                    .expect("Accept{append: Some} carries a non-empty range");
+                info!(
+                    "replication_loop[{}]: AE Accept(entries) range start_tx={} count={} term={} leader_commit={}",
+                    self_id, range.start_tx_id, range.count, range.term, req.leader_commit_tx_id
+                );
+                let entries = decode_records(&req.wal_bytes);
+                if let Err(e) = self.ledger.ledger().append_wal_entries(entries) {
+                    error!(
+                        "replication_loop[{}]: append_wal_entries failed start={} last={}: {}",
+                        self_id, range.start_tx_id, last_tx_id, e
+                    );
+                    let resp = build_ae_response(
+                        &self.node.borrow(),
+                        false,
+                        Some(RaftRejectReason::LogMismatch),
+                    );
+                    let _ = reply.send(resp);
+                    return;
+                }
+                info!(
+                    "replication_loop[{}]: AE Accept(entries) queued to ledger pipeline last_tx={}",
+                    self_id, last_tx_id
+                );
+
+                let commit_index = self.ledger.ledger().last_commit_id();
+                let (pre_w, pre_c, pre_cci) = {
+                    let n = self.node.borrow();
+                    (n.write_index(), n.commit_index(), n.cluster_commit_index())
+                };
+                self.node.borrow_mut().advance(last_tx_id, commit_index);
+                let post_cci = self.node.borrow().cluster_commit_index();
+                info!(
+                    "replication_loop[{}]: AE Accept(entries) advance write={}->{} commit={}->{} cluster_commit={}->{} (ledger_commit={})",
+                    self_id,
+                    pre_w,
+                    last_tx_id.max(pre_w),
+                    pre_c,
+                    commit_index.max(pre_c),
+                    pre_cci,
+                    post_cci,
+                    commit_index
+                );
+                self.mirror.snapshot_from(&self.node.borrow());
+
+                let resp = build_ae_response(&self.node.borrow(), true, None);
+                info!(
+                    "replication_loop[{}]: AE Accept(entries) reply term={} last_write_id={} last_commit_id={}",
+                    self_id, resp.term, resp.last_write_id, resp.last_commit_id
+                );
+                let _ = reply.send(resp);
+            }
+        }
     }
 }
 
@@ -179,7 +447,11 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
                     );
                     continue;
                 }
-                Err(_) => {
+                Err(err) => {
+                    error!(
+                        "replication_loop[{}]: peer={} gate_rx.changed() error: {}",
+                        r.self_id, r.peer_id, err
+                    );
                     info!(
                         "replication_loop[{}]: peer={} gate dropped (shutdown)",
                         r.self_id, r.peer_id
@@ -214,7 +486,10 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
             }
         }
     }
-    info!("replication_loop[{}]: peer={} task exiting", r.self_id, r.peer_id);
+    info!(
+        "replication_loop[{}]: peer={} task exiting",
+        r.self_id, r.peer_id
+    );
 }
 
 async fn replicate_once(r: &mut PeerReplicator) {
@@ -258,8 +533,6 @@ async fn replicate_once(r: &mut PeerReplicator) {
         let mut buffer = vec![0u8; r.append_max_bytes];
         let written = r.tailer.tail(from_tx_id, &mut buffer) as usize;
         if written == 0 {
-            // Tailer didn't surface bytes (segment rotation, transient
-            // race). Skip; next tick re-pulls a fresh request.
             info!(
                 "replication_loop[{}]: peer={} tailer empty for from_tx={} (skip; retry next tick)",
                 r.self_id, r.peer_id, from_tx_id
@@ -295,9 +568,14 @@ async fn replicate_once(r: &mut PeerReplicator) {
         leader_commit_tx_id: req.leader_commit,
     };
 
-    let result =
-        send_append_entries_rpc(r.self_id, r.peer_id, r.host.clone(), proto_req, r.rpc_timeout)
-            .await;
+    let result = send_append_entries_rpc(
+        r.self_id,
+        r.peer_id,
+        r.host.clone(),
+        proto_req,
+        r.rpc_timeout,
+    )
+    .await;
 
     match &result {
         AppendResult::Success {
@@ -415,5 +693,28 @@ fn proto_reject_to_raft(code: u32) -> RaftRejectReason {
         // back. The §5.3 catch-up path will discover the agreement
         // point on subsequent RPCs.
         RaftRejectReason::LogMismatch
+    }
+}
+
+/// Build the proto response from raft's getters.
+fn build_ae_response(
+    node: &RaftNode<DurablePersistence>,
+    success: bool,
+    reject_reason: Option<RaftRejectReason>,
+) -> proto::AppendEntriesResponse {
+    let reject_code = match reject_reason {
+        None => proto::RejectReason::RejectNone as u32,
+        Some(RaftRejectReason::TermBehind) => proto::RejectReason::RejectTermStale as u32,
+        Some(RaftRejectReason::LogMismatch) => proto::RejectReason::RejectPrevMismatch as u32,
+        // RpcTimeout is a leader-side bookkeeping signal; never
+        // surfaces on a follower's reply path.
+        Some(RaftRejectReason::RpcTimeout) => proto::RejectReason::RejectNone as u32,
+    };
+    proto::AppendEntriesResponse {
+        term: node.current_term(),
+        success,
+        last_commit_id: node.commit_index(),
+        last_write_id: node.write_index(),
+        reject_reason: reject_code,
     }
 }

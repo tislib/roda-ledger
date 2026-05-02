@@ -1,23 +1,21 @@
 //! `NodeHandler` — gRPC service implementation for peer-to-peer RPCs
 //! (`AppendEntries`, `Ping`, `RequestVote`, `InstallSnapshot`).
 //!
-//! The handler is a thin translation layer: every mutating RPC is
-//! wrapped in a [`Command`] and posted to the raft loop's mpsc channel
-//! along with a `oneshot` reply channel. The handler awaits the
-//! oneshot and returns the response. The handler owns no raft state.
+//! Each mutating RPC posts a typed message to its dedicated channel:
+//! [`AppendEntriesMsg`] → `RaftLoop`'s command loop, [`RequestVoteMsg`]
+//! → `ConsensusLoop`. The handler owns no raft state; it just bridges
+//! the gRPC framing and the loop-side `oneshot` reply channel.
 //!
 //! `Ping` is read-only (consults [`ClusterMirror`] + the ledger) so it
-//! does not go through the raft loop.
+//! does not go through either loop.
 //!
-//! Shutdown is RAII on the `cmd_tx` side: when the supervisor drops
-//! its sender clone and the loop drains, this handler's
-//! `cmd_tx.send()` calls return errors and the handler reports
-//! `Status::unavailable`. Closing the channel *is* the shutdown
-//! signal — there is no separate latch and no race window between
-//! "check latch" and "enter raft body".
+//! Shutdown is RAII: when every sender clone of a channel drops the
+//! corresponding loop exits. From the handler's side a `send().await`
+//! failure surfaces as `Status::unavailable`. There is no separate
+//! latch and no race window between "check latch" and "enter raft body".
 
 use crate::cluster_mirror::ClusterMirror;
-use crate::command::Command;
+use crate::command::{AppendEntriesMsg, RequestVoteMsg};
 use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
 use ::proto::node::node_server::Node;
@@ -28,20 +26,19 @@ use tonic::{Request, Response, Status};
 
 /// State shared across the gRPC service handler. Constructed once at
 /// cluster bring-up and kept alive for the process lifetime; the gRPC
-/// server holds an `Arc` and clones the `cmd_tx` per-request.
+/// server holds an `Arc` and clones the per-RPC senders per-request.
 pub struct NodeHandlerCore {
     /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9). Used by
     /// the read-only `Ping` handler — every mutating RPC goes through
-    /// the raft loop, which holds its own `LedgerSlot` reference.
+    /// the relevant loop.
     pub ledger: Arc<LedgerSlot>,
     pub node_id: u64,
     /// Lock-free read surface for role / term stamping in `Ping`.
     pub mirror: Arc<ClusterMirror>,
-    /// Sender into the raft loop. Cloned per RPC; dropping the loop's
-    /// receiver causes `send().await` to fail, which surfaces as
-    /// `Status::unavailable` to the caller — the in-process equivalent
-    /// of "the process is gone".
-    pub cmd_tx: mpsc::Sender<Command>,
+    /// Sender into `RaftLoop`'s AE command loop.
+    pub ae_tx: mpsc::Sender<AppendEntriesMsg>,
+    /// Sender into `ConsensusLoop`'s RV channel.
+    pub rv_tx: mpsc::Sender<RequestVoteMsg>,
 }
 
 impl NodeHandlerCore {
@@ -49,13 +46,15 @@ impl NodeHandlerCore {
         ledger: Arc<LedgerSlot>,
         node_id: u64,
         mirror: Arc<ClusterMirror>,
-        cmd_tx: mpsc::Sender<Command>,
+        ae_tx: mpsc::Sender<AppendEntriesMsg>,
+        rv_tx: mpsc::Sender<RequestVoteMsg>,
     ) -> Self {
         Self {
             ledger,
             node_id,
             mirror,
-            cmd_tx,
+            ae_tx,
+            rv_tx,
         }
     }
 }
@@ -86,15 +85,15 @@ impl Node for NodeHandler {
         let node_id = self.core.node_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core
-            .cmd_tx
-            .send(Command::AppendEntries {
+            .ae_tx
+            .send(AppendEntriesMsg {
                 req: request.into_inner(),
                 reply: reply_tx,
             })
             .await
             .map_err(|e| {
                 error!(
-                    "node_handler[{}]: AppendEntries cmd_tx.send failed (raft loop gone): {}",
+                    "node_handler[{}]: AppendEntries ae_tx.send failed (raft loop gone): {}",
                     node_id, e
                 );
                 Status::unavailable("raft loop unavailable")
@@ -116,25 +115,25 @@ impl Node for NodeHandler {
         let node_id = self.core.node_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core
-            .cmd_tx
-            .send(Command::RequestVote {
+            .rv_tx
+            .send(RequestVoteMsg {
                 req: request.into_inner(),
                 reply: reply_tx,
             })
             .await
             .map_err(|e| {
                 error!(
-                    "node_handler[{}]: RequestVote cmd_tx.send failed (raft loop gone): {}",
+                    "node_handler[{}]: RequestVote rv_tx.send failed (consensus loop gone): {}",
                     node_id, e
                 );
-                Status::unavailable("raft loop unavailable")
+                Status::unavailable("consensus loop unavailable")
             })?;
         let resp = reply_rx.await.map_err(|e| {
             error!(
-                "node_handler[{}]: RequestVote reply oneshot recv failed (raft loop dropped reply): {}",
+                "node_handler[{}]: RequestVote reply oneshot recv failed (consensus loop dropped reply): {}",
                 node_id, e
             );
-            Status::internal("raft loop dropped reply")
+            Status::internal("consensus loop dropped reply")
         })?;
         Ok(Response::new(resp))
     }

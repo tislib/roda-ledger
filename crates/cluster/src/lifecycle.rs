@@ -112,7 +112,7 @@ pub(crate) fn join_grpc_threads(
     let join_all = move || {
         for t in owned {
             if let Err(e) = t.join() {
-                spdlog::warn!("{}: gRPC thread panicked: {:?}", label, e);
+                panic!("{}: gRPC thread panicked: {:?}", label, e);
             }
         }
     };
