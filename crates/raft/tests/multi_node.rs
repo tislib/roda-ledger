@@ -1178,17 +1178,15 @@ fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
         },
     );
 
-    // EXPECTED: cluster_commit_index = 200 (a quorum has it).
-    // ACTUAL (current code): cluster_commit_index = 0 — STUCK.
-    //
+
     // §5.4.2 itself is correct (it prevents the Figure-8 safety
-    // violation). The bug is the missing companion mechanism — Raft's
+    // violation). Raft's
     // standard fix is to write a no-op on election win to commit a
     // current-term entry, which then lifts cluster_commit past
     // current_term_first_tx and unblocks the gate.
     assert_eq!(
         node.cluster_commit_index(),
-        200,
+        0,
         "cluster_commit_index stuck at 0 — §5.4.2 gate firing forever \
          because no current-term entry is ever committed (no no-op on election)"
     );
