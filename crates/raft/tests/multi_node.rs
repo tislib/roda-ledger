@@ -863,3 +863,333 @@ fn tick_returns_wakeup_with_future_deadline_after_lazy_arm() {
     let wakeup = node.election().tick(t0);
     assert!(wakeup.deadline > t0, "deadline must be in the future after lazy-arm");
 }
+
+// ── Cluster commit advance under per-peer replication state ──────────────────
+//
+// Stresses how `cluster_commit_index` is computed from the quorum's
+// `match_index` slots. Slot mapping for self_id=1, peers=[1,2,3]:
+// `match_index = [leader_local_commit, peer2_match, peer3_match]`.
+// Majority = 2, so the candidate is `sorted_desc[1]` — the
+// second-highest slot value. The leader's self-slot is fed by
+// `advance(write, commit)` and tracks `local_commit_index` (NOT
+// `local_write_index`); peer slots are fed by
+// `AppendResult::Success { last_commit_id }`.
+
+/// Drive a 3-node node into the leader role by running an election
+/// locally: tick once to lazy-arm, tick past the timeout to start the
+/// candidacy, then deliver granted vote replies until the candidate
+/// wins. Returns `(node, leader_now)` so callers can issue subsequent
+/// `get_append_range(now)` calls with `now >= leader_now` (peer
+/// `next_heartbeat` is initialised to `leader_now`).
+fn make_3node_leader(
+    self_id: NodeId,
+    peers: Vec<NodeId>,
+) -> (RaftNode<MemPersistence>, Instant) {
+    let mut node = fresh_node(self_id, peers.clone());
+    let t0 = Instant::now();
+    let leader_now = t0 + Duration::from_secs(60);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, leader_now);
+    let term = node.current_term();
+    for &peer in peers.iter().filter(|&&p| p != self_id) {
+        common::deliver_vote_reply(&mut node, leader_now, peer, term, true);
+        if node.role().is_leader() {
+            return (node, leader_now);
+        }
+    }
+    panic!("did not become leader, role={:?}", node.role());
+}
+
+#[test]
+fn cluster_index_advance_on_replication() {
+    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
+    let term = node.current_term();
+
+    // Leader writes 200 entries; nothing committed locally yet.
+    node.advance(200, 0);
+    assert_eq!(node.write_index(), 200);
+    assert_eq!(node.commit_index(), 0);
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Leader pulls AE for replica1 (arms in_flight; the actual entries
+    // shipped don't matter — the reply is fabricated below).
+    let _ = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(leader_now);
+
+    // Replica1 acks fully — its commit reached 200. With the leader's
+    // self-slot still at 0, slots = [0, 200, 0]; second-highest = 0 →
+    // no cluster_commit advance.
+    node.replication().peer(2).unwrap().append_result(
+        leader_now,
+        AppendResult::Success {
+            term,
+            last_write_id: 200,
+            last_commit_id: 200,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Leader's local commit catches up. Self-slot → 200; slots =
+    // [200, 200, 0]; second-highest = 200 → advance. Replica2 never
+    // replied (slot 2 stays 0).
+    node.advance(200, 200);
+    assert_eq!(node.cluster_commit_index(), 200);
+}
+
+#[test]
+fn cluster_index_advance_on_replication_lagged() {
+    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
+    let term = node.current_term();
+
+    // Leader writes 200; local commit still 0.
+    node.advance(200, 0);
+
+    // Leader pulls AE for replica1.
+    let _ = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(leader_now);
+
+    // Replica1 acks the WRITE but its commit is still 0 (lagged).
+    // `match_index` is driven by `last_commit_id`, not `last_write_id`,
+    // so slot 1 stays 0.
+    node.replication().peer(2).unwrap().append_result(
+        leader_now,
+        AppendResult::Success {
+            term,
+            last_write_id: 200,
+            last_commit_id: 0,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Leader's local commit catches up. Self-slot → 200, but slots =
+    // [200, 0, 0]; second-highest = 0 → no advance. Replica2 never
+    // replied.
+    node.advance(200, 200);
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Leader sends a heartbeat to replica1. The previous
+    // `get_append_range` pushed `next_heartbeat` out by
+    // `cfg.heartbeat_interval` (50ms default) — wait past it.
+    let after_hb = leader_now + Duration::from_millis(100);
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(after_hb)
+        .expect("heartbeat must be due past next_heartbeat");
+    // Peer's `next_index` was advanced to `last_write_id + 1 = 201` by
+    // the previous reply, and leader's `local_write` is 200, so the AE
+    // is a pure heartbeat.
+    assert!(
+        req.entries.is_empty(),
+        "expected heartbeat AE, got entries={:?}",
+        req.entries
+    );
+
+    // Replica1's commit caught up to 150. Slot 1 → 150; slots =
+    // [200, 150, 0]; second-highest = 150 → advance. Replica2 still
+    // never replied.
+    node.replication().peer(2).unwrap().append_result(
+        after_hb,
+        AppendResult::Success {
+            term,
+            last_write_id: 200,
+            last_commit_id: 150,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 150);
+}
+
+/// Same shape as `cluster_index_advance_on_replication`, but the
+/// leader advances its `local_commit_index` UP FRONT (before the
+/// replica reply) instead of after. The self-slot lift is no longer
+/// the trigger — the trigger is the peer ack alone.
+#[test]
+fn cluster_index_advance_on_replication_leader_commits_first() {
+    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
+    let term = node.current_term();
+
+    // Leader writes AND commits 200 entries up front. Self-slot →
+    // 200; slots = [200, 0, 0]; second-highest = 0 → no advance.
+    node.advance(200, 200);
+    assert_eq!(node.write_index(), 200);
+    assert_eq!(node.commit_index(), 200);
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Leader pulls AE for replica1.
+    let _ = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(leader_now);
+
+    // Replica1 acks fully. Slot 1 → 200; slots = [200, 200, 0];
+    // second-highest = 200 → advance. Replica2 never replied.
+    node.replication().peer(2).unwrap().append_result(
+        leader_now,
+        AppendResult::Success {
+            term,
+            last_write_id: 200,
+            last_commit_id: 200,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 200);
+}
+
+/// Same shape as `cluster_index_advance_on_replication_lagged`, but
+/// the leader's `local_commit_index` is at 200 from the start. The
+/// lagged replica still gates the cluster commit until its own
+/// `last_commit_id` reaches a quorum-cover value.
+#[test]
+fn cluster_index_advance_on_replication_lagged_leader_commits_first() {
+    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
+    let term = node.current_term();
+
+    // Leader writes AND commits 200 entries up front. Self-slot →
+    // 200; slots = [200, 0, 0]; second-highest = 0 → no advance.
+    node.advance(200, 200);
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Leader pulls AE for replica1.
+    let _ = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(leader_now);
+
+    // Replica1 acks the WRITE but its commit is still 0 (lagged).
+    // Slot 1 stays 0 (per-slot guard); slots = [200, 0, 0];
+    // second-highest = 0 → no advance. Replica2 never replied.
+    node.replication().peer(2).unwrap().append_result(
+        leader_now,
+        AppendResult::Success {
+            term,
+            last_write_id: 200,
+            last_commit_id: 0,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Heartbeat to replica1 (peer's `next_index = 201 > local_write
+    // 200`). Wait past `next_heartbeat`.
+    let after_hb = leader_now + Duration::from_millis(100);
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(after_hb)
+        .expect("heartbeat must be due past next_heartbeat");
+    assert!(
+        req.entries.is_empty(),
+        "expected heartbeat AE, got entries={:?}",
+        req.entries
+    );
+
+    // Replica1's commit caught up to 150. Slot 1 → 150; slots =
+    // [200, 150, 0]; second-highest = 150 → advance. Replica2 still
+    // never replied.
+    node.replication().peer(2).unwrap().append_result(
+        after_hb,
+        AppendResult::Success {
+            term,
+            last_write_id: 200,
+            last_commit_id: 150,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 150);
+}
+
+/// **BUG**: when a node promoted to leader inherits prior-term entries
+/// (`local_write = 200`, `current_term_first_tx = 201`) and `cluster_commit`
+/// is below the prior-term boundary, the §5.4.2 / Figure-8 gate at
+/// `node.rs:849` blocks every quorum-acked advance whose value is
+/// `< current_term_first_tx`. The cluster gets stuck —
+/// `quorum.cluster_commit_index` advances internally to 200, but
+/// `node.cluster_commit_index` stays at 0. Standard Raft breaks the
+/// deadlock by writing a no-op on election win to commit a current-term
+/// entry; this codebase doesn't, so the cluster cannot make progress
+/// without external client traffic that lands a current-term entry.
+///
+/// This test exercises the user-reported state
+/// `(current_term_first_tx=201, new_cluster=200, cluster_commit_index=0)`
+/// — quorum advances but node doesn't reflect it.
+#[test]
+fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    let t0 = Instant::now();
+
+    // Become follower; receive 200 prior-term entries with leader_commit=0
+    // (the prior leader never reached quorum). Driver fsyncs WAL but
+    // applies nothing to the ledger (since leader_commit was 0).
+    let _ = node.validate_append_entries_request(
+        t0,
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 200, 1),
+        0,
+    );
+    node.advance(200, 0);
+    assert_eq!(node.write_index(), 200);
+    assert_eq!(node.commit_index(), 0);
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Election timer fires; node 1 wins election at term 2 with peer 2's vote.
+    // `become_leader_after_win` sets `current_term_first_tx = local_write + 1 = 201`.
+    let t1 = t0 + Duration::from_secs(60);
+    common::drive_tick(&mut node, t1);
+    let cand_term = node.current_term();
+    common::deliver_vote_reply(&mut node, t1, 2, cand_term, true);
+    assert!(node.role().is_leader(), "must become leader");
+    let leader_term = node.current_term();
+    assert_eq!(node.cluster_commit_index(), 0);
+
+    // Both peers ack with `last_commit_id = 200` — they happen to have
+    // committed up to the prior-term boundary via some earlier history.
+    // After both acks: quorum match_index = [0 (slot 0 = leader's local_commit),
+    // 200, 200]. Sorted desc = [200, 200, 0]. Candidate = sorted_desc[1] = 200.
+    // `quorum.advance` returns Some(200) — quorum's internal
+    // cluster_commit advances to 200. The §5.4.2 gate fires (200 < 201)
+    // and the body of the if-let chain is skipped. node.cluster_commit_index
+    // stays at 0.
+    let _ = node.replication().peer(2).unwrap().get_append_range(t1);
+    node.replication().peer(2).unwrap().append_result(
+        t1,
+        AppendResult::Success {
+            term: leader_term,
+            last_write_id: 200,
+            last_commit_id: 200,
+        },
+    );
+    let _ = node.replication().peer(3).unwrap().get_append_range(t1);
+    node.replication().peer(3).unwrap().append_result(
+        t1,
+        AppendResult::Success {
+            term: leader_term,
+            last_write_id: 200,
+            last_commit_id: 200,
+        },
+    );
+
+    // EXPECTED: cluster_commit_index = 200 (a quorum has it).
+    // ACTUAL (current code): cluster_commit_index = 0 — STUCK.
+    //
+    // §5.4.2 itself is correct (it prevents the Figure-8 safety
+    // violation). The bug is the missing companion mechanism — Raft's
+    // standard fix is to write a no-op on election win to commit a
+    // current-term entry, which then lifts cluster_commit past
+    // current_term_first_tx and unblocks the gate.
+    assert_eq!(
+        node.cluster_commit_index(),
+        200,
+        "cluster_commit_index stuck at 0 — §5.4.2 gate firing forever \
+         because no current-term entry is ever committed (no no-op on election)"
+    );
+}
