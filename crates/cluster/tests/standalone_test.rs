@@ -6,7 +6,6 @@
 //! still advances on every restart in lock-step with the cluster
 //! path (ADR-0016 §11).
 
-
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

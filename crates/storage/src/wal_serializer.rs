@@ -1,6 +1,6 @@
 use crate::entities::{
-    FunctionRegistered, SegmentHeader, SegmentSealed, TxEntry, TxLink, TxMetadata, WalEntry,
-    WalEntryKind,
+    FunctionRegistered, SegmentHeader, SegmentSealed, TxEntry, TxLink, TxMetadata, TxTerm,
+    WalEntry, WalEntryKind,
 };
 
 pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
@@ -11,6 +11,7 @@ pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
         WalEntry::SegmentSealed(s) => bytemuck::bytes_of(s),
         WalEntry::Link(l) => bytemuck::bytes_of(l),
         WalEntry::FunctionRegistered(f) => bytemuck::bytes_of(f),
+        WalEntry::Term(t) => bytemuck::bytes_of(t),
     }
 }
 
@@ -50,6 +51,10 @@ pub fn parse_wal_record(data: &[u8]) -> Result<WalEntry, std::io::Error> {
             let func_reg: FunctionRegistered = bytemuck::pod_read_unaligned(record_data);
             Ok(WalEntry::FunctionRegistered(func_reg))
         }
+        k if k == WalEntryKind::TxTerm as u8 => {
+            let term: TxTerm = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::Term(term))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown WAL record kind={}", kind),
@@ -61,16 +66,15 @@ pub fn parse_wal_record(data: &[u8]) -> Result<WalEntry, std::io::Error> {
 mod tests {
     use super::*;
     use crate::entities::{
-        EntryKind, FailReason, SegmentHeader, SegmentSealed, TxEntry, TxMetadata, WalEntry,
+        EntryKind, FailReason, SegmentHeader, SegmentSealed, TxEntry, TxMetadata, TxTerm, WalEntry,
         WalEntryKind,
     };
 
     fn make_tx_metadata() -> TxMetadata {
         TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 2,
             fail_reason: FailReason::NONE,
-            link_count: 0,
+            sub_item_count: 2,
             crc32c: 0xDEADBEEF,
             tx_id: 42,
             timestamp: 1_700_000_000,
@@ -114,6 +118,18 @@ mod tests {
         }
     }
 
+    fn make_tx_term() -> TxTerm {
+        TxTerm {
+            entry_type: WalEntryKind::TxTerm as u8,
+            _pad0: [0; 7],
+            term: 7,
+            node_id: 3,
+            node_count: 5,
+            node_voted: 4,
+            _pad1: [0; 12],
+        }
+    }
+
     // --- serialize tests ---
 
     #[test]
@@ -146,6 +162,14 @@ mod tests {
         let buf = serialize_wal_records(&entry);
         assert_eq!(buf.len(), 40);
         assert_eq!(buf[0], WalEntryKind::SegmentSealed as u8);
+    }
+
+    #[test]
+    fn serialize_tx_term_produces_40_bytes() {
+        let entry = WalEntry::Term(make_tx_term());
+        let buf = serialize_wal_records(&entry);
+        assert_eq!(buf.len(), 40);
+        assert_eq!(buf[0], WalEntryKind::TxTerm as u8);
     }
 
     // --- parse tests ---
@@ -201,6 +225,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_tx_term_round_trip() {
+        let original = WalEntry::Term(make_tx_term());
+        let buf = serialize_wal_records(&original);
+        let parsed = parse_wal_record(buf).expect("should parse tx term");
+        assert_eq!(parsed, original);
+        if let WalEntry::Term(t) = parsed {
+            assert_eq!(t.term, 7);
+            assert_eq!(t.node_id, 3);
+            assert_eq!(t.node_count, 5);
+            assert_eq!(t.node_voted, 4);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
     fn parse_uses_only_first_40_bytes_of_larger_slice() {
         let original = WalEntry::Metadata(make_tx_metadata());
         let serialized = serialize_wal_records(&original);
@@ -247,6 +287,7 @@ mod tests {
     fn serialize_then_parse_all_variants_in_sequence() {
         let entries = vec![
             WalEntry::SegmentHeader(make_segment_header()),
+            WalEntry::Term(make_tx_term()),
             WalEntry::Metadata(make_tx_metadata()),
             WalEntry::Entry(make_tx_entry()),
             WalEntry::SegmentSealed(make_segment_sealed()),

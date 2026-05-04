@@ -8,11 +8,11 @@ use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
 use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
-use crate::wal::Wal;
 pub use crate::wait_strategy::WaitStrategy;
+use crate::wal::Wal;
 pub use crate::wasm_runtime::FunctionInfo;
-use crate::wasm_runtime::{WasmRegistry, WasmRuntime};
-use spdlog::{LevelFilter, info, debug};
+use crate::wasm_runtime::{WasmRuntime, validate_name};
+use spdlog::{LevelFilter, debug};
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -30,8 +30,6 @@ pub struct Ledger {
     storage: Arc<Storage>,
     pipeline: Arc<Pipeline>,
     wasm_runtime: Arc<WasmRuntime>,
-    /// Thin facade over the full register / unregister / list lifecycle.
-    wasm_registry: WasmRegistry,
     handles: Vec<JoinHandle<()>>,
     #[allow(dead_code)]
     config: LedgerConfig,
@@ -47,16 +45,10 @@ impl Ledger {
         let storage = Arc::new(storage);
 
         let pipeline = Pipeline::new(&config);
-        let wasm_runtime = Arc::new(WasmRuntime::new());
-        let snapshot = Snapshot::new(&config, wasm_runtime.clone(), storage.clone());
+        let wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
+        let snapshot = Snapshot::new(&config, storage.clone());
         let seal = Seal::new(&config, storage.clone());
         let transactor = Transactor::new(&config, wasm_runtime.clone());
-        let wasm_registry = WasmRegistry::new(
-            wasm_runtime.clone(),
-            storage.clone(),
-            pipeline.ledger_context(),
-            config.wait_strategy,
-        );
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
@@ -67,7 +59,6 @@ impl Ledger {
             storage,
             pipeline,
             wasm_runtime,
-            wasm_registry,
             handles: Vec::new(),
             config,
         }
@@ -87,15 +78,78 @@ impl Ledger {
         binary: &[u8],
         override_existing: bool,
     ) -> io::Result<(u16, u32)> {
-        self.wasm_registry.register(name, binary, override_existing)
+        // Pre-validate eagerly so callers see specific `io::ErrorKind`s
+        // (`InvalidInput` / `InvalidData` / `AlreadyExists`) before we
+        // commit a Sequencer slot. The transactor's call to
+        // `wasm_runtime.register` is the authoritative validator;
+        // this is a fast-path UX for the common rejection cases.
+        validate_name(name)?;
+        self.wasm_runtime.validate(binary)?;
+        if !override_existing && self.wasm_runtime.contains(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("function `{}` is already registered", name),
+            ));
+        }
+        let res = self.submit_and_wait(
+            Operation::FunctionRegistration {
+                name: name.to_string(),
+                binary: binary.to_vec(),
+                override_existing,
+                user_ref: 0,
+            },
+            WaitLevel::Computed,
+        );
+        if res.fail_reason.is_failure() {
+            return Err(io::Error::other(format!(
+                "function registration failed: {:?}",
+                res.fail_reason
+            )));
+        }
+        let version = self.wasm_runtime.version_of(name).ok_or_else(|| {
+            io::Error::other("registration applied but version missing from runtime")
+        })?;
+        let crc = self
+            .wasm_runtime
+            .crc32c_of(name)
+            .ok_or_else(|| io::Error::other("registration applied but crc missing from runtime"))?;
+        Ok((version, crc))
     }
 
     pub fn unregister_function(&self, name: &str) -> io::Result<u16> {
-        self.wasm_registry.unregister(name)
+        validate_name(name)?;
+        // Capture predecessor version BEFORE submit — after the wait the
+        // handler is unloaded, so `version_of` returns None and we can't
+        // read the stamped version back from the registry.
+        let prev = self.wasm_runtime.version_of(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("function `{}` is not registered", name),
+            )
+        })?;
+        let next_version = prev
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("function version overflow (u16 exhausted)"))?;
+        let res = self.submit_and_wait(
+            Operation::FunctionRegistration {
+                name: name.to_string(),
+                binary: Vec::new(),
+                override_existing: true,
+                user_ref: 0,
+            },
+            WaitLevel::Computed,
+        );
+        if res.fail_reason.is_failure() {
+            return Err(io::Error::other(format!(
+                "function unregistration failed: {:?}",
+                res.fail_reason
+            )));
+        }
+        Ok(next_version)
     }
 
     pub fn list_functions(&self) -> Vec<FunctionInfo> {
-        self.wasm_registry.list()
+        self.wasm_runtime.list()
     }
 
     pub fn get_balance(&self, account_id: u64) -> Balance {
@@ -452,7 +506,6 @@ impl Ledger {
             &mut self.seal,
             &self.pipeline,
             &self.storage,
-            &self.wasm_runtime,
         );
 
         recover.recover_until(watermark).map_err(|e| {

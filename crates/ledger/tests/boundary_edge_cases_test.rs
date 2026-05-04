@@ -1,8 +1,8 @@
-use storage::entities::FailReason;
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::time::Duration;
+use storage::StorageConfig;
+use storage::entities::FailReason;
 
 /// Account at max_accounts fails with ACCOUNT_LIMIT_EXCEEDED.
 #[test]

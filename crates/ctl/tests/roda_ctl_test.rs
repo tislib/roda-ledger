@@ -73,9 +73,8 @@ fn create_test_segment(dir: &Path, segment_id: u32, tx_start: u64, num_txs: u32)
         };
         let mut meta = TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 2,
             fail_reason: FailReason::NONE,
-            link_count: 0,
+            sub_item_count: 2,
             crc32c: 0,
             tx_id,
             timestamp: 1_700_000_000 + i as u64,
@@ -316,7 +315,7 @@ fn pack_recomputes_crc() {
 fn pack_validates_structure() {
     let dir = unique_dir("pack_validate");
     let json = dir.join("bad.json");
-    fs::write(&json, r#"{"type":"TxMetadata","tx_id":1,"entry_count":0,"fail_reason":0,"crc32c":"0x00","link_count":0,"user_ref":0,"timestamp":0,"tag":"0000000000000000"}
+    fs::write(&json, r#"{"type":"TxMetadata","tx_id":1,"sub_item_count":0,"fail_reason":0,"crc32c":"0x00","user_ref":0,"timestamp":0,"tag":"0000000000000000"}
 {"type":"SegmentSealed","segment_id":1,"last_tx_id":1,"record_count":2}
 "#).unwrap();
 
@@ -339,7 +338,7 @@ fn pack_validates_structure() {
 fn pack_no_validate_skips() {
     let dir = unique_dir("pack_noval");
     let json = dir.join("bad.json");
-    fs::write(&json, r#"{"type":"TxMetadata","tx_id":1,"entry_count":0,"fail_reason":0,"crc32c":"0x00","link_count":0,"user_ref":0,"timestamp":0,"tag":"0000000000000000"}
+    fs::write(&json, r#"{"type":"TxMetadata","tx_id":1,"sub_item_count":0,"fail_reason":0,"crc32c":"0x00","user_ref":0,"timestamp":0,"tag":"0000000000000000"}
 "#).unwrap();
 
     let out = roda_ctl()

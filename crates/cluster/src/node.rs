@@ -50,7 +50,7 @@ use crate::raft_loop::{COMMAND_CHANNEL_DEPTH, RaftLoop};
 use crate::server::{NodeServerRuntime, Server};
 use ledger::ledger::Ledger;
 use raft::{RaftConfig, RaftNode, Role};
-use spdlog::{debug, error, info};
+use spdlog::{debug, error};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -97,7 +97,7 @@ impl ClusterNode {
     pub fn ledger(&self) -> Arc<Ledger> {
         self.ledger_slot.ledger()
     }
-    
+
     pub fn ledger_slot(&self) -> Arc<LedgerSlot> {
         self.ledger_slot.clone()
     }

@@ -1,9 +1,9 @@
 //! Integration tests for ADR-015 `Ledger::append_wal_entries` + `WalTailer`.
 
-use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use ledger::transaction::{Operation, WaitLevel};
 use std::time::{Duration, Instant};
+use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 
 const WAL_RECORD_SIZE: usize = 40;
 const TX_ID_OFFSET: usize = 8;
@@ -40,9 +40,8 @@ fn wait_until<F: FnMut() -> bool>(label: &str, mut f: F) {
 fn deposit_entries(tx_id: u64, account: u64, amount: u64) -> Vec<WalEntry> {
     let meta = TxMetadata {
         entry_type: WalEntryKind::TxMetadata as u8,
-        entry_count: 1,
-        link_count: 0,
         fail_reason: FailReason::NONE,
+        sub_item_count: 1,
         crc32c: 0,
         tx_id,
         timestamp: 0,

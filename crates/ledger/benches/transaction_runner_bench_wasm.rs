@@ -13,6 +13,7 @@ use ledger::transactor::TransactorRunner;
 use ledger::wasm_runtime::WasmRuntime;
 use std::sync::Arc;
 use std::time::Duration;
+use storage::{Storage, StorageConfig};
 
 const BATCH_SIZE: u64 = 1_000;
 const TRANSFER_WAT: &str = r#"
@@ -30,12 +31,19 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
     let mut group = c.benchmark_group("transaction_runner_wasm");
     group.measurement_time(Duration::from_secs(10));
 
-    let runtime = Arc::new(WasmRuntime::new());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage = Arc::new(
+        Storage::new(StorageConfig {
+            data_dir: tmp.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        })
+        .expect("storage"),
+    );
+    let runtime = Arc::new(WasmRuntime::new(storage));
     let binary = wat::parse_str(TRANSFER_WAT).expect("transfer wat");
-    let crc = crc32c::crc32c(&binary);
     runtime
-        .load_function("wasm_transfer", &binary, 1, crc)
-        .expect("load wasm_transfer");
+        .register("wasm_transfer", &binary, false)
+        .expect("register wasm_transfer");
 
     let mut runner = TransactorRunner::new(10_000_000, runtime.clone());
     let mut current_id = 0u64;

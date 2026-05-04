@@ -1,4 +1,4 @@
-//! WASM Function Registry E2E tests (ADR-014).
+//! WASM Function Registry E2E scenarios (ADR-014).
 //!
 //! Exercises the full register → submit Named → unregister path through
 //! the gRPC surface. Restart / crash scenarios are skipped on the Inline
@@ -21,8 +21,8 @@
 //! "handler loaded from sealed segment" (after `wait_for_snapshot` has
 //! let the seal thread close at least one segment).
 
-use crate::e2e::lib::backend::E2EBackend;
-use crate::e2e::lib::profile::profile;
+use crate::e2e::backend::E2EBackend;
+use crate::e2e::profile::profile;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -65,7 +65,7 @@ fn compile(src: &str) -> Vec<u8> {
 }
 
 /// Submit a Named "deposit" for `(account, amount)` and assert success.
-/// Centralizes the boilerplate every test here needs.
+/// Centralizes the boilerplate every scenario here needs.
 async fn deposit_via_wasm(ctx: &crate::e2e::E2EContext, account: u64, amount: u64, user_ref: u64) {
     let result = ctx
         .submit_function(
@@ -87,8 +87,7 @@ async fn deposit_via_wasm(ctx: &crate::e2e::E2EContext, account: u64, amount: u6
 // 1. wasm function runs properly
 // ═════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn wasm_runs_properly() {
+pub async fn wasm_runs_properly() {
     let ctx = e2e_ctx!(profile: single_node);
 
     // Register v1.
@@ -114,8 +113,7 @@ async fn wasm_runs_properly() {
 //    (wait 100ms before sending the next transaction)
 // ═════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-async fn wasm_new_version_runs_properly() {
+pub async fn wasm_new_version_runs_properly() {
     let ctx = e2e_ctx!(profile: single_node);
 
     // Register v1 and exercise it once.
@@ -150,8 +148,7 @@ async fn wasm_new_version_runs_properly() {
 //      the FunctionRegistered record before restart.
 // ═════════════════════════════════════════════════════════════════════════
 
-#[tokio::test(flavor = "multi_thread")]
-async fn wasm_loaded_after_restart() {
+pub async fn wasm_loaded_after_restart() {
     if E2EBackend::from_env() == E2EBackend::Inline {
         eprintln!("skipping wasm_loaded_after_restart on Inline backend (needs Process)");
         return;
@@ -189,8 +186,7 @@ async fn wasm_loaded_after_restart() {
 //      segment's WAL. Recovery must still find and apply it.
 // ═════════════════════════════════════════════════════════════════════════
 
-#[tokio::test(flavor = "multi_thread")]
-async fn wasm_loaded_after_crash() {
+pub async fn wasm_loaded_after_crash() {
     if E2EBackend::from_env() == E2EBackend::Inline {
         eprintln!("skipping wasm_loaded_after_crash on Inline backend (needs Process)");
         return;
@@ -240,8 +236,7 @@ async fn wasm_loaded_after_crash() {
 //      - then crash     (repeat same state after forced crash)
 // ═════════════════════════════════════════════════════════════════════════
 
-#[tokio::test(flavor = "multi_thread")]
-async fn wasm_new_version_loaded_after_restart_and_crash() {
+pub async fn wasm_new_version_loaded_after_restart_and_crash() {
     if E2EBackend::from_env() == E2EBackend::Inline {
         eprintln!(
             "skipping wasm_new_version_loaded_after_restart_and_crash on Inline backend (needs Process)"
@@ -319,8 +314,7 @@ async fn wasm_new_version_loaded_after_restart_and_crash() {
 //   function should still be absent (unregister WAL record replayed).
 // ═════════════════════════════════════════════════════════════════════════
 
-#[tokio::test(flavor = "multi_thread")]
-async fn wasm_unregister_persists_across_crash() {
+pub async fn wasm_unregister_persists_across_crash() {
     if E2EBackend::from_env() == E2EBackend::Inline {
         eprintln!("skipping wasm_unregister_persists_across_crash on Inline backend");
         return;

@@ -1,7 +1,6 @@
-
-use client::NodeClient;
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use client::NodeClient;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 
 /// Spin up a standalone cluster and connect a high-level client to
 /// it. Returns the harness (so the caller can keep it alive for the

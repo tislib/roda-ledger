@@ -28,13 +28,13 @@ macro_rules! e2e_ctx {
 #[macro_export]
 macro_rules! wait_level {
     (committed) => {
-        roda_ledger::cluster::proto::ledger::WaitLevel::Committed as i32
+        proto::ledger::WaitLevel::Committed as i32
     };
     (computed) => {
-        roda_ledger::cluster::proto::ledger::WaitLevel::Computed as i32
+        proto::ledger::WaitLevel::Computed as i32
     };
     (on_snapshot) => {
-        roda_ledger::cluster::proto::ledger::WaitLevel::Snapshot as i32
+        proto::ledger::WaitLevel::Snapshot as i32
     };
 }
 

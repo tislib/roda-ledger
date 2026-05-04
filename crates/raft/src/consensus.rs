@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use spdlog::{debug, info};
+use spdlog::debug;
 
 use crate::follower::FollowerState;
 use crate::leader::LeaderState;
@@ -159,11 +159,7 @@ impl<'a, P: Persistence> Election<'a, P> {
     /// If we are not Candidate when called, every response is dropped
     /// silently. Cluster polls `node.role()` afterward to update its
     /// `ReplicationGate` / mirror.
-    pub fn handle_votes(
-        &mut self,
-        now: Instant,
-        responses: Vec<(NodeId, VoteOutcome)>,
-    ) {
+    pub fn handle_votes(&mut self, now: Instant, responses: Vec<(NodeId, VoteOutcome)>) {
         self.node.election_handle_votes(now, responses);
     }
 
@@ -384,11 +380,7 @@ impl<P: Persistence> RaftNode<P> {
     /// gate the new follower's `leader_commit` propagation).
     /// Role changes are observed by the cluster polling
     /// `RaftNode::role()` — no action stream.
-    pub(crate) fn transition_to_follower(
-        &mut self,
-        now: Instant,
-        leader_id: Option<NodeId>,
-    ) {
+    pub(crate) fn transition_to_follower(&mut self, now: Instant, leader_id: Option<NodeId>) {
         let mut state = match leader_id {
             Some(id) => NodeState::Follower(FollowerState::with_leader(id)),
             None => NodeState::Follower(FollowerState::new()),
@@ -413,18 +405,12 @@ impl<P: Persistence> RaftNode<P> {
             return false;
         }
 
-        let majority = self.quorum.majority();
-
         let candidate = CandidateState::new(new_term, self.self_id);
         self.state = NodeState::Candidate(candidate);
         self.election_timer.reset(now);
 
         // Single-node cluster: self-vote already crosses majority.
-        let other_peers_empty = !self
-            .peers
-            .iter()
-            .copied()
-            .any(|p| p != self.self_id);
+        let other_peers_empty = !self.peers.iter().copied().any(|p| p != self.self_id);
         if other_peers_empty {
             self.become_leader_after_win(new_term, now);
         }

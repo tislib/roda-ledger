@@ -1,13 +1,19 @@
 //! Process backend — each node runs as a separate OS process.
 //!
-//! Spawns the `roda-ledger` server binary with a generated config.toml,
-//! then connects a gRPC client. Provides real process isolation — suitable
-//! for CI and crash-recovery tests.
+//! Spawns the sibling `e2e-cluster-process` binary with a generated
+//! `config.toml`, then connects a gRPC client. Provides real process
+//! isolation — suitable for CI and crash-recovery tests.
+//!
+//! Binary discovery: Cargo only injects `CARGO_BIN_EXE_<name>` for
+//! same-crate test/bench/example targets, so we cannot use it to point
+//! at `roda-server` from this `[[bin]]`. Instead, the testing crate
+//! ships a sibling `e2e-cluster-process` binary that lives next to
+//! `e2e` in `target/{profile}/`. We resolve it via `current_exe()`.
 
-use crate::e2e::lib::profile::Profile;
-use roda_ledger::client::NodeClient;
+use crate::e2e::profile::Profile;
+use client::NodeClient;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use tokio::time::{Duration, sleep};
 
@@ -26,7 +32,7 @@ pub struct ProcessNode {
 }
 
 impl ProcessNode {
-    /// Spawn one roda-ledger server process using config from the profile.
+    /// Spawn one server process using config from the profile.
     pub async fn start(profile: &Profile) -> Self {
         let mut data_dir = std::env::current_dir().unwrap();
         let rand = rand::random::<u64>() % 1_000_000_000;
@@ -54,14 +60,20 @@ impl ProcessNode {
         }
     }
 
-    fn spawn_server(config_path: &PathBuf) -> Child {
-        let binary = env!("CARGO_BIN_EXE_roda-ledger");
-        Command::new(binary)
+    fn spawn_server(config_path: &Path) -> Child {
+        let binary = locate_server_bin();
+        Command::new(&binary)
             .arg(config_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn roda-ledger binary at {}: {}", binary, e))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to spawn e2e-cluster-process at {}: {}",
+                    binary.display(),
+                    e
+                )
+            })
     }
 
     /// Poll until the server accepts a gRPC connection, with timeout.
@@ -129,4 +141,25 @@ impl Drop for ProcessNode {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
+}
+
+/// Resolve the path to the sibling `e2e-cluster-process` binary —
+/// the one this crate also produces. Both bins land in the same
+/// `target/{profile}/` directory, so we walk up from `current_exe()`.
+fn locate_server_bin() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let dir = exe.parent().expect("exe has no parent dir");
+    let candidate = dir.join(if cfg!(windows) {
+        "e2e-cluster-process.exe"
+    } else {
+        "e2e-cluster-process"
+    });
+    if !candidate.exists() {
+        panic!(
+            "e2e-cluster-process not found at {} — build with: \
+             cargo build -p testing --bin e2e-cluster-process",
+            candidate.display()
+        );
+    }
+    candidate
 }

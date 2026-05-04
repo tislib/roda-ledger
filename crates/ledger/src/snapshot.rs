@@ -1,15 +1,13 @@
 use crate::balance::Balance;
 use crate::config::LedgerConfig;
-use storage::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
-use storage::Storage;
-use crate::wasm_runtime::WasmRuntime;
-use spdlog::error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::JoinHandle;
+use storage::Storage;
+use storage::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 // ── Message types for the Snapshot stage queue (ADR-008) ─────────────────────
 
 /// Single message type for the WAL→Snapshot queue.
@@ -61,28 +59,19 @@ pub enum QueryResponse {
 pub struct Snapshot {
     balances: Arc<Vec<AtomicI64>>,
     indexer: Option<TransactionIndexer>,
-    /// Shared WASM registry — bumped on every `FunctionRegistered` commit
-    /// so each `WasmRuntimeEngine` passively refreshes its handler cache.
-    wasm_runtime: Arc<WasmRuntime>,
-    /// Storage handle for resolving `{data_dir}/functions/{name}_v{N}.wasm`.
+    #[allow(dead_code)]
     storage: Arc<Storage>,
 }
 
 struct SnapshotRunner {
     balances: Arc<Vec<AtomicI64>>,
     /// Total remaining records (entries + links) for the current transaction.
-    pending_records: u8,
+    pending_records: u16,
     indexer: TransactionIndexer,
-    wasm_runtime: Arc<WasmRuntime>,
-    storage: Arc<Storage>,
 }
 
 impl Snapshot {
-    pub fn new(
-        config: &LedgerConfig,
-        wasm_runtime: Arc<WasmRuntime>,
-        storage: Arc<Storage>,
-    ) -> Self {
+    pub fn new(config: &LedgerConfig, storage: Arc<Storage>) -> Self {
         let account_count = config.max_accounts;
         let balances: Arc<Vec<AtomicI64>> =
             Arc::new((0..account_count).map(|_| AtomicI64::new(0)).collect());
@@ -96,7 +85,6 @@ impl Snapshot {
                 config.index_circle2_size(),
                 account_heads_size,
             )),
-            wasm_runtime,
             storage,
         }
     }
@@ -117,8 +105,6 @@ impl Snapshot {
             balances: self.balances.clone(),
             pending_records: 0,
             indexer: self.indexer.take().unwrap(),
-            wasm_runtime: self.wasm_runtime.clone(),
-            storage: self.storage.clone(),
         };
         std::thread::Builder::new()
             .name("snapshot".to_string())
@@ -136,7 +122,7 @@ impl Snapshot {
 
     pub(crate) fn recover_index_tx_metadata(&mut self, metadata: &TxMetadata) {
         if let Some(indexer) = &mut self.indexer {
-            indexer.insert_tx(metadata.tx_id, metadata.entry_count);
+            indexer.insert_tx(metadata.tx_id);
         }
     }
 
@@ -176,8 +162,8 @@ impl SnapshotRunner {
                     SnapshotMessage::Entry(wal_entry) => {
                         match wal_entry {
                             WalEntry::Metadata(m) => {
-                                self.indexer.insert_tx(m.tx_id, m.entry_count);
-                                self.pending_records = m.entry_count.saturating_add(m.link_count);
+                                self.indexer.insert_tx(m.tx_id);
+                                self.pending_records = m.sub_item_count;
                                 last_processed_tx_id = m.tx_id;
                             }
                             WalEntry::Entry(e) => {
@@ -202,37 +188,22 @@ impl SnapshotRunner {
                             }
                             WalEntry::SegmentSealed(_) => {}
                             WalEntry::SegmentHeader(_) => {}
-                            WalEntry::FunctionRegistered(f) => {
-                                // Register / unregister handler. We never
-                                // touch pending_records or the tx_id cursor
-                                // — this record is not a financial
-                                // transaction.
-                                let name = f.name_str().to_string();
-                                if f.is_unregister() {
-                                    if let Err(e) = self.wasm_runtime.unload_function(&name) {
-                                        error!("Snapshot: unload_function({}) failed: {}", name, e);
-                                    }
-                                } else {
-                                    match self.storage.read_function(&name, f.version) {
-                                        Ok(binary) => {
-                                            if let Err(e) = self
-                                                .wasm_runtime
-                                                .load_function(&name, &binary, f.version, f.crc32c)
-                                            {
-                                                error!(
-                                                    "Snapshot: load_function({} v{}) failed: {}",
-                                                    name, f.version, e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Snapshot: read_function({} v{}) failed: {}",
-                                                name, f.version, e
-                                            );
-                                        }
-                                    }
-                                }
+                            WalEntry::FunctionRegistered(_) => {
+                                // The Transactor owns WasmRuntime
+                                // mutations — registration and
+                                // unregistration are applied during the
+                                // FunctionRegistration dispatcher arm.
+                                // The Snapshot stage only sees this
+                                // record as a sub-item of its parent
+                                // TxMetadata; decrement the counter so
+                                // the meta+follower group completes.
+                                self.pending_records = self.pending_records.saturating_sub(1);
+                            }
+                            WalEntry::Term(_) => {
+                                // TxTerm is a sub-item of its parent
+                                // TxMetadata; decrement to complete the
+                                // meta+follower group.
+                                self.pending_records = self.pending_records.saturating_sub(1);
                             }
                         }
                         if last_processed_tx_id > 0 && self.pending_records == 0 {

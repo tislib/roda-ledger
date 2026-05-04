@@ -4,6 +4,7 @@ use ledger::transactor::TransactorRunner;
 use ledger::wasm_runtime::WasmRuntime;
 use std::sync::Arc;
 use std::time::Duration;
+use storage::{Storage, StorageConfig};
 
 const BATCH_SIZE: u64 = 1_000;
 
@@ -12,8 +13,17 @@ fn transaction_runner_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     // Every TransactorRunner takes a WasmRuntime. The built-in bench
-    // never registers anything, so an empty runtime is enough.
-    let runtime = Arc::new(WasmRuntime::new());
+    // never registers anything, so an empty runtime backed by a temp
+    // storage is enough.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage = Arc::new(
+        Storage::new(StorageConfig {
+            data_dir: tmp.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        })
+        .expect("storage"),
+    );
+    let runtime = Arc::new(WasmRuntime::new(storage));
     let mut runner = TransactorRunner::new(10_000_000, runtime);
     let mut current_id = 0u64;
 

@@ -4,12 +4,12 @@
 //! state. Adding Raft means `ctx` manages N nodes instead of 1 — the
 //! test interface does not change.
 
-use crate::e2e::lib::backend::E2EBackend;
-use crate::e2e::lib::backend_inline::InlineNode;
-use crate::e2e::lib::backend_process::ProcessNode;
-use crate::e2e::lib::profile::Profile;
-use roda_ledger::client::{FunctionInfo, NodeClient, SubmitResult};
-use roda_ledger::cluster::proto::ledger::WaitLevel;
+use crate::e2e::backend::E2EBackend;
+use crate::e2e::backend_inline::InlineNode;
+use crate::e2e::backend_process::ProcessNode;
+use crate::e2e::profile::Profile;
+use client::{FunctionInfo, NodeClient, SubmitResult};
+use proto::ledger::WaitLevel;
 use std::net::SocketAddr;
 use tokio::time::{Duration, sleep};
 
@@ -179,8 +179,6 @@ impl E2EContext {
         let mut total_rejected = 0usize;
 
         for chunk in transfers.chunks(BATCH_CHUNK_SIZE) {
-            // Use the raw tonic client for transfer batches since the facade
-            // doesn't have a transfer_batch_and_wait method yet.
             let results = self
                 .client(node)
                 .transfer_batch_and_wait(chunk, wl)

@@ -3,7 +3,7 @@ use std::path::Path;
 use storage::entities::*;
 use storage::{SegmentStaus, WAL_MAGIC, WAL_VERSION};
 
-use super::json::{compute_tx_crc_with_links, verify_tx_crc_with_links};
+use super::json::{compute_tx_crc, verify_tx_crc};
 use super::{CtlError, SegmentReport, SnapshotReport, VerifyReport, make_storage};
 
 pub fn run(
@@ -105,8 +105,7 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
     let mut last_tx_id = 0u64;
     let mut last_meta_tx: Option<u64> = None;
     let mut pending_meta: Option<TxMetadata> = None;
-    let mut pending_entries: Vec<TxEntry> = Vec::new();
-    let mut pending_links: Vec<TxLink> = Vec::new();
+    let mut pending_sub_items: Vec<WalEntry> = Vec::new();
     let mut header_checked = false;
     // Per-account last known computed_balance for continuity checks.
     let mut account_balances: std::collections::HashMap<u64, i64> =
@@ -136,15 +135,8 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                 }
             }
             WalEntry::Metadata(m) => {
-                flush_pending(
-                    &mut pending_meta,
-                    &pending_entries,
-                    &pending_links,
-                    &mut errors,
-                    &mut ok,
-                );
-                pending_entries.clear();
-                pending_links.clear();
+                flush_pending(&mut pending_meta, &pending_sub_items, &mut errors, &mut ok);
+                pending_sub_items.clear();
 
                 if first_tx_id == 0 {
                     first_tx_id = m.tx_id;
@@ -159,8 +151,8 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                 last_meta_tx = Some(m.tx_id);
                 last_tx_id = m.tx_id;
 
-                if m.entry_count == 0 && m.link_count == 0 {
-                    if !verify_tx_crc_with_links(m, &[], &[]) {
+                if m.sub_item_count == 0 {
+                    if !verify_tx_crc(m, &[]) {
                         errors.push(format!("Record CRC mismatch (tx_id {})", m.tx_id));
                         ok = false;
                     }
@@ -191,24 +183,27 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                         }
                     }
                     account_balances.insert(e.account_id, e.computed_balance);
-                    pending_entries.push(*e);
+                    pending_sub_items.push(WalEntry::Entry(*e));
                 }
             }
             WalEntry::Link(l) => {
                 if pending_meta.is_some() {
-                    pending_links.push(*l);
+                    pending_sub_items.push(WalEntry::Link(*l));
+                }
+            }
+            WalEntry::FunctionRegistered(f) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::FunctionRegistered(*f));
+                }
+            }
+            WalEntry::Term(t) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::Term(*t));
                 }
             }
             WalEntry::SegmentSealed(s) => {
-                flush_pending(
-                    &mut pending_meta,
-                    &pending_entries,
-                    &pending_links,
-                    &mut errors,
-                    &mut ok,
-                );
-                pending_entries.clear();
-                pending_links.clear();
+                flush_pending(&mut pending_meta, &pending_sub_items, &mut errors, &mut ok);
+                pending_sub_items.clear();
 
                 if s.segment_id != segment_id {
                     errors.push(format!(
@@ -226,9 +221,6 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                 }
                 last_tx_id = s.last_tx_id;
             }
-            // Function-registry events are validated independently: the
-            // CRC32C is embedded in the record, no cross-record invariants.
-            WalEntry::FunctionRegistered(_) => {}
         }
     });
 
@@ -334,24 +326,34 @@ fn verify_active_wal(storage: &storage::Storage) -> SegmentReport {
 
 fn flush_pending(
     pending_meta: &mut Option<TxMetadata>,
-    entries: &[TxEntry],
-    links: &[TxLink],
+    sub_items: &[WalEntry],
     errors: &mut Vec<String>,
     ok: &mut bool,
 ) {
     if let Some(meta) = pending_meta.take() {
-        // CRC check (covers metadata + entries + links).
-        if !verify_tx_crc_with_links(&meta, entries, links) {
+        // CRC check covers metadata + every sub-item (TxEntry, TxLink,
+        // TxTerm, FunctionRegistered).
+        if !verify_tx_crc(&meta, sub_items) {
             errors.push(format!(
                 "Record CRC mismatch (tx_id {}): expected {:#010x}, actual {:#010x}",
                 meta.tx_id,
                 meta.crc32c,
-                compute_tx_crc_with_links(&meta, entries, links)
+                compute_tx_crc(&meta, sub_items)
             ));
             *ok = false;
         }
 
         // Zero-sum (double-entry): total debits must equal total credits.
+        let entries: Vec<&TxEntry> = sub_items
+            .iter()
+            .filter_map(|e| {
+                if let WalEntry::Entry(e) = e {
+                    Some(e)
+                } else {
+                    None
+                }
+            })
+            .collect();
         if !entries.is_empty() {
             let debit_total: u64 = entries
                 .iter()
@@ -372,24 +374,13 @@ fn flush_pending(
             }
         }
 
-        // Entry count declared in metadata must match actual entries.
-        if entries.len() != meta.entry_count as usize {
+        // Sub-item count declared in metadata must match actual count.
+        if sub_items.len() != meta.sub_item_count as usize {
             errors.push(format!(
-                "tx_id {}: entry_count mismatch (declared={}, actual={})",
+                "tx_id {}: sub_item_count mismatch (declared={}, actual={})",
                 meta.tx_id,
-                meta.entry_count,
-                entries.len()
-            ));
-            *ok = false;
-        }
-
-        // Link count declared in metadata must match actual links.
-        if links.len() != meta.link_count as usize {
-            errors.push(format!(
-                "tx_id {}: link_count mismatch (declared={}, actual={})",
-                meta.tx_id,
-                meta.link_count,
-                links.len()
+                meta.sub_item_count,
+                sub_items.len()
             ));
             *ok = false;
         }

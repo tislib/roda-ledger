@@ -1,8 +1,7 @@
 //! `Quorum` integration with the supervisor/leader/replication path.
 
-
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::{Duration, Instant};
 
 const ACCOUNT: u64 = 1;
@@ -100,7 +99,12 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
 
     // cluster_commit_index must not regress.
     let post = mirror.cluster_commit_index();
-    assert!(post >= pre, "cluster_commit_index regressed: {} -> {}", pre, post);
+    assert!(
+        post >= pre,
+        "cluster_commit_index regressed: {} -> {}",
+        pre,
+        post
+    );
 }
 
 /// After a Leader transition, the new leader's own slot in `Quorum` is

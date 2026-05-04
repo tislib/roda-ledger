@@ -18,7 +18,7 @@
 use ::proto::node as proto;
 use raft::Role;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 const ROLE_INITIALIZING: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
@@ -148,8 +148,7 @@ impl ClusterMirror {
     /// Public to the cluster crate; external callers go through the
     /// driver.
     pub(crate) fn snapshot_from<P: raft::Persistence>(&self, node: &raft::RaftNode<P>) {
-        self.role
-            .store(role_to_u8(node.role()), Ordering::Release);
+        self.role.store(role_to_u8(node.role()), Ordering::Release);
         self.current_term
             .store(node.current_term(), Ordering::Release);
         self.commit_index
@@ -201,5 +200,4 @@ mod tests {
         m.role.store(ROLE_CANDIDATE, Ordering::Release);
         assert_eq!(m.role_proto(), proto::NodeRole::Recovering);
     }
-
 }

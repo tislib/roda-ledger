@@ -11,14 +11,14 @@
 //! `notify_waiters()`, which lets tonic stop accepting new connections, drain
 //! in-flight handlers, and exit cleanly.
 
+use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
 use crate::durable::Term;
 use crate::ledger_handler::LedgerHandler;
 use crate::node_handler::NodeHandler;
 use ::proto::ledger::ledger_server::LedgerServer;
 use ::proto::node::node_server::NodeServer;
-use crate::LedgerSlot;
-use spdlog::{debug, info};
+use spdlog::debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;

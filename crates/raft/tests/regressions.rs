@@ -180,15 +180,8 @@ fn term_log_truncates_with_entry_log() {
     // cluster knows to drop entries past 4 in BOTH the entry log
     // (driver-side I/O) and the term log (synchronous through the
     // trait, already done inside validate).
-    let decision = node.validate_append_entries_request(
-        Instant::now(),
-        2,
-        2,
-        5,
-        2,
-        LogEntryRange::empty(),
-        0,
-    );
+    let decision =
+        node.validate_append_entries_request(Instant::now(), 2, 2, 5, 2, LogEntryRange::empty(), 0);
     assert_eq!(
         decision,
         AppendEntriesDecision::Reject {

@@ -10,14 +10,14 @@
 //! one stage do not cause false sharing with adjacent indexes.
 
 use crate::config::LedgerConfig;
-use storage::entities::{WalEntry, WalInput};
 use crate::snapshot::SnapshotMessage;
 use crate::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use storage::entities::{WalEntry, WalInput};
 
 /// Callback fired by the WAL stage whenever `commit_index` advances.
 pub type CommitHandler = Arc<dyn Fn(u64) + Send + Sync + 'static>;
