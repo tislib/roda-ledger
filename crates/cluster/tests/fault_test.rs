@@ -1,8 +1,8 @@
 //! Process / network / storage fault scenarios.
 
-
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use client::RetryConfig;
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 
 const ACCOUNT: u64 = 1;
@@ -12,7 +12,7 @@ const AMOUNT: u64 = 100;
 
 /// Single-leader cluster (3 nodes), kill leader → re-election, no
 /// committed tx lost.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn kill_leader_no_committed_tx_lost() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -41,7 +41,7 @@ async fn kill_leader_no_committed_tx_lost() {
 }
 
 /// Kill follower → leader continues; ClusterCommit still works.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn kill_follower_leader_continues() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -65,7 +65,7 @@ async fn kill_follower_leader_continues() {
 
 /// Kill TWO of three nodes → surviving node cannot reach quorum;
 /// ClusterCommit waits time out.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn kill_two_of_three_blocks_cluster_commit() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -88,14 +88,14 @@ async fn kill_two_of_three_blocks_cluster_commit() {
 
     // ClusterCommit blocks (and the test's overall budget guards against hang).
     let result = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err(), "ClusterCommit must NOT succeed");
 }
 
 /// Kill TWO of five nodes → cluster still tolerates (majority = 3,
 /// leader + 2 alive followers = 3).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn kill_two_of_five_cluster_continues() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(5))
         .await
@@ -122,7 +122,7 @@ async fn kill_two_of_five_cluster_continues() {
 }
 
 /// Kill THREE of five nodes → no quorum. ClusterCommit blocks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn kill_three_of_five_blocks_cluster_commit() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(5))
         .await
@@ -142,7 +142,7 @@ async fn kill_three_of_five_blocks_cluster_commit() {
     }
 
     let result = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err(), "no quorum → ClusterCommit must block");
 }
@@ -151,7 +151,7 @@ async fn kill_three_of_five_blocks_cluster_commit() {
 /// data lost. (Same shape as `safety_test::acked_cluster_commit_*`
 /// but here we drive a slightly different load and explicitly check
 /// every node's balance post-restart.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn full_restart_preserves_committed_data() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -181,7 +181,7 @@ async fn full_restart_preserves_committed_data() {
 
 /// Repeated leader churn (kill → re-elect)×N preserves every
 /// ClusterCommit-acked write.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn repeated_leader_churn_preserves_commits() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -217,7 +217,7 @@ async fn repeated_leader_churn_preserves_commits() {
 /// the harness alone, so we verify the simpler invariant: the rejoiner
 /// catches up cleanly without panicking and the cluster keeps a
 /// single leader.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn killed_leader_rejoins_as_follower() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -255,7 +255,7 @@ async fn killed_leader_rejoins_as_follower() {
 /// stopping one of three nodes BEFORE the election, so only 2 nodes
 /// participate (one of them fails to respond). The election must still
 /// complete because 2 votes ≥ majority(3) = 2.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn election_completes_with_one_node_silent() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         autostart: false,
@@ -278,7 +278,7 @@ async fn election_completes_with_one_node_silent() {
 /// Slow-link surrogate: a follower restarted mid-load lags but catches
 /// up; `Quorum::get()` keeps advancing because the OTHER follower (still
 /// healthy) + leader form a 2-of-3 majority.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn slow_follower_does_not_block_majority() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         replication_poll_ms: 5,
@@ -305,21 +305,3 @@ async fn slow_follower_does_not_block_majority() {
     // Lagged follower must catch up via leader replication.
     ctl.require_pipeline_commit_at_least(follower_idx, 20).await;
 }
-
-// ── §8.3 Storage failures (most need fault injection — stubs) -----------
-
-/// Storage-failure injection (read-only fs, ENOSPC, partial fdatasync)
-/// requires test infrastructure not present in the harness. Documented
-/// stub.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "infra: storage-failure injection not implemented; needs FUSE-style \
-            fault injector or a writable-fs wrapper that can fail on demand"]
-async fn term_log_write_failure_aborts_election_round() {}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "infra: see term_log_write_failure_aborts_election_round"]
-async fn vote_log_fdatasync_failure_returns_no_grant() {}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "infra: see term_log_write_failure_aborts_election_round"]
-async fn wal_append_failure_returns_reject_wal_append_failed() {}

@@ -59,12 +59,21 @@ message AppendEntriesResponse {
   // True iff the follower accepted and durably appended all bytes.
   bool   success         = 2;
 
-  // Highest tx_id durably on the follower's disk after this RPC.
-  // Leader uses this to advance matchIndex for the follower.
-  uint64 last_tx_id      = 3;
+  // Highest tx_id the follower has durably committed after this
+  // RPC. Leader uses this to advance per-peer match_index and the
+  // cluster-wide quorum (cluster_commit_index). See ADR-0017
+  // §"AE reply: write vs commit watermark".
+  uint64 last_commit_id  = 3;
 
   // Diagnostic detail on reject. See RejectReason.
   uint32 reject_reason   = 4;
+
+  // Highest tx_id the follower has accepted/written into its log.
+  // May be ahead of last_commit_id if the follower acks writes
+  // before durability. Leader uses this to advance the per-peer
+  // replication window (next_index — i.e. "what to ship next").
+  // Invariant: last_write_id >= last_commit_id.
+  uint64 last_write_id   = 5;
 }
 
 enum RejectReason {

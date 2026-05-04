@@ -12,7 +12,7 @@ const AMOUNT: u64 = 100;
 
 /// After leader churn under continuous writes, all surviving nodes
 /// converge on the same balances for every account.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn balances_converge_across_nodes_after_churn() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -55,7 +55,7 @@ async fn balances_converge_across_nodes_after_churn() {
 
 /// Total system + account balances sum to 0 on every node (zero-sum
 /// invariant) after sustained transfers across nodes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn zero_sum_holds_on_every_node_after_load() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -84,7 +84,7 @@ async fn zero_sum_holds_on_every_node_after_load() {
 
 /// A tx that returned `WaitLevel::ClusterCommit` success is still
 /// committed on the cluster after any single-node failure.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_commit_acked_tx_survives_one_node_failure() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -112,7 +112,7 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
 /// Followers' WAL is byte-exact with the leader's after catch-up.
 /// Verified by comparing each follower's `wal_tailer().tail()` output
 /// to the leader's for the same byte range.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wal_is_byte_exact_across_replicas() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig {
         replication_poll_ms: 5,

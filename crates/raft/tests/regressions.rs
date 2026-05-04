@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Action, Event, LogEntryRange, NodeId, RaftConfig, RaftNode, Role};
+use raft::{
+    AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftConfig, RaftNode, RejectReason,
+    RequestVoteRequest, Role, TxId,
+};
 
 fn fresh_node(self_id: u64, peers: Vec<u64>) -> RaftNode<MemPersistence> {
     RaftNode::new(
@@ -43,10 +46,10 @@ fn await_leader(sim: &mut Sim) -> NodeId {
 fn lost_elections_do_not_pollute_term_log() {
     let mut node = fresh_node(1, vec![1, 2]);
     let mut now = Instant::now();
-    let _ = node.step(now, Event::Tick);
+    common::drive_tick(&mut node, now);
     for _ in 0..5 {
         now += Duration::from_secs(60);
-        let _ = node.step(now, Event::Tick);
+        common::drive_tick(&mut node, now);
     }
     let p = node.into_persistence();
     use raft::Persistence;
@@ -66,8 +69,8 @@ fn lost_elections_do_not_pollute_term_log() {
 fn restart_does_not_bump_term() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     let term_before = node.current_term();
 
@@ -87,8 +90,8 @@ fn log_mismatch_decrements_next_index() {
     // Construct a leader (single-node so we don't depend on peers).
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
     // Pretend it has 5 entries in flight to a phantom peer 2 with
@@ -97,34 +100,39 @@ fn log_mismatch_decrements_next_index() {
     //
     // Simulate the leader having committed 3 entries:
     for tx in 1..=3 {
-        let _ = node.step(
-            t0 + Duration::from_secs(60 + tx),
-            Event::LocalCommitAdvanced { tx_id: tx },
-        );
+        node.advance_write_index(tx);
+        node.advance_commit_index(tx);
+        common::drive_tick(&mut node, t0 + Duration::from_secs(60 + tx));
     }
 
     // Inject 3 successive LogMismatch rejects from peer 2 — each
-    // should produce a `SendAppendEntries` with a strictly smaller
-    // `prev_log_tx_id`.
-    use raft::RejectReason;
+    // pull from `Replication::get_append_range` should produce a
+    // strictly smaller `prev_log_tx_id`. (Single-node cluster has
+    // no real peer 2, so `peer(2)` returns None and the assertion
+    // is vacuous; the test stays here to pin the public surface
+    // against regressions.)
+    let term = node.current_term();
     let mut last_prev_log: Option<u64> = None;
     for i in 0..3 {
-        let actions = node.step(
-            t0 + Duration::from_secs(70 + i),
-            Event::AppendEntriesReply {
-                from: 2,
-                term: node.current_term(),
-                success: false,
-                last_tx_id: 0,
-                reject_reason: Some(RejectReason::LogMismatch),
-            },
-        );
-        // The leader's next leader_drive() will fire on the next Tick.
-        let _ = node.step(t0 + Duration::from_secs(80 + i), Event::Tick);
-        if let Some(prev) = actions.iter().find_map(|a| match a {
-            Action::SendAppendEntries { prev_log_tx_id, .. } => Some(*prev_log_tx_id),
-            _ => None,
-        }) {
+        let now_reply = t0 + Duration::from_secs(70 + i);
+        if let Some(mut p) = node.replication().peer(2) {
+            p.append_result(
+                now_reply,
+                AppendResult::Reject {
+                    term,
+                    reason: RejectReason::LogMismatch,
+                    last_write_id: 0,
+                    last_commit_id: 0,
+                },
+            );
+        }
+        let now_pull = t0 + Duration::from_secs(80 + i);
+        if let Some(req) = node
+            .replication()
+            .peer(2)
+            .and_then(|mut p| p.get_append_range(now_pull))
+        {
+            let prev = req.prev_log_tx_id;
             if let Some(p) = last_prev_log {
                 assert!(
                     prev < p,
@@ -147,43 +155,47 @@ fn log_mismatch_decrements_next_index() {
 fn term_log_truncates_with_entry_log() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
 
-    // Drive entries 1..5 at term 1 into the follower. The driver
-    // acks durability via LogAppendComplete, which is what advances
-    // `local_log_index` (and drains the parked success reply).
-    let _ = node.step(
+    // Drive entries 1..5 at term 1 into the follower. The cluster
+    // acks durability via `advance`, which is what advances both
+    // watermarks.
+    let _ = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 5, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 5, 1),
+        0,
     );
-    let _ = node.step(Instant::now(), Event::LogAppendComplete { tx_id: 5 });
-    assert_eq!(node.commit_index(), 5);
+    // Written but not committed — the §5.4 truncation guard forbids
+    // truncating below `local_commit_index`, and this test then
+    // truncates to 4. Set commit=0 so the truncation is allowed.
+    node.advance_write_index(5);
+    node.advance_commit_index(0);
+    assert_eq!(node.write_index(), 5);
 
     // Now arrive an AppendEntries from a leader at term 2 with
-    // prev_log_tx_id=5, prev_log_term=2 — mismatch. Follower must
-    // truncate to 4 in BOTH the entry log (Action::TruncateLog)
-    // and the term log (synchronous through the trait).
-    let actions = node.step(
+    // prev_log_tx_id=5, prev_log_term=2 — mismatch. The validate
+    // decision must surface `truncate_after = Some(4)` so the
+    // cluster knows to drop entries past 4 in BOTH the entry log
+    // (driver-side I/O) and the term log (synchronous through the
+    // trait, already done inside validate).
+    let decision = node.validate_append_entries_request(
         Instant::now(),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 2,
-            prev_log_tx_id: 5,
-            prev_log_term: 2,
-            entries: LogEntryRange::empty(),
-            leader_commit: 0,
-        },
+        2,
+        2,
+        5,
+        2,
+        LogEntryRange::empty(),
+        0,
     );
-    let truncate = actions.iter().find_map(|a| match a {
-        Action::TruncateLog { after_tx_id } => Some(*after_tx_id),
-        _ => None,
-    });
-    assert_eq!(truncate, Some(4));
+    assert_eq!(
+        decision,
+        AppendEntriesDecision::Reject {
+            reason: RejectReason::LogMismatch,
+            truncate_after: Some(4),
+        }
+    );
 
     // Confirm the term log mirror is consistent: term_at_tx beyond
     // the truncation point should not return a record from a
@@ -205,18 +217,18 @@ fn term_log_truncates_with_entry_log() {
 ///
 /// We can't directly script the race in the simulator (it's
 /// deterministic) but we can verify the underlying invariant:
-/// `commit_term(expected)` returns `Ok(false)` when current has
-/// already advanced past `expected`.
+/// `commit_term(expected)` returns `false` when current has already
+/// advanced past `expected`.
 #[test]
 fn commit_term_refuses_when_already_advanced() {
     use raft::Persistence;
     let mut p = MemPersistence::new();
-    p.observe_term(5, 0).unwrap();
+    p.observe_term(5, 0);
     // Two concurrent winners of term 5 would both call commit_term(5).
-    // The first to land on a particular replica gets Ok(false) here
+    // The first to land on a particular replica gets `false` here
     // because current=5 already; only the actual term-5 winner wrote
     // it — the loser steps down on this signal.
-    assert!(!p.commit_term(5, 0).unwrap());
+    assert!(!p.commit_term(5, 0));
 }
 
 /// **Raft §5.4.2 / Figure 8** — a new leader must not commit
@@ -245,27 +257,26 @@ fn commit_term_refuses_when_already_advanced() {
 fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     let mut node = fresh_node(1, vec![1, 2, 3, 4, 5]);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
+    common::drive_tick(&mut node, t0);
 
     // Phase 1 — receive entries 1..=5 at term 1 from a leader
     // whose own commit watermark is still 0 (it crashed before
     // achieving majority on these entries).
-    let _ = node.step(
+    let _ = node.validate_append_entries_request(
         t0 + Duration::from_millis(10),
-        Event::AppendEntriesRequest {
-            from: 2,
-            term: 1,
-            prev_log_tx_id: 0,
-            prev_log_term: 0,
-            entries: LogEntryRange::new(1, 5, 1),
-            leader_commit: 0,
-        },
+        2,
+        1,
+        0,
+        0,
+        LogEntryRange::new(1, 5, 1),
+        0,
     );
-    let _ = node.step(
-        t0 + Duration::from_millis(11),
-        Event::LogAppendComplete { tx_id: 5 },
-    );
-    assert_eq!(node.commit_index(), 5, "local_log_index reflects entries");
+    // Cluster acks raft-log durability; ledger has not yet applied
+    // (leader_commit was 0). Models the §5.4.2 scenario faithfully:
+    // entries durably written but not locally committed.
+    node.advance_write_index(5);
+    node.advance_commit_index(0);
+    assert_eq!(node.write_index(), 5, "entries durable on disk");
     assert_eq!(
         node.cluster_commit_index(),
         0,
@@ -275,28 +286,14 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     // Phase 2 — silence past the election timeout, become
     // candidate at term 2, then collect votes from 2 peers (with
     // self-vote that is 3/5, a majority) and become leader.
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Candidate);
     let cand_term = node.current_term();
     assert_eq!(cand_term, 2);
 
     let now = t0 + Duration::from_secs(60) + Duration::from_millis(1);
-    let _ = node.step(
-        now,
-        Event::RequestVoteReply {
-            from: 3,
-            term: cand_term,
-            granted: true,
-        },
-    );
-    let _ = node.step(
-        now,
-        Event::RequestVoteReply {
-            from: 4,
-            term: cand_term,
-            granted: true,
-        },
-    );
+    common::deliver_vote_reply(&mut node, now, 3, cand_term, true);
+    common::deliver_vote_reply(&mut node, now, 4, cand_term, true);
     assert!(
         node.role().is_leader(),
         "should be leader at term {cand_term} after 3-of-5 votes"
@@ -307,24 +304,20 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     // bring their logs up to the prior-term high-water mark.
     // Without §5.4.2, this advances `cluster_commit` to 5
     // (committing term-1 entries by current-term replica count).
-    let _ = node.step(
+    node.replication().peer(3).unwrap().append_result(
         now,
-        Event::AppendEntriesReply {
-            from: 3,
+        AppendResult::Success {
             term: cand_term,
-            success: true,
-            last_tx_id: 5,
-            reject_reason: None,
+            last_write_id: 5,
+            last_commit_id: 5,
         },
     );
-    let _ = node.step(
+    node.replication().peer(4).unwrap().append_result(
         now,
-        Event::AppendEntriesReply {
-            from: 4,
+        AppendResult::Success {
             term: cand_term,
-            success: true,
-            last_tx_id: 5,
-            reject_reason: None,
+            last_write_id: 5,
+            last_commit_id: 5,
         },
     );
 
@@ -334,6 +327,240 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
         cand_term,
         node.cluster_commit_index(),
         node.commit_index(),
+    );
+}
+
+// ─── AE reply: split watermark (last_write_id vs last_commit_id) ───────────
+//
+// The leader's `on_append_entries_reply` reads two distinct
+// watermarks from each reply and uses them for orthogonal
+// decisions (ADR-0017 §"AE reply: write vs commit watermark"):
+//
+//   `last_write_id`  → `progress.next_index` (the replication
+//                      window — "what to ship next")
+//   `last_commit_id` → `progress.match_index` and `quorum`
+//                      (the durable end — "what's safe to
+//                      commit cluster-wide")
+//
+// These tests pin the split: the library must treat them as
+// independent inputs even though today's cluster bridge happens to
+// populate both from the same durability ack. They exercise the
+// library by feeding replies through the per-peer
+// `Replication::append_result` direct method.
+
+/// Drive a fresh node to leader of a 3-node cluster at term 1, with
+/// `local_log_index = last_written = entries` after construction.
+/// Returns `(node, term, t_after_setup)` so the caller can keep
+/// stepping with consistent timestamps.
+fn leader_with_entries(entries: TxId, t0: Instant) -> (RaftNode<MemPersistence>, u64, Instant) {
+    let mut node = fresh_node(1, vec![1, 2, 3]);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    let term = node.current_term();
+    // 3-node cluster majority = 2 (self-vote + 1 peer = win).
+    common::deliver_vote_reply(&mut node, t0 + Duration::from_secs(60), 2, term, true);
+    assert!(node.role().is_leader(), "test setup: did not become leader");
+
+    let after = t0 + Duration::from_secs(61);
+    if entries > 0 {
+        node.advance_write_index(entries);
+        node.advance_commit_index(entries);
+        common::drive_tick(&mut node, after);
+    }
+    (node, term, after + Duration::from_millis(1))
+}
+
+/// Bug repro: with the old single-watermark logic, `next_index`
+/// advanced from the durable end (`last_commit_id + 1`), causing the
+/// leader to re-ship entries the follower had already accepted but
+/// not yet fsync'd. After the fix `next_index` advances from
+/// `last_write_id + 1`.
+#[test]
+fn ae_reply_advances_next_index_from_write_id_not_commit_id() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(5, t0);
+
+    // Peer 2 has accepted all 5 entries into its log but only fsync'd
+    // 3 of them. Its reply carries the split watermark.
+    node.replication().peer(2).unwrap().append_result(
+        t_setup + Duration::from_millis(10),
+        AppendResult::Success {
+            term,
+            last_write_id: 5,
+            last_commit_id: 3,
+        },
+    );
+
+    // Advance past `next_heartbeat` (default 50ms) and pull the
+    // next AE for peer 2 via `Replication`. With the fix
+    // `next_index = 6`, so the next AE is a heartbeat. Under the
+    // bug `next_index = 4`, the leader would re-ship entries
+    // [4, 5].
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(t_setup + Duration::from_millis(100))
+        .expect("expected the leader to ship a fresh AE to peer 2 after next_heartbeat fires");
+    assert!(
+        req.entries.is_empty(),
+        "leader re-shipped entries the follower already accepted: \
+         next_index must advance from last_write_id (5)+1=6 \
+         (heartbeat), not last_commit_id (3)+1=4 (re-ship). \
+         Got entries={:?}",
+        req.entries
+    );
+}
+
+/// Quorum / `cluster_commit_index` must advance from `last_commit_id`
+/// only (the durable watermark), never from `last_write_id`. Two
+/// peers ack with `last_write_id = 5, last_commit_id = 3`; the
+/// leader's self-slot is at 5. The quorum's middle-of-three is 3,
+/// not 5 — committing entries 4 and 5 here would let a future
+/// leader overwrite them (the canonical write-not-yet-durable
+/// hazard).
+#[test]
+fn ae_reply_quorum_advances_only_to_commit_id() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(5, t0);
+
+    node.replication().peer(2).unwrap().append_result(
+        t_setup + Duration::from_millis(10),
+        AppendResult::Success {
+            term,
+            last_write_id: 5,
+            last_commit_id: 3,
+        },
+    );
+    node.replication().peer(3).unwrap().append_result(
+        t_setup + Duration::from_millis(11),
+        AppendResult::Success {
+            term,
+            last_write_id: 5,
+            last_commit_id: 3,
+        },
+    );
+
+    assert_eq!(
+        node.cluster_commit_index(),
+        3,
+        "cluster_commit must reflect the durable end (last_commit_id=3), \
+         not the accepted end (last_write_id=5). Both peers' write-but-not-durable \
+         entries 4-5 must NOT count toward quorum."
+    );
+}
+
+/// A second reply from the same peer with the same `last_write_id`
+/// but a higher `last_commit_id` advances `match_index` (durability
+/// progressing) without disturbing `next_index`. Pins the
+/// monotonicity contract for the watermark split.
+#[test]
+fn ae_reply_commit_lagging_write_does_not_regress_next_index() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(10, t0);
+
+    // First reply: peer 2 has accepted all 10 but only durable to 3.
+    node.replication().peer(2).unwrap().append_result(
+        t_setup + Duration::from_millis(10),
+        AppendResult::Success {
+            term,
+            last_write_id: 10,
+            last_commit_id: 3,
+        },
+    );
+    // Peer 3 too — gives us a 3/3 majority at commit=3 so we can
+    // observe further commit progress via `cluster_commit_index`.
+    node.replication().peer(3).unwrap().append_result(
+        t_setup + Duration::from_millis(11),
+        AppendResult::Success {
+            term,
+            last_write_id: 10,
+            last_commit_id: 3,
+        },
+    );
+    assert_eq!(node.cluster_commit_index(), 3);
+
+    // Second reply from peer 2: write watermark unchanged, commit
+    // moved up by one. `next_index` must not regress.
+    node.replication().peer(2).unwrap().append_result(
+        t_setup + Duration::from_millis(20),
+        AppendResult::Success {
+            term,
+            last_write_id: 10,
+            last_commit_id: 4,
+        },
+    );
+    node.replication().peer(3).unwrap().append_result(
+        t_setup + Duration::from_millis(21),
+        AppendResult::Success {
+            term,
+            last_write_id: 10,
+            last_commit_id: 4,
+        },
+    );
+    assert_eq!(
+        node.cluster_commit_index(),
+        4,
+        "match_index must advance with last_commit_id even when last_write_id is unchanged"
+    );
+
+    // And next_index is still at 11 — heartbeat to peer 2 on the
+    // next pull.
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(t_setup + Duration::from_millis(120));
+    if let Some(req) = req {
+        assert!(
+            req.entries.is_empty(),
+            "next_index regressed: leader re-shipped entries after the \
+             second reply. Got {:?}",
+            req.entries
+        );
+    }
+}
+
+/// Defensive clamp on a malformed reply where the peer claims to
+/// have committed more than it has written. Debug builds must
+/// panic (`debug_assert!`); release builds clamp commit down to
+/// write and proceed. Same posture as the truncation-below-cluster-
+/// commit guard elsewhere in this file.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "AE reply: last_commit_id="))]
+fn ae_reply_clamps_commit_above_write_defensively() {
+    let t0 = Instant::now();
+    let (mut node, term, t_setup) = leader_with_entries(10, t0);
+
+    // Malformed: peer claims commit=5 with write=3. Library either
+    // panics (debug) or clamps commit to 3 (release).
+    node.replication().peer(2).unwrap().append_result(
+        t_setup + Duration::from_millis(10),
+        AppendResult::Success {
+            term,
+            last_write_id: 3,
+            last_commit_id: 5,
+        },
+    );
+
+    // Release-build path: clamp brought commit down to 3, so peer
+    // 2's match_index = 3 and next_index = 4. Verify the latter
+    // by pulling the next AE via `Replication`.
+    let req = node
+        .replication()
+        .peer(2)
+        .unwrap()
+        .get_append_range(t_setup + Duration::from_millis(100))
+        .expect("expected an AE to peer 2");
+    assert_eq!(
+        req.prev_log_tx_id, 3,
+        "release-build clamp: next_index must be 4 (= clamped commit + 1), \
+         so prev_log_tx_id = 3. Got prev_log_tx_id = {}",
+        req.prev_log_tx_id
+    );
+    assert!(
+        !req.entries.is_empty(),
+        "expected the leader to ship entries [4, 10] starting at next_index=4"
     );
 }
 
@@ -361,4 +588,47 @@ fn three_node_failover_preserves_all_safety_properties() {
     sim.assert_election_safety();
     sim.assert_log_matching();
     sim.assert_state_machine_safety();
+}
+
+// ── §5.4.1 reads write_index, not commit_index (split-watermark refactor) ──
+
+/// A node with `local_write_index = 5` and `local_commit_index = 3`
+/// (durably written but not yet locally committed) must still deny a
+/// vote to a candidate claiming `last_tx_id = 4` at the same term.
+/// §5.4.1's up-to-date check reads the write extent — using the
+/// commit extent would let a candidate with a strictly older durable
+/// log win a vote it shouldn't, breaking Election Safety.
+///
+/// This test is the highest-value regression for the index split:
+/// pre-refactor `local_log_index` conflated write and commit, so the
+/// scenario was inexpressible.
+#[test]
+fn vote_denial_uses_write_index_not_commit_index() {
+    let persistence = MemPersistence::with_state(
+        vec![raft::TermRecord {
+            term: 5,
+            start_tx_id: 1,
+        }],
+        5,
+        0,
+    );
+    let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
+    // Five entries durably written, only three locally committed.
+    node.advance_write_index(5);
+    node.advance_commit_index(3);
+
+    let reply = node.election().handle_request_vote(
+        Instant::now(),
+        RequestVoteRequest {
+            from: 2,
+            term: 6,
+            last_tx_id: 4, // strictly less than our write extent
+            last_term: 5,  // same term as ours
+        },
+    );
+    assert!(
+        !reply.granted,
+        "vote must use write_index (5), not commit_index (3): {:?}",
+        reply
+    );
 }

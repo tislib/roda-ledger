@@ -3,7 +3,7 @@ mod tests {
     use ::proto::ledger::{
         Deposit, SubmitAndWaitRequest, SubmitBatchAndWaitRequest, Transfer, WaitLevel, Withdrawal,
     };
-    use cluster::{ClusterCommitIndex, Role, RoleFlag, Server, Term};
+    use cluster::{ClusterMirror, Role, Server, Term};
     use ledger::ledger::{Ledger, LedgerConfig};
     use ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
     use std::net::SocketAddr;
@@ -225,14 +225,16 @@ mod tests {
 
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
-        let cci = ClusterCommitIndex::from_ledger(&ledger);
+        let mirror = ClusterMirror::new();
+        mirror.set_role_for_standalone(Role::Leader);
+        // Bare server has no cluster_commit_index advancement; tests using
+        // ClusterCommit wait levels won't be exercised against this setup.
         tokio::spawn(async move {
             let server = Server::new(
                 std::sync::Arc::new(cluster::LedgerSlot::new(server_ledger)),
                 addr,
-                std::sync::Arc::new(RoleFlag::new(Role::Leader)),
+                mirror,
                 term,
-                cci,
                 std::sync::Arc::new(tokio::sync::Notify::new()),
             );
             server.run().await.unwrap();

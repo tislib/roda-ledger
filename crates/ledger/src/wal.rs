@@ -109,7 +109,7 @@ impl WalRunner {
 
             let mut entries_ingested: u32 = 0;
             let mut k = available;
-            while k > 0 || self.pending_records > 0 {
+            while ctx.is_running() && (k > 0 || self.pending_records > 0) {
                 if let Some(input) = inbound.pop() {
                     match input {
                         WalInput::Single(entry) => {

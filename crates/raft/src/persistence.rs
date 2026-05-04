@@ -6,12 +6,18 @@
 //!
 //! ## Contract
 //!
-//! When a write method returns `Ok(_)`, the state change is durable
-//! on the underlying medium. `commit_term`, `observe_term`,
+//! When a write method returns, the state change is durable on the
+//! underlying medium. `commit_term`, `observe_term`,
 //! `truncate_term_after`, `vote`, `observe_vote_term` all fsync (or
 //! equivalent) before returning. The library relies on this to
 //! maintain the invariant "raft's in-memory decisions reflect only
 //! durably-persisted state."
+//!
+//! Implementations are responsible for handling their own I/O
+//! failures. The library treats every method as infallible — there is
+//! no error return; if the implementation cannot durably persist a
+//! change, it must panic (and rely on the supervisor to restart the
+//! process), not return a partial-write signal upward.
 //!
 //! Read methods are cheap, side-effect-free queries. They are called
 //! per-RPC (not per-instruction); no caching is required at the
@@ -20,9 +26,8 @@
 //! ## Atomicity boundary
 //!
 //! Writes are atomic at the level of a single method call. A crash
-//! during `commit_term` either leaves the term log unchanged (call
-//! returned `Err`) or contains the new record (call returned
-//! `Ok(true)`).
+//! during `commit_term` either leaves the term log unchanged or
+//! contains the new record.
 //!
 //! `truncate_term_after` rewrites the term log file. Implementations
 //! MUST use rename-based replacement (write tmp file, fsync tmp,
@@ -38,8 +43,6 @@
 //! via `observe_vote_term`. The library calls both `observe_term`
 //! and `observe_vote_term` whenever it observes a higher term via
 //! inbound RPC, so an implementation that only updates one is broken.
-
-use std::io;
 
 use crate::types::{NodeId, Term as TermNum, TxId};
 
@@ -76,22 +79,21 @@ pub trait Persistence {
     /// higher one), and Raft does not require term-log records to
     /// be contiguous.
     ///
-    /// - `Ok(true)`: write succeeded, `current_term` is now `expected`.
-    /// - `Ok(false)`: `current_term >= expected` — a concurrent
-    ///   observer got there first; caller should treat the election
-    ///   as lost.
-    /// - `Err(_)`: I/O failure.
-    fn commit_term(&mut self, expected: TermNum, start_tx_id: TxId) -> io::Result<bool>;
+    /// - `true`: write succeeded, `current_term` is now `expected`.
+    /// - `false`: `current_term >= expected` — a concurrent observer
+    ///   got there first; caller should treat the election as lost.
+    fn commit_term(&mut self, expected: TermNum, start_tx_id: TxId) -> bool;
 
     /// Follower path: record a strictly-higher term observed via
-    /// inbound RPC. Idempotent on equal term, rejects strict
-    /// regressions with `InvalidInput`.
-    fn observe_term(&mut self, term: TermNum, start_tx_id: TxId) -> io::Result<()>;
+    /// inbound RPC. Idempotent on equal term. Implementations must
+    /// reject strict regressions internally (panic / log) — the
+    /// library never observes a regression here.
+    fn observe_term(&mut self, term: TermNum, start_tx_id: TxId);
 
     /// Drop term records whose `start_tx_id > tx_id`. Atomic via
     /// rename-based file replacement. Pairs with the log-suffix
     /// truncation Raft §5.3 demands when a follower's log diverges.
-    fn truncate_term_after(&mut self, tx_id: TxId) -> io::Result<()>;
+    fn truncate_term_after(&mut self, tx_id: TxId);
 
     // ── vote log ────────────────────────────────────────────────────────
 
@@ -109,16 +111,18 @@ pub trait Persistence {
 
     /// Raft §5.4.1: durably grant a vote for `candidate_id` in `term`.
     ///
-    /// - `Ok(true)`: granted (or idempotent re-grant of a same-candidate
+    /// - `true`: granted (or idempotent re-grant of a same-candidate
     ///   vote in the same term).
-    /// - `Ok(false)`: refused (already voted for someone else this
-    ///   term, or `term < vote-log term`).
-    /// - `Err(InvalidInput)`: `candidate_id == 0`.
-    /// - `Err(_)`: I/O failure.
-    fn vote(&mut self, term: TermNum, candidate_id: NodeId) -> io::Result<bool>;
+    /// - `false`: refused (already voted for someone else this term,
+    ///   or `term < vote-log term`).
+    ///
+    /// Implementations MUST panic on `candidate_id == 0` and on I/O
+    /// failure.
+    fn vote(&mut self, term: TermNum, candidate_id: NodeId) -> bool;
 
     /// Record a strictly-higher term observed via inbound RPC,
-    /// clearing the vote slot. Idempotent on equal term, rejects
-    /// strict regressions with `InvalidInput`.
-    fn observe_vote_term(&mut self, term: TermNum) -> io::Result<()>;
+    /// clearing the vote slot. Idempotent on equal term.
+    /// Implementations must reject strict regressions internally
+    /// (panic / log) — the library never observes a regression here.
+    fn observe_vote_term(&mut self, term: TermNum);
 }

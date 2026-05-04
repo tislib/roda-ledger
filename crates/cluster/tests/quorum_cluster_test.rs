@@ -11,7 +11,7 @@ const AMOUNT: u64 = 100;
 /// Leader counts itself toward quorum (slot 0 fed by `on_commit` hook).
 /// In a single-node cluster, `Quorum::get()` advances purely from the
 /// leader's own commits — proving the on-commit hook is wired up.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn leader_counts_itself_in_quorum() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -24,18 +24,18 @@ async fn leader_counts_itself_in_quorum() {
         .expect("ClusterCommit");
     assert_eq!(r.fail_reason, 0);
 
-    // Quorum::get() must be >= the committed tx_id.
-    let quorum = ctl
+    // ClusterMirror::cluster_commit_index() must be >= the committed tx_id.
+    let mirror = ctl
         .handles(0)
         .unwrap()
-        .quorum()
-        .expect("Quorum on single-node cluster");
-    assert!(quorum.get() >= r.tx_id);
+        .mirror()
+        .expect("ClusterMirror on single-node cluster");
+    assert!(mirror.cluster_commit_index() >= r.tx_id);
 }
 
 /// `cluster_commit_index` (mirrored from Quorum) advances on the leader
 /// as peer acks roll in. Verified via `get_pipeline_index`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_commit_index_advances_under_replication() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -60,7 +60,7 @@ async fn cluster_commit_index_advances_under_replication() {
 /// `Quorum::get()` is monotonically non-decreasing under restart of any
 /// follower. After we restart a follower (its slot atomic resets to 0),
 /// the cached majority does NOT regress.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "flaky"]
 async fn quorum_majority_never_regresses_under_follower_restart() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
@@ -77,36 +77,36 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
             .await
             .expect("deposit");
     }
-    let q = ctl.handles(leader_idx).unwrap().quorum().unwrap();
-    let pre = q.get();
+    let mirror = ctl.handles(leader_idx).unwrap().mirror().unwrap();
+    let pre = mirror.cluster_commit_index();
     assert!(pre >= 10);
 
     let follower_idx = ctl.first_follower_index().await.expect("follower");
     ctl.stop_node(follower_idx).await.expect("stop");
     ctl.start_node(follower_idx).await.expect("restart");
     // Wait for the restarted follower to rejoin replication (its slot
-    // in `Quorum` repopulates from the leader's heartbeats).
+    // in raft's quorum tracker repopulates from the leader's heartbeats).
     ctl.wait_for(
         Duration::from_secs(5),
-        "follower's quorum slot repopulates",
+        "follower's cluster commit index repopulates",
         || {
-            let q = q.clone();
+            let mirror = mirror.clone();
             let target = pre;
-            async move { q.get() >= target }
+            async move { mirror.cluster_commit_index() >= target }
         },
     )
     .await
     .expect("follower rejoined");
 
-    // Q::get() must not regress.
-    let post = q.get();
-    assert!(post >= pre, "Quorum::get() regressed: {} -> {}", pre, post);
+    // cluster_commit_index must not regress.
+    let post = mirror.cluster_commit_index();
+    assert!(post >= pre, "cluster_commit_index regressed: {} -> {}", pre, post);
 }
 
 /// After a Leader transition, the new leader's own slot in `Quorum` is
 /// repopulated from its `on_commit` hook within one tick — its first
 /// `submit_and_wait(ClusterCommit)` succeeds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn new_leader_self_slot_repopulated_after_transition() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await

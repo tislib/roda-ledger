@@ -2,10 +2,17 @@
 //!
 //! Owns one `PeerProgress` per follower — `next_index`,
 //! `match_index`, `in_flight` window, and `next_heartbeat` deadline.
-//! The state machine consults it on every `Event::AppendEntriesReply`
-//! to advance/regress `next_index` (Raft §5.3 `next_index -= 1` on
-//! `LogMismatch`) and on every `Tick` to decide which peers need a
-//! fresh AppendEntries.
+//! The state machine consults it on every cluster-driver call into
+//! `Replication::peer(id).append_result(...)` to advance/regress
+//! `next_index` (Raft §5.3 `next_index -= 1` on `LogMismatch`) and on
+//! every `Tick` to decide which peers need a fresh AppendEntries.
+//!
+//! The reply's two watermarks (`last_write_id`, `last_commit_id`) drive
+//! `next_index` and `match_index` independently — see ADR-0017 §"AE
+//! reply: write vs commit watermark". The leader's own write-extent
+//! watermark lives on `RaftNode.local_write_index` (advanced via the
+//! `advance(write, commit)` driver method); `leader_send_to` reads it
+//! directly to bound replication.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -13,10 +20,12 @@ use std::time::{Duration, Instant};
 use crate::types::{NodeId, TxId};
 
 /// One in-flight AppendEntries window. The state machine only
-/// matches on `expires_at` (for timeouts) and `last_tx_id_in_batch`
-/// (for advancing `match_index` on success); no rpc-id is needed
-/// because the library serialises one in-flight RPC per peer at a
-/// time.
+/// matches on `expires_at` (for timeouts); the field
+/// `last_tx_id_in_batch` is kept for diagnostics/symmetry but is no
+/// longer consulted to advance `match_index` — replies carry a
+/// `last_commit_id` of their own (the peer's durable end), which is
+/// what the leader uses. No rpc-id is needed because the library
+/// serialises one in-flight RPC per peer at a time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InFlightAppend {
     pub last_tx_id_in_batch: TxId,
@@ -27,9 +36,14 @@ pub struct InFlightAppend {
 pub struct PeerProgress {
     /// Next tx_id to ship to this peer. On `LogMismatch` reject we
     /// decrement (clamped at 1) until we find the agreement point.
-    /// On success we advance to `last_tx_id_in_batch + 1`.
+    /// On success we advance to the reply's `last_write_id + 1` (the
+    /// peer's accepted/written end — "what the peer already has, so
+    /// don't re-ship it"). See ADR-0017 §"AE reply: write vs commit
+    /// watermark" for why this is the write-id, not the commit-id.
     pub next_index: TxId,
-    /// Highest tx_id known durably replicated on this peer.
+    /// Highest tx_id known durably replicated on this peer. Advanced
+    /// from each reply's `last_commit_id` (the peer's durable end).
+    /// Drives the cluster-wide quorum.
     pub match_index: TxId,
     pub in_flight: Option<InFlightAppend>,
     /// Deadline at which this peer needs a fresh AppendEntries (real
@@ -65,8 +79,12 @@ pub struct LeaderState {
 
 impl LeaderState {
     /// Construct from the leader's view at bring-up. `last_local_tx`
-    /// is the leader's own commit progress; new peers start at
-    /// `next_index = last_local_tx + 1`.
+    /// is the leader's own write extent; new peers start at
+    /// `next_index = last_local_tx + 1` so the leader can immediately
+    /// ship already-on-disk entries from the first
+    /// `Action::SendAppendEntries`. The replication-window upper
+    /// bound is the node-level `local_write_index`, read directly in
+    /// `leader_send_to` (no longer mirrored on `LeaderState`).
     pub fn new(
         peer_ids: &[NodeId],
         last_local_tx: TxId,

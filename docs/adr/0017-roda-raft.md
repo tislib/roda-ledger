@@ -2,54 +2,19 @@
 
 ## Goals
 
-Extract a pure, deterministic Raft state machine as a separate crate inside the roda-ledger workspace. The library is specialized to roda-ledger (not generalized), independent of cluster/ledger code, and testable in isolation with a deterministic simulator. The current `cluster::raft` module is replaced; existing bugs (term-bump-before-win race, missing §5.3 truncation logic, ghost-term bumping on boot) are addressed by the new design.
+Extract a pure, deterministic Raft state machine as a separate crate inside the roda-ledger workspace. The library is specialised to roda-ledger (not generalised), independent of cluster/ledger code, and testable in isolation with a deterministic simulator. The previous `cluster::raft` module is replaced; specific known bugs (term-bump-before-win race, ghost-term bumping on boot, missing §5.3 truncation logic, term log drifting from the entry log) cannot recur under the new design.
 
 `RaftNode` is a **single-node decision system**. It models one node's view of Raft: takes events in, returns actions out, exposes the minimum read surface the driver needs to gate writes and stamp wire responses. Anything that's not a decision input or a decision output does not belong in the library.
 
+The exact Rust types — function signatures, enum variants, field names — live in [crates/raft/src](../../crates/raft/src/). This ADR describes *how the system should work*, not the current shape of the source.
+
 ## Architectural Boundary
 
-**Pure state machine.** No internal threads, no tokio, no tonic, no I/O — including no disk writes, no `data_dir`, no `Storage` handle. The library transitions in-memory state and returns actions describing what the driver must do. The driver (cluster crate) executes actions, performs the durable writes, and feeds results back as new events.
+**Pure state machine.** No internal threads, no tokio, no tonic, no I/O. The library transitions in-memory state and returns actions describing what the driver must do. The driver (cluster crate) executes actions and feeds results back as new events.
 
-```rust
-impl RaftNode {
-    // Construction. The driver hydrates `(current_term, voted_for,
-    // term_records, local_log_index)` off disk and hands them in.
-    // Seed is for randomized election timeouts; tests use fixed seeds
-    // for reproducibility, production seeds from time.
-    pub fn new(
-        node_id: NodeId,
-        peers: Vec<NodeId>,
-        seed: u64,
-        cfg: RaftConfig,
-        initial: RaftInitialState,
-    ) -> Self;
+The library exposes one entry point — a synchronous `step(now, event) -> Vec<Action>` — plus a small read-only query surface (role, current term, the two commit indexes, voted-for). Time enters the library only through the `now` parameter; the library never reads a clock.
 
-    // Primary state transition entry point. `now` is the only way
-    // wall-clock time enters the library — `Event::Tick` is the
-    // explicit "wake and re-check" signal but every event rides this
-    // `now`.
-    pub fn step(&mut self, now: Instant, event: Event) -> Vec<Action>;
-
-    // Read-only queries — &self, no side effects, cheap.
-    pub fn role(&self) -> Role;
-    pub fn current_term(&self) -> u64;
-    pub fn commit_index(&self) -> u64;
-    pub fn cluster_commit_index(&self) -> u64;
-    pub fn voted_for(&self) -> Option<NodeId>;
-    // Trails `current_term` between an `Action::Persist*` and its
-    // matching `Event::*Persisted` ack — observability only.
-    pub fn durable_term(&self) -> u64;
-    pub fn durable_voted_for(&self) -> Option<NodeId>;
-}
-```
-
-That is the entire public surface.
-
-**Crate constraints (enforced via `Cargo.toml`):**
-
-- `raft` depends only on minimal utility crates (`rand`, `spdlog-rs`, `thiserror`).
-- `raft` does NOT depend on `storage`, `tokio`, `tonic`, `proto`, `ledger`, or `cluster`. The library performs zero I/O; durable persistence is the driver's responsibility.
-- If any of these creep in, the boundary is broken.
+**Crate constraints.** `raft` depends only on minimal utility crates (RNG, logging, error). It does NOT depend on `storage`, `tokio`, `tonic`, `proto`, `ledger`, or `cluster`. If any of these creep in, the boundary is broken.
 
 ## Log Ownership Model: Option 3
 
@@ -57,244 +22,114 @@ That is the entire public surface.
 
 **Asymmetric write paths:**
 
-- **Leader:** Ledger assigns tx_id, writes to its store, then notifies raft via `Event::LocalCommitAdvanced`. Raft replicates via `Action::SendAppendEntries`.
-- **Follower:** Raft receives AppendEntries, validates §5.3 prev_log_term match, directs the storage layer via `Action::AppendLog` and `Action::TruncateLog`. Follower's ledger is passive — apply only.
+- **Leader.** Ledger assigns tx_id and writes to its store, then notifies raft via the `advance(local_write_index, local_commit_index)` direct method. Raft replicates by emitting `SendAppendEntries` actions.
+- **Follower.** Raft receives AppendEntries via the direct-method `validate_append_entries_request`, which performs the §5.1/§5.3/§5.4 protocol checks, term-log mirror updates, and watermark clamping synchronously, then returns an `AppendEntriesDecision` describing what the cluster driver must do (truncate WAL after a §5.3 mismatch, append a same-term range, or nothing for a heartbeat / reject). The driver applies the decision to its ledger, awaits durability, and calls `advance(write, commit)` — that call drains the deferred `leader_commit` into `cluster_commit_index`. The wire reply is built from the post-advance `current_term()` / `commit_index()` / `write_index()` getters; raft itself emits no actions for the follower path.
 
-**Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal (`Action::AdvanceClusterCommit { tx_id }`), not on storage durability. This eliminates the rollback-after-truncation problem.
+**Apply-on-commit, not apply-on-durable.** The ledger's apply pipeline is gated on raft's commit signal — drivers poll `cluster_commit_index()` after every `step` / `advance` (there is no dedicated action; see §"Driver call pattern"), not on raw storage durability. This eliminates the rollback-after-truncation problem.
 
-## Two Commit Indexes
+## One Range Per AppendEntries
+
+Raft's §5.3 prev_log_term check is a single (tx_id, term) pair. The library carries one *same-term contiguous range* per AppendEntries — a `(start_tx_id, count, term)` triple — never a heterogeneous batch. A range with `count == 0` is a heartbeat: no entries to append, just §5.3 / `leader_commit` propagation.
+
+When a leader's log spans multiple terms, it ships one AE per same-term chunk, in order, walking the peer's `next_index` forward across term boundaries.
+
+This shape lets the follower update its durable term-log with one `observe_term` call per AE, lets one `(prev_log_tx_id, prev_log_term)` pair carry the full §5.3 contract, and keeps payload bytes out of the library entirely (the driver moves bytes between storage and the wire on its own, indexed by tx_id).
+
+## Three Indexes
 
 The library distinguishes them explicitly:
 
-- **`commit_index`** — local. The largest tx_id this node has durably committed in its own log. On the leader, advanced when the ledger's on-commit hook fires (delivered as `Event::LocalCommitAdvanced`). On followers, advanced when an AppendEntries write durably lands.
-- **`cluster_commit_index`** — cluster-wide. The largest tx_id known to be quorum-committed across the cluster. On the leader, recomputed from per-peer `match_index` whenever an AppendEntries reply arrives. On a follower, the leader's most-recent `leader_commit` clamped to local `commit_index`.
+- **`local_write_index`** (local). The largest tx_id durably written to this node's raft log. Advanced by the driver via `advance(write, commit)` (the `write` argument). Bounds the AE replication window in `leader_send_to`, gates §5.4.1's up-to-date check (the candidate's last-tx claim is compared against this watermark, not the commit watermark — written-but-uncommitted entries still count for vote-denial), and feeds the §5.3 prev_log coverage check.
+- **`local_commit_index`** (local). The largest tx_id this node has durably committed in its own ledger. Advanced by the driver via `advance(write, commit)` (the `commit` argument). On the leader, feeds the quorum self-slot — only locally-committed entries count toward `cluster_commit_index`. On followers, set after the ledger applies entries up to whatever the leader's `leader_commit` says.
+- **`cluster_commit_index`** (cluster-wide). The largest tx_id known to be quorum-committed across the cluster. On the leader, recomputed from per-peer `match_index` whenever an AppendEntries reply arrives. On a follower, the leader's `leader_commit` clamped to local `local_commit_index`. Updated **in place** when the conditions are met — the driver polls the getter to detect changes (see §"Driver call pattern").
 
-These are different facts. The leader's `commit_index` can be ahead of `cluster_commit_index` (it's persisted locally but not yet quorum-acked). A follower's `commit_index` can be ahead of its `cluster_commit_index` (it's persisted entries the leader hasn't yet told it are committed cluster-wide).
+Invariant: `local_write_index >= local_commit_index >= 0`. Debug builds panic via `debug_assert!` on violation; release builds clamp `commit` to `write` defensively (same posture as the AE-reply guard at §"AE reply: write vs commit watermark").
 
-The cluster's writers use `cluster_commit_index` to gate things like `wait_for_transaction_level`. The local apply pipeline uses `cluster_commit_index` (apply-on-commit) — never `commit_index`.
+These are different facts. The leader's `local_commit_index` can be ahead of `cluster_commit_index` (committed locally but not yet quorum-acked). A follower's `local_commit_index` can be ahead of its `cluster_commit_index` (entries applied to the local ledger but the leader's last `leader_commit` still trails). Both can be ahead of one another in the brief window between raft-log fsync and ledger apply on a follower.
+
+Cluster-level reads (e.g. `wait_for_transaction_level`) and the apply pipeline use `cluster_commit_index`. `local_commit_index` is for raft's own bookkeeping and per-node introspection. `local_write_index` is for the §5.4.1 / §5.3 / replication-window decisions.
+
+### AE reply: write vs commit watermark
+
+`AppendEntriesResponse` carries **two** watermarks, each gating a different leader decision:
+
+- **`last_commit_id`** — the highest tx_id the follower has *durably committed* after this RPC. The leader uses it to advance the per-peer `match_index` and the cluster-wide quorum (`cluster_commit_index`). Only durably-replicated entries count toward quorum, and the §5.4 Figure-8 guard reads this watermark.
+- **`last_write_id`** — the highest tx_id the follower has *accepted/written* into its log. The leader uses it solely to advance `next_index` (the replication window — "what to ship next"). The point of `next_index` is to avoid re-shipping entries the follower already has; using the durable watermark for that conflates "what's safe to commit" with "what's already on the wire to this peer", which causes the leader to re-ship entries the follower has accepted but not yet fsync'd.
+
+Invariant: `last_write_id >= last_commit_id`. A peer that violates it is treated as misbehaving — debug builds panic via `debug_assert!`, release builds clamp `last_commit_id` to `last_write_id` defensively (same posture as the truncation-below-cluster-commit guard).
+
+The library treats the two watermarks as independent inputs even when the cluster driver currently populates them from the same durability ack (the follower-side handler waits for fsync before replying). This makes future split-ack architectures — a follower that emits an early write-only ack ahead of fsync — safe to introduce without any further raft-library changes.
 
 ## Required Invariants
 
 The design must enforce these under all schedules:
 
-1. **Election Safety.** At most one leader per term. The candidate path holds the node's serializing lock across `[read current_term → run RPCs → commit term on Won]`, and the term commit atomically checks `current_term + 1 == new_term`.
+1. **Election Safety (§5.2).** At most one leader per term. The candidate's self-vote is durably persisted before any RequestVote goes out; the term log is committed atomically on election win, not on candidacy entry. A `commit_term(expected_new, start_tx_id)` returning `Ok(false)` means a concurrent observer already advanced past `expected_new` — the candidate must step down.
 
-2. **Log Matching (§5.3).** AppendEntries rejection due to prev_log mismatch triggers `next_index[peer] -= 1` (or jump-back-by-conflicting-term optimization), not exponential backoff. Followers truncate divergent suffixes when prev_log_term mismatches.
+2. **Log Matching (§5.3).** AppendEntries rejection due to prev_log mismatch triggers `next_index[peer] -= 1` (clamped at 1), not exponential backoff. Followers truncate divergent suffixes when prev_log_term mismatches, and the term log is truncated synchronously alongside the entry log so `term_at_tx` cannot return phantom records past the new high-water mark.
 
-3. **Term log truncation.** When log entries past tx_id N are truncated, the term log truncates records with `start_tx_id > N`. `Term::truncate_after(tx_id)` is part of the term-log API.
+3. **Leader Completeness / Figure 8 (§5.4.2).** A leader does not commit entries from prior terms by counting replicas. Once an entry from the leader's *current* term has been committed by replica count, prior entries follow via the Log Matching property. The library tracks the leader's current-term first-entry watermark and gates `cluster_commit_index` advancement on it. Single-node clusters bypass the gate (no peer can disagree, so no future leader can overwrite).
 
-4. **No boot-time term bumping.** Nodes coming back up sit at their persisted term; only candidates running an actual election bump term.
+4. **No boot-time term bumping.** A node coming back up sits at its persisted term; only candidates running an actual election bump term. The constructor never advances state.
 
-5. **Atomic term commit on election win.** `Term::commit_term(expected_new: u64, start_tx_id: u64)` asserts `current + 1 == expected_new` and rejects if violated. Term log is NOT written until election victory.
+5. **Durability before externalisation.** Two cases: (a) Term-log and vote-log writes go through a synchronous `Persistence` trait — when the trait returns `Ok`, the state is durable, and only then does the library externalise its consequences (replies, role transitions). (b) The follower's `AppendEntries success` reply and the `cluster_commit` advance derived from `leader_commit` are gated by the cluster driver's WAL durability ack: validate stores the observed `leader_commit` in `FollowerState::pending_leader_commit`; the next `advance(write, commit)` (which the driver only issues after fsync) drains that value into `cluster_commit_index` (clamped to the freshly-updated `local_commit_index`). The success reply itself is constructed from the post-advance getters, so the leader cannot count an entry as durably replicated until the peer has actually written it. The reply carries `last_commit_id` (durable) and `last_write_id` (accepted) separately — see §"AE reply: write vs commit watermark" — so that future split-ack architectures can decouple the two without breaking the durability-gates-quorum invariant.
+
+6. **Fatal-on-unrecoverable-persistence-failure.** If the persistence trait returns `Err` from a write that, if the library proceeded, would diverge in-memory state from on-disk state (term-log truncate, term observation), the library emits a fatal-error action, freezes the node, and refuses further forward progress. The driver must shut the node down on receipt — partial state recovery from this point is not safe. (Errors that leave the on-disk state untouched, like a refused vote or a refused `commit_term`, are recoverable and the library reacts in-band.)
+
+7. **Term log allows non-contiguous forward jumps.** The term log can validly skip terms — a node that observed a higher term via RPC (vote-log advance) but did not receive entries from that term will not have a term-log record for it, and a later election win at an even higher term commits a non-adjacent record. `commit_term` is gated on `current < expected`, not `current + 1 == expected`. Ranged term-log records mean each record covers the inclusive interval starting at `start_tx_id` until the next record (or open-ended if no next record exists).
+
+8. **Quorum monotonicity.** Per-peer `match_index` is monotonically non-decreasing on success. `cluster_commit_index` itself is monotonic — out-of-order, late, or duplicated peer acks cannot lower it. A defensive `regress` lowers a peer's slot when a partially-recovered peer resurfaces with a shorter durable log, but the watermark holds.
+
+9. **Indexes are not persisted by the raft library.** Only the term log and vote log are durable through the `Persistence` trait. `local_write_index`, `local_commit_index`, and `cluster_commit_index` are in-memory; the driver hydrates them on boot via `advance(write, commit)` reading from whatever durable state it owns (today the ledger's commit watermark, which collapses write and commit). Implicit recovery invariant: `ledger.last_commit_id <= raft_wal.last_tx_id` post-recovery, otherwise the leader's quorum self-slot bumps past entries that aren't on disk. This is a hidden coupling between the cluster-side ledger and the raft library's correctness — write-ahead-of-commit divergence is collapsed back to the surfaced watermark on restart, by design.
 
 ## What raft Owns
 
-- **In-memory model** of the term log (`Term`) and vote state (`Vote`). Pure data structures — no file handles, no storage crate, no I/O. Mutators update memory; the driver mirrors the change to disk via the action stream.
-- Role state and transitions (`Initializing`, `Candidate`, `Leader`, `Follower`)
-- Election timer state (deadlines as data, not as `tokio::sleep`)
-- Per-peer replication state (`next_index`, `match_index`, in-flight tracking) — internal, not exposed
-- Quorum / `cluster_commit_index` calculation
-- All policy decisions: when to truncate, when to apply, when to send AppendEntries, when to grant a vote
+- Role state and transitions (Initializing, Candidate, Leader, Follower, plus a frozen-on-fatal terminal).
+- Election-timer state — deadlines as data, not as `tokio::sleep` instances.
+- Per-peer replication state (next_index, match_index, in-flight tracking) — internal, not exposed.
+- Quorum / cluster_commit_index calculation.
+- The Figure 8 watermark for the leader's current term.
+- The deferred follower-side `leader_commit` slot (one outstanding value at a time, drained into `cluster_commit_index` on the next `advance(write, commit)`).
+- All policy decisions: when to truncate, when to apply, when to send AppendEntries, when to grant a vote, when to step down, when to declare the node fatally failed.
 
 ## What raft Does NOT Own
 
-- **Durable persistence of the term/vote logs.** The driver instantiates whatever storage layer it likes (`storage::TermStorage`, `storage::VoteStorage`, or otherwise), routes `Action::PersistTerm` / `Action::PersistVote` into it, and acks back via `Event::TermPersisted` / `Event::VotePersisted`.
-- Log bytes and log durability mechanics for entry data (the storage layer is external; raft requests operations via `Action`).
-- Tx_id assignment (ledger does this on the leader).
-- Application of committed entries (ledger's pipeline does this; raft just signals "tx_id N is committed").
-- Network transport (driver translates `Action::SendAppendEntries` to a tonic RPC).
-- Tokio/async (driver wraps the library in async).
-- Wall-clock time (raft observes time only through `step(now, _)`).
-- Filesystem paths and `data_dir` configuration. The library does not know — and refuses to know — where the disk lives.
+- **Durable persistence of the term and vote logs.** A `Persistence` trait describes the durable contract; the driver instantiates whatever storage layer it likes (production: disk-backed term/vote files; tests: an in-memory fake) and hands the implementation to `RaftNode` at construction. Trait writes are synchronous and atomic per call.
+- The entry-log payload bytes and entry-log durability mechanics. The library asks the driver to append or truncate via actions; the driver acks via events.
+- Tx_id assignment (the ledger does this on the leader).
+- Application of committed entries (the ledger's pipeline does this; raft just signals "tx_id N is committed cluster-wide").
+- Network transport (the driver translates `SendAppendEntries` to a wire RPC).
+- Tokio / async (the driver wraps the library in async).
+- Wall-clock time (the library observes time only through the `now` parameter to `step`).
+- Filesystem paths and `data_dir` configuration.
 
-## Public API
+## Persistence trait contract
 
-### Event/Action — state transitions
+A single trait covers durable term-log and vote-log access. Reads are cheap, side-effect-free queries. Writes (record election win, record observed higher term, truncate term log, grant vote, observe higher vote-log term) are synchronous — when the call returns `Ok(_)`, the state is durable on the underlying medium. The library does not maintain a "pending" mirror.
 
-Payload bytes do **not** flow through the library. `LogEntryMeta` carries only `(tx_id, term)` — enough for §5.3 prev-log-term matching and `match_index`/`next_index` arithmetic. The driver moves payload bytes between storage and the wire on its own, indexed by `tx_id`.
+The trait's `truncate_term_after` must use rename-based atomic replacement so a crash mid-truncate leaves the original file intact. Other writes are atomic at single-call granularity.
 
-```rust
-pub struct LogEntryMeta { pub tx_id: u64, pub term: u64 }
+The vote log carries its own per-term `voted_for` slot, kept in sync with the term log via an `observe_vote_term` call. The library calls both `observe_term` and `observe_vote_term` whenever it observes a higher term via inbound RPC. The vote log can validly race ahead of the term log when a candidate has self-voted at term N but not yet won; the read-side `current_term()` returns `max(term-log term, vote-log term)`.
 
-pub enum Event {
-    // The driver fires Tick whenever an Action::SetWakeup deadline arrives.
-    // Wall-clock time enters via the `now` parameter to step(), not via
-    // a field on the variant itself.
-    Tick,
+## Read-only query API
 
-    // Inbound RPCs
-    AppendEntriesRequest {
-        from: NodeId,
-        term: u64,
-        prev_log_tx_id: u64,
-        prev_log_term: u64,
-        entries: Vec<LogEntryMeta>,
-        leader_commit: u64,
-    },
-    AppendEntriesReply {
-        from: NodeId,
-        term: u64,
-        success: bool,
-        last_tx_id: u64,
-        reject_reason: Option<RejectReason>,
-    },
-    RequestVoteRequest {
-        from: NodeId,
-        term: u64,
-        last_tx_id: u64,
-        last_term: u64,
-    },
-    RequestVoteReply {
-        from: NodeId,
-        term: u64,
-        granted: bool,
-    },
+The driver consumes a small, fixed set of queries: current role, current term, local write index, local commit index, cluster commit index, voted-for. The role is enough for gRPC handlers to gate writes (Leader accepts, others reject) and to stamp wire responses; the cluster commit index is what `wait_for_transaction_level` and similar consumers query. The driver polls `cluster_commit_index()` after every `step` / `advance` to detect cluster-commit advances — there is no dedicated action for that signal.
 
-    // Leader-only: ledger reports it durably committed an entry locally.
-    // Bridge from the ledger's on-commit hook into raft. Advances the
-    // leader's own slot in match_index, feeding into cluster_commit_index.
-    LocalCommitAdvanced { tx_id: u64 },
+Queries are cheap and side-effect-free. No peer state, election deadlines, or per-peer introspection are exposed in v1 — they are observability concerns, not decision inputs. Add when there is a concrete consumer.
 
-    // Driver acks for log directives (follower path).
-    LogAppendComplete { tx_id: u64 },
-    LogTruncateComplete { up_to: u64 },
-}
+## Driver call pattern
 
-// Durable term/vote persistence is mediated by a `Persistence` trait
-// the driver supplies. The trait's writes are synchronous: when a
-// trait method returns `Ok(_)`, the change is durable and the
-// library proceeds. There are no `Action::PersistTerm` /
-// `Event::TermPersisted` ack pairs — that would re-introduce the
-// "pending persist" bookkeeping the trait approach is meant to
-// eliminate.
-pub trait Persistence {
-    fn current_term(&self) -> u64;
-    fn last_term_record(&self) -> Option<TermRecord>;
-    fn term_at_tx(&self, tx_id: u64) -> Option<TermRecord>;
-    fn commit_term(&mut self, expected: u64, start_tx_id: u64) -> io::Result<bool>;
-    fn observe_term(&mut self, term: u64, start_tx_id: u64) -> io::Result<()>;
-    fn truncate_term_after(&mut self, tx_id: u64) -> io::Result<()>;
-    fn voted_for(&self) -> Option<NodeId>;
-    fn vote(&mut self, term: u64, candidate_id: NodeId) -> io::Result<bool>;
-    fn observe_vote_term(&mut self, term: u64) -> io::Result<()>;
-}
+The library exposes three state-changing entry points:
 
-pub enum Action {
-    SendAppendEntries {
-        to: NodeId,
-        term: u64,
-        prev_log_tx_id: u64,
-        prev_log_term: u64,
-        entries: Vec<LogEntryMeta>,
-        leader_commit: u64,
-    },
-    SendAppendEntriesReply {
-        to: NodeId,
-        term: u64,
-        success: bool,
-        last_tx_id: u64,
-    },
-    SendRequestVote {
-        to: NodeId,
-        term: u64,
-        last_tx_id: u64,
-        last_term: u64,
-    },
-    SendRequestVoteReply {
-        to: NodeId,
-        term: u64,
-        granted: bool,
-    },
+- `step(now, event) -> Vec<Action>` — processes leader-side events (`AppendEntriesReply`, `RequestVoteRequest`, `RequestVoteReply`) and the timer `Tick`. Returns the actions the driver must execute (outbound RPCs, wakeup deadlines, fatal signals).
+- `validate_append_entries_request(now, ...) -> AppendEntriesDecision` — the **follower-side** entry point. The library performs §5.1/§5.3/§5.4 protocol checks, term observation, follower transition, election-timer reset, term-log mirror updates, and watermark clamping synchronously, then returns a decision describing what the cluster driver must do with its WAL. Variants:
+  - `Reject { reason, truncate_after }` — the driver builds a reject reply from the getters and (if `truncate_after.is_some()`) drops entry-log records past the truncation point.
+  - `Accept { append: None }` — heartbeat. The library has already advanced `cluster_commit_index = min(leader_commit, local_commit_index)` in place; the driver builds the success reply from getters.
+  - `Accept { append: Some(range) }` — entries to durably persist. The driver appends `wal_bytes` to its ledger, awaits fsync, then calls `advance(write, commit)`. The deferred `leader_commit` (stored in `FollowerState::pending_leader_commit`) is consumed inside that `advance` call. The success reply is built from the post-advance getters.
+  - `Fatal { reason }` — a `Persistence` write failed mid-validate; the node has frozen itself. The driver MUST NOT touch the WAL, MUST NOT call `advance`, and MUST NOT send a success reply.
+- `advance(local_write_index, local_commit_index)` — pure state mutator for driver-side watermark progress (raft-log fsync, ledger apply). Returns nothing and queues no actions. By convention the driver follows `advance` with `step(Event::Tick)` to flush deferred outputs (heartbeats, `SetWakeup` re-arming). On a follower, `advance` also drains any deferred `leader_commit` set by the most recent `validate_append_entries_request` into `cluster_commit_index`.
 
-    // Follower: raft directs the log layer. TruncateLog implies
-    // both the entry-log truncation and the paired term-log
-    // truncation (§5.3). AppendLog metadata only — payload routing is
-    // entirely on the driver.
-    TruncateLog { after_tx_id: u64 },
-    AppendLog { tx_id: u64, term: u64 },
-
-    // Both: signal cluster commit advanced — ledger should apply through here
-    AdvanceClusterCommit { tx_id: u64 },
-
-    // Role transition
-    BecomeRole { role: Role, term: u64 },
-
-    // Time management — see "Timeout Handling" below
-    SetWakeup { at: Instant },
-}
-```
-
-### Construction
-
-`RaftNode<P: Persistence>` takes the already-opened `Persistence` and reads through it:
-
-```rust
-pub fn new(
-    self_id: NodeId,
-    peers: Vec<NodeId>,
-    persistence: P,
-    cfg: RaftConfig,
-    seed: u64,
-) -> RaftNode<P>;
-
-/// Recover the persistence on shutdown / simulator crash.
-pub fn into_persistence(self) -> P;
-```
-
-`local_log_index` starts at 0; the driver feeds `Event::LogAppendComplete` for any entries already on disk before exposing the node to RPCs. The library trusts whatever the persistence says; ADR-0017 §"No boot-time term bumping": the constructor does not increment term.
-
-The previous `RaftInitialState` struct is gone — durable state lives behind the trait, not in a one-shot bootstrap argument:
-
-```rust
-// Old (pre-trait)
-pub struct RaftInitialState {
-    pub current_term: u64,
-    pub voted_for: Option<NodeId>,
-    pub term_records: Vec<TermRecord>,  // raft::TermRecord, oldest first
-    pub local_log_index: u64,
-}
-```
-
-### Synchronous trait persistence
-
-The trait write methods are synchronous. When `commit_term`, `observe_term`, `truncate_term_after`, `vote`, or `observe_vote_term` returns `Ok(_)`, the change is durable on the underlying medium and the library may proceed to externalise its consequences (send replies, append log, etc.). The library does not maintain "pending" state behind the trait — `current_term()`, `voted_for()`, etc. delegate straight to the trait without caching.
-
-The driver supplies the implementation:
-
-- **Production** wires a disk-backed `DiskPersistence` that wraps the term + vote log files. Its writes `fdatasync` (or rename, in the case of `truncate_term_after`) before returning.
-- **Tests + simulator** wire a `MemPersistence` (in-memory `Vec<TermRecord>` plus two scalars). Same trait, same semantic contract — no temp dirs.
-
-This is the "etcd-raft shape": pure decision system + driver-supplied durable backing. There is no `Action::Persist*` / `Event::*Persisted` ack pair; that bookkeeping was traded for a synchronous trait callback.
-
-### Read-only query API
-
-```rust
-// Current role of this node — used by gRPC handlers to gate writes
-// (Leader accepts, others reject) and to stamp wire responses.
-pub fn role(&self) -> Role;
-
-// Current durable term known to this node.
-pub fn current_term(&self) -> u64;
-
-// Local: largest tx_id durably committed in this node's own log.
-pub fn commit_index(&self) -> u64;
-
-// Cluster-wide: largest tx_id known quorum-committed.
-// On the leader, recomputed from peer match_indexes.
-// On a follower, the leader's leader_commit clamped to local commit_index.
-// This is what wait_for_transaction_level and similar consumers query.
-pub fn cluster_commit_index(&self) -> u64;
-```
-
-That's it. Anything beyond these — peer states, election deadlines, leader id, log extents, voted_for — is internal to raft.
-
-**Why no `leader_id`:** the role tells the driver everything it needs. A non-leader rejects writes regardless of who the leader is.
-
-**Why no `voted_for`:** internal to raft's election logic. The driver has no decision to make based on it.
-
-**Why no `last_log_index` / `last_log_term`:** raft doesn't own the log. The storage layer knows.
-
-**Why no `peer_state` or `election_deadline` or `status`:** observability concerns, not decision inputs. v1 is the decision system, nothing more.
+`Action::AdvanceClusterCommit` does not exist. When the leader's quorum advances or a follower's `leader_commit` propagates past the local watermark, `cluster_commit_index` is updated **in place**; the driver detects the change by polling `cluster_commit_index()` after each `step` / `advance` / `validate_append_entries_request`.
 
 ## Timeout Handling
 
@@ -304,172 +139,73 @@ That's it. Anything beyond these — peer states, election deadlines, leader id,
 
 Every timeout is represented as an `Instant` deadline owned by the library:
 
-1. Library computes the deadline (e.g. "election fires at `now + random(150..300ms)`").
+1. The library computes the deadline (e.g. "election fires at `now + random(150..300ms)`").
 2. Stores it in internal state.
-3. Emits `Action::SetWakeup { at: Instant }` whenever the next deadline changes.
+3. Emits a `SetWakeup { at: Instant }` action whenever the next deadline changes.
 
-The driver:
-
-1. Receives the deadline.
-2. Schedules `tokio::time::sleep_until(deadline)`.
-3. When the sleep fires, calls `raft.step(Event::Tick { now: Instant::now() })`.
-4. Raft checks "has any deadline elapsed?" and reacts.
+The driver receives the deadline, schedules a sleep that fires at it, and on fire calls `step(now, Tick)`. The library checks "has any deadline elapsed?" on each `Tick` and reacts.
 
 The library never sleeps. The driver sleeps. The library only checks "is `now >= deadline`?" on each `Tick`.
 
 ### Three timeout categories
 
-**Election timeout (Follower / Candidate / Initializing).** If no leader heartbeat arrives within the window, transition to Candidate and start an election. Internal `election_deadline: Instant`. Reset whenever a valid AppendEntries arrives, a vote is granted, or a new term begins. On `Tick` with `now >= election_deadline`, transition to Candidate and emit candidacy actions (`PersistTerm`, `PersistVote`, `SendRequestVote × N`).
+**Election timeout** (Follower / Candidate / Initializing). If no leader heartbeat arrives within the window, transition to Candidate and start an election. The window is randomised within a `[min_ms, max_ms]` range to prevent split votes. Reset on a valid AppendEntries from the current leader, on granting a vote, or on entering Candidate.
 
-**Heartbeat interval (Leader).** The leader sends AppendEntries to every peer at a regular interval to suppress their election timers. Per-peer `next_heartbeat: Instant`. On `Tick`, scan peers; for each with `now >= next_heartbeat` and no in-flight AppendEntries, emit a fresh `SendAppendEntries`.
+**Heartbeat interval** (Leader). The leader sends AppendEntries to every peer at a regular interval to suppress their election timers. Per-peer next-heartbeat tracking; on `Tick`, scan peers and emit a fresh `SendAppendEntries` for each due peer that has no in-flight RPC.
 
-**RPC deadline (Candidate / Leader).** An RPC fired at a peer might never come back. Library tracks per-RPC `expires_at: Instant`. On `Tick`, expired RPCs are treated as failed replies. (Alternatively, the driver enforces via `tokio::time::timeout` and synthesizes an `Event::AppendEntriesReply { reject_reason: RpcTimeout }` — either works.)
-
-### Driver loop
-
-```rust
-loop {
-    // After every step, scan actions for SetWakeup and re-arm sleep.
-    let next_wakeup = current_wakeup;
-
-    tokio::select! {
-        _ = tokio::time::sleep_until(next_wakeup) => {
-            let actions = raft.step(Instant::now(), Event::Tick);
-            process_actions(actions).await;
-        }
-        msg = inbound_rpc.recv() => {
-            let actions = raft.step(Instant::now(), Event::from(msg));
-            process_actions(actions).await;
-        }
-        commit = ledger_on_commit.recv() => {
-            let actions = raft.step(Instant::now(),
-                Event::LocalCommitAdvanced { tx_id: commit });
-            process_actions(actions).await;
-        }
-        // ... other event sources
-    }
-}
-
-// Sketch — `process_actions` walks the action list in order. Persist
-// actions write durably *before* any Send is issued, then the driver
-// feeds the ack back through step(now, Event::*Persisted).
-async fn process_actions(actions: Vec<Action>) {
-    for a in actions {
-        match a {
-            Action::PersistTerm { term, start_tx_id } => {
-                term_log.append(TermRecord { term, start_tx_id })?;
-                term_log.sync()?;
-                inject(Event::TermPersisted { term, start_tx_id });
-            }
-            Action::PersistVote { term, voted_for } => {
-                vote_log.append(VoteRecord { term, voted_for })?;
-                vote_log.sync()?;
-                inject(Event::VotePersisted { term, voted_for });
-            }
-            Action::TruncateLog { after_tx_id } => {
-                wal.truncate_after(after_tx_id)?;
-                term_log.truncate_after(after_tx_id)?;
-                inject(Event::LogTruncateComplete { up_to: after_tx_id });
-            }
-            Action::AppendLog { tx_id, .. } => {
-                // payload was extracted from the inbound AE on receipt;
-                // the driver writes (metadata + payload) here.
-                wal.append(...)?;
-                inject(Event::LogAppendComplete { tx_id });
-            }
-            Action::SendAppendEntries { .. } => grpc.send_append_entries(...).await,
-            // ...
-            Action::SetWakeup { at } => current_wakeup = at,
-            Action::BecomeRole { .. } | Action::AdvanceClusterCommit { .. } => {
-                // observability + apply-pipeline gating
-            }
-        }
-    }
-}
-```
-
-After every `step`, scan the action list for `SetWakeup` and re-arm `current_wakeup`. That's the entire interaction model.
+**RPC deadline** (Candidate / Leader). An RPC fired at a peer might never come back. The library tracks per-RPC `expires_at`. On `Tick`, expired RPCs are treated as failed replies.
 
 ### Why this works
 
-**Determinism.** The library's behaviour is a function of `(state, event_stream)`. No hidden time dependency. Tests feed `Event::Tick { now: <chosen instant> }` and assert on outputs. The simulator can compress 10 minutes of cluster activity into 50ms of test time.
+**Determinism.** The library's behaviour is a function of `(state, event_stream)`. No hidden time dependency. Tests feed `Tick` events with chosen instants and assert on outputs. The simulator can compress 10 minutes of cluster activity into 50 ms of test time.
 
 **No async leakage.** No `tokio::time` in the library. No `Future`. No `async fn`. The library compiles without an async runtime.
 
 **Crisp testability of timeout-sensitive bugs.** Timer race conditions become trivial to reproduce: feed events in a chosen order, assert on actions. No real clock involved.
 
-### Election timeout randomization
+### Election timeout randomisation
 
-Raft requires randomized election timeouts to prevent split votes. The library is pure, so it can't call `rand::thread_rng()`.
+`RaftNode::new` takes a `seed: u64`. The internal RNG is seeded from this. Tests use fixed seeds for reproducibility; production uses time-based seeding done by the driver. "Raft owns its own RNG, seeded externally" is a clean abstraction with less round-tripping than the alternative of routing randomness through events.
 
-`RaftNode::new` takes a `seed: u64`. Internal RNG is seeded from this. Tests use fixed seeds for reproducibility; production uses time-based seeding done by the driver. Less round-tripping than the alternative (driver provides randomness via events), and "raft owns its own RNG seeded externally" is a clean abstraction.
+`RaftConfig::validate()` checks the configured timer windows at construction: the heartbeat interval must be safely below the minimum election timeout (so a single missed heartbeat doesn't trigger an election storm), and the `[min, max]` election-timer range must be non-empty.
 
 ### What this rules out
 
-- **Internal `tokio::sync::Notify` or channels** — would mean raft is wired into a runtime.
-- **`async fn step`** — raft must be synchronous; the driver handles async.
-- **Background tasks inside the library** — anything that needs to run "in the background" is the driver's job.
-- **Direct calls to `Instant::now()` inside the library** — time enters only through the `now` parameter to `step`.
-- **Disk I/O inside the library** — no `File`, no `fdatasync`, no `data_dir`. Durability is the driver's job, mediated by `Action::Persist*` and `Event::*Persisted`.
-
-## Workspace Layout
-
-```
-crates/
-  raft/
-    src/
-      lib.rs
-      node.rs                     # RaftNode + step() + read-only queries
-      event.rs                    # Event enum (incl. *Persisted ack events)
-      action.rs                   # Action enum (incl. Persist* directives)
-      role.rs                     # Role state machine
-      leader.rs                   # leader-specific state
-      candidate.rs                # candidate-specific state
-      follower.rs                 # follower-specific state
-      term.rs                     # in-memory term-log model (no I/O)
-      vote.rs                     # in-memory vote model (no I/O)
-      timer.rs                    # election timer (deadlines as data)
-      quorum.rs                   # match_index tracking, cluster_commit_index calculation
-      log_entry.rs                # LogEntryMeta { tx_id, term }
-      types.rs                    # NodeId, RejectReason
-    tests/
-      common/mod.rs               # shared deterministic harness
-      simulator.rs                # end-to-end scenarios
-      safety_properties.rs        # proptest §5.4 properties
-```
-
-The driver lives outside the raft crate (today: `cluster::*`, future: any consumer). It owns the disk-backed term and vote logs (e.g. `storage::TermStorage`, `storage::VoteStorage`), instantiates them, and routes the action stream into them.
+- Internal channels or notify primitives — would mean raft is wired into a runtime.
+- An `async fn step` — raft must be synchronous; the driver handles async.
+- Background tasks inside the library.
+- Direct calls to `Instant::now()` inside the library.
+- Disk I/O inside the library — durability is the driver's job, mediated by the `Persistence` trait and the entry-log action/event ack pairs.
 
 ## Test Strategy
 
-**Unit tests** inside `crates/raft/src/` modules: `Term`, `Vote`, `Quorum`, `ElectionTimer`, `Role` transitions in isolation.
+**Unit tests** inside the source modules: in-isolation tests of role transitions, the quorum / commit-index calculator, the election timer, the deferred-reply slot, persistence semantics.
 
-**Property tests** in `crates/raft/tests/`: §5.4 safety properties (Election Safety, Log Matching, Leader Completeness, State Machine Safety) verified across randomized event schedules using `proptest`.
+**Integration tests** drive a single `RaftNode` through chosen event sequences and assert on the action stream. Each known-bug class has a regression test that fails on the buggy behaviour and passes after the fix; this includes the recently-added durability-before-reply, fatal-on-unrecoverable-failure, and Figure 8 gate.
 
-**Deterministic simulator** in `crates/raft/tests/simulator.rs`: fake clock, fake message bus. Drives N RaftNode instances through millions of randomly-ordered events. Asserts invariants hold throughout. Designed to run 10K schedules per CI invocation.
+**Property tests** verify the four §5.4 safety properties (Election Safety, Log Matching, Leader Completeness, State Machine Safety) hold across randomised event schedules.
 
-**Fault injection in the simulator:** message drop, reorder, duplication, network partition, node crash and recovery mid-operation.
+**Deterministic simulator** owns N `RaftNode` instances behind a fake clock and a fake message bus. It drives the cluster through scheduled events with fault injection (drop, reorder, duplicate, partition, crash + restart) and asserts safety invariants throughout. Designed for high schedule counts per CI run.
 
-**Read-API tests:** assert that `role()`, `current_term()`, `commit_index()`, `cluster_commit_index()` return values consistent with the action stream emitted by the same `step` call. (E.g. if `step` returned `Action::BecomeRole { role: Leader, term: 5 }`, then `role()` must return `Leader` and `current_term()` must return 5 immediately after.)
+**Read-API consistency**: query results agree with the action stream emitted by `step` at every transition. If a step returns a role-transition action, the role query must reflect the new role immediately after.
 
-**Timer tests:** since time enters only through `Event::Tick { now }`, every timer-related scenario is reproducible. Tests construct specific `Tick` sequences and assert the resulting `Action` stream — no flakiness from real clocks.
+**Timer tests**: time enters only through `Tick`, so every timer scenario is reproducible from a chosen sequence of `Tick` events.
 
-## Non-Goals (v1, deferred to later)
+## Non-Goals (v1, deferred)
 
-- **Pre-vote.** Document the assumption: partitioned nodes that bump term repeatedly can disrupt the cluster on rejoin. Acceptable for v1.
+- **Pre-vote.** A partitioned node that bumps term repeatedly can disrupt the cluster on rejoin. Acceptable for v1.
 - **Leader leases / read-index.** All reads go through the leader and use the same commit-index check as writes.
 - **Joint consensus / online membership changes.** Cluster membership is fixed at config-file time.
 - **InstallSnapshot.** Scaffold only; full implementation deferred.
-- **Observability surface.** No `peer_state`, `election_deadline`, `status`, or per-peer introspection in v1. Add when there's a concrete consumer.
-
-These are documented in `crates/raft/README.md` so consumers know what the library does and doesn't guarantee.
+- **Observability surface.** No peer state, election deadlines, status, or per-peer introspection in v1. Add when there is a concrete consumer.
 
 ## Success Criteria
 
-The new library is correct when:
+The library is correct when:
 
-1. The four §5.4 safety properties hold under the property test suite (10K schedules per run).
-2. The deterministic simulator runs 1M+ random events without invariant violations.
-3. Bug class regressions from the previous implementation cannot recur: term-bump-before-win, ghost-term-on-boot, missing §5.3 truncation, term log not truncating alongside log truncation.
-4. Read-API consistency: query results agree with the action stream emitted by `step` at every transition.
-5. All timer-sensitive scenarios are reproducibly testable through synthetic `Event::Tick` sequences with no real-clock dependency.
+1. The four §5.4 safety properties hold under the property test suite at the configured schedule count per CI run.
+2. The deterministic simulator runs the configured number of random schedules without invariant violations.
+3. The known bug classes from the prior `cluster::raft` implementation cannot recur: term-bump-before-win, ghost-term-on-boot, missing §5.3 truncation, term log drifting from the entry log.
+4. The added invariants from this design hold in their dedicated regression tests: durability-before-reply, fatal-on-unrecoverable-persistence-failure, Figure 8 prior-term commit guard.
+5. Read-API consistency: query results agree with the action stream emitted by `step` at every transition.
+6. All timer-sensitive scenarios are reproducibly testable through synthetic `Tick` sequences with no real-clock dependency.

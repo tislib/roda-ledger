@@ -1,9 +1,9 @@
 //! High-level test harness. `ClusterTestingControl` is the single
 //! entry point for cluster-style tests: it owns per-node data dirs,
 //! ports, configs, and either the running `ClusterNode`s or the
-//! bare components (Ledger / Term / Vote / RoleFlag / LedgerSlot /
-//! ClusterCommitIndex) needed to drive `LedgerHandler` /
-//! `NodeHandler` directly.
+//! bare components (Ledger / Term / Vote / ClusterMirror /
+//! LedgerSlot) needed to drive `LedgerHandler` directly without
+//! networking.
 //!
 //! Three deployment shapes are supported via [`ClusterTestingMode`]:
 //! - [`ClusterTestingMode::Bare`] — single node, no servers. Each
@@ -23,28 +23,26 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
-use client::{ClusterClient, NodeClient, PipelineIndex, SubmitResult};
-use cluster::cluster_commit::ClusterCommitIndex;
-use cluster::config::{
-    ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection,
-};
+use ::proto::node::{self as nproto, node_client::NodeClient as ProtoNodeClient};
+use client::{ClusterClient, NodeClient, PipelineIndex, RetryConfig, SubmitResult};
+use cluster::Role;
+use cluster::cluster_mirror::ClusterMirror;
+use cluster::config::{ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection};
+use cluster::durable::{Term, Vote};
 use cluster::ledger_handler::LedgerHandler;
 use cluster::ledger_slot::LedgerSlot;
 use cluster::node::{ClusterNode, Handles};
-use cluster::node_handler::{NodeHandler, NodeHandlerCore};
-use proto::ledger as lproto;
-use ::proto::node::{self as nproto, node_client::NodeClient as ProtoNodeClient};
-use cluster::raft::{Role, RoleFlag, Term, Vote};
 use ledger::config::LedgerConfig;
-use storage::StorageConfig;
 use ledger::ledger::Ledger;
 use ledger::wait_strategy::WaitStrategy;
-use spdlog::{info, warn, Level};
+use proto::ledger as lproto;
+use spdlog::{Level, info, warn};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use storage::StorageConfig;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
@@ -155,8 +153,8 @@ impl std::error::Error for ClusterTestingError {}
 #[derive(Clone, Debug)]
 pub enum ClusterTestingMode {
     /// Single node, no servers. Each slot gets `Ledger`, `Term`,
-    /// `Vote`, `RoleFlag` (with `role`), `LedgerSlot`, and
-    /// `ClusterCommitIndex` — enough to construct `LedgerHandler`
+    /// `Vote`, `ClusterMirror` (role pinned to `role`), and
+    /// `LedgerSlot` — enough to construct `LedgerHandler`
     /// / `NodeHandler` and drive them directly. Used for handler-
     /// level integration tests that don't go through gRPC.
     Bare { role: Role },
@@ -201,6 +199,7 @@ pub struct ClusterTestingConfig {
     /// `temp_cluster_<label>_<nanos>/` under `current_dir()` and
     /// removes it in `Drop`.
     pub data_dir_root: Option<PathBuf>,
+    pub retry_config: RetryConfig,
 }
 
 impl Default for ClusterTestingConfig {
@@ -218,6 +217,7 @@ impl Default for ClusterTestingConfig {
             ledger_log_level: Level::Info,
             autostart: true,
             data_dir_root: None,
+            retry_config: Default::default(),
         }
     }
 }
@@ -269,10 +269,10 @@ struct NodeAddr {
 struct BareComponents {
     ledger: Arc<Ledger>,
     term: Arc<Term>,
+    #[allow(dead_code)]
     vote: Arc<Vote>,
-    role_flag: Arc<RoleFlag>,
+    mirror: Arc<ClusterMirror>,
     ledger_slot: Arc<LedgerSlot>,
-    cluster_commit_index: Arc<ClusterCommitIndex>,
 }
 
 struct NodeSlot {
@@ -325,6 +325,7 @@ pub struct ClusterTestingControl {
     /// watermark. Used by [`Self::ensure_caught_up_at`] as the catch-
     /// up target for `require_*` reads.
     last_tx_id: Arc<AtomicU64>,
+    retry_config: RetryConfig,
 }
 
 impl ClusterTestingControl {
@@ -452,6 +453,7 @@ impl ClusterTestingControl {
             cached_leader_idx: Arc::new(Mutex::new(None)),
             cluster_client: None,
             last_tx_id: Arc::new(AtomicU64::new(0)),
+            retry_config: config.retry_config.clone(),
         };
 
         // 5) Optionally start every slot. Standalone/Cluster also
@@ -490,7 +492,7 @@ impl ClusterTestingControl {
             self.cluster_client = None;
             return Ok(());
         }
-        let cc = ClusterClient::connect(&urls)
+        let cc = ClusterClient::connect_with_retry(&urls, self.retry_config.clone())
             .await
             .map_err(ClusterTestingError::Connect)?;
         self.cluster_client = Some(cc);
@@ -503,7 +505,7 @@ impl ClusterTestingControl {
     /// (`ClusterNode::new`), runs (`ClusterNode::run`) the node, and
     /// waits for the gRPC servers to bind so the slot is immediately
     /// usable on return. In Bare mode it constructs `Ledger`/`Term`/
-    /// `Vote`/`RoleFlag`/`LedgerSlot`/`ClusterCommitIndex`.
+    /// `Vote`/`ClusterMirror`/`LedgerSlot`.
     /// Idempotent.
     pub async fn start_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
         match self.mode {
@@ -659,17 +661,16 @@ impl ClusterTestingControl {
 
         let term = Arc::new(Term::open_in_dir(&dir_str).map_err(ClusterTestingError::Build)?);
         let vote = Arc::new(Vote::open_in_dir(&dir_str).map_err(ClusterTestingError::Build)?);
-        let role_flag = Arc::new(RoleFlag::new(role));
+        let mirror = ClusterMirror::new();
+        mirror.set_role_for_standalone(role);
         let ledger_slot = Arc::new(LedgerSlot::new(ledger.clone()));
-        let cci = ClusterCommitIndex::from_ledger(&ledger);
 
         slot.bare = Some(BareComponents {
             ledger,
             term,
             vote,
-            role_flag,
+            mirror,
             ledger_slot,
-            cluster_commit_index: cci,
         });
         Ok(())
     }
@@ -737,7 +738,7 @@ impl ClusterTestingControl {
             .node
             .as_ref()
             .ok_or(ClusterTestingError::NotStarted { idx: i })?;
-        Ok(node.ledger_slot().clone())
+        Ok(node.ledger_slot())
     }
 
     /// Bare-mode-only accessors (the running modes hide these
@@ -752,17 +753,13 @@ impl ClusterTestingControl {
         Ok(bare.vote.clone())
     }
 
-    pub fn role_flag(&self, i: usize) -> Result<Arc<RoleFlag>, ClusterTestingError> {
+    /// Bare-mode-only — read the cluster mirror that backs this slot's
+    /// `LedgerHandler`. The mirror is constructed pinned to the role
+    /// passed into [`ClusterTestingMode::Bare`]; `mirror.is_leader()`
+    /// gates writes through the handler.
+    pub fn mirror(&self, i: usize) -> Result<Arc<ClusterMirror>, ClusterTestingError> {
         let bare = self.bare(i)?;
-        Ok(bare.role_flag.clone())
-    }
-
-    pub fn cluster_commit_index(
-        &self,
-        i: usize,
-    ) -> Result<Arc<ClusterCommitIndex>, ClusterTestingError> {
-        let bare = self.bare(i)?;
-        Ok(bare.cluster_commit_index.clone())
+        Ok(bare.mirror.clone())
     }
 
     /// Build a `LedgerHandler` over slot `i`'s bare components.
@@ -771,30 +768,9 @@ impl ClusterTestingControl {
         let bare = self.bare(i)?;
         Ok(LedgerHandler::new(
             bare.ledger_slot.clone(),
-            bare.role_flag.clone(),
+            bare.mirror.clone(),
             bare.term.clone(),
-            bare.cluster_commit_index.clone(),
         ))
-    }
-
-    /// Build a `NodeHandler` over slot `i`'s bare components, with
-    /// a caller-chosen `claimed_node_id` (often a peer's id rather
-    /// than this node's). Bare-mode-only.
-    pub fn node_handler(
-        &self,
-        i: usize,
-        claimed_node_id: u64,
-    ) -> Result<NodeHandler, ClusterTestingError> {
-        let bare = self.bare(i)?;
-        let core = Arc::new(NodeHandlerCore::new(
-            bare.ledger_slot.clone(),
-            claimed_node_id,
-            bare.term.clone(),
-            bare.vote.clone(),
-            bare.role_flag.clone(),
-            None,
-        ));
-        Ok(NodeHandler::new(core))
     }
 
     pub fn index_of(&self, node_id: u64) -> Option<usize> {
@@ -1004,7 +980,7 @@ impl ClusterTestingControl {
                 let compute = b.ledger.last_compute_id();
                 let commit = b.ledger.last_commit_id();
                 let snapshot = b.ledger.last_snapshot_id();
-                cluster_commit = cluster_commit.max(b.cluster_commit_index.get());
+                cluster_commit = cluster_commit.max(b.mirror.cluster_commit_index());
                 info!(
                     "{:<8} {:<26} {:<14} {:<13} {:<14}",
                     node_id, url, compute, commit, snapshot
@@ -1195,6 +1171,26 @@ impl ClusterTestingControl {
         let r = self
             .cluster_client_or_err()?
             .deposit_and_wait(account, amount, user_ref, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(r.tx_id);
+        Ok(r)
+    }
+
+    /// Submit a deposit and wait for the requested `WaitLevel`.
+    pub async fn deposit_and_wait_no_retry(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        wait_level: lproto::WaitLevel,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .deposit_and_wait_no_retry(account, amount, user_ref, wait_level)
             .await
             .map_err(|e| ClusterTestingError::Rpc {
                 op: "deposit_and_wait",

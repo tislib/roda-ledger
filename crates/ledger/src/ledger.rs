@@ -12,7 +12,7 @@ use crate::wal::Wal;
 pub use crate::wait_strategy::WaitStrategy;
 pub use crate::wasm_runtime::FunctionInfo;
 use crate::wasm_runtime::{WasmRegistry, WasmRuntime};
-use spdlog::{LevelFilter, info};
+use spdlog::{LevelFilter, info, debug};
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -41,7 +41,7 @@ impl Ledger {
     pub fn new(config: LedgerConfig) -> Self {
         spdlog::default_logger().set_level_filter(LevelFilter::MoreSevereEqual(config.log_level));
 
-        info!("Initializing Ledger with config: {:?}", config);
+        debug!("Initializing Ledger with config: {:?}", config);
 
         let storage = Storage::new(config.storage.clone()).unwrap();
         let storage = Arc::new(storage);
@@ -251,11 +251,6 @@ impl Ledger {
         self.transactor.get_rejected_count()
     }
 
-    /// Register a callback fired every time the WAL commit-index advances.
-    pub fn on_commit(&self, handler: CommitHandler) -> Result<(), CommitHandler> {
-        self.pipeline.set_commit_handler(handler)
-    }
-
     /// Drive the cluster-commit gate consulted by the seal stage
     /// (ADR-0016 §10). The seal stage refuses to seal a segment whose
     /// last `tx_id` exceeds this value — guaranteeing sealed segments
@@ -402,7 +397,7 @@ impl Ledger {
     }
 
     pub fn start(&mut self) -> std::io::Result<()> {
-        info!("Starting Ledger stages...");
+        debug!("Starting Ledger stages...");
 
         // Crash recovery: must run BEFORE normal recovery.
         Recover::crash_recover_if_needed(&self.storage).map_err(|e| {
@@ -445,7 +440,7 @@ impl Ledger {
             );
         }
 
-        info!("Ledger started successfully.");
+        debug!("Ledger started successfully.");
 
         Ok(())
     }
@@ -491,7 +486,7 @@ impl Ledger {
     /// `watermark = u64::MAX` is equivalent to `start()` (no
     /// truncation, no snapshot filter, no clamp).
     pub fn start_with_recovery_until(&mut self, watermark: u64) -> std::io::Result<()> {
-        info!("Starting Ledger with recovery watermark = {}...", watermark);
+        debug!("Starting Ledger with recovery watermark = {}...", watermark);
 
         // Crash recovery first: a torn tail in wal.bin should be fixed
         // before we reason about which records cross the watermark.
@@ -567,7 +562,7 @@ impl Ledger {
                 })?);
         }
 
-        info!(
+        debug!(
             "Ledger started successfully via start_with_recovery_until(watermark={}).",
             watermark
         );
@@ -577,7 +572,7 @@ impl Ledger {
 
 impl Drop for Ledger {
     fn drop(&mut self) {
-        info!("Shutting down Ledger...");
+        debug!("Shutting down Ledger...");
         self.pipeline.shutdown();
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();
