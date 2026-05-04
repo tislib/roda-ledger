@@ -93,7 +93,6 @@ impl ConsensusLoop {
         info!("consensus_loop[{}]: started", self_id);
 
         loop {
-            self.gate.hello();
             let now = Instant::now();
 
             // 1. Drive election-side time forward. `tick` is cheap and
