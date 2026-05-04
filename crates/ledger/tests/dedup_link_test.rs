@@ -1,10 +1,10 @@
-use storage::entities::{FailReason, TxLinkKind};
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse, TransactionResult};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::fs;
 use std::time::Duration;
+use storage::StorageConfig;
+use storage::entities::{FailReason, TxLinkKind};
 
 fn unique_dir(name: &str) -> String {
     let nanos = std::time::SystemTime::now()

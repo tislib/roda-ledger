@@ -1,7 +1,7 @@
-use storage::entities::FailReason;
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::transaction::Operation;
 use std::time::Duration;
+use storage::entities::FailReason;
 
 /// After 10K mixed operations, sum of all account balances (including system account 0) must be 0.
 #[test]

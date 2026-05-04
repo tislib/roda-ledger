@@ -1,12 +1,12 @@
 use ledger::index::IndexedTxEntry;
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use storage::{Storage, StorageConfig};
 use ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
+use storage::{Storage, StorageConfig};
 
 fn unique_dir(name: &str) -> String {
     let nanos = std::time::SystemTime::now()
@@ -360,7 +360,6 @@ fn test_query_survives_segment_rotation() {
 // ── Pre-seal and post-seal: data accessible via cold tier after seal ─────────
 
 #[test]
-
 #[ignore = "flaky test"]
 fn test_cold_tier_accessible_after_seal() {
     let dir = unique_dir("cold_after_seal");

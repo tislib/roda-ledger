@@ -315,8 +315,8 @@ pub fn load(data_dir: &Path, segment_id: u32) -> io::Result<FunctionSnapshotData
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StorageConfig;
     use crate::Storage;
+    use crate::config::StorageConfig;
     use tempfile::tempdir;
 
     fn temp_storage() -> (Storage, tempfile::TempDir) {

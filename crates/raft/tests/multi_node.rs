@@ -223,7 +223,13 @@ fn higher_term_in_append_reply_demotes_leader() {
     common::drive_tick(&mut leader_node, t0);
     common::drive_tick(&mut leader_node, t0 + Duration::from_secs(60));
     let term = leader_node.current_term();
-    common::deliver_vote_reply(&mut leader_node, t0 + Duration::from_secs(60), 1, term, true);
+    common::deliver_vote_reply(
+        &mut leader_node,
+        t0 + Duration::from_secs(60),
+        1,
+        term,
+        true,
+    );
     assert!(leader_node.role().is_leader());
 
     leader_node.replication().peer(1).unwrap().append_result(
@@ -351,15 +357,8 @@ fn leader_commit_clamp_to_local_log() {
 #[test]
 fn empty_append_entries_is_a_heartbeat() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let decision = node.validate_append_entries_request(
-        Instant::now(),
-        2,
-        1,
-        0,
-        0,
-        LogEntryRange::empty(),
-        0,
-    );
+    let decision =
+        node.validate_append_entries_request(Instant::now(), 2, 1, 0, 0, LogEntryRange::empty(), 0);
     // Heartbeat: Accept with no entries to append; cluster builds
     // the success reply from `current_term()` / watermark getters.
     assert_eq!(decision, AppendEntriesDecision::Accept { append: None });
@@ -382,15 +381,8 @@ fn append_entries_from_old_leader_is_rejected() {
     );
     assert_eq!(node.current_term(), 5);
     // Now an old leader at term 3 sends AE — must be refused.
-    let decision = node.validate_append_entries_request(
-        Instant::now(),
-        3,
-        3,
-        0,
-        0,
-        LogEntryRange::empty(),
-        0,
-    );
+    let decision =
+        node.validate_append_entries_request(Instant::now(), 3, 3, 0, 0, LogEntryRange::empty(), 0);
     assert_eq!(
         decision,
         AppendEntriesDecision::Reject {
@@ -490,7 +482,11 @@ fn vote_denied_when_candidate_last_term_below_ours() {
             last_term: 2,   // but older term — must deny
         },
     );
-    assert!(!reply.granted, "must deny when last_term < ours: {:?}", reply);
+    assert!(
+        !reply.granted,
+        "must deny when last_term < ours: {:?}",
+        reply
+    );
 }
 
 #[test]
@@ -640,15 +636,8 @@ fn heartbeat_propagates_leader_commit_advance() {
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Heartbeat at term 1 with leader_commit=2.
-    let decision = node.validate_append_entries_request(
-        Instant::now(),
-        2,
-        1,
-        3,
-        1,
-        LogEntryRange::empty(),
-        2,
-    );
+    let decision =
+        node.validate_append_entries_request(Instant::now(), 2, 1, 3, 1, LogEntryRange::empty(), 2);
     // Heartbeat: Accept with no entries.
     assert_eq!(decision, AppendEntriesDecision::Accept { append: None });
     // The advance is observable via the getter (no dedicated
@@ -870,7 +859,10 @@ fn tick_returns_wakeup_with_future_deadline_after_lazy_arm() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     let t0 = Instant::now();
     let wakeup = node.election().tick(t0);
-    assert!(wakeup.deadline > t0, "deadline must be in the future after lazy-arm");
+    assert!(
+        wakeup.deadline > t0,
+        "deadline must be in the future after lazy-arm"
+    );
 }
 
 // ── Cluster commit advance under per-peer replication state ──────────────────
@@ -890,10 +882,7 @@ fn tick_returns_wakeup_with_future_deadline_after_lazy_arm() {
 /// wins. Returns `(node, leader_now)` so callers can issue subsequent
 /// `get_append_range(now)` calls with `now >= leader_now` (peer
 /// `next_heartbeat` is initialised to `leader_now`).
-fn make_3node_leader(
-    self_id: NodeId,
-    peers: Vec<NodeId>,
-) -> (RaftNode<MemPersistence>, Instant) {
+fn make_3node_leader(self_id: NodeId, peers: Vec<NodeId>) -> (RaftNode<MemPersistence>, Instant) {
     let mut node = fresh_node(self_id, peers.clone());
     let t0 = Instant::now();
     let leader_now = t0 + Duration::from_secs(60);
@@ -1142,15 +1131,7 @@ fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
     // Become follower; receive 200 prior-term entries with leader_commit=0
     // (the prior leader never reached quorum). Driver fsyncs WAL but
     // applies nothing to the ledger (since leader_commit was 0).
-    let _ = node.validate_append_entries_request(
-        t0,
-        2,
-        1,
-        0,
-        0,
-        LogEntryRange::new(1, 200, 1),
-        0,
-    );
+    let _ = node.validate_append_entries_request(t0, 2, 1, 0, 0, LogEntryRange::new(1, 200, 1), 0);
     node.advance_write_index(200);
     node.advance_commit_index(0);
     assert_eq!(node.write_index(), 200);
@@ -1193,7 +1174,6 @@ fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
             last_commit_id: 200,
         },
     );
-
 
     // §5.4.2 itself is correct (it prevents the Figure-8 safety
     // violation). Raft's

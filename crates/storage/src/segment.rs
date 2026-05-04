@@ -29,8 +29,8 @@ pub struct Segment {
     pub loaded: bool,
 
     // wal
-    wal_file: Option<File>,       // if unloaded, wal_file is None
-    pub wal_data: Vec<u8>, // in case of closed or sealed mode
+    wal_file: Option<File>, // if unloaded, wal_file is None
+    pub wal_data: Vec<u8>,  // in case of closed or sealed mode
     pub status: SegmentStaus,
 
     // active segment only
@@ -343,10 +343,7 @@ impl Segment {
         Ok(())
     }
 
-    pub fn visit_wal_records(
-        &self,
-        mut handler: impl FnMut(&WalEntry),
-    ) -> Result<(), Error> {
+    pub fn visit_wal_records(&self, mut handler: impl FnMut(&WalEntry)) -> Result<(), Error> {
         assert!(self.loaded, "Segment is not loaded, cannot visit");
 
         if !self.wal_data.len().is_multiple_of(40) {

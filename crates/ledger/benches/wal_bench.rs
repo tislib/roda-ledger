@@ -1,16 +1,16 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::config::LedgerConfig;
-use storage::entities::{
-    EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind, WalInput,
-};
 use ledger::ledger::WaitStrategy;
 use ledger::pipeline::Pipeline;
-use storage::Storage;
 use ledger::wal::Wal;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use storage::Storage;
+use storage::entities::{
+    EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind, WalInput,
+};
 
 fn make_deposit_entries(tx_id: u64, account_id: u64, amount: u64) -> [WalEntry; 2] {
     let metadata = TxMetadata {

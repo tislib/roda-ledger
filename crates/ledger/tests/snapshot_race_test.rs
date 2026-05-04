@@ -1,9 +1,9 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use storage::StorageConfig;
 
 /// Integration-level reproduction of the race condition documented in the snapshot unit test.
 ///

@@ -1,15 +1,15 @@
 use crate::balance::Balance;
 use crate::config::LedgerConfig;
-use storage::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
-use storage::Storage;
 use crate::wasm_runtime::WasmRuntime;
 use spdlog::error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::JoinHandle;
+use storage::Storage;
+use storage::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
 // ── Message types for the Snapshot stage queue (ADR-008) ─────────────────────
 
 /// Single message type for the WAL→Snapshot queue.

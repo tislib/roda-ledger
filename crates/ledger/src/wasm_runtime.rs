@@ -24,9 +24,7 @@
 //!
 //! No `unsafe`, no raw pointers, no generics.
 
-use storage::entities::{FunctionRegistered, WalEntry};
 use crate::pipeline::LedgerContext;
-use storage::Storage;
 use crate::transactor::TransactorState;
 use crate::wait_strategy::WaitStrategy;
 use std::cell::RefCell;
@@ -36,6 +34,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use storage::Storage;
+use storage::entities::{FunctionRegistered, WalEntry};
 use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 /// The required export name on every registered function.

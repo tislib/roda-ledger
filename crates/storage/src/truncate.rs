@@ -69,10 +69,7 @@ impl Segment {
     /// Used by [`storage::Storage::truncate_wal_above`] when an
     /// entire segment falls past the recovery watermark (ADR-0016 §9).
     /// Missing files are tolerated — every removal is idempotent.
-    pub fn delete_all_files_for_segment(
-        data_dir: &str,
-        segment_id: u32,
-    ) -> Result<(), Error> {
+    pub fn delete_all_files_for_segment(data_dir: &str, segment_id: u32) -> Result<(), Error> {
         let dir = Path::new(data_dir);
         let candidates = [
             segment_wal_path(dir, segment_id),
@@ -101,10 +98,7 @@ impl Segment {
     /// segment — its existing balance snapshot captured state past the
     /// watermark and is no longer trustworthy. Missing files are
     /// tolerated.
-    pub fn delete_snapshot_files_for_segment(
-        data_dir: &str,
-        segment_id: u32,
-    ) -> Result<(), Error> {
+    pub fn delete_snapshot_files_for_segment(data_dir: &str, segment_id: u32) -> Result<(), Error> {
         let dir = Path::new(data_dir);
         let candidates = [
             snapshot_bin_path(dir, segment_id),

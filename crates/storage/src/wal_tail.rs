@@ -10,8 +10,8 @@
 //! points at the same inode. We detect this by comparing our stashed inode
 //! with `stat(wal.bin)` and advance to the next segment file.
 
-use crate::entities::{WalEntry, WalEntryKind};
 use crate::engine::Storage;
+use crate::entities::{WalEntry, WalEntryKind};
 use crate::layout::{active_wal_path, segment_wal_path};
 use crate::wal_serializer::parse_wal_record;
 use spdlog::{debug, trace};
@@ -128,11 +128,7 @@ impl WalTailer {
                     trace!(
                         "DIAG-flake-replication: tailer.tail advance_segment=false \
                          from_tx_id={} segment_id={} is_active={} position={} file_len={}",
-                        from_tx_id,
-                        pre_segment_id,
-                        pre_is_active,
-                        pre_position,
-                        pre_file_len,
+                        from_tx_id, pre_segment_id, pre_is_active, pre_position, pre_file_len,
                     );
                     break;
                 }
@@ -257,10 +253,7 @@ impl WalTailer {
                         "DIAG-flake-replication: tailer.seek END parking cursor \
                          from_tx_id={} segment_id={} is_active={} \
                          first_tx_in_segment={:?} (None == only-header / no-tx-records)",
-                        from_tx_id,
-                        cursor.segment_id,
-                        cursor.is_active,
-                        other,
+                        from_tx_id, cursor.segment_id, cursor.is_active, other,
                     );
                     return Ok(());
                 }

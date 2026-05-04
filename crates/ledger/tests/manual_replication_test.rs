@@ -1,7 +1,6 @@
 //! Manual leader → follower replication using `WalTailer` on the leader and
 //! `append_wal_entries` on the follower (ADR-015 smoke test).
 
-use storage::entities::SYSTEM_ACCOUNT_ID;
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use ledger::transaction::{Operation, WaitLevel};
 use ledger::wait_strategy::WaitStrategy;
@@ -13,6 +12,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use storage::entities::SYSTEM_ACCOUNT_ID;
 
 const BATCHES: u64 = 20;
 const BATCH_SIZE: u64 = 5_000;

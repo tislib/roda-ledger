@@ -1,10 +1,6 @@
 use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::dedup::{DedupCache, DedupResult};
-use storage::entities::{
-    EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
-    WalEntryKind, WalInput,
-};
 use crate::pipeline::TransactorContext;
 use crate::transaction::{Operation, Transaction, TransactionInput};
 use crate::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
@@ -15,6 +11,10 @@ use std::hint::spin_loop;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use storage::entities::{
+    EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
+    WalEntryKind, WalInput,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TransactorState — shared inter-state buffer
@@ -531,10 +531,8 @@ impl TransactorRunner {
             let mut state = self.state.borrow_mut();
             for entry in &entries {
                 match entry {
-                    WalEntry::Metadata(m) => {
-                        if m.tx_id > max_tx_id {
-                            max_tx_id = m.tx_id;
-                        }
+                    WalEntry::Metadata(m) if m.tx_id > max_tx_id => {
+                        max_tx_id = m.tx_id;
                     }
                     WalEntry::Entry(e) => {
                         if e.tx_id > max_tx_id {

@@ -13,8 +13,8 @@
 //! `AtomicUsize` load. No `Mutex`, no `await`, no contention with
 //! the async runtime threads.
 
-use ledger::ledger::Ledger;
 use arc_swap::ArcSwap;
+use ledger::ledger::Ledger;
 use std::sync::Arc;
 
 pub struct LedgerSlot {

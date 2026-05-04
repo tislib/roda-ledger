@@ -89,9 +89,7 @@ impl RaftConfig {
         }
         let hb_ms = self.heartbeat_interval.as_millis() as u64;
         if hb_ms.saturating_mul(2) >= self.election_timer.min_ms {
-            return Err(
-                "RaftConfig: heartbeat_interval * 2 must be < election_timer.min_ms",
-            );
+            return Err("RaftConfig: heartbeat_interval * 2 must be < election_timer.min_ms");
         }
         Ok(())
     }
@@ -130,9 +128,7 @@ pub enum AppendEntriesDecision {
     /// `advance(new_write, new_commit)` before replying. The deferred
     /// `leader_commit` is propagated into `cluster_commit_index`
     /// inside that `advance` call.
-    Accept {
-        append: Option<LogEntryRange>,
-    },
+    Accept { append: Option<LogEntryRange> },
 }
 
 /// Role-specific state held inline so the type system enforces
@@ -366,9 +362,7 @@ impl<P: Persistence> RaftNode<P> {
             // bypass it (no peer can overwrite), and followers bypass
             // it via `current_term_first_tx == 0`.
             if matches!(self.state, NodeState::Leader(_))
-                && let Some(adv) = self
-                    .quorum
-                    .advance(self.self_slot, self.local_commit_index)
+                && let Some(adv) = self.quorum.advance(self.self_slot, self.local_commit_index)
                 && !(self.peers.len() > 1 && adv < self.current_term_first_tx)
                 && adv > self.cluster_commit_index
             {
@@ -416,22 +410,14 @@ impl<P: Persistence> RaftNode<P> {
 
     pub(crate) fn replication_peer_next_index(&self, peer_id: NodeId) -> TxId {
         match &self.state {
-            NodeState::Leader(l) => l
-                .peers
-                .get(&peer_id)
-                .map(|p| p.next_index)
-                .unwrap_or(0),
+            NodeState::Leader(l) => l.peers.get(&peer_id).map(|p| p.next_index).unwrap_or(0),
             _ => 0,
         }
     }
 
     pub(crate) fn replication_peer_match_index(&self, peer_id: NodeId) -> TxId {
         match &self.state {
-            NodeState::Leader(l) => l
-                .peers
-                .get(&peer_id)
-                .map(|p| p.match_index)
-                .unwrap_or(0),
+            NodeState::Leader(l) => l.peers.get(&peer_id).map(|p| p.match_index).unwrap_or(0),
             _ => 0,
         }
     }
@@ -838,7 +824,9 @@ impl<P: Persistence> RaftNode<P> {
                     Ok(last_commit_id)
                 } else {
                     match reject_reason {
-                        Some(RejectReason::TermBehind) | Some(RejectReason::RpcTimeout) => Err(None),
+                        Some(RejectReason::TermBehind) | Some(RejectReason::RpcTimeout) => {
+                            Err(None)
+                        }
                         // LogMismatch (explicit) and the unannotated
                         // case both mean §5.3: walk `next_index` back
                         // one entry. Clamp at 1 — tx_id 0 is the "no
@@ -879,7 +867,6 @@ impl<P: Persistence> RaftNode<P> {
             Err(None) => {}
         }
     }
-
 }
 
 #[cfg(test)]
@@ -933,7 +920,12 @@ mod tests {
             if term == cur {
                 return;
             }
-            assert!(term > cur, "observe_term regression: incoming={} current={}", term, cur);
+            assert!(
+                term > cur,
+                "observe_term regression: incoming={} current={}",
+                term,
+                cur
+            );
             self.term_log.push(crate::TermRecord { term, start_tx_id });
         }
         fn truncate_term_after(&mut self, tx_id: TxId) {
@@ -1352,26 +1344,12 @@ mod tests {
         let mut node = fresh(1, vec![1, 2, 3]);
         let now = Instant::now();
         // First AE with leader_commit=2.
-        let _ = node.validate_append_entries_request(
-            now,
-            2,
-            1,
-            0,
-            0,
-            LogEntryRange::new(1, 3, 1),
-            2,
-        );
+        let _ =
+            node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 3, 1), 2);
         // Second AE before the cluster has called advance — same prev=0,
         // extended range, leader_commit bumped to 5.
-        let _ = node.validate_append_entries_request(
-            now,
-            2,
-            1,
-            0,
-            0,
-            LogEntryRange::new(1, 5, 1),
-            5,
-        );
+        let _ =
+            node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 5, 1), 5);
         // Cluster fsyncs durability up to 5 and the ledger applies up
         // to 5. Drain should use the second AE's leader_commit.
         node.advance_write_index(5);
@@ -1407,10 +1385,8 @@ mod tests {
         }
         let term = node.current_term();
         for peer in peers.iter().filter(|&&p| p != self_id) {
-            node.election().handle_votes(
-                leader_now,
-                vec![(*peer, VoteOutcome::Granted { term })],
-            );
+            node.election()
+                .handle_votes(leader_now, vec![(*peer, VoteOutcome::Granted { term })]);
             if node.role().is_leader() {
                 return (node, leader_now);
             }
@@ -1597,11 +1573,7 @@ mod tests {
         // `next_heartbeat`; in-flight being None is necessary but not
         // sufficient.
         let later = leader_now + Duration::from_millis(100);
-        let req2 = node
-            .replication()
-            .peer(2)
-            .unwrap()
-            .get_append_range(later);
+        let req2 = node.replication().peer(2).unwrap().get_append_range(later);
         assert!(
             req2.is_some(),
             "timeout must clear in_flight so a fresh request can fire after next_heartbeat"

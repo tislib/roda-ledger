@@ -1,3 +1,4 @@
+#![allow(clippy::result_large_err)]
 //! High-level test harness. `ClusterTestingControl` is the single
 //! entry point for cluster-style tests: it owns per-node data dirs,
 //! ports, configs, and either the running `ClusterNode`s or the
@@ -332,7 +333,7 @@ impl ClusterTestingControl {
     /// Upper bound on how long `ensure_caught_up_at` will wait for a
     /// node's snapshot watermark to reach the harness's
     /// `last_tx_id`. Generous enough to cover post-restart election
-    /// + replication windows; if a real test needs more, that's a
+    /// and replication windows; if a real test needs more, that's a
     /// signal something is wrong, not a knob to tune.
     pub const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -552,22 +553,21 @@ impl ClusterTestingControl {
             // The drop is bounded internally by `drain_in_drop`'s
             // 5-second timeout, so a wedged task can't hang us.
             drop(h);
-            if addr.client_port != 0 {
-                if let Err(e) = wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
-                {
-                    spdlog::warn!(
-                        "stop_node({i}): client_port {} not released: {e}",
-                        addr.client_port
-                    );
-                }
+            if addr.client_port != 0
+                && let Err(e) = wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
+            {
+                spdlog::warn!(
+                    "stop_node({i}): client_port {} not released: {e}",
+                    addr.client_port
+                );
             }
-            if addr.node_port != 0 {
-                if let Err(e) = wait_for_tcp_release(addr.node_port, Duration::from_secs(2)).await {
-                    spdlog::warn!(
-                        "stop_node({i}): node_port {} not released: {e}",
-                        addr.node_port
-                    );
-                }
+            if addr.node_port != 0
+                && let Err(e) = wait_for_tcp_release(addr.node_port, Duration::from_secs(2)).await
+            {
+                spdlog::warn!(
+                    "stop_node({i}): node_port {} not released: {e}",
+                    addr.node_port
+                );
             }
         }
 

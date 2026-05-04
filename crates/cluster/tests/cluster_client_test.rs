@@ -14,12 +14,11 @@
 //! - The standalone [`NodeClient`] still works (regression guard
 //!   for the rename + retry refactor).
 
-
-use client::{ClusterClient, NodeClient, RetryConfig};
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
-use storage::entities::SYSTEM_ACCOUNT_ID;
+use client::{ClusterClient, NodeClient, RetryConfig};
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
+use storage::entities::SYSTEM_ACCOUNT_ID;
 
 const ACCOUNT_A: u64 = 100;
 const ACCOUNT_B: u64 = 200;

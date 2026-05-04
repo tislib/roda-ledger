@@ -1,9 +1,9 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+use storage::StorageConfig;
 
 #[test]
 fn crash_recovery_test() {

@@ -4,7 +4,9 @@
 //! cluster-side I/O driver.
 
 pub mod cluster_mirror;
+mod command;
 pub mod config;
+mod consensus;
 pub mod durable;
 pub mod ledger_handler;
 pub mod ledger_slot;
@@ -12,11 +14,9 @@ pub(crate) mod lifecycle;
 pub mod mapping;
 pub mod node;
 pub mod node_handler;
-pub mod server;
-mod command;
-mod consensus;
 mod raft_loop;
 mod replication;
+pub mod server;
 
 pub use cluster_mirror::ClusterMirror;
 pub use config::Config;

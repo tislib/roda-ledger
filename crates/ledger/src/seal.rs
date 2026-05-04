@@ -1,14 +1,14 @@
 use crate::config::LedgerConfig;
-use storage::entities::WalEntry;
 use crate::pipeline::SealContext;
-use storage::FunctionSnapshotRecord;
-use storage::SegmentStaus::SEALED;
-use storage::{Segment, Storage};
 use rustc_hash::FxHashMap;
 use spdlog::{debug, error, warn};
 use std::sync::Arc;
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
+use storage::FunctionSnapshotRecord;
+use storage::SegmentStaus::SEALED;
+use storage::entities::WalEntry;
+use storage::{Segment, Storage};
 
 pub struct Seal {
     runner: Option<SealRunner>, // will be taken out when start() is called

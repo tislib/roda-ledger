@@ -37,9 +37,9 @@ use ::proto::node as proto;
 use ::proto::node::node_client::NodeClient;
 use raft::{
     AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftNode,
-    RejectReason as RaftRejectReason, Role, TxId,
+    RejectReason as RaftRejectReason, TxId,
 };
-use spdlog::{debug, error, info};
+use spdlog::{debug, error};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;

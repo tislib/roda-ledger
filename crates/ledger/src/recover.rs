@@ -1,14 +1,14 @@
-use storage::entities::{FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind};
 use crate::pipeline::Pipeline;
 use crate::seal::Seal;
 use crate::snapshot::Snapshot;
-use storage::SegmentStaus::SEALED;
-use storage::{Segment, Storage};
 use crate::transactor::Transactor;
 use crate::wasm_runtime::WasmRuntime;
-use spdlog::{debug, info, warn};
+use spdlog::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use storage::SegmentStaus::SEALED;
+use storage::entities::{FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind};
+use storage::{Segment, Storage};
 
 const ENTRY_SIZE: usize = 40;
 
@@ -675,10 +675,8 @@ impl<'r> Recover<'r> {
             // — a corrupt snapshot just gets skipped, falling back to
             // an earlier one or genesis.
             match segment.load_snapshot() {
-                Ok(Some(data)) if data.last_tx_id <= watermark => {
-                    if segment.id() >= best {
-                        best = segment.id();
-                    }
+                Ok(Some(data)) if data.last_tx_id <= watermark && segment.id() >= best => {
+                    best = segment.id();
                 }
                 _ => {}
             }

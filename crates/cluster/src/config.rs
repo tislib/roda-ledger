@@ -166,7 +166,7 @@ impl Default for ClusterSection {
 
 // ── Top-level Config ───────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerSection,
@@ -181,19 +181,6 @@ pub struct Config {
     /// they're meaningless in standalone mode.
     pub cluster: Option<ClusterSection>,
     pub ledger: LedgerConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerSection::default(),
-            // Default = standalone. Operators who want clustering
-            // opt in by writing a `[cluster]` block; absence means
-            // "single process, no replication".
-            cluster: None,
-            ledger: LedgerConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug)]

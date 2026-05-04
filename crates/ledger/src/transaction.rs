@@ -1,5 +1,5 @@
-use storage::entities::FailReason;
 use serde::{Deserialize, Serialize};
+use storage::entities::FailReason;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Operation {

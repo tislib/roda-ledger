@@ -1,8 +1,5 @@
-use storage::entities::{WalEntry, WalInput};
-use storage::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use crate::pipeline::WalContext;
 use crate::snapshot::SnapshotMessage;
-use storage::{Segment, Storage, Syncer};
 use crate::wait_strategy::WaitStrategy;
 use Ordering::Release;
 use arc_swap::ArcSwap;
@@ -12,6 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{JoinHandle, yield_now};
+use storage::entities::{WalEntry, WalInput};
+use storage::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
+use storage::{Segment, Storage, Syncer};
 
 pub struct Wal {
     storage: Arc<Storage>,

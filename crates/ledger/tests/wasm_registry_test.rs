@@ -9,9 +9,9 @@
 //! Each test spins up its own `Ledger` against a fresh temp data_dir
 //! (`LedgerConfig::temp`) so tests are independent and isolable.
 
-use storage::StorageConfig;
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::transaction::{Operation, WaitLevel};
+use storage::StorageConfig;
 
 // ──────────────────────────────────────────────────────────────────────────
 // WAT fixtures

@@ -9,8 +9,8 @@
 //!
 //! Both circle sizes must be powers of two so modulo reduces to a bitmask.
 
-use storage::entities::{EntryKind, TxLinkKind, WalEntryKind};
 use std::collections::HashMap;
+use storage::entities::{EntryKind, TxLinkKind, WalEntryKind};
 
 // ── TxSlot (circle1) ──────────────────────────────────────────────────────────
 

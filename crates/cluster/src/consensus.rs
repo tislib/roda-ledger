@@ -45,7 +45,7 @@ use ledger::transaction::Operation;
 use raft::Role::Leader;
 use raft::request_vote::RequestVoteRequest;
 use raft::{NodeId, RaftNode, Role, VoteOutcome};
-use spdlog::{debug, error, info};
+use spdlog::{debug, error};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;

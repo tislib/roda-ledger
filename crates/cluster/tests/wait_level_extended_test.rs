@@ -3,7 +3,6 @@
 use ::proto::ledger as proto;
 use ::proto::ledger::WaitLevel;
 use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
-use client::RetryConfig;
 use cluster::{LedgerHandler, Role, Term};
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use ledger::ledger::Ledger;
