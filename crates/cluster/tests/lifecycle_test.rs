@@ -13,7 +13,7 @@ const AMOUNT: u64 = 100;
 /// `SupervisorHandles::abort` aborts the driver, watcher, both servers,
 /// and all transient peer tasks. Verified by checking that ports are
 /// freed afterwards (proxy for "all server tasks exited").
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn supervisor_abort_releases_all_ports() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -38,7 +38,7 @@ async fn supervisor_abort_releases_all_ports() {
 }
 
 /// `Drop` of a harness with a temp data dir removes it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn harness_drop_removes_owned_temp_dir() {
     let temp_root_path: std::path::PathBuf;
     {
@@ -60,7 +60,7 @@ async fn harness_drop_removes_owned_temp_dir() {
 }
 
 /// Caller-supplied `data_dir_root` survives Drop (no rm).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn caller_owned_data_dir_survives_drop() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -87,7 +87,7 @@ async fn caller_owned_data_dir_survives_drop() {
 
 /// Restart cycle on the same harness slot — data dir reopened, term
 /// bumps, ledger keeps its committed state.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_node_restart_preserves_state() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -111,7 +111,7 @@ async fn cluster_node_restart_preserves_state() {
 /// abort. Indirect: a stopped leader's port is fully free within a
 /// short window, meaning the per-peer tasks (and the gRPC servers
 /// they depended on) have all stopped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn peer_tasks_drain_on_supervisor_abort() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -131,7 +131,7 @@ async fn peer_tasks_drain_on_supervisor_abort() {
 }
 
 /// Standalone harness drop releases its single port.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn standalone_drop_releases_port() {
     let port: u16;
     {

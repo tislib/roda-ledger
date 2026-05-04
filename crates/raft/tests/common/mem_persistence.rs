@@ -4,8 +4,6 @@
 //! Mirrors the semantic contract of any disk-backed implementation
 //! exactly — the library should behave identically against either.
 
-use std::io;
-
 use raft::types::Term as TermNum;
 use raft::{NodeId, Persistence, TermRecord, TxId};
 
@@ -14,15 +12,6 @@ pub struct MemPersistence {
     term_log: Vec<TermRecord>,
     vote_term: TermNum,
     voted_for: NodeId,
-    /// Test fault-injection: when set, `truncate_term_after` returns
-    /// an `io::Error` instead of mutating the term log. Used by the
-    /// regression tests in `tests/error_handling.rs` to verify the
-    /// library promotes a persistence I/O failure into an
-    /// `Action::FatalError` instead of silently continuing.
-    pub fail_truncate: bool,
-    /// Test fault-injection: when set, `observe_term` returns an
-    /// `io::Error`. Same purpose as `fail_truncate`.
-    pub fail_observe_term: bool,
 }
 
 impl MemPersistence {
@@ -37,8 +26,6 @@ impl MemPersistence {
             term_log,
             vote_term,
             voted_for,
-            fail_truncate: false,
-            fail_observe_term: false,
         }
     }
 }
@@ -70,10 +57,10 @@ impl Persistence for MemPersistence {
         best
     }
 
-    fn commit_term(&mut self, expected: TermNum, start_tx_id: TxId) -> io::Result<bool> {
+    fn commit_term(&mut self, expected: TermNum, start_tx_id: TxId) -> bool {
         let current = self.current_term();
         if current >= expected {
-            return Ok(false);
+            return false;
         }
         // Allow term-log skips: when the vote log raced ahead of the
         // term log (observed-higher-term-via-RPC, no entries yet) the
@@ -84,36 +71,25 @@ impl Persistence for MemPersistence {
             term: expected,
             start_tx_id,
         });
-        Ok(true)
+        true
     }
 
-    fn observe_term(&mut self, term: TermNum, start_tx_id: TxId) -> io::Result<()> {
-        if self.fail_observe_term {
-            return Err(io::Error::other("mem_persistence: injected observe_term failure"));
-        }
+    fn observe_term(&mut self, term: TermNum, start_tx_id: TxId) {
         let current = self.current_term();
         if term == current {
-            return Ok(());
+            return;
         }
-        if term < current {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "mem_persistence: observe_term regression incoming={} current={}",
-                    term, current
-                ),
-            ));
-        }
+        assert!(
+            term > current,
+            "mem_persistence: observe_term regression incoming={} current={}",
+            term,
+            current
+        );
         self.term_log.push(TermRecord { term, start_tx_id });
-        Ok(())
     }
 
-    fn truncate_term_after(&mut self, tx_id: TxId) -> io::Result<()> {
-        if self.fail_truncate {
-            return Err(io::Error::other("mem_persistence: injected truncate_term_after failure"));
-        }
+    fn truncate_term_after(&mut self, tx_id: TxId) {
         self.term_log.retain(|r| r.start_tx_id <= tx_id);
-        Ok(())
     }
 
     fn vote_term(&self) -> TermNum {
@@ -127,45 +103,39 @@ impl Persistence for MemPersistence {
         }
     }
 
-    fn vote(&mut self, term: TermNum, candidate_id: NodeId) -> io::Result<bool> {
-        if candidate_id == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mem_persistence: candidate_id must be non-zero",
-            ));
-        }
+    fn vote(&mut self, term: TermNum, candidate_id: NodeId) -> bool {
+        assert!(
+            candidate_id != 0,
+            "mem_persistence: candidate_id must be non-zero"
+        );
         if term < self.vote_term {
-            return Ok(false);
+            return false;
         }
         if term == self.vote_term {
             if self.voted_for == candidate_id {
-                return Ok(true);
+                return true;
             }
             if self.voted_for != 0 {
-                return Ok(false);
+                return false;
             }
         }
         self.vote_term = term;
         self.voted_for = candidate_id;
-        Ok(true)
+        true
     }
 
-    fn observe_vote_term(&mut self, term: TermNum) -> io::Result<()> {
+    fn observe_vote_term(&mut self, term: TermNum) {
         if term == self.vote_term {
-            return Ok(());
+            return;
         }
-        if term < self.vote_term {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "mem_persistence: observe_vote_term regression incoming={} current={}",
-                    term, self.vote_term
-                ),
-            ));
-        }
+        assert!(
+            term > self.vote_term,
+            "mem_persistence: observe_vote_term regression incoming={} current={}",
+            term,
+            self.vote_term
+        );
         self.vote_term = term;
         self.voted_for = 0;
-        Ok(())
     }
 }
 
@@ -184,17 +154,17 @@ mod tests {
     #[test]
     fn commit_term_then_observe_advances() {
         let mut p = MemPersistence::new();
-        assert!(p.commit_term(1, 0).unwrap());
+        assert!(p.commit_term(1, 0));
         assert_eq!(p.current_term(), 1);
-        p.observe_term(5, 50).unwrap();
+        p.observe_term(5, 50);
         assert_eq!(p.current_term(), 5);
     }
 
     #[test]
     fn commit_term_returns_false_when_already_advanced() {
         let mut p = MemPersistence::new();
-        p.observe_term(5, 0).unwrap();
-        assert!(!p.commit_term(3, 0).unwrap());
+        p.observe_term(5, 0);
+        assert!(!p.commit_term(3, 0));
         assert_eq!(p.current_term(), 5);
     }
 
@@ -204,26 +174,26 @@ mod tests {
     #[test]
     fn commit_term_accepts_forward_skips() {
         let mut p = MemPersistence::new();
-        assert!(p.commit_term(5, 0).unwrap());
+        assert!(p.commit_term(5, 0));
         assert_eq!(p.current_term(), 5);
     }
 
     #[test]
     fn truncate_after_drops_higher_records() {
         let mut p = MemPersistence::new();
-        p.commit_term(1, 0).unwrap();
-        p.commit_term(2, 50).unwrap();
-        p.commit_term(3, 100).unwrap();
-        p.truncate_term_after(75).unwrap();
+        p.commit_term(1, 0);
+        p.commit_term(2, 50);
+        p.commit_term(3, 100);
+        p.truncate_term_after(75);
         assert_eq!(p.current_term(), 2);
     }
 
     #[test]
     fn term_at_tx_resolves_in_memory() {
         let mut p = MemPersistence::new();
-        p.commit_term(1, 0).unwrap();
-        p.commit_term(2, 50).unwrap();
-        p.commit_term(3, 100).unwrap();
+        p.commit_term(1, 0);
+        p.commit_term(2, 50);
+        p.commit_term(3, 100);
         assert_eq!(p.term_at_tx(0).unwrap().term, 1);
         assert_eq!(p.term_at_tx(75).unwrap().term, 2);
         assert_eq!(p.term_at_tx(150).unwrap().term, 3);
@@ -232,45 +202,45 @@ mod tests {
     #[test]
     fn vote_flow_matches_disk_semantics() {
         let mut p = MemPersistence::new();
-        assert!(p.vote(1, 7).unwrap());
-        assert!(p.vote(1, 7).unwrap()); // idempotent
-        assert!(!p.vote(1, 9).unwrap()); // different candidate refused
-        p.observe_vote_term(2).unwrap();
+        assert!(p.vote(1, 7));
+        assert!(p.vote(1, 7)); // idempotent
+        assert!(!p.vote(1, 9)); // different candidate refused
+        p.observe_vote_term(2);
         assert_eq!(p.voted_for(), None);
-        assert!(p.vote(2, 9).unwrap());
+        assert!(p.vote(2, 9));
     }
 
     #[test]
-    fn vote_with_zero_candidate_id_errors() {
+    #[should_panic(expected = "candidate_id must be non-zero")]
+    fn vote_with_zero_candidate_id_panics() {
         let mut p = MemPersistence::new();
-        let err = p.vote(1, 0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = p.vote(1, 0);
     }
 
     #[test]
-    fn observe_vote_lower_term_errors() {
+    #[should_panic(expected = "observe_vote_term regression")]
+    fn observe_vote_lower_term_panics() {
         let mut p = MemPersistence::new();
-        p.observe_vote_term(5).unwrap();
-        let err = p.observe_vote_term(4).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        p.observe_vote_term(5);
+        p.observe_vote_term(4);
     }
 
     // ── term-log boundary semantics ─────────────────────────────────────────
 
-    /// `commit_term(0)` returns `Ok(false)` — `current >= expected`
+    /// `commit_term(0)` returns `false` — `current >= expected`
     /// short-circuits before the lag check. Semantically a no-op.
     #[test]
     fn commit_term_zero_returns_false() {
         let mut p = MemPersistence::new();
-        assert!(!p.commit_term(0, 0).unwrap());
+        assert!(!p.commit_term(0, 0));
     }
 
     /// `commit_term(5)` after `observe(5)` is a refused stale-election.
     #[test]
     fn commit_term_after_same_observe_returns_false() {
         let mut p = MemPersistence::new();
-        p.observe_term(5, 0).unwrap();
-        assert!(!p.commit_term(5, 0).unwrap());
+        p.observe_term(5, 0);
+        assert!(!p.commit_term(5, 0));
     }
 
     /// `commit_term(5)` after `observe(7)` is also refused — current
@@ -278,16 +248,16 @@ mod tests {
     #[test]
     fn commit_term_after_higher_observe_returns_false() {
         let mut p = MemPersistence::new();
-        p.observe_term(7, 0).unwrap();
-        assert!(!p.commit_term(5, 0).unwrap());
+        p.observe_term(7, 0);
+        assert!(!p.commit_term(5, 0));
     }
 
     /// `term_at_tx(0)` when the only record starts at tx 0 returns it.
     #[test]
     fn term_at_tx_zero_with_zero_start_returns_record() {
         let mut p = MemPersistence::new();
-        p.commit_term(1, 0).unwrap();
-        p.observe_term(5, 0).unwrap();
+        p.commit_term(1, 0);
+        p.observe_term(5, 0);
         let r = p.term_at_tx(0).unwrap();
         assert_eq!(r.term, 5);
         assert_eq!(r.start_tx_id, 0);
@@ -297,7 +267,7 @@ mod tests {
     #[test]
     fn term_at_tx_below_only_records_start_returns_none() {
         let mut p = MemPersistence::new();
-        p.observe_term(5, 100).unwrap();
+        p.observe_term(5, 100);
         assert_eq!(p.term_at_tx(0), None);
     }
 
@@ -305,9 +275,9 @@ mod tests {
     #[test]
     fn term_at_tx_max_returns_latest() {
         let mut p = MemPersistence::new();
-        p.commit_term(1, 0).unwrap();
-        p.commit_term(2, 50).unwrap();
-        p.commit_term(3, 100).unwrap();
+        p.commit_term(1, 0);
+        p.commit_term(2, 50);
+        p.commit_term(3, 100);
         let r = p.term_at_tx(u64::MAX).unwrap();
         assert_eq!(r.term, 3);
         assert_eq!(r.start_tx_id, 100);
@@ -317,10 +287,10 @@ mod tests {
     #[test]
     fn truncate_after_u64_max_is_a_noop() {
         let mut p = MemPersistence::new();
-        p.commit_term(1, 0).unwrap();
-        p.commit_term(2, 50).unwrap();
+        p.commit_term(1, 0);
+        p.commit_term(2, 50);
         let before_term = p.current_term();
-        p.truncate_term_after(u64::MAX).unwrap();
+        p.truncate_term_after(u64::MAX);
         assert_eq!(p.current_term(), before_term);
     }
 
@@ -331,13 +301,13 @@ mod tests {
     #[test]
     fn cross_term_vote_sequence_for_same_node() {
         let mut p = MemPersistence::new();
-        assert!(p.vote(1, 7).unwrap());
-        p.observe_vote_term(2).unwrap();
-        assert!(p.vote(2, 7).unwrap());
+        assert!(p.vote(1, 7));
+        p.observe_vote_term(2);
+        assert!(p.vote(2, 7));
         assert_eq!(p.voted_for(), Some(7));
         // A vote at the older term is refused (vote-log term has
         // moved past it).
-        assert!(!p.vote(1, 9).unwrap());
+        assert!(!p.vote(1, 9));
     }
 
     /// `observe_vote_term` clears the slot; an immediate `vote` in
@@ -345,10 +315,10 @@ mod tests {
     #[test]
     fn observe_vote_term_clears_then_vote_grants() {
         let mut p = MemPersistence::new();
-        assert!(p.vote(7, 5).unwrap());
-        p.observe_vote_term(9).unwrap();
+        assert!(p.vote(7, 5));
+        p.observe_vote_term(9);
         assert_eq!(p.voted_for(), None);
-        assert!(p.vote(9, 11).unwrap());
+        assert!(p.vote(9, 11));
         assert_eq!(p.voted_for(), Some(11));
     }
 }

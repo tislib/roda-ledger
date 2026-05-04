@@ -37,6 +37,7 @@ bytes.workspace = true
 # Binary-only deps. They could be split out with feature flags but the win
 # is too small to be worth the complexity.
 clap.workspace = true
+log = "0.4.29"
 
 [dev-dependencies]
 cluster-test-utils.workspace = true

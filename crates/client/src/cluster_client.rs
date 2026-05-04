@@ -261,6 +261,18 @@ impl ClusterClient {
             .await
     }
 
+    pub async fn deposit_and_wait_no_retry(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        wait_level: proto::WaitLevel,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .deposit_and_wait_no_retry(account, amount, user_ref, wait_level)
+            .await
+    }
+
     pub async fn withdraw_and_wait(
         &self,
         account: u64,
@@ -470,7 +482,7 @@ impl ClusterLeaderClient {
     async fn with_leader_retry<F, Fut, T>(&self, op_name: &str, op: F) -> Result<T>
     where
         F: Fn(NodeClient) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T>>,
     {
         let max = self.retry.max_retry_count;
         let n_nodes = self.nodes.len();
@@ -581,6 +593,18 @@ impl ClusterLeaderClient {
                 .await
         })
         .await
+    }
+
+    pub async fn deposit_and_wait_no_retry(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        wait_level: proto::WaitLevel,
+    ) -> Result<SubmitResult> {
+        let c = &self.nodes[self.current_leader_index()];
+        c.deposit_and_wait(account, amount, user_ref, wait_level)
+            .await
     }
 
     pub async fn withdraw_and_wait(

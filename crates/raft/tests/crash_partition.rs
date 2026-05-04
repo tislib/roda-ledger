@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::Sim;
 use common::mem_persistence::MemPersistence;
-use raft::{Event, NodeId, Persistence, RaftConfig, RaftNode, Role};
+use raft::{LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role};
 
 fn await_leader_in(sim: &mut Sim, ids: &[NodeId]) -> NodeId {
     let deadline = sim.clock() + Duration::from_secs(5);
@@ -90,8 +90,8 @@ fn boot_recovers_term_and_vote() {
     // deterministically without a simulator.
     let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), 1);
     assert_eq!(node.voted_for(), Some(1));
@@ -116,27 +116,27 @@ fn restart_preserves_one_vote_per_term_rule() {
     // multi-node config and replay an RV from a different candidate.
     let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
     let t0 = Instant::now();
-    let _ = node.step(t0, Event::Tick);
-    let _ = node.step(t0 + Duration::from_secs(60), Event::Tick);
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.voted_for(), Some(1));
     let term = node.current_term();
     let p = node.into_persistence();
 
     // Restart in a 3-node cluster shape so RV semantics make sense.
     let mut node = RaftNode::new(1, vec![1, 2, 3], p, RaftConfig::default(), 42);
-    let actions = node.step(
+    let reply = node.election().handle_request_vote(
         Instant::now(),
-        Event::RequestVoteRequest {
+        RequestVoteRequest {
             from: 2,
             term,
             last_tx_id: 0,
             last_term: 0,
         },
     );
-    let granted = actions
-        .iter()
-        .any(|a| matches!(a, raft::Action::SendRequestVoteReply { granted: true, .. }));
-    assert!(!granted, "vote granted in same term to a different node");
+    assert!(
+        !reply.granted,
+        "vote granted in same term to a different node"
+    );
 }
 
 // ── Network partitions ──────────────────────────────────────────────────────
@@ -292,4 +292,98 @@ fn symmetric_partition_no_quorum_either_side() {
     );
 
     sim.assert_election_safety();
+}
+
+// ── Index-split refactor regressions ──────────────────────────────────────
+
+/// After driver-side hydration via `advance`, a restarted node
+/// should reflect the recovered watermarks. Pre-refactor this was
+/// implicit through `LogAppendComplete`; post-refactor `advance` is
+/// the canonical entry point.
+#[test]
+fn restart_recovers_local_indexes_via_advance() {
+    let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    assert!(node.role().is_leader());
+    node.advance_write_index(7);
+    node.advance_commit_index(7);
+    assert_eq!(node.commit_index(), 7);
+    assert_eq!(node.write_index(), 7);
+
+    // Crash + restart preserves only the term/vote logs.
+    let p = node.into_persistence();
+    let mut restarted = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
+    assert_eq!(restarted.commit_index(), 0);
+    assert_eq!(restarted.write_index(), 0);
+
+    // Driver hydrates from the durable ledger watermark.
+    restarted.advance_write_index(7);
+    restarted.advance_commit_index(7);
+    assert_eq!(restarted.commit_index(), 7);
+    assert_eq!(restarted.write_index(), 7);
+}
+
+/// Pre-crash, the leader had `local_write_index = 5` and
+/// `local_commit_index = 3` (durably written but not yet locally
+/// committed). The driver's recovery path surfaces only the ledger's
+/// commit watermark (3) — see ADR-0017 §"Required Invariants" #9. We
+/// pin this collapse as **expected** behavior so a future change
+/// adding index persistence has to update the contract explicitly.
+#[test]
+fn write_ahead_of_commit_collapses_on_restart() {
+    let mut node = RaftNode::new(1, vec![1], MemPersistence::new(), RaftConfig::default(), 42);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    assert!(node.role().is_leader());
+    node.advance_write_index(5);
+    node.advance_commit_index(3);
+    assert_eq!(node.write_index(), 5);
+    assert_eq!(node.commit_index(), 3);
+
+    let p = node.into_persistence();
+    let mut restarted = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
+    // Driver only knows about the ledger's last_commit_id; the raft-
+    // log WAL extent is not separately surfaced today.
+    restarted.advance_write_index(3);
+    restarted.advance_commit_index(3);
+    assert_eq!(restarted.write_index(), 3);
+    assert_eq!(restarted.commit_index(), 3);
+}
+
+/// A leader that observes a higher term steps down to follower; the
+/// node-level `local_write_index` survives the role swing. Pre-
+/// refactor `LeaderState.last_written` was dropped on step-down — the
+/// node-scoped split fixes this for free.
+#[test]
+fn leader_step_down_preserves_write_index() {
+    let mut node = RaftNode::new(1, vec![1, 2, 3], MemPersistence::new(), RaftConfig::default(), 42);
+    let t0 = Instant::now();
+    common::drive_tick(&mut node, t0);
+    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
+    // Single-vote majority requires a peer-vote to win; force win
+    // via a record_grant by sending a vote reply at the right term.
+    let term_now = node.current_term();
+    common::deliver_vote_reply(&mut node, t0 + Duration::from_secs(60), 2, term_now, true);
+    assert!(node.role().is_leader(), "test setup: must be leader");
+
+    node.advance_write_index(5);
+    node.advance_commit_index(5);
+    assert_eq!(node.write_index(), 5);
+
+    // Inbound RPC at a strictly higher term forces step-down.
+    let _ = node.validate_append_entries_request(
+        t0 + Duration::from_secs(61),
+        2,
+        term_now + 1,
+        5,
+        term_now,
+        LogEntryRange::empty(),
+        0,
+    );
+    assert!(matches!(node.role(), Role::Follower));
+    // Survives the role transition.
+    assert_eq!(node.write_index(), 5);
 }

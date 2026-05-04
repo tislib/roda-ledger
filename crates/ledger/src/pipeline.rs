@@ -65,9 +65,6 @@ pub struct Pipeline {
 
     /// Shared wait strategy used by every stage's idle/backpressure loops.
     wait_strategy: WaitStrategy,
-
-    /// Optional hook fired by the WAL stage every time `commit_index`
-    commit_handler: OnceLock<CommitHandler>,
 }
 
 impl Pipeline {
@@ -97,20 +94,7 @@ impl Pipeline {
 
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
-            commit_handler: OnceLock::new(),
         })
-    }
-
-    /// Install the commit-index callback. Returns `Err` if already set —
-    /// the hook is intentionally one-shot so the WAL stage can rely on
-    /// it being stable for the lifetime of the pipeline.
-    pub fn set_commit_handler(&self, handler: CommitHandler) -> Result<(), CommitHandler> {
-        self.commit_handler.set(handler)
-    }
-
-    #[inline]
-    fn commit_handler(&self) -> Option<&CommitHandler> {
-        self.commit_handler.get()
     }
 
     #[inline(always)]
@@ -378,9 +362,6 @@ impl WalContext {
     #[inline]
     pub fn set_commit_index(&self, id: u64) {
         self.pipeline.commit_index.store(id, Ordering::Release);
-        if let Some(handler) = self.pipeline.commit_handler() {
-            handler(id);
-        }
     }
 
     #[inline]

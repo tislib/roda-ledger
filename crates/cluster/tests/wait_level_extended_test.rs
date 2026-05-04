@@ -1,16 +1,16 @@
 //! Wait levels and read semantics on cluster.
 
-
 use ::proto::ledger as proto;
 use ::proto::ledger::WaitLevel;
 use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
+use client::RetryConfig;
 use cluster::{LedgerHandler, Role, Term};
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use ledger::ledger::Ledger;
-use storage::{TermRecord, TermStorage};
 use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage::{TermRecord, TermStorage};
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tonic::Request;
@@ -40,7 +40,7 @@ async fn wait_committed(ledger: &Ledger, tx_id: u64) {
 
 // ── Wait levels via cluster client API -----------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wait_level_computed_on_cluster() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -54,7 +54,7 @@ async fn wait_level_computed_on_cluster() {
     assert!(r.tx_id > 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wait_level_committed_on_cluster() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -67,7 +67,7 @@ async fn wait_level_committed_on_cluster() {
     assert_eq!(r.fail_reason, 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wait_level_snapshot_on_cluster() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -84,7 +84,7 @@ async fn wait_level_snapshot_on_cluster() {
 /// `WaitLevel::ClusterCommit` requires snapshot ≥ tx, commit ≥ tx,
 /// AND `cluster_commit_index ≥ tx`. End-to-end ack on a 3-node
 /// cluster proves the wait succeeds when all three advance.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wait_level_cluster_commit_requires_full_advance() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -99,7 +99,7 @@ async fn wait_level_cluster_commit_requires_full_advance() {
 
 /// `WaitLevel::ClusterCommit` blocks (and eventually times out) when no
 /// quorum is reachable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wait_level_cluster_commit_blocks_without_quorum() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -265,16 +265,13 @@ async fn get_status_with_correct_term_succeeds() {
 
 // ── Submit semantics on non-leader roles ---------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn submit_on_follower_returns_failed_precondition() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
         .expect("start");
     let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let follower_idx = ctl
-        .first_follower_index()
-        .await
-        .expect("follower idx");
+    let follower_idx = ctl.first_follower_index().await.expect("follower idx");
     let err = ctl
         .raw_client_for_slot(follower_idx)
         .expect("raw follower client")
