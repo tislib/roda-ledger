@@ -36,6 +36,15 @@ pub enum Operation {
         override_existing: bool,
         user_ref: u64,
     },
+    /// Internal cluster operation: record a new Raft term and the local
+    /// quorum snapshot. Submitted only by the cluster layer (never by
+    /// clients). Carries no `user_ref` — dedup is bypassed.
+    NewTerm {
+        term: u64,
+        node_id: u64,
+        node_count: u16,
+        node_voted: u16,
+    },
 }
 
 impl Operation {
@@ -46,6 +55,7 @@ impl Operation {
             Operation::Withdrawal { user_ref, .. } => *user_ref,
             Operation::Function { user_ref, .. } => *user_ref,
             Operation::FunctionRegistration { user_ref, .. } => *user_ref,
+            Operation::NewTerm { .. } => 0,
         }
     }
 }

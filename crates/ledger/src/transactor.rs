@@ -15,6 +15,7 @@ use storage::entities::{
     EntryKind, FailReason, FunctionRegistered, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind,
     TxMetadata, WalEntry, WalEntryKind, WalInput,
 };
+use storage::entries::wal_tx_term_entry;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TransactorState — shared inter-state buffer
@@ -679,6 +680,11 @@ impl TransactorRunner {
             // other operations and for failed registrations.
             let mut pending_function_registration: Option<(String, u16, u32)> = None;
 
+            // Carries (term, node_id, node_count, node_voted) from the
+            // `Operation::NewTerm` arm to the post-bookkeeping push site
+            // below. Same staging trick as the function-registration path.
+            let mut pending_term: Option<(u64, u64, u16, u16)> = None;
+
             match operation {
                 Operation::Deposit {
                     user_ref,
@@ -769,6 +775,20 @@ impl TransactorRunner {
                     // verify/rollback block, so we stash it here).
                     pending_function_registration =
                         registration_outcome.map(|(version, crc)| (name.clone(), version, crc));
+                }
+                Operation::NewTerm {
+                    term,
+                    node_id,
+                    node_count,
+                    node_voted,
+                } => {
+                    // Internal cluster op: emit a TxMetadata so the term
+                    // record is anchored to a tx_id (and visible in the
+                    // standard meta+follower stream), then stage the
+                    // TxTerm for the post-bookkeeping push below — same
+                    // shape as Operation::FunctionRegistration.
+                    self.state.borrow_mut().meta(*b"NEWTERM\0", 0, timestamp);
+                    pending_term = Some((term, node_id, node_count, node_voted));
                 }
                 Operation::Function {
                     name,
@@ -880,6 +900,16 @@ impl TransactorRunner {
                 let record = FunctionRegistered::new(&name, version, crc);
                 let mut s = self.state.borrow_mut();
                 s.entries.push(WalEntry::FunctionRegistered(record));
+                s.position += 1;
+            }
+
+            // Same post-bookkeeping pattern for Operation::NewTerm: the
+            // TxTerm is appended after meta/CRC math so entry_count
+            // stays at 0 on the meta. Manually advance `position` by 1.
+            if let Some((term, node_id, node_count, node_voted)) = pending_term {
+                let record = wal_tx_term_entry(term, node_id, node_count, node_voted);
+                let mut s = self.state.borrow_mut();
+                s.entries.push(WalEntry::Term(record));
                 s.position += 1;
             }
         }

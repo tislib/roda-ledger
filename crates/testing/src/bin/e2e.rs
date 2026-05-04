@@ -22,7 +22,7 @@ fn main() {
         scenario(
             "correctness::deposit_committed_reflects_in_balance",
             false,
-            || e2e::correctness::deposit_committed_reflects_in_balance(),
+            e2e::correctness::deposit_committed_reflects_in_balance,
         ),
         scenario("correctness::matrix_transfer_grid", false, || {
             e2e::correctness::matrix_transfer_grid()
@@ -53,7 +53,7 @@ fn main() {
         scenario(
             "wasm::wasm_new_version_loaded_after_restart_and_crash",
             true,
-            || e2e::wasm::wasm_new_version_loaded_after_restart_and_crash(),
+            e2e::wasm::wasm_new_version_loaded_after_restart_and_crash,
         ),
         scenario("wasm::wasm_unregister_persists_across_crash", true, || {
             e2e::wasm::wasm_unregister_persists_across_crash()
