@@ -1,5 +1,6 @@
 use storage::entities::TxLinkKind;
 use storage::entities::*;
+use storage::wal_serializer::serialize_wal_records;
 use storage::{WAL_MAGIC, WAL_VERSION};
 
 pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
@@ -13,8 +14,7 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
         WalEntry::Metadata(m) => serde_json::json!({
             "type": "TxMetadata",
             "tx_id": m.tx_id,
-            "entry_count": m.entry_count,
-            "link_count": m.link_count,
+            "sub_item_count": m.sub_item_count,
             "fail_reason": m.fail_reason.as_u8(),
             "crc32c": format!("{:#010x}", m.crc32c),
             "user_ref": m.user_ref,
@@ -82,11 +82,9 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
         }
         "TxMetadata" => {
             let tx_id = value["tx_id"].as_u64().ok_or("missing tx_id")?;
-            let entry_count = value["entry_count"].as_u64().ok_or("missing entry_count")? as u8;
-            let link_count = value
-                .get("link_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u8;
+            let sub_item_count = value["sub_item_count"]
+                .as_u64()
+                .ok_or("missing sub_item_count")? as u16;
             let fail_reason = FailReason::from_u8(value["fail_reason"].as_u64().unwrap_or(0) as u8);
             let user_ref = value.get("user_ref").and_then(|v| v.as_u64()).unwrap_or(0);
             let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -97,9 +95,8 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 .unwrap_or([0u8; 8]);
             Ok(WalEntry::Metadata(TxMetadata {
                 entry_type: WalEntryKind::TxMetadata as u8,
-                entry_count,
-                link_count,
                 fail_reason,
+                sub_item_count,
                 crc32c: 0,
                 tx_id,
                 timestamp,
@@ -177,25 +174,18 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
     }
 }
 
-pub fn compute_tx_crc(meta: &TxMetadata, entries: &[TxEntry]) -> u32 {
-    compute_tx_crc_with_links(meta, entries, &[])
-}
-
-pub fn compute_tx_crc_with_links(meta: &TxMetadata, entries: &[TxEntry], links: &[TxLink]) -> u32 {
+pub fn compute_tx_crc(meta: &TxMetadata, sub_items: &[WalEntry]) -> u32 {
     let mut m = *meta;
     m.crc32c = 0;
     let mut digest = crc32c::crc32c(bytemuck::bytes_of(&m));
-    for e in entries {
-        digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(e));
-    }
-    for l in links {
-        digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(l));
+    for entry in sub_items {
+        digest = crc32c::crc32c_append(digest, serialize_wal_records(entry));
     }
     digest
 }
 
-pub fn verify_tx_crc_with_links(meta: &TxMetadata, entries: &[TxEntry], links: &[TxLink]) -> bool {
-    compute_tx_crc_with_links(meta, entries, links) == meta.crc32c
+pub fn verify_tx_crc(meta: &TxMetadata, sub_items: &[WalEntry]) -> bool {
+    compute_tx_crc(meta, sub_items) == meta.crc32c
 }
 
 fn hex_encode_tag(tag: &[u8; 8]) -> String {

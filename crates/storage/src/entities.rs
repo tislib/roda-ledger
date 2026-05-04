@@ -55,14 +55,13 @@ impl FailReason {
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxMetadata {
     pub entry_type: u8,          // 1 @ 0  — WalEntryKind::TxMetadata
-    pub entry_count: u8,         // 1 @ 1  — number of TxEntry records following
-    pub link_count: u8,          // 1 @ 2  — number of TxLink records after entries
-    pub fail_reason: FailReason, // 1 @ 3
-    pub crc32c: u32,             // 4 @ 4  — CRC32C; zero this field when computing
-    pub tx_id: u64,              // 8 @ 8
-    pub timestamp: u64,          // 8 @ 16
-    pub user_ref: u64,           // 8 @ 24
-    pub tag: [u8; 8],            // 8 @ 32
+    pub fail_reason: FailReason, // 1 @ 1
+    pub sub_item_count: u16, // 2 @ 2  — TxEntry + TxLink + TxTerm + FunctionRegistered following
+    pub crc32c: u32,         // 4 @ 4  — CRC32C; zero this field when computing
+    pub tx_id: u64,          // 8 @ 8
+    pub timestamp: u64,      // 8 @ 16
+    pub user_ref: u64,       // 8 @ 24
+    pub tag: [u8; 8],        // 8 @ 32
 } // total: 40 bytes
 
 /// First record in every WAL segment. 40 bytes.

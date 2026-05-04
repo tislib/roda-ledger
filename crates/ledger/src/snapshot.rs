@@ -66,7 +66,7 @@ pub struct Snapshot {
 struct SnapshotRunner {
     balances: Arc<Vec<AtomicI64>>,
     /// Total remaining records (entries + links) for the current transaction.
-    pending_records: u8,
+    pending_records: u16,
     indexer: TransactionIndexer,
 }
 
@@ -122,7 +122,7 @@ impl Snapshot {
 
     pub(crate) fn recover_index_tx_metadata(&mut self, metadata: &TxMetadata) {
         if let Some(indexer) = &mut self.indexer {
-            indexer.insert_tx(metadata.tx_id, metadata.entry_count);
+            indexer.insert_tx(metadata.tx_id);
         }
     }
 
@@ -162,8 +162,8 @@ impl SnapshotRunner {
                     SnapshotMessage::Entry(wal_entry) => {
                         match wal_entry {
                             WalEntry::Metadata(m) => {
-                                self.indexer.insert_tx(m.tx_id, m.entry_count);
-                                self.pending_records = m.entry_count.saturating_add(m.link_count);
+                                self.indexer.insert_tx(m.tx_id);
+                                self.pending_records = m.sub_item_count;
                                 last_processed_tx_id = m.tx_id;
                             }
                             WalEntry::Entry(e) => {
@@ -190,15 +190,21 @@ impl SnapshotRunner {
                             WalEntry::SegmentHeader(_) => {}
                             WalEntry::FunctionRegistered(_) => {
                                 // The Transactor owns WasmRuntime
-                                // mutations now — registration and
+                                // mutations — registration and
                                 // unregistration are applied during the
                                 // FunctionRegistration dispatcher arm.
                                 // The Snapshot stage only sees this
-                                // record as a passive WAL trailer
-                                // following its TxMetadata; no balance
-                                // or index work is needed.
+                                // record as a sub-item of its parent
+                                // TxMetadata; decrement the counter so
+                                // the meta+follower group completes.
+                                self.pending_records = self.pending_records.saturating_sub(1);
                             }
-                            WalEntry::Term(_) => {}
+                            WalEntry::Term(_) => {
+                                // TxTerm is a sub-item of its parent
+                                // TxMetadata; decrement to complete the
+                                // meta+follower group.
+                                self.pending_records = self.pending_records.saturating_sub(1);
+                            }
                         }
                         if last_processed_tx_id > 0 && self.pending_records == 0 {
                             ctx.set_processed_index(last_processed_tx_id);

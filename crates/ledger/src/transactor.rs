@@ -16,6 +16,7 @@ use storage::entities::{
     TxMetadata, WalEntry, WalEntryKind, WalInput,
 };
 use storage::entries::wal_tx_term_entry;
+use storage::wal_serializer::serialize_wal_records;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TransactorState — shared inter-state buffer
@@ -98,9 +99,8 @@ impl TransactorState {
     pub fn meta(&mut self, tag: [u8; 8], user_ref: u64, timestamp: u64) {
         self.entries.push(WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 0,
-            link_count: 0,
             fail_reason: FailReason::NONE,
+            sub_item_count: 0,
             crc32c: 0,
             tx_id: self.tx_id,
             timestamp,
@@ -180,9 +180,8 @@ impl TransactorState {
 
         let mut meta = TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 0,
-            link_count: 1,
             fail_reason: FailReason::DUPLICATE,
+            sub_item_count: 1,
             crc32c: 0,
             tx_id: self.tx_id,
             timestamp,
@@ -674,17 +673,6 @@ impl TransactorRunner {
             // self.transaction_buffer while mutating self.state below.
             let operation = self.transaction_buffer[idx].operation.clone();
 
-            // Carries (name, version, crc) from the
-            // `Operation::FunctionRegistration` arm to the
-            // post-bookkeeping push site below. Stays `None` for all
-            // other operations and for failed registrations.
-            let mut pending_function_registration: Option<(String, u16, u32)> = None;
-
-            // Carries (term, node_id, node_count, node_voted) from the
-            // `Operation::NewTerm` arm to the post-bookkeeping push site
-            // below. Same staging trick as the function-registration path.
-            let mut pending_term: Option<(u64, u64, u16, u16)> = None;
-
             match operation {
                 Operation::Deposit {
                     user_ref,
@@ -754,27 +742,24 @@ impl TransactorRunner {
                             .register(&name, &binary, override_existing)
                     };
 
-                    // 3. On failure, flip the fail flag — verify/rollback
-                    //    below will stamp the meta and truncate any
-                    //    followers (none in this branch). On success,
-                    //    we'll push the FunctionRegistered AFTER the
-                    //    bookkeeping so it is not counted as a TxEntry
-                    //    follower (it isn't TxEntry, but `entry_count`
-                    //    is computed by length so the post-bookkeep
-                    //    push keeps the meta's entry_count = 0 honest).
-                    let registration_outcome = match outcome {
-                        Ok(vc) => Some(vc),
+                    // 3. On success, push the `FunctionRegistered` as a
+                    //    real sub-item of the meta — verify/commit will
+                    //    count it (sub_item_count = 1) and include it in
+                    //    the meta's CRC. On failure, flip the fail flag;
+                    //    rollback() truncates past `position` so no
+                    //    follower is ever written.
+                    match outcome {
+                        Ok((version, crc)) => {
+                            let record = FunctionRegistered::new(&name, version, crc);
+                            self.state
+                                .borrow_mut()
+                                .entries
+                                .push(WalEntry::FunctionRegistered(record));
+                        }
                         Err(_) => {
                             self.state.borrow_mut().fail(FailReason::INVALID_OPERATION);
-                            None
                         }
-                    };
-                    // Carry the outcome forward; the post-bookkeeping
-                    // push happens in a separate stage below this match
-                    // (we cannot easily plumb it through the existing
-                    // verify/rollback block, so we stash it here).
-                    pending_function_registration =
-                        registration_outcome.map(|(version, crc)| (name.clone(), version, crc));
+                    }
                 }
                 Operation::NewTerm {
                     term,
@@ -782,13 +767,15 @@ impl TransactorRunner {
                     node_count,
                     node_voted,
                 } => {
-                    // Internal cluster op: emit a TxMetadata so the term
-                    // record is anchored to a tx_id (and visible in the
-                    // standard meta+follower stream), then stage the
-                    // TxTerm for the post-bookkeeping push below — same
-                    // shape as Operation::FunctionRegistration.
-                    self.state.borrow_mut().meta(*b"NEWTERM\0", 0, timestamp);
-                    pending_term = Some((term, node_id, node_count, node_voted));
+                    // Internal cluster op: emit a TxMetadata anchoring
+                    // the term to a tx_id, then push the TxTerm as the
+                    // single sub-item of that meta. The standard
+                    // verify/commit path stamps sub_item_count = 1 and
+                    // CRCs the term record alongside the meta.
+                    let record = wal_tx_term_entry(term, node_id, node_count, node_voted);
+                    let mut s = self.state.borrow_mut();
+                    s.meta(*b"NEWTERM\0", 0, timestamp);
+                    s.entries.push(WalEntry::Term(record));
                 }
                 Operation::Function {
                     name,
@@ -827,13 +814,13 @@ impl TransactorRunner {
                             if status != 0 {
                                 s.fail(FailReason::from_u8(status));
                             } else {
-                                // TxMetadata.entry_count is u8 — a WASM
-                                // function can call credit/debit more
-                                // than 255 times. Reject those here so
-                                // the meta's entry_count can losslessly
-                                // encode the real count downstream.
+                                // TxMetadata.sub_item_count is u16 — a
+                                // WASM function can call credit/debit
+                                // more than 65,535 times. Reject those
+                                // here so the meta's sub_item_count can
+                                // losslessly encode the real count.
                                 let entry_count = s.entries.len() - s.position - 1;
-                                if entry_count > u8::MAX as usize {
+                                if entry_count > u16::MAX as usize {
                                     s.fail(FailReason::ENTRY_LIMIT_EXCEEDED);
                                 }
                             }
@@ -852,8 +839,7 @@ impl TransactorRunner {
 
                 if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.fail_reason = fail_reason;
-                    m.entry_count = 0;
-                    m.link_count = 0;
+                    m.sub_item_count = 0;
                     m.crc32c = 0;
                     let digest = crc32c::crc32c(bytemuck::bytes_of(m));
                     m.crc32c = digest;
@@ -864,10 +850,10 @@ impl TransactorRunner {
                 self.dedup.insert(user_ref, tx_id);
                 self.state.borrow_mut().position += 1;
             } else {
-                let entry_count = s.entries.len() - meta_idx - 1;
+                let sub_item_count = s.entries.len() - meta_idx - 1;
 
                 if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
-                    m.entry_count = entry_count as u8;
+                    m.sub_item_count = sub_item_count as u16;
                     m.crc32c = 0;
                 }
                 let mut digest = if let Some(WalEntry::Metadata(m)) = s.entries.get(meta_idx) {
@@ -876,9 +862,7 @@ impl TransactorRunner {
                     0
                 };
                 for i in (meta_idx + 1)..s.entries.len() {
-                    if let WalEntry::Entry(e) = &s.entries[i] {
-                        digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(e));
-                    }
+                    digest = crc32c::crc32c_append(digest, serialize_wal_records(&s.entries[i]));
                 }
                 if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.crc32c = digest;
@@ -886,31 +870,7 @@ impl TransactorRunner {
 
                 drop(s);
                 self.dedup.insert(user_ref, tx_id);
-                self.state.borrow_mut().position += 1 + entry_count;
-            }
-
-            // For successful FunctionRegistration: append the
-            // FunctionRegistered record AFTER the verify/rollback
-            // bookkeeping so it is invisible to entry_count/CRC math
-            // (the meta is stamped with entry_count = 0). Manually
-            // advance `position` by 1 to keep the next tx's meta_idx
-            // aligned with `entries.len()`. Mirrors the pattern in
-            // `emit_duplicate`.
-            if let Some((name, version, crc)) = pending_function_registration {
-                let record = FunctionRegistered::new(&name, version, crc);
-                let mut s = self.state.borrow_mut();
-                s.entries.push(WalEntry::FunctionRegistered(record));
-                s.position += 1;
-            }
-
-            // Same post-bookkeeping pattern for Operation::NewTerm: the
-            // TxTerm is appended after meta/CRC math so entry_count
-            // stays at 0 on the meta. Manually advance `position` by 1.
-            if let Some((term, node_id, node_count, node_voted)) = pending_term {
-                let record = wal_tx_term_entry(term, node_id, node_count, node_voted);
-                let mut s = self.state.borrow_mut();
-                s.entries.push(WalEntry::Term(record));
-                s.position += 1;
+                self.state.borrow_mut().position += 1 + sub_item_count;
             }
         }
 

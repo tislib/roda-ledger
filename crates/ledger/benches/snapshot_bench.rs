@@ -13,9 +13,8 @@ use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, Wa
 fn make_snapshot_messages(tx_id: u64, account_id: u64, amount: u64) -> [SnapshotMessage; 2] {
     let metadata = TxMetadata {
         entry_type: WalEntryKind::TxMetadata as u8,
-        entry_count: 1,
-        link_count: 0,
         fail_reason: FailReason::NONE,
+        sub_item_count: 1,
         crc32c: 0,
         tx_id,
         timestamp: 0,

@@ -67,6 +67,10 @@ struct Cursor {
     /// True when the file was opened as `wal.bin`. Becomes irrelevant
     /// after we advance to the next segment.
     is_active: bool,
+    /// Most recent `TxMetadata.tx_id` observed while filtering. Sub-items
+    /// (`TxTerm`, `FunctionRegistered`) carry no tx_id of their own and
+    /// inherit this for the `>= from_tx_id` filter.
+    last_meta_tx_id: u64,
 }
 
 impl WalTailer {
@@ -155,14 +159,23 @@ impl WalTailer {
             }
             cursor.position += n_aligned as u64;
 
-            // In-place filter: keep records whose kind has a tx_id and
-            // tx_id >= from_tx_id, or structural records when from_tx_id==0.
+            // In-place filter: keep records whose tx_id (own or inherited
+            // from the preceding meta) is >= from_tx_id. Structural
+            // segment delimiters are kept only on full replay (from_tx_id==0).
             let from_tx_id = cursor.from_tx_id;
             let records = n_aligned / WAL_RECORD_SIZE;
             let mut w = 0usize;
             for r in 0..records {
                 let src = r * WAL_RECORD_SIZE;
-                let keep = record_matches(&dst[src..src + WAL_RECORD_SIZE], from_tx_id);
+                let rec = &dst[src..src + WAL_RECORD_SIZE];
+                if rec[0] == WalEntryKind::TxMetadata as u8 {
+                    cursor.last_meta_tx_id = u64::from_le_bytes(
+                        rec[TX_ID_OFFSET..TX_ID_OFFSET + 8]
+                            .try_into()
+                            .expect("WAL record is exactly 40 bytes"),
+                    );
+                }
+                let keep = record_matches(rec, from_tx_id, cursor.last_meta_tx_id);
                 if keep {
                     if w != r {
                         dst.copy_within(src..src + WAL_RECORD_SIZE, w * WAL_RECORD_SIZE);
@@ -282,6 +295,7 @@ impl WalTailer {
         let file = File::open(path)?;
         let inode = file.metadata()?.ino();
         let carried_from_tx = self.cursor.as_ref().map_or(0, |c| c.from_tx_id);
+        let carried_last_meta = self.cursor.as_ref().map_or(0, |c| c.last_meta_tx_id);
         self.cursor = Some(Cursor {
             from_tx_id: carried_from_tx,
             file,
@@ -289,6 +303,7 @@ impl WalTailer {
             position: 0,
             segment_id,
             is_active,
+            last_meta_tx_id: carried_last_meta,
         });
         Ok(())
     }
@@ -361,23 +376,31 @@ fn first_tx_id_in_file(file: &File) -> Option<u64> {
 }
 
 #[inline]
-fn record_matches(record: &[u8], from_tx_id: u64) -> bool {
+fn record_matches(record: &[u8], from_tx_id: u64, last_meta_tx_id: u64) -> bool {
     debug_assert_eq!(record.len(), WAL_RECORD_SIZE);
     let kind = record[0];
-    let has_tx_id = kind == WalEntryKind::TxMetadata as u8
+    let has_own_tx_id = kind == WalEntryKind::TxMetadata as u8
         || kind == WalEntryKind::TxEntry as u8
         || kind == WalEntryKind::Link as u8;
 
-    if !has_tx_id {
-        return from_tx_id == 0;
+    if has_own_tx_id {
+        let tx_id = u64::from_le_bytes(
+            record[TX_ID_OFFSET..TX_ID_OFFSET + 8]
+                .try_into()
+                .expect("WAL record is exactly 40 bytes"),
+        );
+        return tx_id >= from_tx_id;
     }
 
-    let tx_id = u64::from_le_bytes(
-        record[TX_ID_OFFSET..TX_ID_OFFSET + 8]
-            .try_into()
-            .expect("WAL record is exactly 40 bytes"),
-    );
-    tx_id >= from_tx_id
+    // Sub-items (TxTerm, FunctionRegistered) inherit tx_id from the
+    // preceding TxMetadata. Segment delimiters keep the original
+    // "only on full replay" rule.
+    let inherits_tx_id =
+        kind == WalEntryKind::TxTerm as u8 || kind == WalEntryKind::FunctionRegistered as u8;
+    if inherits_tx_id {
+        return last_meta_tx_id >= from_tx_id;
+    }
+    from_tx_id == 0
 }
 
 #[cfg(test)]
@@ -388,8 +411,8 @@ mod tests {
     fn record_matches_filters_structural_unless_from_zero() {
         let mut header = [0u8; WAL_RECORD_SIZE];
         header[0] = WalEntryKind::SegmentHeader as u8;
-        assert!(record_matches(&header, 0));
-        assert!(!record_matches(&header, 1));
+        assert!(record_matches(&header, 0, 0));
+        assert!(!record_matches(&header, 1, 0));
     }
 
     #[test]
@@ -397,8 +420,23 @@ mod tests {
         let mut rec = [0u8; WAL_RECORD_SIZE];
         rec[0] = WalEntryKind::TxMetadata as u8;
         rec[TX_ID_OFFSET..TX_ID_OFFSET + 8].copy_from_slice(&5u64.to_le_bytes());
-        assert!(record_matches(&rec, 0));
-        assert!(record_matches(&rec, 5));
-        assert!(!record_matches(&rec, 6));
+        assert!(record_matches(&rec, 0, 0));
+        assert!(record_matches(&rec, 5, 0));
+        assert!(!record_matches(&rec, 6, 0));
+    }
+
+    #[test]
+    fn sub_item_inherits_parent_meta_tx_id() {
+        let mut term = [0u8; WAL_RECORD_SIZE];
+        term[0] = WalEntryKind::TxTerm as u8;
+        // last_meta_tx_id = 10, from_tx_id = 5 → keep
+        assert!(record_matches(&term, 5, 10));
+        // last_meta_tx_id = 10, from_tx_id = 11 → drop
+        assert!(!record_matches(&term, 11, 10));
+
+        let mut func = [0u8; WAL_RECORD_SIZE];
+        func[0] = WalEntryKind::FunctionRegistered as u8;
+        assert!(record_matches(&func, 5, 10));
+        assert!(!record_matches(&func, 11, 10));
     }
 }

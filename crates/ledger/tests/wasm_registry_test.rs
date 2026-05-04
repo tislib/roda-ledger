@@ -45,7 +45,8 @@ const REJECT_WAT: &str = r#"
 
 /// Parametrized loop: calls `credit(param0, param1)` + `debit(param2, param1)`
 /// `param3` times, producing `2 * param3` entries. Used to exercise the
-/// post-WASM `ENTRY_LIMIT_EXCEEDED` check (entry_count is u8, so >255 rejects).
+/// post-WASM `ENTRY_LIMIT_EXCEEDED` check (sub_item_count is u16, so
+/// >65,535 rejects).
 const LOOP_TRANSFER_WAT: &str = r#"
     (module
       (import "ledger" "credit" (func $credit (param i64 i64)))
@@ -299,21 +300,22 @@ fn named_rolls_back_on_nonzero_status() {
 
 #[test]
 fn named_exceeding_entry_limit_rejects_and_rolls_back() {
-    // TxMetadata.entry_count is a u8, so a successful WASM execution that
-    // emits more than 255 credit/debit records cannot be encoded losslessly.
-    // The transactor must detect this after `execute` returns and fail the
-    // tx with `ENTRY_LIMIT_EXCEEDED` (= 4), triggering the standard rollback
-    // path so neither account retains any of the interim balance changes.
+    // TxMetadata.sub_item_count is a u16, so a successful WASM execution
+    // that emits more than 65,535 credit/debit records cannot be encoded
+    // losslessly. The transactor must detect this after `execute` returns
+    // and fail the tx with `ENTRY_LIMIT_EXCEEDED` (= 4), triggering the
+    // standard rollback path so neither account retains any of the
+    // interim balance changes.
     let ledger = start_ledger();
     ledger
         .register_function("loop_transfer", &compile(LOOP_TRANSFER_WAT), false)
         .expect("register");
 
-    // 200 iterations → 400 entries, well past the 255 cap.
+    // 33_000 iterations → 66_000 entries, just past the 65_535 cap.
     let over = ledger.submit_and_wait(
         Operation::Function {
             name: "loop_transfer".into(),
-            params: [1, 10, 2, 200, 0, 0, 0, 0],
+            params: [1, 10, 2, 33_000, 0, 0, 0, 0],
             user_ref: 1,
         },
         WaitLevel::Committed,

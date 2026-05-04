@@ -122,19 +122,11 @@ impl<'r> Recover<'r> {
                     last_good = offset;
                 }
 
-                // FunctionRegistered is a standalone, non-transactional
-                // WAL record. No follower records, no cross-record CRC.
-                // Validate its length, accept it, and move on.
-                k if k == WalEntryKind::FunctionRegistered as u8 => {
-                    offset += ENTRY_SIZE;
-                    last_good = offset;
-                }
-
-                // ── Transaction: TxMetadata + entries + links ───────────
+                // ── Transaction: TxMetadata + sub-items ─────────────────
                 k if k == WalEntryKind::TxMetadata as u8 => {
                     let meta: TxMetadata =
                         bytemuck::pod_read_unaligned(&data[offset..offset + ENTRY_SIZE]);
-                    let expected = meta.entry_count as usize + meta.link_count as usize;
+                    let expected = meta.sub_item_count as usize;
                     let tx_start = offset;
 
                     // Check whether enough records remain for this tx.
@@ -154,7 +146,11 @@ impl<'r> Recover<'r> {
                     let mut followers_ok = true;
                     for _ in 0..expected {
                         let fk = data[foff];
-                        if fk != WalEntryKind::TxEntry as u8 && fk != WalEntryKind::Link as u8 {
+                        if fk != WalEntryKind::TxEntry as u8
+                            && fk != WalEntryKind::Link as u8
+                            && fk != WalEntryKind::TxTerm as u8
+                            && fk != WalEntryKind::FunctionRegistered as u8
+                        {
                             followers_ok = false;
                             break;
                         }
@@ -257,7 +253,7 @@ impl<'r> Recover<'r> {
                     return false;
                 }
                 let meta: TxMetadata = bytemuck::pod_read_unaligned(&data[off..off + ENTRY_SIZE]);
-                let expected = meta.entry_count as usize + meta.link_count as usize;
+                let expected = meta.sub_item_count as usize;
                 let records_available = (data.len() - off) / ENTRY_SIZE - 1;
 
                 if records_available < expected {
@@ -271,7 +267,11 @@ impl<'r> Recover<'r> {
                 let mut follower_slices: Vec<&[u8]> = Vec::with_capacity(expected);
                 for _ in 0..expected {
                     let fk = data[foff];
-                    if fk != WalEntryKind::TxEntry as u8 && fk != WalEntryKind::Link as u8 {
+                    if fk != WalEntryKind::TxEntry as u8
+                        && fk != WalEntryKind::Link as u8
+                        && fk != WalEntryKind::TxTerm as u8
+                        && fk != WalEntryKind::FunctionRegistered as u8
+                    {
                         followers_ok = false;
                         break;
                     }

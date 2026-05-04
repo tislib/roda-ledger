@@ -73,9 +73,8 @@ mod tests {
     fn make_tx_metadata() -> TxMetadata {
         TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 2,
             fail_reason: FailReason::NONE,
-            link_count: 0,
+            sub_item_count: 2,
             crc32c: 0xDEADBEEF,
             tx_id: 42,
             timestamp: 1_700_000_000,

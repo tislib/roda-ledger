@@ -120,8 +120,9 @@ impl Segment {
 
     /// Read the transaction at the given byte offset in this segment's WAL data.
     ///
-    /// Returns the `TxMetadata` followed by all its `TxEntry` records.
-    /// The segment must be loaded first.
+    /// Returns the `TxMetadata` followed by all its sub-items (`TxEntry`,
+    /// `TxLink`, `TxTerm`, or `FunctionRegistered`). The segment must be
+    /// loaded first.
     pub fn read_transaction_at_offset(&self, offset: u64) -> std::io::Result<Vec<WalEntry>> {
         let wal_data = self.wal_data();
         let offset = offset as usize;
@@ -131,12 +132,11 @@ impl Segment {
         }
 
         let metadata = parse_wal_record(&wal_data[offset..])?;
-        let (entry_count, link_count) = match &metadata {
-            WalEntry::Metadata(m) => (m.entry_count as usize, m.link_count as usize),
+        let total = match &metadata {
+            WalEntry::Metadata(m) => m.sub_item_count as usize,
             _ => return Ok(Vec::new()),
         };
 
-        let total = entry_count + link_count;
         let mut entries = Vec::with_capacity(1 + total);
         entries.push(metadata);
 

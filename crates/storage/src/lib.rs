@@ -11,7 +11,7 @@ pub mod term;
 mod truncate;
 pub mod vote;
 mod wal_reader;
-mod wal_serializer;
+pub mod wal_serializer;
 pub mod wal_tail;
 
 pub use crate::config::StorageConfig;

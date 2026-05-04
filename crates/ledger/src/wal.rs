@@ -55,7 +55,7 @@ impl Wal {
 
 pub struct WalRunner {
     storage: Arc<Storage>,
-    pending_records: u8,
+    pending_records: u16,
     last_written_tx_id: Arc<AtomicU64>,
     active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
     retry_count: u64,
@@ -213,17 +213,15 @@ impl WalRunner {
     fn move_pending_entry(&mut self, entry: &WalEntry) -> bool {
         match entry {
             WalEntry::Metadata(m) => {
-                self.pending_records = m.entry_count.saturating_add(m.link_count);
+                self.pending_records = m.sub_item_count;
             }
-            WalEntry::Entry(_) | WalEntry::Link(_) => {
+            WalEntry::Entry(_)
+            | WalEntry::Link(_)
+            | WalEntry::Term(_)
+            | WalEntry::FunctionRegistered(_) => {
                 self.pending_records = self.pending_records.saturating_sub(1);
             }
             WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
-            // FunctionRegistered is a standalone (non-transactional) WAL
-            // record. It carries no tx_id and does not participate in the
-            // entry-count book-keeping.
-            WalEntry::FunctionRegistered(_) => {}
-            WalEntry::Term(_) => {}
         }
         self.pending_records == 0
     }
