@@ -21,6 +21,7 @@ use ::proto::node as proto;
 use ::proto::node::node_server::Node;
 use spdlog::error;
 use std::sync::Arc;
+use log::info;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
@@ -112,6 +113,7 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
+        info!("");
         let node_id = self.core.node_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core

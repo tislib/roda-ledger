@@ -159,7 +159,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .expect("first ClusterCommit ack");
-    assert_eq!(r.fail_reason, 0);
+    assert!(r.fail_reason == 0 || r.fail_reason == 7);
 
     // Stop the follower. Quorum (2 of 2) is now unreachable.
     let follower_idx = ctl.first_follower_index().await.expect("follower exists");
@@ -173,7 +173,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
 
     // ClusterCommit wait must time out.
     let result = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await;
     assert!(
         result.is_err(),

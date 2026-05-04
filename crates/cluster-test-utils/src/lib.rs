@@ -1180,6 +1180,26 @@ impl ClusterTestingControl {
         Ok(r)
     }
 
+    /// Submit a deposit and wait for the requested `WaitLevel`.
+    pub async fn deposit_and_wait_no_retry(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        wait_level: lproto::WaitLevel,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .deposit_and_wait_no_retry(account, amount, user_ref, wait_level)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(r.tx_id);
+        Ok(r)
+    }
+
     /// Submit a transfer (fire-and-forget).
     pub async fn transfer(
         &self,

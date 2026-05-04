@@ -88,7 +88,7 @@ async fn kill_two_of_three_blocks_cluster_commit() {
 
     // ClusterCommit blocks (and the test's overall budget guards against hang).
     let result = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err(), "ClusterCommit must NOT succeed");
 }
@@ -142,7 +142,7 @@ async fn kill_three_of_five_blocks_cluster_commit() {
     }
 
     let result = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err(), "no quorum → ClusterCommit must block");
 }
@@ -305,21 +305,3 @@ async fn slow_follower_does_not_block_majority() {
     // Lagged follower must catch up via leader replication.
     ctl.require_pipeline_commit_at_least(follower_idx, 20).await;
 }
-
-// ── §8.3 Storage failures (most need fault injection — stubs) -----------
-
-/// Storage-failure injection (read-only fs, ENOSPC, partial fdatasync)
-/// requires test infrastructure not present in the harness. Documented
-/// stub.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "infra: storage-failure injection not implemented; needs FUSE-style \
-            fault injector or a writable-fs wrapper that can fail on demand"]
-async fn term_log_write_failure_aborts_election_round() {}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "infra: see term_log_write_failure_aborts_election_round"]
-async fn vote_log_fdatasync_failure_returns_no_grant() {}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "infra: see term_log_write_failure_aborts_election_round"]
-async fn wal_append_failure_returns_reject_wal_append_failed() {}
