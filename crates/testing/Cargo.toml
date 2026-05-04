@@ -1,0 +1,42 @@
+[package]
+name = "testing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+autobins = false
+
+[lib]
+name = "testing"
+path = "src/lib.rs"
+
+[[bin]]
+name = "e2e"
+path = "src/bin/e2e.rs"
+
+[[bin]]
+name = "e2e-cluster-process"
+path = "src/bin/e2e_cluster_process.rs"
+
+[dependencies]
+proto.workspace = true
+storage.workspace = true
+ledger.workspace = true
+client.workspace = true
+cluster.workspace = true
+cluster-test-utils.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+serde.workspace = true
+toml.workspace = true
+spdlog-rs.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+
+# WASM scenario fixtures use `wat::parse_str` to assemble WAT into bytes
+# at runtime. Same version as the ledger crate uses.
+wat = "1"
+
+libtest-mimic = "0.7"

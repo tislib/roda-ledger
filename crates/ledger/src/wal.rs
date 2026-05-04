@@ -223,6 +223,7 @@ impl WalRunner {
             // record. It carries no tx_id and does not participate in the
             // entry-count book-keeping.
             WalEntry::FunctionRegistered(_) => {}
+            WalEntry::Term(_) => {}
         }
         self.pending_records == 0
     }

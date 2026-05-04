@@ -9,6 +9,7 @@ pub enum WalEntryKind {
     SegmentSealed = 3,
     Link = 4,
     FunctionRegistered = 5,
+    TxTerm = 6,
 }
 
 #[repr(u8)]
@@ -186,6 +187,22 @@ impl FunctionRegistered {
     }
 }
 
+/// Raft term/quorum snapshot recorded inline in the WAL stream. Written by
+/// the cluster layer at every term transition so a recovering node can read
+/// the WAL alone and learn which term was active at each point. Structural
+/// (carries no `tx_id`) like `SegmentHeader` and `FunctionRegistered`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct TxTerm {
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::TxTerm (6)
+    pub _pad0: [u8; 7],  // 7 @ 1  — align term to 8
+    pub term: u64,       // 8 @ 8
+    pub node_id: u64,    // 8 @ 16 — local node id
+    pub node_count: u16, // 2 @ 24 — total voters in the cluster
+    pub node_voted: u16, // 2 @ 26 — votes received in this term
+    pub _pad1: [u8; 12], // 12 @ 28 — pad to 40
+} // total: 40 bytes
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalEntry {
     Metadata(TxMetadata),
@@ -194,6 +211,7 @@ pub enum WalEntry {
     SegmentSealed(SegmentSealed),
     Link(TxLink),
     FunctionRegistered(FunctionRegistered),
+    Term(TxTerm),
 }
 
 impl WalEntry {
@@ -205,6 +223,7 @@ impl WalEntry {
             WalEntry::SegmentSealed(_) => WalEntryKind::SegmentSealed,
             WalEntry::Link(_) => WalEntryKind::Link,
             WalEntry::FunctionRegistered(_) => WalEntryKind::FunctionRegistered,
+            WalEntry::Term(_) => WalEntryKind::TxTerm,
         }
     }
 
@@ -219,6 +238,9 @@ impl WalEntry {
             // transaction and the Pipeline's commit/snapshot indexes never
             // advance from it.
             WalEntry::FunctionRegistered(_) => 0,
+            // TxTerm is a structural cluster-state record; its position in
+            // the WAL stream defines when the term applies.
+            WalEntry::Term(_) => 0,
         }
     }
 }
@@ -270,3 +292,4 @@ const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SegmentSealed>() == 40);
 const _: () = assert!(std::mem::size_of::<TxLink>() == 40);
 const _: () = assert!(std::mem::size_of::<FunctionRegistered>() == 40);
+const _: () = assert!(std::mem::size_of::<TxTerm>() == 40);

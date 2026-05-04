@@ -34,7 +34,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Clippy check
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -45,5 +45,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Run tests
-        run: cargo test --workspace --lib --bins --tests --examples --all-features --release
+      - name: Test ledger
+        run: cargo test -p ledger --release
+      - name: Test cluster
+        run: cargo test -p cluster --release -- --test-threads=1
+      - name: Test raft
+        run: cargo test -p raft --release
+      - name: Test ctl
+        run: cargo test -p ctl --release
+      - name: Doctests
+        run: cargo test --doc

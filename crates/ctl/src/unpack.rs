@@ -93,7 +93,8 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
             }
             WalEntry::SegmentHeader(_)
             | WalEntry::SegmentSealed(_)
-            | WalEntry::FunctionRegistered(_) => {
+            | WalEntry::FunctionRegistered(_)
+            | WalEntry::Term(_) => {
                 if let Some((prev, idx)) = pending_meta.take() {
                     if let Err(e) = flush_tx(
                         &prev,

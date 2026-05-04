@@ -51,6 +51,7 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "crc32c": format!("{:#010x}", f.crc32c),
             "unregister": f.is_unregister(),
         }),
+        WalEntry::Term(_) => serde_json::json!({ "type": "Term" }),
     }
 }
 

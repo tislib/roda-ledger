@@ -2,7 +2,6 @@ mod config;
 mod engine;
 pub mod entities;
 pub mod entries;
-pub mod function_snapshot;
 mod index;
 mod layout;
 mod segment;
@@ -17,7 +16,6 @@ pub mod wal_tail;
 
 pub use crate::config::StorageConfig;
 pub use engine::*;
-pub use function_snapshot::{FunctionSnapshotData, FunctionSnapshotRecord};
 pub use segment::*;
 pub use snapshot::*;
 pub use syncer::*;

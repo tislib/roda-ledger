@@ -473,6 +473,101 @@ fn register_is_observable_before_and_during_concurrent_txs() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Same-batch register + call
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn register_and_call_in_same_batch() {
+    // The Transactor processes operations sequentially within a batch,
+    // and `Operation::FunctionRegistration` installs the handler before
+    // the next op runs. So a batch of [Register foo, Function foo]
+    // should both succeed without any external snapshot wait.
+    let ledger = start_ledger();
+    let binary = compile(TRANSFER_WAT);
+
+    let results = ledger.submit_batch_and_wait(
+        vec![
+            Operation::FunctionRegistration {
+                name: "transfer".into(),
+                binary,
+                override_existing: false,
+                user_ref: 0,
+            },
+            Operation::Function {
+                name: "transfer".into(),
+                params: [10, 100, 20, 0, 0, 0, 0, 0],
+                user_ref: 1,
+            },
+        ],
+        WaitLevel::OnSnapshot,
+    );
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].fail_reason.is_success(),
+        "registration should succeed: {:?}",
+        results[0].fail_reason
+    );
+    assert!(
+        results[1].fail_reason.is_success(),
+        "in-batch call should succeed: {:?}",
+        results[1].fail_reason
+    );
+
+    assert_eq!(ledger.get_balance(10), -100);
+    assert_eq!(ledger.get_balance(20), 100);
+
+    // Handler is observable through the public listing.
+    let list = ledger.list_functions();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "transfer");
+    assert_eq!(list[0].version, 1);
+}
+
+#[test]
+fn unregister_and_call_in_same_batch_fails_call() {
+    // Pre-register, then submit [Unregister foo, Function foo]. The
+    // Function should fail with INVALID_OPERATION because the unregister
+    // processed first and dropped the handler.
+    let ledger = start_ledger();
+    ledger
+        .register_function("transfer", &compile(TRANSFER_WAT), false)
+        .unwrap();
+
+    let results = ledger.submit_batch_and_wait(
+        vec![
+            Operation::FunctionRegistration {
+                name: "transfer".into(),
+                binary: Vec::new(), // empty => unregister
+                override_existing: true,
+                user_ref: 0,
+            },
+            Operation::Function {
+                name: "transfer".into(),
+                params: [10, 100, 20, 0, 0, 0, 0, 0],
+                user_ref: 1,
+            },
+        ],
+        WaitLevel::OnSnapshot,
+    );
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].fail_reason.is_success(),
+        "unregistration should succeed: {:?}",
+        results[0].fail_reason
+    );
+    // INVALID_OPERATION (5) — handler is gone.
+    assert_eq!(
+        results[1].fail_reason.as_u8(),
+        5,
+        "post-unregister call must fail with INVALID_OPERATION (got {:?})",
+        results[1].fail_reason
+    );
+    assert!(ledger.list_functions().is_empty());
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Function snapshot persistence across restart
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -511,7 +606,7 @@ fn make_dir() -> DirGuard {
 }
 
 #[test]
-fn function_snapshot_loads_handler_after_restart() {
+fn handler_loads_after_restart() {
     let guard = make_dir();
 
     // Phase 1: register, submit enough transactions to force a seal
@@ -524,7 +619,7 @@ fn function_snapshot_loads_handler_after_restart() {
             .expect("register");
 
         // Fire enough ops to cross the 5-tx segment boundary so at least
-        // one segment seals and emits a function snapshot.
+        // one segment seals.
         for i in 0..12 {
             let r = ledger.submit_and_wait(
                 Operation::Function {
@@ -541,7 +636,8 @@ fn function_snapshot_loads_handler_after_restart() {
         // the next open.
     }
 
-    // Confirm a function snapshot exists on disk.
+    // The Transactor now owns WasmRuntime, so registration state lives
+    // ONLY in the WAL — there are no `function_snapshot_*.bin` files.
     let snap_count = std::fs::read_dir(&guard.0)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -552,14 +648,13 @@ fn function_snapshot_loads_handler_after_restart() {
                 .unwrap_or(false)
         })
         .count();
-    assert!(
-        snap_count >= 1,
-        "expected at least one function_snapshot_*.bin on disk, found {}",
-        snap_count
+    assert_eq!(
+        snap_count, 0,
+        "function_snapshot_*.bin should no longer be emitted (transactor owns WasmRuntime)"
     );
 
     // Phase 2: reopen the same data_dir. Recovery should reload the
-    // handler from the function snapshot before replaying any tail WAL.
+    // handler by replaying the FunctionRegistered records in the WAL.
     let mut ledger = Ledger::new(persistent_config(&guard.0));
     ledger.start().expect("second start");
 
@@ -587,7 +682,7 @@ fn function_snapshot_loads_handler_after_restart() {
 }
 
 #[test]
-fn function_snapshot_preserves_latest_version() {
+fn latest_version_preserved_after_restart() {
     let guard = make_dir();
 
     // Phase 1: register v1, run some ops, register v2 (override), run more
@@ -653,7 +748,7 @@ fn function_snapshot_preserves_latest_version() {
 }
 
 #[test]
-fn function_snapshot_records_unregistered_entries() {
+fn unregister_persists_across_restart() {
     let guard = make_dir();
 
     // Phase 1: register two functions, unregister one, force a seal.

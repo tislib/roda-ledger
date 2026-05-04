@@ -229,6 +229,7 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
             // Function-registry events are validated independently: the
             // CRC32C is embedded in the record, no cross-record invariants.
             WalEntry::FunctionRegistered(_) => {}
+            WalEntry::Term(_) => {}
         }
     });
 

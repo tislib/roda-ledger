@@ -12,8 +12,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use storage::entities::{
-    EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
-    WalEntryKind, WalInput,
+    EntryKind, FailReason, FunctionRegistered, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind,
+    TxMetadata, WalEntry, WalEntryKind, WalInput,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,6 +319,26 @@ impl Transactor {
         &mut self.dedup
     }
 
+    /// Recovery hook — replay a `FunctionRegistered` WAL record by
+    /// either reloading the binary from disk and inserting it into the
+    /// runtime's registry, or unloading the handler. Mirrors the
+    /// pattern of [`DedupCache::recover_entry`] but for the WASM
+    /// runtime. Called from [`crate::recover::Recover::recover_until`]
+    /// on every `WalEntry::FunctionRegistered` encountered during
+    /// replay.
+    pub(crate) fn recover_function_registered(
+        &self,
+        record: &FunctionRegistered,
+    ) -> std::io::Result<()> {
+        let name = record.name_str();
+        if record.is_unregister() {
+            self.wasm_runtime.recover_unregister(name)
+        } else {
+            self.wasm_runtime
+                .recover_register(name, record.version, record.crc32c)
+        }
+    }
+
     pub fn start(&mut self, ctx: TransactorContext) -> std::io::Result<JoinHandle<()>> {
         let cap = ctx.input_capacity();
         let balances = std::mem::take(&mut self.balances);
@@ -550,6 +570,36 @@ impl TransactorRunner {
             }
         }
 
+        // Mirror function-registry mutations onto our WasmRuntime so a
+        // follower can serve `Operation::Function` calls against a
+        // freshly-replicated handler. NOTE(ADR-015 follow-up): the
+        // binary itself is NOT replicated through AppendEntries today,
+        // so a follower's `recover_register` will fail with NotFound on
+        // `read_function`. That's a pre-existing latent bug — flagged
+        // here so a future change can ship the binary alongside the
+        // record. Errors are logged and continued through; the rest of
+        // the batch is still applied so balances stay in sync.
+        let runtime = self.wasm_engine.runtime();
+        for entry in &entries {
+            if let WalEntry::FunctionRegistered(f) = entry {
+                let name = f.name_str();
+                let result = if f.is_unregister() {
+                    runtime.recover_unregister(name)
+                } else {
+                    runtime.recover_register(name, f.version, f.crc32c)
+                };
+                if let Err(e) = result {
+                    spdlog::warn!(
+                        "follower: replicated FunctionRegistered({} v{}) failed to apply: {} \
+                         (binary replication pending, see ADR-015)",
+                        name,
+                        f.version,
+                        e
+                    );
+                }
+            }
+        }
+
         // Update dedup outside the state borrow. Filter mirrors
         // `Recover` (skip DUPLICATE; skip user_ref==0).
         for entry in &entries {
@@ -623,6 +673,12 @@ impl TransactorRunner {
             // self.transaction_buffer while mutating self.state below.
             let operation = self.transaction_buffer[idx].operation.clone();
 
+            // Carries (name, version, crc) from the
+            // `Operation::FunctionRegistration` arm to the
+            // post-bookkeeping push site below. Stays `None` for all
+            // other operations and for failed registrations.
+            let mut pending_function_registration: Option<(String, u16, u32)> = None;
+
             match operation {
                 Operation::Deposit {
                     user_ref,
@@ -667,6 +723,52 @@ impl TransactorRunner {
                         s.credit(from, amount);
                         s.debit(to, amount);
                     }
+                }
+                Operation::FunctionRegistration {
+                    name,
+                    binary,
+                    override_existing,
+                    user_ref,
+                } => {
+                    // 1. TxMetadata first (mirrors Operation::Function).
+                    self.state
+                        .borrow_mut()
+                        .meta(*b"FNREG\0\0\0", user_ref, timestamp);
+
+                    // 2. Run the registry mutation against WasmRuntime.
+                    let is_unregister = binary.is_empty();
+                    let outcome = if is_unregister {
+                        self.wasm_engine
+                            .runtime()
+                            .unregister(&name)
+                            .map(|v| (v, 0u32))
+                    } else {
+                        self.wasm_engine
+                            .runtime()
+                            .register(&name, &binary, override_existing)
+                    };
+
+                    // 3. On failure, flip the fail flag — verify/rollback
+                    //    below will stamp the meta and truncate any
+                    //    followers (none in this branch). On success,
+                    //    we'll push the FunctionRegistered AFTER the
+                    //    bookkeeping so it is not counted as a TxEntry
+                    //    follower (it isn't TxEntry, but `entry_count`
+                    //    is computed by length so the post-bookkeep
+                    //    push keeps the meta's entry_count = 0 honest).
+                    let registration_outcome = match outcome {
+                        Ok(vc) => Some(vc),
+                        Err(_) => {
+                            self.state.borrow_mut().fail(FailReason::INVALID_OPERATION);
+                            None
+                        }
+                    };
+                    // Carry the outcome forward; the post-bookkeeping
+                    // push happens in a separate stage below this match
+                    // (we cannot easily plumb it through the existing
+                    // verify/rollback block, so we stash it here).
+                    pending_function_registration =
+                        registration_outcome.map(|(version, crc)| (name.clone(), version, crc));
                 }
                 Operation::Function {
                     name,
@@ -765,6 +867,20 @@ impl TransactorRunner {
                 drop(s);
                 self.dedup.insert(user_ref, tx_id);
                 self.state.borrow_mut().position += 1 + entry_count;
+            }
+
+            // For successful FunctionRegistration: append the
+            // FunctionRegistered record AFTER the verify/rollback
+            // bookkeeping so it is invisible to entry_count/CRC math
+            // (the meta is stamped with entry_count = 0). Manually
+            // advance `position` by 1 to keep the next tx's meta_idx
+            // aligned with `entries.len()`. Mirrors the pattern in
+            // `emit_duplicate`.
+            if let Some((name, version, crc)) = pending_function_registration {
+                let record = FunctionRegistered::new(&name, version, crc);
+                let mut s = self.state.borrow_mut();
+                s.entries.push(WalEntry::FunctionRegistered(record));
+                s.position += 1;
             }
         }
 

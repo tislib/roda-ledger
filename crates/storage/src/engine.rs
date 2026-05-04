@@ -1,5 +1,4 @@
 use crate::config::StorageConfig;
-use crate::function_snapshot::{self, FunctionSnapshotData, FunctionSnapshotRecord};
 use crate::layout::{active_wal_path, parse_segment_id};
 use crate::wal_tail::WalTailer;
 use crate::{Segment, SegmentStaus};
@@ -451,56 +450,6 @@ impl Storage {
             .open(&path)?;
         Ok(())
     }
-
-    // ─── Function-registry snapshot (ADR-014) ──────────────────────────────
-
-    /// Atomically write a function-registry snapshot paired to
-    /// `segment_id` (same trigger as the balance snapshot).
-    pub fn save_function_snapshot(
-        &self,
-        segment_id: u32,
-        last_tx_id: u64,
-        records: &[FunctionSnapshotRecord],
-    ) -> std::io::Result<()> {
-        function_snapshot::save(
-            Path::new(&self.config.data_dir),
-            segment_id,
-            last_tx_id,
-            records,
-        )
-    }
-
-    /// Load and validate the function snapshot written at `segment_id`.
-    pub fn load_function_snapshot(&self, segment_id: u32) -> std::io::Result<FunctionSnapshotData> {
-        function_snapshot::load(Path::new(&self.config.data_dir), segment_id)
-    }
-
-    /// List segment ids that have a `function_snapshot_{N}.bin` file on
-    /// disk, ascending. Recovery uses the last entry to locate the most
-    /// recent function snapshot; everything after it is reconstructed
-    /// by WAL replay of `FunctionRegistered` records.
-    pub fn list_function_snapshot_ids(&self) -> Result<Vec<u32>, std::io::Error> {
-        let dir = &self.config.data_dir;
-        if !std::path::Path::new(dir).exists() {
-            return Ok(Vec::new());
-        }
-        let mut ids: Vec<u32> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name();
-                let name = name.to_str()?;
-                let stripped = name.strip_prefix("function_snapshot_")?;
-                let stripped = stripped.strip_suffix(".bin")?;
-                if stripped.len() == 6 && stripped.chars().all(|c| c.is_ascii_digit()) {
-                    stripped.parse::<u32>().ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        ids.sort_unstable();
-        Ok(ids)
-    }
 }
 
 impl Drop for Storage {
@@ -572,17 +521,5 @@ mod tests {
         let p = storage.function_binary_path("my_fn", 7);
         assert!(p.ends_with("functions/my_fn_v7.wasm"));
         assert!(p.starts_with(&storage.config.data_dir));
-    }
-
-    #[test]
-    fn list_function_snapshot_ids_is_sorted_and_filtered() {
-        let (storage, _td) = temp_storage();
-        assert!(storage.list_function_snapshot_ids().unwrap().is_empty());
-
-        storage.save_function_snapshot(3, 0, &[]).unwrap();
-        storage.save_function_snapshot(1, 0, &[]).unwrap();
-        storage.save_function_snapshot(2, 0, &[]).unwrap();
-
-        assert_eq!(storage.list_function_snapshot_ids().unwrap(), vec![1, 2, 3]);
     }
 }

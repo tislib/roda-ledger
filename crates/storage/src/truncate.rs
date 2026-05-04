@@ -64,7 +64,9 @@ impl Segment {
     /// `wal_{id}.bin`, `wal_{id}.crc`, `wal_{id}.seal`,
     /// `wal_index_{id}.bin`, `account_index_{id}.bin`,
     /// `snapshot_{id}.bin`, `snapshot_{id}.crc`. Also clears any
-    /// `function_snapshot_{id}.{bin,crc}` paired to this segment.
+    /// legacy `function_snapshot_{id}.{bin,crc}` paired to this segment
+    /// (no longer emitted, but cleaned up defensively in case an older
+    /// version's data directory is being truncated).
     ///
     /// Used by [`storage::Storage::truncate_wal_above`] when an
     /// entire segment falls past the recovery watermark (ADR-0016 §9).
@@ -93,11 +95,11 @@ impl Segment {
     }
 
     /// Removes only the snapshot pair (`snapshot_{id}.bin` +
-    /// `snapshot_{id}.crc`, plus any `function_snapshot_{id}.*`)
-    /// for this segment id. Used after truncating a *straddling*
-    /// segment — its existing balance snapshot captured state past the
-    /// watermark and is no longer trustworthy. Missing files are
-    /// tolerated.
+    /// `snapshot_{id}.crc`, plus any legacy
+    /// `function_snapshot_{id}.*`) for this segment id. Used after
+    /// truncating a *straddling* segment — its existing balance
+    /// snapshot captured state past the watermark and is no longer
+    /// trustworthy. Missing files are tolerated.
     pub fn delete_snapshot_files_for_segment(data_dir: &str, segment_id: u32) -> Result<(), Error> {
         let dir = Path::new(data_dir);
         let candidates = [

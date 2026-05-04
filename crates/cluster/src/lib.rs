@@ -16,6 +16,7 @@ pub mod node;
 pub mod node_handler;
 mod raft_loop;
 mod replication;
+pub mod runner;
 pub mod server;
 
 pub use cluster_mirror::ClusterMirror;
@@ -25,4 +26,5 @@ pub use ledger_handler::LedgerHandler;
 pub use ledger_slot::LedgerSlot;
 pub use node_handler::{NodeHandler, NodeHandlerCore};
 pub use raft::Role;
+pub use runner::run;
 pub use server::{NodeServerRuntime, Server};

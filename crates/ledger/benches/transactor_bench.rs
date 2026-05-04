@@ -8,6 +8,7 @@ use std::hint::spin_loop;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use storage::{Storage, StorageConfig};
 
 fn transactor_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("transactor");
@@ -20,7 +21,15 @@ fn transactor_bench(c: &mut Criterion) {
         max_accounts: 10_000_000,
         ..LedgerConfig::default()
     };
-    let runtime = Arc::new(WasmRuntime::new());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage = Arc::new(
+        Storage::new(StorageConfig {
+            data_dir: tmp.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        })
+        .expect("storage"),
+    );
+    let runtime = Arc::new(WasmRuntime::new(storage));
     let mut transactor = Transactor::new(&config, runtime);
 
     let handle = transactor.start(pipeline.transactor_context()).unwrap();

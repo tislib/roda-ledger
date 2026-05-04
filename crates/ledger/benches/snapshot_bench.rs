@@ -59,9 +59,12 @@ fn snapshot_bench(c: &mut Criterion) {
         ..StorageConfig::default()
     };
     let storage = Arc::new(Storage::new(storage_cfg).unwrap());
-    let wasm_runtime = Arc::new(WasmRuntime::new());
+    // Built once for completeness even though this bench doesn't
+    // exercise the wasm runtime — the Snapshot constructor no longer
+    // takes one.
+    let _wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
 
-    let mut snapshot = Snapshot::new(&config, wasm_runtime, storage);
+    let mut snapshot = Snapshot::new(&config, storage);
     let handle = snapshot.start(pipeline.snapshot_context()).unwrap();
 
     let snapshot_ctx = pipeline.snapshot_context();

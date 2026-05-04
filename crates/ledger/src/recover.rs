@@ -2,60 +2,14 @@ use crate::pipeline::Pipeline;
 use crate::seal::Seal;
 use crate::snapshot::Snapshot;
 use crate::transactor::Transactor;
-use crate::wasm_runtime::WasmRuntime;
 use spdlog::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use storage::SegmentStaus::SEALED;
-use storage::entities::{FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind};
+use storage::entities::{FailReason, TxMetadata, WalEntry, WalEntryKind};
 use storage::{Segment, Storage};
 
 const ENTRY_SIZE: usize = 40;
-
-/// Apply a single `FunctionRegistered` WAL record during recovery —
-/// either load or unload the handler. Free function so the per-segment
-/// `visit_wal_records` closures can call it without double-borrowing
-/// `&mut self`.
-///
-/// A failure here is non-recoverable: the WAL committed this record, so
-/// if we cannot reinstate the corresponding handler the registry state
-/// would silently diverge from the authoritative log. The error is
-/// propagated all the way up and aborts startup.
-fn apply_function_registered(
-    storage: &Storage,
-    wasm_runtime: &WasmRuntime,
-    f: &FunctionRegistered,
-) -> Result<(), std::io::Error> {
-    let name = f.name_str();
-    if f.is_unregister() {
-        return wasm_runtime.unload_function(name).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("recover: unload_function({}) failed: {}", name, e),
-            )
-        });
-    }
-    let binary = storage.read_function(name, f.version).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!(
-                "recover: read_function({} v{}) failed: {}",
-                name, f.version, e
-            ),
-        )
-    })?;
-    wasm_runtime
-        .load_function(name, &binary, f.version, f.crc32c)
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "recover: load_function({} v{}) failed: {}",
-                    name, f.version, e
-                ),
-            )
-        })
-}
 
 pub struct Recover<'r> {
     transactor: &'r mut Transactor,
@@ -63,7 +17,6 @@ pub struct Recover<'r> {
     seal: &'r mut Seal,
     pipeline: &'r Arc<Pipeline>,
     storage: &'r Storage,
-    wasm_runtime: &'r Arc<WasmRuntime>,
     segments: Vec<Segment>,
 }
 
@@ -74,7 +27,6 @@ impl<'r> Recover<'r> {
         seal: &'r mut Seal,
         pipeline: &'r Arc<Pipeline>,
         storage: &'r Storage,
-        wasm_runtime: &'r Arc<WasmRuntime>,
     ) -> Self {
         Self {
             transactor,
@@ -82,14 +34,9 @@ impl<'r> Recover<'r> {
             seal,
             pipeline,
             storage,
-            wasm_runtime,
             segments: vec![],
         }
     }
-
-    // apply_function_registered lives as a free fn below so the visitor
-    // closures can borrow only `storage` + `wasm_runtime` (shared) and
-    // leave `self.snapshot` free for mutable capture.
 
     /// Runs crash recovery on the active WAL segment if needed.
     ///
@@ -406,10 +353,77 @@ impl<'r> Recover<'r> {
         let mut last_tx_id = 0;
         let mut recover_balances = HashMap::new();
 
-        // Load the latest function snapshot (if any) and seed WasmRuntime
-        // with the handlers it recorded. WAL replay below fills in any
-        // register / unregister records landed after the snapshot.
-        self.recover_function_snapshot()?;
+        // Pre-pass: replay every `FunctionRegistered` record in every
+        // sealed segment up to AND INCLUDING the snapshot segment.
+        // The balance snapshot captures balances only — function
+        // registrations live ONLY in the WAL, so we have to walk the
+        // whole sealed history. Segments AFTER the snapshot are
+        // covered by the main per-segment pass below; including the
+        // snapshot segment here is necessary because the main loop
+        // treats it as snapshot-only and skips its WAL records.
+        // Segment loads here are reused (cached) by the main pass.
+        // Watermark filtering is by preceding TxMetadata.tx_id (same
+        // discipline as the main loop).
+        {
+            let transactor = &*self.transactor;
+            for segment in self.segments.iter_mut() {
+                if segment.id() > latest_snapshot_segment_id {
+                    // Segments strictly after the snapshot are visited
+                    // by the main pass for both balances and functions.
+                    continue;
+                }
+                segment.load().map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to load segment {} for function pre-pass: {}",
+                            segment.id(),
+                            e
+                        ),
+                    )
+                })?;
+                let mut skipping_tx = false;
+                let mut function_apply_err: Option<std::io::Error> = None;
+                segment
+                    .visit_wal_records(|record| match record {
+                        WalEntry::Metadata(m) => {
+                            skipping_tx = m.tx_id > watermark;
+                        }
+                        WalEntry::FunctionRegistered(f) => {
+                            if skipping_tx {
+                                return;
+                            }
+                            if function_apply_err.is_none()
+                                && let Err(e) = transactor.recover_function_registered(f)
+                            {
+                                function_apply_err = Some(std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "recover: replay FunctionRegistered({} v{}) failed: {}",
+                                        f.name_str(),
+                                        f.version,
+                                        e
+                                    ),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    })
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to visit wal records (function pre-pass) for segment {}: {}",
+                                segment.id(),
+                                e
+                            ),
+                        )
+                    })?;
+                if let Some(e) = function_apply_err {
+                    return Err(e);
+                }
+            }
+        }
 
         // restore the latest snapshot
         for segment in self.segments.iter_mut() {
@@ -492,12 +506,8 @@ impl<'r> Recover<'r> {
             // once we are past the last accepted transaction — they
             // occurred temporally after a rejected tx (ADR-0016 §9).
             let mut skipping_tx = false;
-            // Borrow the fields we need through local refs so the closure
-            // captures them by shared ref (WASM side) and mutable ref
-            // (snapshot side) without double-borrowing `self`.
-            let storage = self.storage;
-            let wasm_runtime = self.wasm_runtime.as_ref();
             let snapshot = &mut self.snapshot;
+            let transactor = &*self.transactor;
             let mut function_apply_err: Option<std::io::Error> = None;
             segment
                 .visit_wal_records(|record| match record {
@@ -529,9 +539,17 @@ impl<'r> Recover<'r> {
                             return;
                         }
                         if function_apply_err.is_none()
-                            && let Err(e) = apply_function_registered(storage, wasm_runtime, f)
+                            && let Err(e) = transactor.recover_function_registered(f)
                         {
-                            function_apply_err = Some(e);
+                            function_apply_err = Some(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "recover: replay FunctionRegistered({} v{}) failed: {}",
+                                    f.name_str(),
+                                    f.version,
+                                    e
+                                ),
+                            ));
                         }
                     }
                     _ => {}
@@ -558,8 +576,6 @@ impl<'r> Recover<'r> {
         let mut current_recover_tx_id = 0u64;
         // Same skipping discipline as the sealed-segment loop above.
         let mut skipping_tx = false;
-        let storage = self.storage;
-        let wasm_runtime = self.wasm_runtime.as_ref();
         let snapshot = &mut self.snapshot;
         let transactor = &mut self.transactor;
         let mut function_apply_err: Option<std::io::Error> = None;
@@ -602,9 +618,17 @@ impl<'r> Recover<'r> {
                         return;
                     }
                     if function_apply_err.is_none()
-                        && let Err(e) = apply_function_registered(storage, wasm_runtime, f)
+                        && let Err(e) = transactor.recover_function_registered(f)
                     {
-                        function_apply_err = Some(e);
+                        function_apply_err = Some(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "recover: replay FunctionRegistered({} v{}) failed: {}",
+                                f.name_str(),
+                                f.version,
+                                e
+                            ),
+                        ));
                     }
                 }
                 _ => {}
@@ -682,93 +706,5 @@ impl<'r> Recover<'r> {
             }
         }
         Ok(best)
-    }
-
-    /// Load the most recent function snapshot (if any) and install its
-    /// handlers in both `WasmRuntime` and the `Seal` stage's tracker. Any
-    /// `FunctionRegistered` WAL record landing after this snapshot is
-    /// picked up by the WAL-replay loop further down.
-    fn recover_function_snapshot(&mut self) -> Result<(), std::io::Error> {
-        let ids = self.storage.list_function_snapshot_ids().map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to list function snapshots: {}", e),
-            )
-        })?;
-        let Some(&segment_id) = ids.last() else {
-            return Ok(());
-        };
-
-        let data = self
-            .storage
-            .load_function_snapshot(segment_id)
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to load function snapshot for segment {}: {}",
-                        segment_id, e
-                    ),
-                )
-            })?;
-
-        debug!(
-            "recover: loaded function snapshot for segment {} with {} records",
-            segment_id,
-            data.records.len()
-        );
-
-        for record in &data.records {
-            let name = record.name_str();
-            // Seed the Seal stage's tracker so the next emitted snapshot
-            // is a correct superset of this one.
-            self.seal
-                .recover_function(name.to_string(), record.version, record.crc32c)
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to seed seal tracker for function {} v{}: {}",
-                            name, record.version, e
-                        ),
-                    )
-                })?;
-
-            // crc32c == 0 means "unregistered" — keep the seal tracker
-            // entry (audit trail) but do NOT install a handler.
-            if record.crc32c == 0 {
-                continue;
-            }
-
-            // A failure here is non-recoverable: the function snapshot is
-            // the authoritative replay source for its segment range. If we
-            // cannot reconstruct a handler it committed, the registry
-            // would silently diverge.
-            let binary = self
-                .storage
-                .read_function(name, record.version)
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "recover: read_function({} v{}) referenced by snapshot failed: {}",
-                            name, record.version, e
-                        ),
-                    )
-                })?;
-            self.wasm_runtime
-                .load_function(name, &binary, record.version, record.crc32c)
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "recover: load_function({} v{}) from snapshot failed: {}",
-                            name, record.version, e
-                        ),
-                    )
-                })?;
-        }
-
-        Ok(())
     }
 }

@@ -8,9 +8,9 @@
 //! profile as defaults. Backends override them at startup (e.g. free port,
 //! temp directory).
 
-use roda_ledger::cluster::ServerSection;
-use roda_ledger::config::{LedgerConfig, StorageConfig};
-use roda_ledger::wait_strategy::WaitStrategy;
+use cluster::config::ServerSection;
+use ledger::config::{LedgerConfig, StorageConfig};
+use ledger::wait_strategy::WaitStrategy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,7 +36,7 @@ pub struct Profile {
 
 fn load_profiles() -> HashMap<String, Profile> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let path = Path::new(manifest_dir).join("tests/e2e/lib/profiles.toml");
+    let path = Path::new(manifest_dir).join("src/e2e/profiles.toml");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
 

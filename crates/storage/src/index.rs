@@ -55,7 +55,8 @@ impl Segment {
                 WalEntry::Link(_)
                 | WalEntry::SegmentHeader(_)
                 | WalEntry::SegmentSealed(_)
-                | WalEntry::FunctionRegistered(_) => {}
+                | WalEntry::FunctionRegistered(_)
+                | WalEntry::Term(_) => {}
             }
             offset += 40;
         }

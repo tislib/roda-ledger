@@ -3,10 +3,13 @@
 //! Two layers:
 //!
 //! - [`WasmRuntime`] — shared (`Arc`) registry. Owns the wasmtime [`Engine`],
-//!   the map of compiled [`Module`]s keyed by name, and **the** `Linker`
-//!   with the three host imports already wired. All three are built exactly
-//!   once per `Ledger`. Registration work (compile + signature check +
-//!   insert) happens only on `load_function` — never on the hot path.
+//!   the map of compiled [`Module`]s keyed by name, **the** `Linker` with
+//!   the three host imports already wired, and a handle to [`Storage`] for
+//!   persisting/reading function binaries on disk. All construction work
+//!   happens exactly once per `Ledger`. Registration (validate + write
+//!   binary + compile + insert) happens via [`WasmRuntime::register`],
+//!   called from the Transactor's `Operation::FunctionRegistration`
+//!   dispatcher arm — never on the hot transaction path.
 //!
 //! - [`WasmRuntimeEngine`] — per-Transactor execution layer. Owns:
 //!   - a long-lived `Store<Rc<RefCell<TransactorState>>>` — **not**
@@ -24,9 +27,7 @@
 //!
 //! No `unsafe`, no raw pointers, no generics.
 
-use crate::pipeline::LedgerContext;
 use crate::transactor::TransactorState;
-use crate::wait_strategy::WaitStrategy;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -35,7 +36,6 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use storage::Storage;
-use storage::entities::{FunctionRegistered, WalEntry};
 use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 /// The required export name on every registered function.
@@ -80,29 +80,32 @@ type Registry = HashMap<String, Registered>;
 
 /// Shared wasmtime state for the ledger. One per `Ledger`, wrapped in
 /// `Arc` and shared with every `WasmRuntimeEngine`. Owns the [`Engine`],
-/// the shared [`Linker`] with host imports pre-wired, and the registry
-/// of compiled [`Module`]s.
+/// the shared [`Linker`] with host imports pre-wired, the registry of
+/// compiled [`Module`]s, and a handle to [`Storage`] for persisting and
+/// reading function binaries on disk.
 pub struct WasmRuntime {
     engine: Engine,
     linker: Linker<WasmStoreData>,
     handlers: RwLock<Registry>,
     update_seq: AtomicU32,
+    storage: Arc<Storage>,
 }
 
 impl WasmRuntime {
     /// Construct a new, empty runtime with a default `Engine`.
-    pub fn new() -> Self {
-        Self::with_engine(Engine::default())
+    pub fn new(storage: Arc<Storage>) -> Self {
+        Self::with_engine(Engine::default(), storage)
     }
 
     /// Construct a new runtime with the provided engine.
-    pub fn with_engine(engine: Engine) -> Self {
+    pub fn with_engine(engine: Engine, storage: Arc<Storage>) -> Self {
         let linker = build_host_linker(&engine);
         Self {
             engine,
             linker,
             handlers: RwLock::new(Registry::new()),
             update_seq: AtomicU32::new(0),
+            storage,
         }
     }
 
@@ -119,7 +122,11 @@ impl WasmRuntime {
     /// Compile a binary, verify its CRC32C matches, and insert it into
     /// the registry under the given `version`. Increments `update_seq`
     /// so every engine's next lookup picks it up.
-    pub fn load_function(
+    ///
+    /// Internal: callers should prefer [`Self::register`] (transactor
+    /// dispatcher) or [`Self::recover_register`] (recovery hook), which
+    /// also persist the binary on disk and bookkeep version monotonicity.
+    pub(crate) fn load_function(
         &self,
         name: &str,
         binary: &[u8],
@@ -162,7 +169,10 @@ impl WasmRuntime {
 
     /// Remove a function from the registry. Not an error if the name is
     /// unknown — recovery may legitimately replay such a record.
-    pub fn unload_function(&self, name: &str) -> io::Result<()> {
+    ///
+    /// Internal: callers should prefer [`Self::unregister`] or
+    /// [`Self::recover_unregister`].
+    pub(crate) fn unload_function(&self, name: &str) -> io::Result<()> {
         let mut guard = self
             .handlers
             .write()
@@ -244,11 +254,94 @@ impl WasmRuntime {
             .get(name)
             .map(|r| (r.crc32c, r.module.clone()))
     }
-}
 
-impl Default for WasmRuntime {
-    fn default() -> Self {
-        Self::new()
+    // ── lifecycle methods (called from Transactor + recovery) ──────────────
+
+    /// Validate a binary's ABI + name, compute the next monotonic
+    /// version, persist the binary on disk, compile, and insert into the
+    /// registry. Returns `(version, crc32c)` of the installed handler.
+    ///
+    /// Called from the Transactor's `Operation::FunctionRegistration`
+    /// dispatcher arm. The caller pre-validates inputs in
+    /// [`crate::ledger::Ledger::register_function`] for synchronous
+    /// `io::ErrorKind` reporting; the validation here is the
+    /// authoritative one.
+    pub fn register(
+        &self,
+        name: &str,
+        binary: &[u8],
+        override_existing: bool,
+    ) -> io::Result<(u16, u32)> {
+        validate_name(name)?;
+        self.validate(binary)?;
+
+        if !override_existing && self.contains(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("function `{}` is already registered", name),
+            ));
+        }
+
+        let next_version = self.next_version(name)?;
+        self.storage.write_function(name, next_version, binary)?;
+        let crc = crc32c::crc32c(binary);
+        self.load_function(name, binary, next_version, crc)?;
+        Ok((next_version, crc))
+    }
+
+    /// Unregister the currently-loaded function under `name`. Writes a
+    /// 0-byte `{name}_v{N+1}.wasm` on disk (audit trail) and removes the
+    /// handler from the registry. Returns the version stamped onto the
+    /// unregister record.
+    pub fn unregister(&self, name: &str) -> io::Result<u16> {
+        validate_name(name)?;
+
+        if !self.contains(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("function `{}` is not registered", name),
+            ));
+        }
+
+        let next_version = self.next_version(name)?;
+        self.storage.write_function(name, next_version, &[])?;
+        self.unload_function(name)?;
+        Ok(next_version)
+    }
+
+    /// Recovery hook — replay a register record from the WAL by reading
+    /// the binary from disk at `(name, version)` and inserting it into
+    /// the registry. Does NOT increment a fresh version (the version
+    /// recorded in the WAL is authoritative).
+    pub fn recover_register(&self, name: &str, version: u16, crc32c: u32) -> io::Result<()> {
+        let binary = self.storage.read_function(name, version)?;
+        self.load_function(name, &binary, version, crc32c)
+    }
+
+    /// Recovery hook — replay an unregister record from the WAL.
+    pub fn recover_unregister(&self, name: &str) -> io::Result<()> {
+        self.unload_function(name)
+    }
+
+    /// Snapshot of every currently-loaded function with its version + CRC32C.
+    pub fn list(&self) -> Vec<FunctionInfo> {
+        self.handlers_snapshot()
+            .into_iter()
+            .map(|(name, version, crc32c)| FunctionInfo {
+                name,
+                version,
+                crc32c,
+            })
+            .collect()
+    }
+
+    /// Next monotonic version for `name`. The in-memory registry holds
+    /// the authoritative counter; the on-disk `functions/` directory is
+    /// reference data only.
+    fn next_version(&self, name: &str) -> io::Result<u16> {
+        let prev = self.version_of(name).unwrap_or(0);
+        prev.checked_add(1)
+            .ok_or_else(|| io::Error::other("function version overflow (u16 exhausted)"))
     }
 }
 
@@ -467,6 +560,14 @@ impl WasmRuntimeEngine {
     pub fn state(&self) -> &Rc<RefCell<TransactorState>> {
         &self.state
     }
+
+    /// The shared `WasmRuntime` this engine resolves callers against.
+    /// Used by the Transactor's `Operation::FunctionRegistration`
+    /// dispatcher arm to install / remove handlers.
+    #[inline]
+    pub fn runtime(&self) -> &WasmRuntime {
+        &self.runtime
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -561,181 +662,16 @@ pub fn validate_name(name: &str) -> io::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WasmRegistry — Ledger-facing façade (ADR-014 register/unregister/list)
+// FunctionInfo — public surface returned from list_functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Metadata returned by [`WasmRegistry::list`] for every currently
+/// Metadata returned by [`WasmRuntime::list`] for every currently
 /// registered WASM function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionInfo {
     pub name: String,
     pub version: u16,
     pub crc32c: u32,
-}
-
-/// Facade over the full function-registry lifecycle: validate → write
-/// to disk → push `FunctionRegistered` onto the WAL → block until the
-/// Snapshot stage commits it and the live runtime reflects the change.
-///
-/// Owned by [`crate::ledger::Ledger`] as a thin composition layer so
-/// the Ledger's public API (`register_function` / `unregister_function`
-/// / `list_functions`) reduces to one-line delegations.
-///
-/// Holds:
-/// - `Arc<WasmRuntime>` — the shared registry whose `update_seq` gates
-///   every engine's caller cache;
-/// - `Arc<Storage>` — the `{data_dir}/functions` binary store;
-/// - [`LedgerContext`] — the pipeline handle used to push
-///   non-transactional WAL entries;
-/// - `WaitStrategy` — backpressure + polling cadence for the blocking
-///   waits after WAL push.
-#[derive(Clone)]
-pub struct WasmRegistry {
-    runtime: Arc<WasmRuntime>,
-    storage: Arc<Storage>,
-    ledger_ctx: LedgerContext,
-    wait_strategy: WaitStrategy,
-}
-
-impl WasmRegistry {
-    pub fn new(
-        runtime: Arc<WasmRuntime>,
-        storage: Arc<Storage>,
-        ledger_ctx: LedgerContext,
-        wait_strategy: WaitStrategy,
-    ) -> Self {
-        Self {
-            runtime,
-            storage,
-            ledger_ctx,
-            wait_strategy,
-        }
-    }
-
-    /// Register a WASM function under `name` at the next monotonic
-    /// version. Returns `(version, crc32c)` once the Snapshot stage has
-    /// committed the record and the live runtime reflects the handler.
-    pub fn register(
-        &self,
-        name: &str,
-        binary: &[u8],
-        override_existing: bool,
-    ) -> io::Result<(u16, u32)> {
-        // 1. Validate (ABI + name).
-        validate_name(name)?;
-        self.runtime.validate(binary)?;
-
-        // 2. Uniqueness check against the live registry.
-        if !override_existing && self.runtime.contains(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("function `{}` is already registered", name),
-            ));
-        }
-
-        // 3. Pick next version. The WAL + WasmRuntime carry the
-        //    authoritative version counter; the on-disk `functions/`
-        //    directory is reference data only.
-        let next_version = self.next_version(name)?;
-        self.storage.write_function(name, next_version, binary)?;
-        let crc = crc32c::crc32c(binary);
-
-        // 4. Push WAL record (non-transactional; bypasses Transactor).
-        let record = FunctionRegistered::new(name, next_version, crc);
-        self.push_wal_entry_blocking(WalEntry::FunctionRegistered(record));
-
-        // 5. Wait for the Snapshot stage to commit it.
-        self.wait_until_loaded(name, crc);
-
-        Ok((next_version, crc))
-    }
-
-    /// Unregister the currently-loaded function under `name`. Writes a
-    /// 0-byte `{name}_v{N+1}.wasm` on disk and a WAL record with
-    /// `crc32c = 0`. Blocks until the Snapshot stage commits it and the
-    /// handler is gone from the live runtime. Returns the version
-    /// number stamped on the unregister record. Errors with
-    /// [`io::ErrorKind::NotFound`] if `name` is not currently loaded.
-    pub fn unregister(&self, name: &str) -> io::Result<u16> {
-        validate_name(name)?;
-
-        if !self.runtime.contains(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("function `{}` is not registered", name),
-            ));
-        }
-
-        let next_version = self.next_version(name)?;
-        // Empty file under the next version — audit-trail preserved.
-        self.storage.write_function(name, next_version, &[])?;
-        let record = FunctionRegistered::new(name, next_version, 0);
-        self.push_wal_entry_blocking(WalEntry::FunctionRegistered(record));
-
-        self.wait_until_unloaded(name);
-        Ok(next_version)
-    }
-
-    /// Snapshot of every currently-loaded function with its version + CRC32C.
-    pub fn list(&self) -> Vec<FunctionInfo> {
-        self.runtime
-            .handlers_snapshot()
-            .into_iter()
-            .map(|(name, version, crc32c)| FunctionInfo {
-                name,
-                version,
-                crc32c,
-            })
-            .collect()
-    }
-
-    // ── internals ──────────────────────────────────────────────────────
-
-    /// Next monotonic version number for `name`. The authoritative
-    /// counter is the in-memory registry (installed by the Snapshot
-    /// stage from committed `FunctionRegistered` WAL records).
-    fn next_version(&self, name: &str) -> io::Result<u16> {
-        let prev = self.runtime.version_of(name).unwrap_or(0);
-        prev.checked_add(1)
-            .ok_or_else(|| io::Error::other("function version overflow (u16 exhausted)"))
-    }
-
-    /// Push a WAL entry with backpressure.
-    fn push_wal_entry_blocking(&self, mut entry: WalEntry) {
-        let mut retry_count = 0u64;
-        while self.ledger_ctx.is_running() {
-            match self.ledger_ctx.push_wal_entry(entry) {
-                Ok(()) => return,
-                Err(returned) => {
-                    entry = returned;
-                    self.wait_strategy.retry(retry_count);
-                    retry_count += 1;
-                }
-            }
-        }
-    }
-
-    fn wait_until_loaded(&self, name: &str, expected_crc: u32) {
-        let mut retry_count = 0u64;
-        while self.ledger_ctx.is_running() {
-            if self.runtime.crc32c_of(name) == Some(expected_crc) {
-                return;
-            }
-            self.wait_strategy.retry(retry_count);
-            retry_count += 1;
-        }
-    }
-
-    fn wait_until_unloaded(&self, name: &str) {
-        let mut retry_count = 0u64;
-        while self.ledger_ctx.is_running() {
-            if !self.runtime.contains(name) {
-                return;
-            }
-            self.wait_strategy.retry(retry_count);
-            retry_count += 1;
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -745,6 +681,18 @@ impl WasmRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage::StorageConfig;
+    use tempfile::TempDir;
+
+    fn temp_runtime() -> (WasmRuntime, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StorageConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        };
+        let storage = Arc::new(Storage::new(cfg).expect("storage"));
+        (WasmRuntime::new(storage), dir)
+    }
 
     fn noop_wat() -> Vec<u8> {
         wat::parse_str(
@@ -804,35 +752,35 @@ mod tests {
 
     #[test]
     fn validate_accepts_valid_module() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         rt.validate(&noop_wat()).unwrap();
         rt.validate(&transfer_wat()).unwrap();
     }
 
     #[test]
     fn validate_rejects_bad_arity() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         let err = rt.validate(&bad_arity_wat()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn validate_rejects_missing_export() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         let err = rt.validate(&missing_export_wat()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn validate_rejects_garbage() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         let err = rt.validate(b"not a wasm binary").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn load_increments_update_seq() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         assert_eq!(rt.last_update_seq(), 0);
 
         let bin = noop_wat();
@@ -846,7 +794,7 @@ mod tests {
 
     #[test]
     fn load_rejects_crc_mismatch() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         let bin = noop_wat();
         let err = rt
             .load_function("noop", &bin, 1, crc32c::crc32c(&bin) ^ 1)
@@ -874,14 +822,14 @@ mod tests {
 
     #[test]
     fn unload_unknown_is_noop() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         rt.unload_function("does_not_exist").unwrap();
         assert_eq!(rt.last_update_seq(), 1);
     }
 
     #[test]
     fn registry_contains_and_len_track_load_unload() {
-        let rt = WasmRuntime::new();
+        let (rt, _td) = temp_runtime();
         assert!(rt.is_empty());
         let bin = noop_wat();
         rt.load_function("noop", &bin, 1, crc32c::crc32c(&bin))

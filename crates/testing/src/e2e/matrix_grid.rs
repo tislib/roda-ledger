@@ -1,6 +1,7 @@
 //! Matrix grid — shared topology and math for matrix transfer tests.
 //!
-//! See `tests/e2e/matrix-testing-scenario.md` for the full specification.
+//! See `crates/testing/src/e2e/matrix-testing-scenario.md` for the full
+//! specification.
 //!
 //! This module provides the grid construction, account ID mapping, and
 //! expected balance formula. Test logic (iterations, verification, assertions)
