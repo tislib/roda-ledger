@@ -45,7 +45,7 @@ use ledger::transaction::Operation;
 use raft::Role::Leader;
 use raft::request_vote::RequestVoteRequest;
 use raft::{NodeId, RaftNode, Role, VoteOutcome};
-use spdlog::{error, info};
+use spdlog::{debug, error, info};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -96,7 +96,7 @@ impl ConsensusLoop {
 
     pub(crate) async fn run(mut self) {
         let self_id = self.self_id;
-        info!("consensus_loop[{}]: started", self_id);
+        debug!("consensus_loop[{}]: started", self_id);
 
         loop {
             let now = Instant::now();
@@ -117,7 +117,7 @@ impl ConsensusLoop {
                     let n = self.node.borrow();
                     (n.current_term(), n.role())
                 };
-                info!(
+                debug!(
                     "consensus_loop[{}]: election.start() = true (term={}, role={:?})",
                     self_id, term_after, role_after
                 );
@@ -126,19 +126,19 @@ impl ConsensusLoop {
 
                 let requests = self.node.borrow_mut().election().get_requests();
                 if requests.is_empty() {
-                    info!(
+                    debug!(
                         "consensus_loop[{}]: election.get_requests() empty (single-node short-circuit or no peers)",
                         self_id
                     );
                 } else {
-                    info!(
+                    debug!(
                         "consensus_loop[{}]: election.get_requests() = {} requests at term={}",
                         self_id,
                         requests.len(),
                         term_after
                     );
                     let responses = self.send_request_votes_concurrent(requests).await;
-                    info!(
+                    debug!(
                         "consensus_loop[{}]: election round collected {} responses",
                         self_id,
                         responses.len()
@@ -152,7 +152,7 @@ impl ConsensusLoop {
                         let n = self.node.borrow();
                         (n.current_term(), n.role())
                     };
-                    info!(
+                    debug!(
                         "consensus_loop[{}]: election.handle_votes() done — term={} role={:?}",
                         self_id, post_term, post_role
                     );
@@ -180,7 +180,7 @@ impl ConsensusLoop {
                     match maybe_msg {
                         Some(msg) => self.handle_request_vote_msg(msg),
                         None => {
-                            info!("consensus_loop[{}]: rv channel closed; shutting down", self_id);
+                            debug!("consensus_loop[{}]: rv channel closed; shutting down", self_id);
                             break;
                         }
                     }
@@ -192,13 +192,13 @@ impl ConsensusLoop {
             }
         }
 
-        info!("consensus_loop[{}]: exiting", self_id);
+        debug!("consensus_loop[{}]: exiting", self_id);
     }
 
     fn handle_request_vote_msg(&mut self, msg: RequestVoteMsg) {
         let self_id = self.self_id;
         let RequestVoteMsg { req, reply } = msg;
-        info!(
+        debug!(
             "consensus_loop[{}]: cmd RequestVote candidate={} term={} last_tx_id={} last_term={}",
             self_id, req.candidate_id, req.term, req.last_tx_id, req.last_term
         );
@@ -216,7 +216,7 @@ impl ConsensusLoop {
         // (higher term observed). Sync the gate so replication pauses
         // immediately.
         self.sync_gate_from_role();
-        info!(
+        debug!(
             "consensus_loop[{}]: RequestVote reply term={} granted={}",
             self_id, result.term, result.granted
         );
@@ -286,7 +286,7 @@ impl ConsensusLoop {
         };
         let playing = matches!(role, Role::Leader);
         self.gate.set_playing(playing);
-        info!(
+        debug!(
             "consensus_loop[{}]: gate={} (role={:?}, term={})",
             self.self_id, playing, role, term
         );
@@ -309,7 +309,7 @@ async fn send_one_request_vote(
             return VoteOutcome::Failed;
         }
     };
-    info!(
+    debug!(
         "consensus_loop[{}]: RequestVote → peer={} term={} last_tx_id={} last_term={}",
         candidate_id, peer, req.term, req.last_tx_id, req.last_term
     );
@@ -336,7 +336,7 @@ async fn send_one_request_vote(
             return VoteOutcome::Failed;
         }
     };
-    info!(
+    debug!(
         "consensus_loop[{}]: RequestVote ← peer={} term={} granted={}",
         candidate_id, peer, resp.term, resp.vote_granted
     );

@@ -113,7 +113,6 @@ impl Node for NodeHandler {
         &self,
         request: Request<proto::RequestVoteRequest>,
     ) -> Result<Response<proto::RequestVoteResponse>, Status> {
-        info!("");
         let node_id = self.core.node_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core

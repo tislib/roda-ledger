@@ -50,7 +50,7 @@ use crate::raft_loop::{COMMAND_CHANNEL_DEPTH, RaftLoop};
 use crate::server::{NodeServerRuntime, Server};
 use ledger::ledger::Ledger;
 use raft::{RaftConfig, RaftNode, Role};
-use spdlog::{error, info};
+use spdlog::{debug, error, info};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -78,7 +78,7 @@ impl ClusterNode {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start()?;
         let durable = Arc::new(DurablePersistence::open(&config.ledger.storage.data_dir)?);
-        info!(
+        debug!(
             "cluster::new: opened durable persistence (term={}, voted_for={:?}, clustered={})",
             durable.term.get_current_term(),
             durable.vote.get_voted_for(),
@@ -146,7 +146,7 @@ impl ClusterNode {
                 error!("standalone ledger gRPC server exited: {}", e);
             }
         })?;
-        info!(
+        debug!(
             "standalone: client-facing Ledger gRPC up on {} (dedicated thread)",
             client_addr
         );
@@ -198,7 +198,8 @@ impl ClusterNode {
         // collapse write and commit at boot.
         let durable_last_tx_id = self.ledger_slot.ledger().last_commit_id();
         if durable_last_tx_id > 0 {
-            node.advance(durable_last_tx_id, durable_last_tx_id);
+            node.advance_write_index(durable_last_tx_id);
+            node.advance_commit_index(durable_last_tx_id);
             // Lazy-arm the election timer so the raft loop's first
             // iteration sees a populated wakeup deadline.
             let _ = node.election().tick(Instant::now());
@@ -292,7 +293,7 @@ impl ClusterNode {
             }
         })?;
 
-        info!(
+        debug!(
             "cluster: bring-up complete (node_id={}, peers={}, client={}, node={}; \
              ledger-grpc on its own thread, node-grpc + raft co-hosted on a LocalSet thread)",
             self_id,

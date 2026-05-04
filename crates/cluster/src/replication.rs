@@ -39,7 +39,7 @@ use raft::{
     AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftNode,
     RejectReason as RaftRejectReason, Role, TxId,
 };
-use spdlog::{error, info};
+use spdlog::{debug, error, info};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -131,13 +131,13 @@ impl ReplicationLoop {
 
     pub(crate) async fn run(mut self) {
         let self_id = self.self_id;
-        info!("replication_loop/l[{}]: started", self_id);
+        debug!("replication_loop/l[{}]: started", self_id);
 
         // Spawn per-peer outbound AE tasks.
         let cluster = match self.config.cluster.as_ref() {
             Some(c) => c,
             None => {
-                info!(
+                debug!(
                     "replication_loop/l[{}]: no cluster section; main task only",
                     self_id
                 );
@@ -164,7 +164,7 @@ impl ReplicationLoop {
             };
             handles.push(tokio::task::spawn_local(peer_replication_loop(replicator)));
         }
-        info!(
+        debug!(
             "replication_loop/l[{}]: spawned {} peer task(s) (tick_interval={:?})",
             self_id,
             handles.len(),
@@ -181,10 +181,13 @@ impl ReplicationLoop {
             match h.await {
                 Ok(()) => {}
                 Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(e) => error!("replication_loop/l[{}]: peer task cancelled: {}", self_id, e),
+                Err(e) => error!(
+                    "replication_loop/l[{}]: peer task cancelled: {}",
+                    self_id, e
+                ),
             }
         }
-        info!(
+        debug!(
             "replication_loop/l[{}]: all peer tasks drained; exiting",
             self_id
         );
@@ -208,7 +211,7 @@ impl ReplicationLoop {
                             self.handle_append_entries(msg).await;
                         }
                         None => {
-                            info!("replication_loop/l[{}]: ae channel closed; main loop exiting", self_id);
+                            debug!("replication_loop/l[{}]: ae channel closed; main loop exiting", self_id);
                             break;
                         }
                     }
@@ -226,8 +229,8 @@ impl ReplicationLoop {
     /// the mirror. Logs both pre- and post-advance index triples.
     fn poll_ledger_watermark(&mut self) {
         let self_id = self.self_id;
-        let commit_index = self.ledger.ledger().last_commit_id();
         let write_index = self.ledger.ledger().last_compute_id();
+        let commit_index = self.ledger.ledger().last_commit_id();
         if write_index == self.last_seen_write && commit_index == self.last_seen_commit {
             return;
         }
@@ -240,9 +243,10 @@ impl ReplicationLoop {
                 n.role(),
             )
         };
-        self.node.borrow_mut().advance(write_index, commit_index);
+        self.node.borrow_mut().advance_write_index(write_index);
+        self.node.borrow_mut().advance_commit_index(commit_index);
         let post_cci = self.node.borrow().cluster_commit_index();
-        info!(
+        debug!(
             "replication_loop/l[{}]: advance role={:?} write={}->{} commit={}->{} cluster_commit={}->{} (ledger compute={} commit={})",
             self_id,
             role_pre,
@@ -263,7 +267,7 @@ impl ReplicationLoop {
     async fn handle_append_entries(&mut self, msg: AppendEntriesMsg) {
         let AppendEntriesMsg { req, reply } = msg;
         let self_id = self.self_id;
-        info!(
+        debug!(
             "replication_loop/f[{}]: cmd AppendEntries from={} term={} prev_tx={} prev_term={} from_tx={} to_tx={} leader_commit={} wal_bytes={}",
             self_id,
             req.leader_id,
@@ -297,31 +301,27 @@ impl ReplicationLoop {
                 reason,
                 truncate_after,
             } => {
-                info!(
+                debug!(
                     "replication_loop/f[{}]: AE Reject reason={:?} truncate_after={:?}",
                     self_id, reason, truncate_after
                 );
                 if let Some(after) = truncate_after {
-                    info!(
+                    debug!(
                         "replication_loop/f[{}]: AE Reject truncate WAL TODO (after={})",
                         self_id, after
                     );
                 }
                 let resp = build_ae_response(&self.node.borrow(), false, Some(reason));
-                info!(
+                debug!(
                     "replication_loop/f[{}]: AE Reject reply term={} last_write_id={} last_commit_id={}",
                     self_id, resp.term, resp.last_write_id, resp.last_commit_id
                 );
                 let _ = reply.send(resp);
             }
             AppendEntriesDecision::Accept { append: None } => {
-                let commit_index = self.ledger.ledger().last_commit_id();
-                let (pre_w, pre_c, pre_cci) = {
-                    let n = self.node.borrow();
-                    (n.write_index(), n.commit_index(), n.cluster_commit_index())
-                };
-                self.node.borrow_mut().advance(commit_index, commit_index);
-                self.mirror.snapshot_from(&self.node.borrow());
+                // let commit_index = self.ledger.ledger().last_commit_id();
+                // self.node.borrow_mut().advance_commit_index(commit_index);
+                // self.mirror.snapshot_from(&self.node.borrow());
 
                 let resp = build_ae_response(&self.node.borrow(), true, None);
                 let _ = reply.send(resp);
@@ -332,7 +332,7 @@ impl ReplicationLoop {
                 let last_tx_id = range
                     .last_tx_id()
                     .expect("Accept{append: Some} carries a non-empty range");
-                info!(
+                debug!(
                     "replication_loop/f[{}]: AE Accept(entries) range start_tx={} count={} term={} leader_commit={}",
                     self_id, range.start_tx_id, range.count, range.term, req.leader_commit_tx_id
                 );
@@ -350,7 +350,7 @@ impl ReplicationLoop {
                     let _ = reply.send(resp);
                     return;
                 }
-                info!(
+                debug!(
                     "replication_loop/f[{}]: AE Accept(entries) queued to ledger pipeline last_tx={}",
                     self_id, last_tx_id
                 );
@@ -360,9 +360,10 @@ impl ReplicationLoop {
                     let n = self.node.borrow();
                     (n.write_index(), n.commit_index(), n.cluster_commit_index())
                 };
-                self.node.borrow_mut().advance(last_tx_id, commit_index);
+                self.node.borrow_mut().advance_write_index(last_tx_id);
+                self.node.borrow_mut().advance_commit_index(commit_index);
                 let post_cci = self.node.borrow().cluster_commit_index();
-                info!(
+                debug!(
                     "replication_loop/f[{}]: AE Accept(entries) advance write={}->{} commit={}->{} cluster_commit={}->{} (ledger_commit={})",
                     self_id,
                     pre_w,
@@ -376,7 +377,7 @@ impl ReplicationLoop {
                 self.mirror.snapshot_from(&self.node.borrow());
 
                 let resp = build_ae_response(&self.node.borrow(), true, None);
-                info!(
+                debug!(
                     "replication_loop/f[{}]: AE Accept(entries) reply term={} last_write_id={} last_commit_id={}",
                     self_id, resp.term, resp.last_write_id, resp.last_commit_id
                 );
@@ -401,7 +402,7 @@ struct PeerReplicator {
 }
 
 async fn peer_replication_loop(mut r: PeerReplicator) {
-    info!(
+    debug!(
         "replication_loop/l[{}]: peer={} task started (host={})",
         r.self_id, r.peer_id, r.host
     );
@@ -410,14 +411,14 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
             // Cursor is stale across pause windows: we may rejoin at a
             // different `next_index` if the leader regressed peers
             // before we get to play again.
-            info!(
+            debug!(
                 "replication_loop/l[{}]: peer={} gate=false → reset tailer, await flip",
                 r.self_id, r.peer_id
             );
             r.tailer.reset();
             match r.gate_rx.changed().await {
                 Ok(()) => {
-                    info!(
+                    debug!(
                         "replication_loop/l[{}]: peer={} gate flipped, resuming",
                         r.self_id, r.peer_id
                     );
@@ -428,7 +429,7 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
                         "replication_loop/l[{}]: peer={} gate_rx.changed() error: {}",
                         r.self_id, r.peer_id, err
                     );
-                    info!(
+                    debug!(
                         "replication_loop/l[{}]: peer={} gate dropped (shutdown)",
                         r.self_id, r.peer_id
                     );
@@ -441,7 +442,8 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
         // self advance
         let write_index = r.ledger.ledger().last_compute_id();
         let commit_index = r.ledger.ledger().last_commit_id();
-        r.node.borrow_mut().advance(write_index, commit_index);
+        r.node.borrow_mut().advance_write_index(write_index);
+        r.node.borrow_mut().advance_commit_index(commit_index);
         r.mirror.snapshot_from(&r.node.borrow());
 
         let next = Instant::now() + r.tick_interval;
@@ -453,13 +455,13 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
             result = r.gate_rx.changed() => {
                 match result {
                     Ok(()) => {
-                        info!(
+                        debug!(
                             "replication_loop/l[{}]: peer={} gate flipped during sleep",
                             r.self_id, r.peer_id
                         );
                     }
                     Err(_) => {
-                        info!(
+                        debug!(
                             "replication_loop/l[{}]: peer={} gate dropped during sleep (shutdown)",
                             r.self_id, r.peer_id
                         );
@@ -469,7 +471,7 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
             }
         }
     }
-    info!(
+    debug!(
         "replication_loop/l[{}]: peer={} task exiting",
         r.self_id, r.peer_id
     );
@@ -507,7 +509,7 @@ async fn replicate_once(r: &mut PeerReplicator) {
         let mut buffer = vec![0u8; r.append_max_bytes];
         let written = r.tailer.tail(from_tx_id, &mut buffer) as usize;
         if written == 0 {
-            info!(
+            debug!(
                 "replication_loop/l[{}]: peer={} tailer empty for from_tx={} (skip; retry next tick)",
                 r.self_id, r.peer_id, from_tx_id
             );
@@ -516,7 +518,7 @@ async fn replicate_once(r: &mut PeerReplicator) {
         buffer.truncate(written);
         wal_bytes = buffer;
         to_tx_id = last_tx_id;
-        info!(
+        debug!(
             "replication_loop/l[{}]: peer={} → AE entries term={} prev_tx={} prev_term={} from_tx={} to_tx={} count={} leader_commit={} wal_bytes={}",
             r.self_id,
             r.peer_id,
@@ -557,7 +559,7 @@ async fn replicate_once(r: &mut PeerReplicator) {
             last_write_id,
             last_commit_id,
         } => {
-            info!(
+            debug!(
                 "replication_loop/l[{}]: peer={} ← AE Success term={} last_write_id={} last_commit_id={}",
                 r.self_id, r.peer_id, term, last_write_id, last_commit_id
             );
@@ -568,13 +570,13 @@ async fn replicate_once(r: &mut PeerReplicator) {
             last_write_id,
             last_commit_id,
         } => {
-            info!(
+            debug!(
                 "replication_loop/l[{}]: peer={} ← AE Reject term={} reason={:?} last_write_id={} last_commit_id={}",
                 r.self_id, r.peer_id, term, reason, last_write_id, last_commit_id
             );
         }
         AppendResult::Timeout => {
-            info!(
+            debug!(
                 "replication_loop/l[{}]: peer={} ← AE Timeout (treated as no-progress)",
                 r.self_id, r.peer_id
             );
@@ -584,7 +586,7 @@ async fn replicate_once(r: &mut PeerReplicator) {
     let mut node = r.node.borrow_mut();
     if let Some(mut p) = node.replication().peer(r.peer_id) {
         p.append_result(now, result);
-        info!(
+        debug!(
             "replication_loop/l[{}]: peer={} append_result fed: next_index={} match_index={}",
             r.self_id,
             r.peer_id,
@@ -592,7 +594,7 @@ async fn replicate_once(r: &mut PeerReplicator) {
             p.match_index()
         );
     } else {
-        info!(
+        debug!(
             "replication_loop/l[{}]: peer={} append_result: no longer leader, dropping result",
             r.self_id, r.peer_id
         );

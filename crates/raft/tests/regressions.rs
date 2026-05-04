@@ -100,7 +100,8 @@ fn log_mismatch_decrements_next_index() {
     //
     // Simulate the leader having committed 3 entries:
     for tx in 1..=3 {
-        node.advance(tx, tx);
+        node.advance_write_index(tx);
+        node.advance_commit_index(tx);
         common::drive_tick(&mut node, t0 + Duration::from_secs(60 + tx));
     }
 
@@ -169,7 +170,8 @@ fn term_log_truncates_with_entry_log() {
     // Written but not committed — the §5.4 truncation guard forbids
     // truncating below `local_commit_index`, and this test then
     // truncates to 4. Set commit=0 so the truncation is allowed.
-    node.advance(5, 0);
+    node.advance_write_index(5);
+    node.advance_commit_index(0);
     assert_eq!(node.write_index(), 5);
 
     // Now arrive an AppendEntries from a leader at term 2 with
@@ -272,7 +274,8 @@ fn figure_8_new_leader_does_not_commit_prior_term_entries_by_replica_count() {
     // Cluster acks raft-log durability; ledger has not yet applied
     // (leader_commit was 0). Models the §5.4.2 scenario faithfully:
     // entries durably written but not locally committed.
-    node.advance(5, 0);
+    node.advance_write_index(5);
+    node.advance_commit_index(0);
     assert_eq!(node.write_index(), 5, "entries durable on disk");
     assert_eq!(
         node.cluster_commit_index(),
@@ -360,7 +363,8 @@ fn leader_with_entries(entries: TxId, t0: Instant) -> (RaftNode<MemPersistence>,
 
     let after = t0 + Duration::from_secs(61);
     if entries > 0 {
-        node.advance(entries, entries);
+        node.advance_write_index(entries);
+        node.advance_commit_index(entries);
         common::drive_tick(&mut node, after);
     }
     (node, term, after + Duration::from_millis(1))
@@ -610,7 +614,8 @@ fn vote_denial_uses_write_index_not_commit_index() {
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     // Five entries durably written, only three locally committed.
-    node.advance(5, 3);
+    node.advance_write_index(5);
+    node.advance_commit_index(3);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),

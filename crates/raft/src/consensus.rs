@@ -414,13 +414,6 @@ impl<P: Persistence> RaftNode<P> {
         }
 
         let majority = self.quorum.majority();
-        info!(
-            "raft: node_id={} starting election for term {} (peers={}, majority={})",
-            self.self_id,
-            new_term,
-            self.peers.len(),
-            majority
-        );
 
         let candidate = CandidateState::new(new_term, self.self_id);
         self.state = NodeState::Candidate(candidate);
@@ -455,11 +448,6 @@ impl<P: Persistence> RaftNode<P> {
             self.transition_to_follower(now, None);
             return;
         }
-
-        info!(
-            "raft: node_id={} won election at term {} (start_tx_id={})",
-            self.self_id, new_term, start_tx_id
-        );
 
         self.election_timer.disarm();
         self.quorum.reset_peers(self.self_slot);

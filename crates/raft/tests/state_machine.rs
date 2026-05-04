@@ -295,11 +295,14 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), 1);
 
-    node.advance(1, 1);
+    node.advance_write_index(1);
+    node.advance_commit_index(1);
     common::drive_tick(&mut node, t0 + Duration::from_secs(61));
-    node.advance(2, 2);
+    node.advance_write_index(2);
+    node.advance_commit_index(2);
     common::drive_tick(&mut node, t0 + Duration::from_secs(61));
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     common::drive_tick(&mut node, t0 + Duration::from_secs(61));
     assert_eq!(node.commit_index(), 3);
 
@@ -317,7 +320,8 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // before any election runs, otherwise `start_tx_id` for the
     // post-election term boundary lands at 1 and shadows the
     // existing entries on `term_at_tx` lookups.
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     common::drive_tick(&mut node, t0 + Duration::from_secs(119));
     common::drive_tick(&mut node, t0 + Duration::from_secs(120));
     common::drive_tick(&mut node, t0 + Duration::from_secs(180));
@@ -340,7 +344,8 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // `local_log_index = 0`.
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     common::drive_tick(&mut node, t0 + Duration::from_secs(181));
     common::drive_tick(&mut node, t0 + Duration::from_secs(182));
     common::drive_tick(&mut node, t0 + Duration::from_secs(240));

@@ -17,7 +17,7 @@
 //! keeps that path lock-free in the common case.
 
 use raft::{Persistence, TermRecord as RaftTermRecord};
-use spdlog::{info, warn};
+use spdlog::{debug, info, warn};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -131,7 +131,7 @@ impl Term {
             current = current.max(rec.term);
             ring.push(rec);
         })?;
-        info!(
+        debug!(
             "term: opened {} (current={}, records_loaded={})",
             file.path().display(),
             current,
@@ -192,7 +192,7 @@ impl Term {
             ring.push(rec);
         }
         self.current.store(next, Ordering::Release);
-        info!(
+        debug!(
             "term: opened term {} at start_tx_id={} ({})",
             next,
             start_tx_id,
@@ -227,7 +227,7 @@ impl Term {
             ring.push(rec);
         }
         self.current.store(expected, Ordering::Release);
-        info!(
+        debug!(
             "term: committed term {} at start_tx_id={} ({})",
             expected,
             start_tx_id,
@@ -265,7 +265,7 @@ impl Term {
             ring.push(rec);
         }
         self.current.store(term, Ordering::Release);
-        info!(
+        debug!(
             "term: observed term {} at start_tx_id={} ({})",
             term,
             start_tx_id,
@@ -288,7 +288,7 @@ impl Term {
             ring.push(rec);
         })?;
         self.current.store(current, Ordering::Release);
-        info!(
+        debug!(
             "term: truncated after tx_id={} (current={}, records_loaded={}, {})",
             tx_id,
             current,
@@ -332,7 +332,7 @@ impl Vote {
             Some(rec) => (rec.term, rec.voted_for),
             None => (0, 0),
         };
-        info!(
+        debug!(
             "vote: opened {} (current_term={}, voted_for={})",
             file.path().display(),
             term,
@@ -395,7 +395,7 @@ impl Vote {
         writer.sync()?;
         self.voted_for.store(candidate_id, Ordering::Release);
         self.current_term.store(term, Ordering::Release);
-        info!(
+        debug!(
             "vote: granted term={} candidate_id={} ({})",
             term,
             candidate_id,
@@ -432,7 +432,7 @@ impl Vote {
         writer.sync()?;
         self.voted_for.store(0, Ordering::Release);
         self.current_term.store(term, Ordering::Release);
-        info!(
+        debug!(
             "vote: observed higher term={} (cleared voted_for) ({})",
             term,
             writer.path().display(),

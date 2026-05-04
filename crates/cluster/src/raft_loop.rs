@@ -25,7 +25,7 @@ use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
 use crate::replication::{ReplicationGate, ReplicationLoop};
 use raft::RaftNode;
-use spdlog::info;
+use spdlog::{debug, info};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl RaftLoop {
 
     pub async fn run(mut self) {
         let self_id = self.node.borrow().self_id();
-        info!("raft_loop[{}]: starting consensus + replication", self_id);
+        debug!("raft_loop[{}]: starting consensus + replication", self_id);
 
         let (gate, gate_rx) = ReplicationGate::new();
 
@@ -103,6 +103,6 @@ impl RaftLoop {
         // `JoinError::is_panic()`.
         tokio::join!(consensus.run(), replication.run());
 
-        info!("raft_loop[{}]: both loops exited", self_id);
+        debug!("raft_loop[{}]: both loops exited", self_id);
     }
 }

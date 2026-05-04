@@ -343,18 +343,21 @@ impl<P: Persistence> RaftNode<P> {
     /// builds panic on violation; release builds clamp the commit
     /// argument down to the write argument (same posture as the
     /// AE-reply guard).
-    pub fn advance(&mut self, local_write_index: TxId, local_commit_index: TxId) {
+    pub fn advance_write_index(&mut self, local_write_index: TxId) {
         debug_assert!(
-            local_commit_index <= local_write_index,
+            self.local_commit_index <= local_write_index,
             "advance: commit_index={} > write_index={}",
-            local_commit_index,
+            self.local_commit_index,
             local_write_index
         );
-        let new_commit = local_commit_index.min(local_write_index);
 
         if local_write_index > self.local_write_index {
             self.local_write_index = local_write_index;
         }
+    }
+    pub fn advance_commit_index(&mut self, local_commit_index: TxId) {
+        let new_commit = local_commit_index;
+
         if new_commit > self.local_commit_index {
             self.local_commit_index = new_commit;
             // Leader-only: feed the new local commit into the quorum
@@ -1054,7 +1057,8 @@ mod tests {
         let _ = node.election().tick(t0 + Duration::from_secs(60));
         let _ = node.election().start(t0 + Duration::from_secs(60));
         assert!(node.role().is_leader());
-        node.advance(7, 7);
+        node.advance_write_index(7);
+        node.advance_commit_index(7);
         // `advance` is silent; observe via getters per ADR-0017
         // §"Driver call pattern".
         assert_eq!(node.commit_index(), 7);
@@ -1288,7 +1292,8 @@ mod tests {
             3, // leader_commit covering all three entries
         );
         // Cluster fsyncs entries and the ledger applies them.
-        node.advance(3, 3);
+        node.advance_write_index(3);
+        node.advance_commit_index(3);
         // cluster_commit advances to min(leader_commit=3, local_commit=3) = 3.
         assert_eq!(node.cluster_commit_index(), 3);
     }
@@ -1307,7 +1312,8 @@ mod tests {
         );
         // Cluster fsync covers the 3 entries but ledger has only
         // applied 2 of them.
-        node.advance(3, 2);
+        node.advance_write_index(3);
+        node.advance_commit_index(2);
         // cluster_commit clamps to local_commit (2), not leader_commit (10).
         assert_eq!(node.cluster_commit_index(), 2);
     }
@@ -1334,7 +1340,8 @@ mod tests {
 
         // Now drive the candidate back into a follower term — the new
         // FollowerState starts with no pending_leader_commit.
-        node.advance(3, 3);
+        node.advance_write_index(3);
+        node.advance_commit_index(3);
         // cluster_commit must NOT pick up the stale leader_commit=3
         // because pending_leader_commit was wiped on the transition.
         assert_eq!(node.cluster_commit_index(), 0);
@@ -1367,7 +1374,8 @@ mod tests {
         );
         // Cluster fsyncs durability up to 5 and the ledger applies up
         // to 5. Drain should use the second AE's leader_commit.
-        node.advance(5, 5);
+        node.advance_write_index(5);
+        node.advance_commit_index(5);
         assert_eq!(node.cluster_commit_index(), 5);
     }
 
@@ -1460,7 +1468,8 @@ mod tests {
         // Leader-side ledger writes entries 1..=3 at the current term
         // (set by the election win as `current_term_first_tx`'s
         // start_tx_id) and acks durability via `advance`.
-        node.advance(3, 3);
+        node.advance_write_index(3);
+        node.advance_commit_index(3);
 
         let req = node
             .replication()
@@ -1479,7 +1488,8 @@ mod tests {
     #[test]
     fn replication_append_result_success_advances_match_and_next_index() {
         let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
-        node.advance(3, 3);
+        node.advance_write_index(3);
+        node.advance_commit_index(3);
         // Pull the request to arm in_flight.
         let _ = node
             .replication()
@@ -1506,7 +1516,8 @@ mod tests {
     #[test]
     fn replication_append_result_log_mismatch_walks_back_next_index() {
         let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
-        node.advance(5, 5);
+        node.advance_write_index(5);
+        node.advance_commit_index(5);
         // After election, next_index = local_write_index + 1 *at
         // election time*. We bumped local_write to 5 via `advance`
         // *after* the election, so peer next_index is still 1.
@@ -1562,7 +1573,8 @@ mod tests {
     #[test]
     fn replication_append_result_timeout_clears_in_flight_only() {
         let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
-        node.advance(3, 3);
+        node.advance_write_index(3);
+        node.advance_commit_index(3);
         let _ = node
             .replication()
             .peer(2)

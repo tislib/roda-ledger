@@ -57,7 +57,8 @@ fn single_node_leader_commits_own_writes_immediately() {
 
     // `advance` is silent; observe the cluster_commit advance via
     // the getter (ADR-0017 §"Driver call pattern").
-    node.advance(5, 5);
+    node.advance_write_index(5);
+    node.advance_commit_index(5);
     assert_eq!(node.commit_index(), 5);
     assert_eq!(node.write_index(), 5);
     assert_eq!(node.cluster_commit_index(), 5);
@@ -103,7 +104,7 @@ fn two_node_cluster_without_peer_replies_keeps_bumping_term() {
 
 // ── advance() behavior tests (split-watermark refactor) ────────────────
 
-/// `advance` is monotonic — a regressed argument is silently
+/// `advance_*` is monotonic — a regressed argument is silently
 /// ignored. Mirrors `Quorum`'s monotonicity invariant for
 /// `cluster_commit_index`.
 #[test]
@@ -114,42 +115,35 @@ fn advance_is_monotonic() {
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
-    node.advance(5, 3);
+    // Write monotonicity: regressed write argument is ignored. Tested
+    // before any commit advance so the new `advance_write_index`
+    // debug_assert (`local_commit_index <= local_write_index`) holds.
+    node.advance_write_index(5);
     assert_eq!(node.write_index(), 5);
-    assert_eq!(node.commit_index(), 3);
-
-    node.advance(2, 1);
+    node.advance_write_index(2);
     assert_eq!(node.write_index(), 5, "write must not regress");
-    assert_eq!(node.commit_index(), 3, "commit must not regress");
-}
 
-/// Release-build `advance` clamps `commit > write` defensively (the
-/// debug build panics via `debug_assert!`). This test exercises the
-/// release-build branch by running with debug assertions disabled
-/// — same posture as the AE-reply guard.
-#[test]
-#[cfg(not(debug_assertions))]
-fn advance_clamps_commit_above_write_in_release() {
-    let mut node = fresh(1, vec![1]);
-    let t0 = Instant::now();
-    common::drive_tick(&mut node, t0);
-    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
-    assert!(node.role().is_leader());
-    node.advance(3, 5);
-    // commit clamped to write.
-    assert_eq!(node.write_index(), 3);
+    // Commit monotonicity: regressed commit argument is ignored.
+    node.advance_commit_index(3);
     assert_eq!(node.commit_index(), 3);
+    node.advance_commit_index(1);
+    assert_eq!(node.commit_index(), 3, "commit must not regress");
 }
 
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "advance: commit_index=5 > write_index=3")]
-fn advance_panics_on_commit_above_write_in_debug() {
+fn advance_write_panics_below_commit_in_debug() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
-    node.advance(3, 5);
+    // Drive write/commit to 5, then attempt to regress write below
+    // commit — `advance_write_index` must panic on the invariant
+    // `local_commit_index <= local_write_index`.
+    node.advance_write_index(5);
+    node.advance_commit_index(5);
+    node.advance_write_index(3);
 }
 
 /// `advance` only updates `cluster_commit_index` on a leader. On a
@@ -159,7 +153,8 @@ fn advance_panics_on_commit_above_write_in_debug() {
 fn advance_updates_cluster_commit_on_leader_only() {
     // Initializing follower: cluster_commit must NOT advance.
     let mut follower = fresh(1, vec![1, 2, 3]);
-    follower.advance(5, 5);
+    follower.advance_write_index(5);
+    follower.advance_commit_index(5);
     assert_eq!(follower.write_index(), 5);
     assert_eq!(follower.commit_index(), 5);
     assert_eq!(
@@ -175,7 +170,8 @@ fn advance_updates_cluster_commit_on_leader_only() {
     common::drive_tick(&mut leader, t0);
     common::drive_tick(&mut leader, t0 + Duration::from_secs(60));
     assert!(leader.role().is_leader());
-    leader.advance(5, 5);
+    leader.advance_write_index(5);
+    leader.advance_commit_index(5);
     assert_eq!(leader.cluster_commit_index(), 5);
 }
 
@@ -193,6 +189,7 @@ fn advance_returns_unit() {
 
     // The method is `() -> ()` — no actions returned. We assert on
     // the post-condition observable via getters.
-    node.advance(5, 5);
+    node.advance_write_index(5);
+    node.advance_commit_index(5);
     assert_eq!(node.cluster_commit_index(), 5);
 }

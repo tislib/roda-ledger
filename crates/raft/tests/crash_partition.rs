@@ -307,7 +307,8 @@ fn restart_recovers_local_indexes_via_advance() {
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
-    node.advance(7, 7);
+    node.advance_write_index(7);
+    node.advance_commit_index(7);
     assert_eq!(node.commit_index(), 7);
     assert_eq!(node.write_index(), 7);
 
@@ -318,7 +319,8 @@ fn restart_recovers_local_indexes_via_advance() {
     assert_eq!(restarted.write_index(), 0);
 
     // Driver hydrates from the durable ledger watermark.
-    restarted.advance(7, 7);
+    restarted.advance_write_index(7);
+    restarted.advance_commit_index(7);
     assert_eq!(restarted.commit_index(), 7);
     assert_eq!(restarted.write_index(), 7);
 }
@@ -336,7 +338,8 @@ fn write_ahead_of_commit_collapses_on_restart() {
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
-    node.advance(5, 3);
+    node.advance_write_index(5);
+    node.advance_commit_index(3);
     assert_eq!(node.write_index(), 5);
     assert_eq!(node.commit_index(), 3);
 
@@ -344,7 +347,8 @@ fn write_ahead_of_commit_collapses_on_restart() {
     let mut restarted = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
     // Driver only knows about the ledger's last_commit_id; the raft-
     // log WAL extent is not separately surfaced today.
-    restarted.advance(3, 3);
+    restarted.advance_write_index(3);
+    restarted.advance_commit_index(3);
     assert_eq!(restarted.write_index(), 3);
     assert_eq!(restarted.commit_index(), 3);
 }
@@ -365,7 +369,8 @@ fn leader_step_down_preserves_write_index() {
     common::deliver_vote_reply(&mut node, t0 + Duration::from_secs(60), 2, term_now, true);
     assert!(node.role().is_leader(), "test setup: must be leader");
 
-    node.advance(5, 5);
+    node.advance_write_index(5);
+    node.advance_commit_index(5);
     assert_eq!(node.write_index(), 5);
 
     // Inbound RPC at a strictly higher term forces step-down.

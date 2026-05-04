@@ -348,7 +348,8 @@ impl Sim {
             // Invariants" notes the implicit recovery invariant
             // `ledger.last_commit_id <= raft_wal.last_tx_id`.)
             if last_tx > 0 {
-                n.advance(last_tx, last_tx);
+                n.advance_write_index(last_tx);
+                n.advance_commit_index(last_tx);
             }
             b.node = Some(n);
             b.last_observed_role = Role::Initializing;
@@ -418,7 +419,8 @@ impl Sim {
                 // Single direct call advances both watermarks. Write
                 // bounds the AE replication window, commit feeds the
                 // leader's quorum self-slot.
-                node.advance(tx, tx);
+                node.advance_write_index(tx);
+                node.advance_commit_index(tx);
             }
         }
         self.observe_after_event(leader_id, now);
@@ -741,7 +743,8 @@ impl Sim {
                     if let Some(node) =
                         self.nodes.get_mut(&target).and_then(|b| b.node.as_mut())
                     {
-                        node.advance(last_tx, last_tx);
+                        node.advance_write_index(last_tx);
+                        node.advance_commit_index(last_tx);
                     }
                 }
                 (true, None)

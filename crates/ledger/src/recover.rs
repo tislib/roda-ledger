@@ -6,7 +6,7 @@ use storage::SegmentStaus::SEALED;
 use storage::{Segment, Storage};
 use crate::transactor::Transactor;
 use crate::wasm_runtime::WasmRuntime;
-use spdlog::{info, warn};
+use spdlog::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -136,7 +136,7 @@ impl<'r> Recover<'r> {
                 );
                 active.truncate_wal(valid_end as u64)?;
             } else {
-                info!("crash recovery: active segment is consistent, no truncation needed");
+                debug!("crash recovery: active segment is consistent, no truncation needed");
             }
         }
 
@@ -384,7 +384,7 @@ impl<'r> Recover<'r> {
     /// without that, `recover_until` is correct on its own — it simply
     /// won't physically reclaim the disk space of the rejected tail.
     pub fn recover_until(&mut self, watermark: u64) -> Result<(), std::io::Error> {
-        info!("Starting recovery (watermark={})...", watermark);
+        debug!("Starting recovery (watermark={})...", watermark);
 
         // locate segments
         self.segments = self.storage.list_all_segments().map_err(|e| {
@@ -632,7 +632,7 @@ impl<'r> Recover<'r> {
         self.pipeline
             .set_sequencer_next_id(effective_last.saturating_add(1));
 
-        info!(
+        debug!(
             "Recovery completed successfully (last_tx_id={}, watermark={}).",
             effective_last, watermark
         );
@@ -714,7 +714,7 @@ impl<'r> Recover<'r> {
                 )
             })?;
 
-        info!(
+        debug!(
             "recover: loaded function snapshot for segment {} with {} records",
             segment_id,
             data.records.len()

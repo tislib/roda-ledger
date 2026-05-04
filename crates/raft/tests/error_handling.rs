@@ -50,7 +50,8 @@ fn truncation_below_cluster_commit_index_panics_in_debug() {
     let now = Instant::now();
 
     // Hydrate watermarks to 10.
-    node.advance(10, 10);
+    node.advance_write_index(10);
+    node.advance_commit_index(10);
 
     // First AE: matching prev_log to advance cluster_commit_index to 5.
     let _ = node.validate_append_entries_request(now, 2, 1, 10, 1, LogEntryRange::empty(), 5);
@@ -120,7 +121,8 @@ fn pending_leader_commit_lost_on_follower_to_candidate_transition() {
     // Cluster (which does not know about the role change) finally
     // reports durability. cluster_commit must stay put — no stale
     // follower state to drain.
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     assert_eq!(
         node.cluster_commit_index(),
         0,
@@ -161,7 +163,8 @@ fn pending_leader_commit_overwritten_when_second_ae_arrives_before_advance() {
 
     // Cluster acks durability up to 5. Drain inside `advance` picks
     // up the second AE's leader_commit (5), not the first's (2).
-    node.advance(5, 5);
+    node.advance_write_index(5);
+    node.advance_commit_index(5);
     assert_eq!(
         node.cluster_commit_index(),
         5,

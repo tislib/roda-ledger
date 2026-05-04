@@ -305,7 +305,8 @@ fn prev_log_tx_id_zero_skips_term_match_check() {
     );
     // Cluster acks durability via `advance`. Watermarks now reflect
     // the new state — what the driver stamps onto the success reply.
-    node.advance(1, 1);
+    node.advance_write_index(1);
+    node.advance_commit_index(1);
     assert_eq!(node.write_index(), 1);
     assert_eq!(node.commit_index(), 1);
 }
@@ -340,7 +341,8 @@ fn leader_commit_clamp_to_local_log() {
     // Cluster acks durability. `advance` drains
     // `pending_leader_commit`, clamped at the new
     // `local_commit_index = 3`.
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     assert_eq!(node.cluster_commit_index(), 3);
 }
 
@@ -449,7 +451,8 @@ fn cluster_commit_query_reflects_advance() {
     // immediately. The driver polls `cluster_commit_index()` to
     // observe the change (no dedicated action; ADR-0017 §"Driver
     // call pattern").
-    node.advance(7, 7);
+    node.advance_write_index(7);
+    node.advance_commit_index(7);
     assert!(node.cluster_commit_index() >= 7);
 }
 
@@ -475,7 +478,8 @@ fn vote_denied_when_candidate_last_term_below_ours() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),
@@ -503,7 +507,8 @@ fn vote_denied_when_same_last_term_but_lower_last_tx_id() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance(10, 10);
+    node.advance_write_index(10);
+    node.advance_commit_index(10);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),
@@ -535,7 +540,8 @@ fn vote_granted_when_candidate_last_term_above_ours() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance(10, 10);
+    node.advance_write_index(10);
+    node.advance_commit_index(10);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),
@@ -629,7 +635,8 @@ fn heartbeat_propagates_leader_commit_advance() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Heartbeat at term 1 with leader_commit=2.
@@ -668,7 +675,8 @@ fn heartbeat_leader_commit_clamps_to_local_commit() {
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
     // Five entries durably written, only three committed locally.
-    node.advance(5, 3);
+    node.advance_write_index(5);
+    node.advance_commit_index(3);
 
     // Heartbeat with leader_commit=10 (intentionally above our
     // commit). Cluster commit advances only to local_commit_index=3.
@@ -706,7 +714,8 @@ fn local_write_index_survives_election_loss() {
     let mut node = RaftNode::new(1, vec![1, 2, 3], persistence, RaftConfig::default(), 42);
     let t0 = Instant::now();
     // Hydrate the write extent before any election runs.
-    node.advance(3, 3);
+    node.advance_write_index(3);
+    node.advance_commit_index(3);
     // First Tick lazy-arms; second Tick expires → Candidate.
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
@@ -906,7 +915,8 @@ fn cluster_index_advance_on_replication() {
     let term = node.current_term();
 
     // Leader writes 200 entries; nothing committed locally yet.
-    node.advance(200, 0);
+    node.advance_write_index(200);
+    node.advance_commit_index(0);
     assert_eq!(node.write_index(), 200);
     assert_eq!(node.commit_index(), 0);
     assert_eq!(node.cluster_commit_index(), 0);
@@ -935,7 +945,8 @@ fn cluster_index_advance_on_replication() {
     // Leader's local commit catches up. Self-slot → 200; slots =
     // [200, 200, 0]; second-highest = 200 → advance. Replica2 never
     // replied (slot 2 stays 0).
-    node.advance(200, 200);
+    node.advance_write_index(200);
+    node.advance_commit_index(200);
     assert_eq!(node.cluster_commit_index(), 200);
 }
 
@@ -945,7 +956,8 @@ fn cluster_index_advance_on_replication_lagged() {
     let term = node.current_term();
 
     // Leader writes 200; local commit still 0.
-    node.advance(200, 0);
+    node.advance_write_index(200);
+    node.advance_commit_index(0);
 
     // Leader pulls AE for replica1.
     let _ = node
@@ -970,7 +982,8 @@ fn cluster_index_advance_on_replication_lagged() {
     // Leader's local commit catches up. Self-slot → 200, but slots =
     // [200, 0, 0]; second-highest = 0 → no advance. Replica2 never
     // replied.
-    node.advance(200, 200);
+    node.advance_write_index(200);
+    node.advance_commit_index(200);
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Leader sends a heartbeat to replica1. The previous
@@ -1017,7 +1030,8 @@ fn cluster_index_advance_on_replication_leader_commits_first() {
 
     // Leader writes AND commits 200 entries up front. Self-slot →
     // 200; slots = [200, 0, 0]; second-highest = 0 → no advance.
-    node.advance(200, 200);
+    node.advance_write_index(200);
+    node.advance_commit_index(200);
     assert_eq!(node.write_index(), 200);
     assert_eq!(node.commit_index(), 200);
     assert_eq!(node.cluster_commit_index(), 0);
@@ -1053,7 +1067,8 @@ fn cluster_index_advance_on_replication_lagged_leader_commits_first() {
 
     // Leader writes AND commits 200 entries up front. Self-slot →
     // 200; slots = [200, 0, 0]; second-highest = 0 → no advance.
-    node.advance(200, 200);
+    node.advance_write_index(200);
+    node.advance_commit_index(200);
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Leader pulls AE for replica1.
@@ -1136,7 +1151,8 @@ fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
         LogEntryRange::new(1, 200, 1),
         0,
     );
-    node.advance(200, 0);
+    node.advance_write_index(200);
+    node.advance_commit_index(0);
     assert_eq!(node.write_index(), 200);
     assert_eq!(node.commit_index(), 0);
     assert_eq!(node.cluster_commit_index(), 0);

@@ -18,7 +18,7 @@ use crate::node_handler::NodeHandler;
 use ::proto::ledger::ledger_server::LedgerServer;
 use ::proto::node::node_server::NodeServer;
 use crate::LedgerSlot;
-use spdlog::info;
+use spdlog::{debug, info};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -63,7 +63,7 @@ impl Server {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let handler = LedgerHandler::new(self.ledger_slot, self.mirror.clone(), self.term);
 
-        info!("Ledger gRPC server listening on {}", self.addr);
+        debug!("Ledger gRPC server listening on {}", self.addr);
 
         let reflection_service = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(proto::ledger::FILE_DESCRIPTOR_SET)
@@ -78,7 +78,7 @@ impl Server {
             })
             .await?;
 
-        info!("Ledger gRPC server shut down cleanly");
+        debug!("Ledger gRPC server shut down cleanly");
 
         Ok(())
     }
@@ -118,7 +118,7 @@ impl NodeServerRuntime {
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Node gRPC server listening on {}", self.addr);
+        debug!("Node gRPC server listening on {}", self.addr);
         let shutdown = self.shutdown.clone();
         TonicServer::builder()
             .add_service(Self::service(self.handler, self.max_message_bytes))
@@ -126,7 +126,7 @@ impl NodeServerRuntime {
                 shutdown.notified().await;
             })
             .await?;
-        info!("Node gRPC server shut down cleanly");
+        debug!("Node gRPC server shut down cleanly");
         Ok(())
     }
 }
