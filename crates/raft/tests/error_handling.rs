@@ -42,7 +42,10 @@ fn make_follower(persistence: MemPersistence) -> RaftNode<MemPersistence> {
 #[should_panic(expected = "truncation below cluster_commit_index")]
 fn truncation_below_cluster_commit_index_panics_in_debug() {
     let persistence = MemPersistence::with_state(
-        vec![raft::TermRecord { term: 1, start_tx_id: 1 }],
+        vec![raft::TermRecord {
+            term: 1,
+            start_tx_id: 1,
+        }],
         1,
         0,
     );
@@ -96,15 +99,8 @@ fn pending_leader_commit_lost_on_follower_to_candidate_transition() {
     let now = Instant::now();
 
     // First validate stages `leader_commit=3` waiting on durability.
-    let decision = node.validate_append_entries_request(
-        now,
-        2,
-        1,
-        0,
-        0,
-        LogEntryRange::new(1, 3, 1),
-        3,
-    );
+    let decision =
+        node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 3, 1), 3);
     assert_eq!(
         decision,
         AppendEntriesDecision::Accept {
@@ -139,27 +135,11 @@ fn pending_leader_commit_overwritten_when_second_ae_arrives_before_advance() {
     let now = Instant::now();
 
     // First AE: prev=0, entries 1..3, leader_commit=2.
-    let _ = node.validate_append_entries_request(
-        now,
-        2,
-        1,
-        0,
-        0,
-        LogEntryRange::new(1, 3, 1),
-        2,
-    );
+    let _ = node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 3, 1), 2);
 
     // Second AE before any advance: same prev=0 but an extended
     // range 1..5, leader_commit=5.
-    let _ = node.validate_append_entries_request(
-        now,
-        2,
-        1,
-        0,
-        0,
-        LogEntryRange::new(1, 5, 1),
-        5,
-    );
+    let _ = node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 5, 1), 5);
 
     // Cluster acks durability up to 5. Drain inside `advance` picks
     // up the second AE's leader_commit (5), not the first's (2).

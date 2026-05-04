@@ -1,9 +1,8 @@
 //! Resource lifecycle: harness drop/cleanup, supervisor abort, restart
 //! semantics on the same data dir.
 
-
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 use tokio::time::sleep;
 

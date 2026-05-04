@@ -16,10 +16,9 @@
 //!
 //! All Pings are observation-only; the test makes no writes.
 
-
-use proto::node as nproto;
 use ::proto::node::node_client::NodeClient;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl}; 
+use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use proto::node as nproto;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 

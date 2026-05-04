@@ -65,10 +65,7 @@ enum Delivery {
     /// the leader (this scheduled item's `target`). The leader feeds
     /// the result through
     /// `node.replication().peer(from).unwrap().append_result(now, result)`.
-    AppendEntriesReply {
-        from: NodeId,
-        result: AppendResult,
-    },
+    AppendEntriesReply { from: NodeId, result: AppendResult },
     /// Inbound `RequestVote` from candidate `from`. The voter
     /// (this scheduled item's `target`) calls
     /// `node.election().handle_request_vote(now, RequestVoteRequest { ... })`
@@ -83,10 +80,7 @@ enum Delivery {
     /// Outcome of a `RequestVote` arriving back at the candidate.
     /// The candidate (this scheduled item's `target`) feeds it into
     /// `node.election().handle_votes(now, vec![(from, outcome)])`.
-    RequestVoteReply {
-        from: NodeId,
-        outcome: VoteOutcome,
-    },
+    RequestVoteReply { from: NodeId, outcome: VoteOutcome },
 }
 
 use mem_persistence::MemPersistence;
@@ -664,9 +658,7 @@ impl Sim {
                 // scheduled even when the candidate-round Tick is
                 // sitting in the queue at an earlier — now-stale —
                 // deadline.)
-                let already = self
-                    .earliest_queued_tick_for(src)
-                    .is_some_and(|q| q == d);
+                let already = self.earliest_queued_tick_for(src).is_some_and(|q| q == d);
                 if !already {
                     self.schedule(d, src, Delivery::Tick);
                 }
@@ -740,9 +732,7 @@ impl Sim {
                     // Synchronous-apply harness model: ledger applies
                     // AE entries the moment they're durable, so write
                     // and commit watermarks move together.
-                    if let Some(node) =
-                        self.nodes.get_mut(&target).and_then(|b| b.node.as_mut())
-                    {
+                    if let Some(node) = self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
                         node.advance_write_index(last_tx);
                         node.advance_commit_index(last_tx);
                     }
@@ -764,14 +754,11 @@ impl Sim {
         if self.is_dropped(target, from) || self.rolled_drop() {
             return;
         }
-        let (reply_term, last_commit_id, last_write_id) = match self
-            .nodes
-            .get(&target)
-            .and_then(|b| b.node.as_ref())
-        {
-            Some(n) => (n.current_term(), n.commit_index(), n.write_index()),
-            None => return,
-        };
+        let (reply_term, last_commit_id, last_write_id) =
+            match self.nodes.get(&target).and_then(|b| b.node.as_ref()) {
+                Some(n) => (n.current_term(), n.commit_index(), n.write_index()),
+                None => return,
+            };
         let result = if success {
             AppendResult::Success {
                 term: reply_term,
@@ -895,15 +882,14 @@ impl Sim {
             .map(|n| (n.role(), n.current_term()));
         if let Some((role, term)) = observed
             && let Some(b) = self.nodes.get_mut(&src)
+            && (role != b.last_observed_role || term != b.last_observed_term)
         {
-            if role != b.last_observed_role || term != b.last_observed_term {
-                self.transitions.push((src, role, term));
-                if matches!(role, Role::Leader) {
-                    self.leaders_per_term.entry(term).or_default().insert(src);
-                }
-                b.last_observed_role = role;
-                b.last_observed_term = term;
+            self.transitions.push((src, role, term));
+            if matches!(role, Role::Leader) {
+                self.leaders_per_term.entry(term).or_default().insert(src);
             }
+            b.last_observed_role = role;
+            b.last_observed_term = term;
         }
 
         // Re-poll the next wakeup, only re-scheduling a Tick if the

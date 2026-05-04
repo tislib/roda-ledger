@@ -160,7 +160,7 @@ impl ClusterClient {
             match self.nodes[pick].get_pipeline_index().await {
                 Ok(idx) => {
                     if idx.is_leader {
-                        let _ = self.leader.set_current_leader_index(pick);
+                        self.leader.set_current_leader_index(pick);
                     } else if follower.is_none() {
                         follower = Some(self.nodes[pick].clone());
                     }

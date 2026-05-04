@@ -85,12 +85,16 @@ jobs:
           git clone --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" /root/roda-ledger
           cd /root/roda-ledger
 
+          # Pre-build both bins so the runner can resolve its sibling
+          # `e2e-cluster-process` via `current_exe()` on the first
+          # spawn — they land in the same target/release/ directory.
+          /root/.cargo/bin/cargo build -p testing \
+            --bin e2e --bin e2e-cluster-process --release
+
           # Run E2E tests with Process backend
           echo "::group::E2E Test Output"
-          E2E_BACKEND=process /root/.cargo/bin/cargo test \
-            --test e2e_tests \
-            --features "e2e_tests,cluster" \
-            --release \
+          E2E_BACKEND=process /root/.cargo/bin/cargo run \
+            -p testing --bin e2e --release \
             -- --test-threads=1 --nocapture 2>&1 | tee /root/e2e-test-output.txt
           echo "::endgroup::"
           SETUP_EOF

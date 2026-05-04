@@ -1,10 +1,6 @@
 use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::dedup::{DedupCache, DedupResult};
-use storage::entities::{
-    EntryKind, FailReason, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind, TxMetadata, WalEntry,
-    WalEntryKind, WalInput,
-};
 use crate::pipeline::TransactorContext;
 use crate::transaction::{Operation, Transaction, TransactionInput};
 use crate::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
@@ -15,6 +11,12 @@ use std::hint::spin_loop;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use storage::entities::{
+    EntryKind, FailReason, FunctionRegistered, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind,
+    TxMetadata, WalEntry, WalEntryKind, WalInput,
+};
+use storage::entries::wal_tx_term_entry;
+use storage::wal_serializer::serialize_wal_records;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TransactorState — shared inter-state buffer
@@ -97,9 +99,8 @@ impl TransactorState {
     pub fn meta(&mut self, tag: [u8; 8], user_ref: u64, timestamp: u64) {
         self.entries.push(WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 0,
-            link_count: 0,
             fail_reason: FailReason::NONE,
+            sub_item_count: 0,
             crc32c: 0,
             tx_id: self.tx_id,
             timestamp,
@@ -179,9 +180,8 @@ impl TransactorState {
 
         let mut meta = TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
-            entry_count: 0,
-            link_count: 1,
             fail_reason: FailReason::DUPLICATE,
+            sub_item_count: 1,
             crc32c: 0,
             tx_id: self.tx_id,
             timestamp,
@@ -317,6 +317,26 @@ impl Transactor {
 
     pub(crate) fn dedup_cache_mut(&mut self) -> &mut DedupCache {
         &mut self.dedup
+    }
+
+    /// Recovery hook — replay a `FunctionRegistered` WAL record by
+    /// either reloading the binary from disk and inserting it into the
+    /// runtime's registry, or unloading the handler. Mirrors the
+    /// pattern of [`DedupCache::recover_entry`] but for the WASM
+    /// runtime. Called from [`crate::recover::Recover::recover_until`]
+    /// on every `WalEntry::FunctionRegistered` encountered during
+    /// replay.
+    pub(crate) fn recover_function_registered(
+        &self,
+        record: &FunctionRegistered,
+    ) -> std::io::Result<()> {
+        let name = record.name_str();
+        if record.is_unregister() {
+            self.wasm_runtime.recover_unregister(name)
+        } else {
+            self.wasm_runtime
+                .recover_register(name, record.version, record.crc32c)
+        }
     }
 
     pub fn start(&mut self, ctx: TransactorContext) -> std::io::Result<JoinHandle<()>> {
@@ -531,10 +551,8 @@ impl TransactorRunner {
             let mut state = self.state.borrow_mut();
             for entry in &entries {
                 match entry {
-                    WalEntry::Metadata(m) => {
-                        if m.tx_id > max_tx_id {
-                            max_tx_id = m.tx_id;
-                        }
+                    WalEntry::Metadata(m) if m.tx_id > max_tx_id => {
+                        max_tx_id = m.tx_id;
                     }
                     WalEntry::Entry(e) => {
                         if e.tx_id > max_tx_id {
@@ -548,6 +566,36 @@ impl TransactorRunner {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Mirror function-registry mutations onto our WasmRuntime so a
+        // follower can serve `Operation::Function` calls against a
+        // freshly-replicated handler. NOTE(ADR-015 follow-up): the
+        // binary itself is NOT replicated through AppendEntries today,
+        // so a follower's `recover_register` will fail with NotFound on
+        // `read_function`. That's a pre-existing latent bug — flagged
+        // here so a future change can ship the binary alongside the
+        // record. Errors are logged and continued through; the rest of
+        // the batch is still applied so balances stay in sync.
+        let runtime = self.wasm_engine.runtime();
+        for entry in &entries {
+            if let WalEntry::FunctionRegistered(f) = entry {
+                let name = f.name_str();
+                let result = if f.is_unregister() {
+                    runtime.recover_unregister(name)
+                } else {
+                    runtime.recover_register(name, f.version, f.crc32c)
+                };
+                if let Err(e) = result {
+                    spdlog::warn!(
+                        "follower: replicated FunctionRegistered({} v{}) failed to apply: {} \
+                         (binary replication pending, see ADR-015)",
+                        name,
+                        f.version,
+                        e
+                    );
                 }
             }
         }
@@ -670,6 +718,65 @@ impl TransactorRunner {
                         s.debit(to, amount);
                     }
                 }
+                Operation::FunctionRegistration {
+                    name,
+                    binary,
+                    override_existing,
+                    user_ref,
+                } => {
+                    // 1. TxMetadata first (mirrors Operation::Function).
+                    self.state
+                        .borrow_mut()
+                        .meta(*b"FNREG\0\0\0", user_ref, timestamp);
+
+                    // 2. Run the registry mutation against WasmRuntime.
+                    let is_unregister = binary.is_empty();
+                    let outcome = if is_unregister {
+                        self.wasm_engine
+                            .runtime()
+                            .unregister(&name)
+                            .map(|v| (v, 0u32))
+                    } else {
+                        self.wasm_engine
+                            .runtime()
+                            .register(&name, &binary, override_existing)
+                    };
+
+                    // 3. On success, push the `FunctionRegistered` as a
+                    //    real sub-item of the meta — verify/commit will
+                    //    count it (sub_item_count = 1) and include it in
+                    //    the meta's CRC. On failure, flip the fail flag;
+                    //    rollback() truncates past `position` so no
+                    //    follower is ever written.
+                    match outcome {
+                        Ok((version, crc)) => {
+                            let record = FunctionRegistered::new(&name, version, crc);
+                            self.state
+                                .borrow_mut()
+                                .entries
+                                .push(WalEntry::FunctionRegistered(record));
+                        }
+                        Err(_) => {
+                            self.state.borrow_mut().fail(FailReason::INVALID_OPERATION);
+                        }
+                    }
+                }
+                Operation::NewTerm {
+                    term,
+                    node_id,
+                    node_count,
+                    node_voted,
+                } => {
+                    // Internal cluster op: emit a TxMetadata anchoring
+                    // the term to a tx_id, then push the TxTerm as the
+                    // single sub-item of that meta. The standard
+                    // verify/commit path stamps sub_item_count = 1 and
+                    // CRCs the term record alongside the meta.
+                    let record = wal_tx_term_entry(term, node_id, node_count, node_voted);
+                    let mut s = self.state.borrow_mut();
+                    s.meta(*b"NEWTERM\0", 0, timestamp);
+                    s.entries.push(WalEntry::Term(record));
+                }
                 Operation::Function {
                     name,
                     params,
@@ -707,13 +814,13 @@ impl TransactorRunner {
                             if status != 0 {
                                 s.fail(FailReason::from_u8(status));
                             } else {
-                                // TxMetadata.entry_count is u8 — a WASM
-                                // function can call credit/debit more
-                                // than 255 times. Reject those here so
-                                // the meta's entry_count can losslessly
-                                // encode the real count downstream.
+                                // TxMetadata.sub_item_count is u16 — a
+                                // WASM function can call credit/debit
+                                // more than 65,535 times. Reject those
+                                // here so the meta's sub_item_count can
+                                // losslessly encode the real count.
                                 let entry_count = s.entries.len() - s.position - 1;
-                                if entry_count > u8::MAX as usize {
+                                if entry_count > u16::MAX as usize {
                                     s.fail(FailReason::ENTRY_LIMIT_EXCEEDED);
                                 }
                             }
@@ -732,8 +839,7 @@ impl TransactorRunner {
 
                 if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.fail_reason = fail_reason;
-                    m.entry_count = 0;
-                    m.link_count = 0;
+                    m.sub_item_count = 0;
                     m.crc32c = 0;
                     let digest = crc32c::crc32c(bytemuck::bytes_of(m));
                     m.crc32c = digest;
@@ -744,10 +850,10 @@ impl TransactorRunner {
                 self.dedup.insert(user_ref, tx_id);
                 self.state.borrow_mut().position += 1;
             } else {
-                let entry_count = s.entries.len() - meta_idx - 1;
+                let sub_item_count = s.entries.len() - meta_idx - 1;
 
                 if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
-                    m.entry_count = entry_count as u8;
+                    m.sub_item_count = sub_item_count as u16;
                     m.crc32c = 0;
                 }
                 let mut digest = if let Some(WalEntry::Metadata(m)) = s.entries.get(meta_idx) {
@@ -756,9 +862,7 @@ impl TransactorRunner {
                     0
                 };
                 for i in (meta_idx + 1)..s.entries.len() {
-                    if let WalEntry::Entry(e) = &s.entries[i] {
-                        digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(e));
-                    }
+                    digest = crc32c::crc32c_append(digest, serialize_wal_records(&s.entries[i]));
                 }
                 if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
                     m.crc32c = digest;
@@ -766,7 +870,7 @@ impl TransactorRunner {
 
                 drop(s);
                 self.dedup.insert(user_ref, tx_id);
-                self.state.borrow_mut().position += 1 + entry_count;
+                self.state.borrow_mut().position += 1 + sub_item_count;
             }
         }
 

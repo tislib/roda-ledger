@@ -21,7 +21,6 @@ use ::proto::node as proto;
 use ::proto::node::node_server::Node;
 use spdlog::error;
 use std::sync::Arc;
-use log::info;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 

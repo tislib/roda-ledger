@@ -1,5 +1,5 @@
-use storage::entities::FailReason;
 use serde::{Deserialize, Serialize};
+use storage::entities::FailReason;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Operation {
@@ -26,6 +26,25 @@ pub enum Operation {
         params: [i64; 8],
         user_ref: u64,
     },
+    /// Register a WASM function (or unregister, when `binary` is empty).
+    /// Flows through the Sequencer and Transactor like any other op so a
+    /// later operation in the same batch can immediately invoke the
+    /// just-registered function.
+    FunctionRegistration {
+        name: String,
+        binary: Vec<u8>,
+        override_existing: bool,
+        user_ref: u64,
+    },
+    /// Internal cluster operation: record a new Raft term and the local
+    /// quorum snapshot. Submitted only by the cluster layer (never by
+    /// clients). Carries no `user_ref` — dedup is bypassed.
+    NewTerm {
+        term: u64,
+        node_id: u64,
+        node_count: u16,
+        node_voted: u16,
+    },
 }
 
 impl Operation {
@@ -35,6 +54,8 @@ impl Operation {
             Operation::Deposit { user_ref, .. } => *user_ref,
             Operation::Withdrawal { user_ref, .. } => *user_ref,
             Operation::Function { user_ref, .. } => *user_ref,
+            Operation::FunctionRegistration { user_ref, .. } => *user_ref,
+            Operation::NewTerm { .. } => 0,
         }
     }
 }

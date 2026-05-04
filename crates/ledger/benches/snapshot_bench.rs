@@ -1,21 +1,20 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::config::{LedgerConfig, StorageConfig};
-use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use ledger::ledger::WaitStrategy;
 use ledger::pipeline::Pipeline;
 use ledger::snapshot::{Snapshot, SnapshotMessage};
-use storage::Storage;
 use ledger::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::time::Duration;
+use storage::Storage;
+use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 
 fn make_snapshot_messages(tx_id: u64, account_id: u64, amount: u64) -> [SnapshotMessage; 2] {
     let metadata = TxMetadata {
         entry_type: WalEntryKind::TxMetadata as u8,
-        entry_count: 1,
-        link_count: 0,
         fail_reason: FailReason::NONE,
+        sub_item_count: 1,
         crc32c: 0,
         tx_id,
         timestamp: 0,
@@ -59,9 +58,12 @@ fn snapshot_bench(c: &mut Criterion) {
         ..StorageConfig::default()
     };
     let storage = Arc::new(Storage::new(storage_cfg).unwrap());
-    let wasm_runtime = Arc::new(WasmRuntime::new());
+    // Built once for completeness even though this bench doesn't
+    // exercise the wasm runtime — the Snapshot constructor no longer
+    // takes one.
+    let _wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
 
-    let mut snapshot = Snapshot::new(&config, wasm_runtime, storage);
+    let mut snapshot = Snapshot::new(&config, storage);
     let handle = snapshot.start(pipeline.snapshot_context()).unwrap();
 
     let snapshot_ctx = pipeline.snapshot_context();

@@ -1,4 +1,4 @@
-use crate::entities::{SegmentHeader, SegmentSealed, WalEntryKind};
+use crate::entities::{SegmentHeader, SegmentSealed, TxTerm, WalEntryKind};
 use crate::{WAL_MAGIC, WAL_VERSION};
 
 pub fn wal_segment_header_entry(segment_id: u32) -> SegmentHeader {
@@ -25,5 +25,17 @@ pub fn wal_segment_sealed_entry(
         last_tx_id,
         record_count: record_count + 1, // +1 for the sealed record itself
         _pad1: [0; 16],
+    }
+}
+
+pub fn wal_tx_term_entry(term: u64, node_id: u64, node_count: u16, node_voted: u16) -> TxTerm {
+    TxTerm {
+        entry_type: WalEntryKind::TxTerm as u8,
+        _pad0: [0; 7],
+        term,
+        node_id,
+        node_count,
+        node_voted,
+        _pad1: [0; 12],
     }
 }

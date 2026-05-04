@@ -359,7 +359,13 @@ fn write_ahead_of_commit_collapses_on_restart() {
 /// node-scoped split fixes this for free.
 #[test]
 fn leader_step_down_preserves_write_index() {
-    let mut node = RaftNode::new(1, vec![1, 2, 3], MemPersistence::new(), RaftConfig::default(), 42);
+    let mut node = RaftNode::new(
+        1,
+        vec![1, 2, 3],
+        MemPersistence::new(),
+        RaftConfig::default(),
+        42,
+    );
     let t0 = Instant::now();
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));

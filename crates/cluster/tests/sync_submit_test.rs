@@ -263,15 +263,13 @@ mod tests {
             .unwrap();
 
         let request = SubmitAndWaitRequest {
-            operation: Some(
-                proto::ledger::submit_and_wait_request::Operation::Deposit(
-                    Deposit {
-                        account: 1,
-                        amount: 1000,
-                        user_ref: 0,
-                    },
-                ),
-            ),
+            operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                Deposit {
+                    account: 1,
+                    amount: 1000,
+                    user_ref: 0,
+                },
+            )),
             wait_level: WaitLevel::Committed as i32,
         };
 
@@ -289,15 +287,13 @@ mod tests {
             .unwrap();
 
         let request = SubmitAndWaitRequest {
-            operation: Some(
-                proto::ledger::submit_and_wait_request::Operation::Deposit(
-                    Deposit {
-                        account: 5,
-                        amount: 500,
-                        user_ref: 0,
-                    },
-                ),
-            ),
+            operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                Deposit {
+                    account: 5,
+                    amount: 500,
+                    user_ref: 0,
+                },
+            )),
             wait_level: WaitLevel::Snapshot as i32,
         };
 
@@ -320,13 +316,11 @@ mod tests {
 
         let request = SubmitAndWaitRequest {
             operation: Some(
-                proto::ledger::submit_and_wait_request::Operation::Withdrawal(
-                    Withdrawal {
-                        account: 100,
-                        amount: 999,
-                        user_ref: 0,
-                    },
-                ),
+                proto::ledger::submit_and_wait_request::Operation::Withdrawal(Withdrawal {
+                    account: 100,
+                    amount: 999,
+                    user_ref: 0,
+                }),
             ),
             wait_level: WaitLevel::Committed as i32,
         };
@@ -348,15 +342,13 @@ mod tests {
         // Deposit first
         client
             .submit_and_wait(SubmitAndWaitRequest {
-                operation: Some(
-                    proto::ledger::submit_and_wait_request::Operation::Deposit(
-                        Deposit {
-                            account: 1,
-                            amount: 1000,
-                            user_ref: 0,
-                        },
-                    ),
-                ),
+                operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                    Deposit {
+                        account: 1,
+                        amount: 1000,
+                        user_ref: 0,
+                    },
+                )),
                 wait_level: WaitLevel::Snapshot as i32,
             })
             .await
@@ -364,16 +356,14 @@ mod tests {
 
         let response = client
             .submit_and_wait(SubmitAndWaitRequest {
-                operation: Some(
-                    proto::ledger::submit_and_wait_request::Operation::Transfer(
-                        Transfer {
-                            from: 1,
-                            to: 2,
-                            amount: 400,
-                            user_ref: 0,
-                        },
-                    ),
-                ),
+                operation: Some(proto::ledger::submit_and_wait_request::Operation::Transfer(
+                    Transfer {
+                        from: 1,
+                        to: 2,
+                        amount: 400,
+                        user_ref: 0,
+                    },
+                )),
                 wait_level: WaitLevel::Snapshot as i32,
             })
             .await
@@ -395,27 +385,23 @@ mod tests {
         let request = SubmitBatchAndWaitRequest {
             operations: vec![
                 SubmitAndWaitRequest {
-                    operation: Some(
-                        proto::ledger::submit_and_wait_request::Operation::Deposit(
-                            Deposit {
-                                account: 1,
-                                amount: 100,
-                                user_ref: 0,
-                            },
-                        ),
-                    ),
+                    operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                        Deposit {
+                            account: 1,
+                            amount: 100,
+                            user_ref: 0,
+                        },
+                    )),
                     wait_level: 0,
                 },
                 SubmitAndWaitRequest {
-                    operation: Some(
-                        proto::ledger::submit_and_wait_request::Operation::Deposit(
-                            Deposit {
-                                account: 2,
-                                amount: 200,
-                                user_ref: 0,
-                            },
-                        ),
-                    ),
+                    operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                        Deposit {
+                            account: 2,
+                            amount: 200,
+                            user_ref: 0,
+                        },
+                    )),
                     wait_level: 0,
                 },
             ],
@@ -446,26 +432,22 @@ mod tests {
         let request = SubmitBatchAndWaitRequest {
             operations: vec![
                 SubmitAndWaitRequest {
-                    operation: Some(
-                        proto::ledger::submit_and_wait_request::Operation::Deposit(
-                            Deposit {
-                                account: 1,
-                                amount: 100,
-                                user_ref: 0,
-                            },
-                        ),
-                    ),
+                    operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                        Deposit {
+                            account: 1,
+                            amount: 100,
+                            user_ref: 0,
+                        },
+                    )),
                     wait_level: 0,
                 },
                 SubmitAndWaitRequest {
                     operation: Some(
-                        proto::ledger::submit_and_wait_request::Operation::Withdrawal(
-                            Withdrawal {
-                                account: 99,
-                                amount: 999,
-                                user_ref: 0,
-                            },
-                        ),
+                        proto::ledger::submit_and_wait_request::Operation::Withdrawal(Withdrawal {
+                            account: 99,
+                            amount: 999,
+                            user_ref: 0,
+                        }),
                     ),
                     wait_level: 0,
                 },
@@ -492,15 +474,13 @@ mod tests {
             .unwrap();
 
         let request = SubmitAndWaitRequest {
-            operation: Some(
-                proto::ledger::submit_and_wait_request::Operation::Deposit(
-                    Deposit {
-                        account: 1,
-                        amount: 100,
-                        user_ref: 0,
-                    },
-                ),
-            ),
+            operation: Some(proto::ledger::submit_and_wait_request::Operation::Deposit(
+                Deposit {
+                    account: 1,
+                    amount: 100,
+                    user_ref: 0,
+                },
+            )),
             wait_level: WaitLevel::Computed as i32,
         };
 

@@ -1,10 +1,10 @@
-//! Crash recovery E2E tests.
+//! Crash recovery E2E scenarios.
 //!
 //! Verify that the ledger recovers to exactly the committed state
 //! after a kill -9. Only supported on the Process backend.
 
-use crate::e2e::lib::backend::E2EBackend;
-use crate::e2e::lib::profile::profile;
+use crate::e2e::backend::E2EBackend;
+use crate::e2e::profile::profile;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -14,8 +14,7 @@ use tokio::time::sleep;
 /// 2. Kill and restart
 /// 3. Verify pipeline index shows 1M for all stages
 /// 4. Verify balances
-#[tokio::test(flavor = "multi_thread")]
-async fn simple_crash_recovery() {
+pub async fn simple_crash_recovery() {
     if E2EBackend::from_env() == E2EBackend::Inline {
         eprintln!("skipping simple_crash_recovery on Inline backend (requires Process)");
         return;
@@ -73,8 +72,7 @@ async fn simple_crash_recovery() {
 /// killed 500ms into the load. Failed batches reconnect and retry with
 /// the same user_ref (idempotency key). After all batches complete,
 /// verify balance = TX_COUNT × AMOUNT exactly.
-#[tokio::test(flavor = "multi_thread")]
-async fn crash_in_the_middle() {
+pub async fn crash_in_the_middle() {
     if E2EBackend::from_env() == E2EBackend::Inline {
         eprintln!("skipping crash_in_the_middle on Inline backend (requires Process)");
         return;

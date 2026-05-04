@@ -13,16 +13,15 @@
 //! 4. `WaitForTransaction` short-circuits to `NOT_FOUND` on unknown tx
 //!    and `TERM_MISMATCH` on term fence failure.
 
-
 use ::proto::ledger as proto;
 use ::proto::ledger::ledger_server::Ledger as LedgerSvc;
 use cluster::{LedgerHandler, Role, Term};
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 use ledger::ledger::Ledger;
-use storage::{TermRecord, TermStorage};
 use ledger::transaction::Operation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage::{TermRecord, TermStorage};
 use tempfile::TempDir;
 use tonic::Request;
 

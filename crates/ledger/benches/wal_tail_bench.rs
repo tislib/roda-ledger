@@ -1,18 +1,17 @@
 //! Benchmarks for `WalTailer` — the ADR-015 leader-side raw WAL reader.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use std::time::Duration;
+use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 
 const WAL_RECORD_SIZE: usize = 40;
 
 fn deposit_entries(tx_id: u64, account: u64, amount: u64) -> Vec<WalEntry> {
     let meta = TxMetadata {
         entry_type: WalEntryKind::TxMetadata as u8,
-        entry_count: 1,
-        link_count: 0,
         fail_reason: FailReason::NONE,
+        sub_item_count: 1,
         crc32c: 0,
         tx_id,
         timestamp: 0,

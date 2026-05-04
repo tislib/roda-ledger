@@ -8,11 +8,10 @@
 //! - `no_leader_blocks_writes`
 //! - `mid_election_cluster_commit_not_lost`
 
-
 use ::proto::ledger::WaitLevel;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
-use storage::entities::{FailReason, SYSTEM_ACCOUNT_ID};
 use std::time::Duration;
+use storage::entities::{FailReason, SYSTEM_ACCOUNT_ID};
 use tokio::time::sleep;
 
 const ACCOUNT: u64 = 7;
@@ -406,8 +405,7 @@ async fn no_leader_blocks_writes() {
     // the Initializing/Candidate oscillation — every attempt must reject.
     // Negative-path: bypasses the harness's leader-routing retry loop.
     for attempt in 0..5 {
-        ctl
-            .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, attempt + 1, WaitLevel::Computed)
+        ctl.deposit_and_wait_no_retry(ACCOUNT, AMOUNT, attempt + 1, WaitLevel::Computed)
             .await
             .expect_err("submit must fail when no leader");
         sleep(Duration::from_millis(100)).await;

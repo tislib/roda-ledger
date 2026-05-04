@@ -7,11 +7,11 @@
 //! only the surviving prefix.
 
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use storage::StorageConfig;
 
 /// Deterministic wait that goes further than `wait_for_transaction`:
 /// requires both `last_commit_id` AND `last_snapshot_id` to be at or

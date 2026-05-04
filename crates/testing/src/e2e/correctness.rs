@@ -1,14 +1,13 @@
-//! Basic correctness E2E tests.
+//! Basic correctness E2E scenarios.
 //!
 //! Balance invariants, WAL checksums, double-entry verification.
 //! These verify fundamental ledger operations through the E2E DSL,
 //! running against whichever backend is selected at runtime.
 
-use crate::e2e::lib::matrix_test::MatrixGrid;
+use crate::e2e::matrix_grid::MatrixGrid;
 use std::sync::Arc;
 
-#[tokio::test]
-async fn deposit_committed_reflects_in_balance() {
+pub async fn deposit_committed_reflects_in_balance() {
     let ctx = e2e_ctx!(profile: single_node);
 
     deposit!(ctx, account: 1, amount: 1000, wait: on_snapshot);
@@ -17,9 +16,8 @@ async fn deposit_committed_reflects_in_balance() {
 }
 
 /// Matrix Testing Scenario — sequential iteration submission.
-/// See `tests/e2e/matrix-testing-scenario.md`.
-#[tokio::test]
-async fn matrix_transfer_grid() {
+/// See `src/e2e/matrix-testing-scenario.md`.
+pub async fn matrix_transfer_grid() {
     let ctx = e2e_ctx!(profile: single_node);
     let grid = MatrixGrid::new(100, 100, 10_000, 10);
 
@@ -86,8 +84,7 @@ async fn matrix_transfer_grid() {
 ///
 /// Same grid topology and invariants, but iterations fire concurrently.
 /// Stresses the pipeline under parallel gRPC load.
-#[tokio::test]
-async fn matrix_concurrent_transfer_grid() {
+pub async fn matrix_concurrent_transfer_grid() {
     let ctx = Arc::new(e2e_ctx!(profile: single_node));
     let grid = MatrixGrid::new(100, 100, 10_000, 10);
 

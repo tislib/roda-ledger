@@ -9,6 +9,7 @@ members = [
     "crates/cluster",
     "crates/cluster-test-utils",
     "crates/ctl",
+    "crates/testing",
 ]
 
 # `cargo run` / `cargo build` from the root act on cluster (which produces the binary).
@@ -68,6 +69,7 @@ client = { path = "crates/client" }
 cluster = { path = "crates/cluster" }
 cluster-test-utils = { path = "crates/cluster-test-utils" }
 ctl = { path = "crates/ctl" }
+testing = { path = "crates/testing" }
 
 [profile.release]
 opt-level = 3

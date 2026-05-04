@@ -5,8 +5,8 @@ use ::proto::ledger::WaitLevel;
 use cluster::Config;
 use cluster::config::ConfigError;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
-use std::time::Duration;
 use spdlog::error;
+use std::time::Duration;
 
 const ACCOUNT: u64 = 1;
 const AMOUNT: u64 = 100;

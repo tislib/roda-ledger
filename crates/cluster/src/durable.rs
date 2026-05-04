@@ -17,7 +17,7 @@
 //! keeps that path lock-free in the common case.
 
 use raft::{Persistence, TermRecord as RaftTermRecord};
-use spdlog::{debug, info, warn};
+use spdlog::{debug, warn};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -499,7 +499,9 @@ impl Persistence for DurablePersistence {
     fn commit_term(&mut self, expected: u64, start_tx_id: u64) -> bool {
         self.term
             .commit_term(expected, start_tx_id)
-            .unwrap_or_else(|e| panic!("durable: commit_term({expected},{start_tx_id}) failed: {e}"))
+            .unwrap_or_else(|e| {
+                panic!("durable: commit_term({expected},{start_tx_id}) failed: {e}")
+            })
     }
 
     fn observe_term(&mut self, term: u64, start_tx_id: u64) {
@@ -578,7 +580,7 @@ mod tests {
         let (_td, term) = open_term();
         // ADR-0017 §"Required Invariants" #7: the vote log can race ahead,
         // so commit_term accepts any current < expected.
-        assert_eq!(term.commit_term(5, 100).unwrap(), true);
+        assert!(term.commit_term(5, 100).unwrap());
         assert_eq!(term.get_current_term(), 5);
         assert_eq!(
             term.last_record(),
@@ -593,8 +595,8 @@ mod tests {
     fn term_commit_term_returns_false_when_already_advanced() {
         let (_td, term) = open_term();
         term.observe(5, 100).unwrap();
-        assert_eq!(term.commit_term(3, 50).unwrap(), false);
-        assert_eq!(term.commit_term(5, 200).unwrap(), false);
+        assert!(!term.commit_term(3, 50).unwrap());
+        assert!(!term.commit_term(5, 200).unwrap());
         assert_eq!(term.get_current_term(), 5);
     }
 

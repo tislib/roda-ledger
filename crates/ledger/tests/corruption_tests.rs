@@ -1,9 +1,9 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+use storage::StorageConfig;
 
 // 100 tx/segment + snapshot every seal → many seals, many snapshots
 const SMALL_SEGMENT_TX_COUNT: u64 = 100;

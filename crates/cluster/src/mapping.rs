@@ -1,6 +1,6 @@
 use ::proto::ledger as proto;
-use storage::entities::FailReason;
 use ledger::transaction::{Operation, TransactionStatus};
+use storage::entities::FailReason;
 
 pub fn deposit_to_op(d: proto::Deposit) -> Operation {
     Operation::Deposit {
@@ -39,7 +39,10 @@ pub fn function_to_op(n: proto::Function) -> Operation {
     }
 }
 
-pub fn submit_request_to_op(req: proto::SubmitOperationRequest) -> Result<Operation, tonic::Status> {
+#[allow(clippy::result_large_err)]
+pub fn submit_request_to_op(
+    req: proto::SubmitOperationRequest,
+) -> Result<Operation, tonic::Status> {
     match req.operation {
         Some(proto::submit_operation_request::Operation::Deposit(d)) => Ok(deposit_to_op(d)),
         Some(proto::submit_operation_request::Operation::Withdrawal(w)) => Ok(withdrawal_to_op(w)),
@@ -49,6 +52,7 @@ pub fn submit_request_to_op(req: proto::SubmitOperationRequest) -> Result<Operat
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn submit_and_wait_request_to_op(
     req: proto::SubmitAndWaitRequest,
 ) -> Result<Operation, tonic::Status> {

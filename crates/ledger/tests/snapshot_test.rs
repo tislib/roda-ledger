@@ -1,9 +1,9 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::{SNAPSHOT_MAGIC, StorageConfig};
 use ledger::transaction::Operation;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+use storage::{SNAPSHOT_MAGIC, StorageConfig};
 
 /// Force snapshot creation: very small WAL segments (100 tx/segment) + snapshot every seal.
 /// With 35K transactions → many seals → snapshot.

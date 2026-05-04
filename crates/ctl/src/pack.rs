@@ -130,17 +130,15 @@ fn recompute_crcs(entries: &mut [WalEntry]) {
     let mut i = 0;
     while i < entries.len() {
         if let WalEntry::Metadata(ref meta) = entries[i] {
-            let count = meta.entry_count as usize;
-            let mut tx_entries: Vec<TxEntry> = Vec::with_capacity(count);
+            let count = meta.sub_item_count as usize;
+            let mut sub_items: Vec<WalEntry> = Vec::with_capacity(count);
             for j in 1..=count {
-                if i + j < entries.len()
-                    && let WalEntry::Entry(e) = &entries[i + j]
-                {
-                    tx_entries.push(*e);
+                if i + j < entries.len() {
+                    sub_items.push(entries[i + j]);
                 }
             }
             let mut m = *meta;
-            m.crc32c = compute_tx_crc(&m, &tx_entries);
+            m.crc32c = compute_tx_crc(&m, &sub_items);
             entries[i] = WalEntry::Metadata(m);
             i += 1 + count;
         } else {

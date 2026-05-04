@@ -9,8 +9,8 @@
 //!
 //! Both circle sizes must be powers of two so modulo reduces to a bitmask.
 
-use storage::entities::{EntryKind, TxLinkKind, WalEntryKind};
 use std::collections::HashMap;
+use storage::entities::{EntryKind, TxLinkKind, WalEntryKind};
 
 // ── TxSlot (circle1) ──────────────────────────────────────────────────────────
 
@@ -21,10 +21,10 @@ use std::collections::HashMap;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TxSlot {
-    pub tx_id: u64,      // 8 @ 0  — 0 = empty slot
-    pub offset: u32,     // 4 @ 8  — start index in circle2
-    pub entry_count: u8, // 1 @ 12 — number of IndexedTxEntry records for this tx
-    pub _pad: [u8; 3],   // 3 @ 13
+    pub tx_id: u64,       // 8 @ 0  — 0 = empty slot
+    pub offset: u32,      // 4 @ 8  — start index in circle2
+    pub entry_count: u16, // 2 @ 12 — number of IndexedTxEntry records for this tx
+    pub _pad: [u8; 2],    // 2 @ 14
 } // 16 bytes total
 
 // ── IndexedTxEntry (circle2) ──────────────────────────────────────────────────
@@ -127,15 +127,17 @@ impl TransactionIndexer {
     /// Record a transaction's starting position in `circle2`.
     ///
     /// Must be called once per `TxMetadata`, before the matching
-    /// `insert_entry` calls. `entry_count` is the number of `TxEntry`
-    /// records that will follow.
-    pub fn insert_tx(&mut self, tx_id: u64, entry_count: u8) {
+    /// `insert_entry` calls. The slot's `entry_count` starts at 0 and
+    /// is bumped by each `insert_entry` for the same tx_id — the WAL
+    /// meta no longer carries a TxEntry-only count, only a combined
+    /// `sub_item_count`, so the indexer counts entries as they arrive.
+    pub fn insert_tx(&mut self, tx_id: u64) {
         let slot_idx = (tx_id as usize) & self.circle1_mask;
         self.circle1[slot_idx] = TxSlot {
             tx_id,
             offset: (self.write_head2 & self.circle2_mask) as u32,
-            entry_count,
-            _pad: [0; 3],
+            entry_count: 0,
+            _pad: [0; 2],
         };
     }
 
@@ -177,6 +179,15 @@ impl TransactionIndexer {
 
         self.account_heads[head_slot] = (account_id, slot_idx as u32);
         self.write_head2 += 1;
+
+        // Bump the per-tx entry counter on circle1 so `get_transaction`
+        // knows how many circle2 slots to read. Skip if the tx_id was
+        // evicted (collision) — the caller will see a None on lookup.
+        let tx_slot_idx = (tx_id as usize) & self.circle1_mask;
+        if self.circle1[tx_slot_idx].tx_id == tx_id {
+            self.circle1[tx_slot_idx].entry_count =
+                self.circle1[tx_slot_idx].entry_count.saturating_add(1);
+        }
     }
 
     /// Record a link for a transaction.
@@ -288,7 +299,7 @@ mod tests {
     #[test]
     fn get_transaction_single_entry_hit() {
         let mut idx = small();
-        idx.insert_tx(1, 1);
+        idx.insert_tx(1);
         idx.insert_entry(1, 100, 500, EntryKind::Credit, 500);
 
         let entries = idx.get_transaction(1).expect("cache hit expected");
@@ -303,7 +314,7 @@ mod tests {
     #[test]
     fn get_transaction_multiple_entries_hit() {
         let mut idx = small();
-        idx.insert_tx(2, 2);
+        idx.insert_tx(2);
         idx.insert_entry(2, 200, 1_000, EntryKind::Debit, -1_000);
         idx.insert_entry(2, 201, 1_000, EntryKind::Credit, 1_000);
 
@@ -323,10 +334,10 @@ mod tests {
     fn get_transaction_miss_after_circle1_eviction() {
         let mut idx = small(); // circle1_size = 16 → mask = 15
         // tx_id 1 and tx_id 17 both map to slot 1 (1 % 16 == 17 % 16)
-        idx.insert_tx(1, 1);
+        idx.insert_tx(1);
         idx.insert_entry(1, 100, 100, EntryKind::Credit, 100);
 
-        idx.insert_tx(17, 1);
+        idx.insert_tx(17);
         idx.insert_entry(17, 101, 200, EntryKind::Debit, -200);
 
         // tx 1 was evicted from circle1 slot 1 by tx 17
@@ -340,16 +351,16 @@ mod tests {
         // circle2_size = 4 so it wraps quickly
         let mut idx = TransactionIndexer::new(16, 4, 16);
 
-        idx.insert_tx(1, 1);
+        idx.insert_tx(1);
         idx.insert_entry(1, 100, 10, EntryKind::Credit, 10);
 
         // fill circle2 completely — slot used by tx 1 will be overwritten
         for tx_id in 2..=4 {
-            idx.insert_tx(tx_id, 1);
+            idx.insert_tx(tx_id);
             idx.insert_entry(tx_id, tx_id * 10, 1, EntryKind::Credit, 1);
         }
         // one more entry overwrites circle2 slot 0 (where tx 1 was)
-        idx.insert_tx(5, 1);
+        idx.insert_tx(5);
         idx.insert_entry(5, 50, 1, EntryKind::Credit, 1);
 
         // circle1 slot for tx 1 is still valid, but circle2 slot is overwritten
@@ -361,7 +372,7 @@ mod tests {
     #[test]
     fn account_history_single_entry() {
         let mut idx = small();
-        idx.insert_tx(10, 1);
+        idx.insert_tx(10);
         idx.insert_entry(10, 42, 750, EntryKind::Credit, 750);
 
         let hist = idx.get_account_history(42, 0, 10);
@@ -373,7 +384,7 @@ mod tests {
     fn account_history_chain_newest_first() {
         let mut idx = small();
         for tx_id in 1..=5u64 {
-            idx.insert_tx(tx_id, 1);
+            idx.insert_tx(tx_id);
             idx.insert_entry(
                 tx_id,
                 999,
@@ -394,7 +405,7 @@ mod tests {
     fn account_history_limit_respected() {
         let mut idx = small();
         for tx_id in 1..=8u64 {
-            idx.insert_tx(tx_id, 1);
+            idx.insert_tx(tx_id);
             idx.insert_entry(tx_id, 777, 1, EntryKind::Credit, 1);
         }
 
@@ -406,10 +417,10 @@ mod tests {
     fn account_history_miss_on_head_collision() {
         let mut idx = small(); // account_heads_size = 16 → mask = 15
         // account 1 and account 17 map to the same head slot
-        idx.insert_tx(1, 1);
+        idx.insert_tx(1);
         idx.insert_entry(1, 1, 100, EntryKind::Credit, 100);
 
-        idx.insert_tx(2, 1);
+        idx.insert_tx(2);
         idx.insert_entry(2, 17, 200, EntryKind::Credit, 200);
 
         // account 1's head has been overwritten by account 17
@@ -425,7 +436,7 @@ mod tests {
     fn account_history_from_tx_id_lower_bound() {
         let mut idx = small();
         for tx_id in 1..=6u64 {
-            idx.insert_tx(tx_id, 1);
+            idx.insert_tx(tx_id);
             idx.insert_entry(tx_id, 55, 1, EntryKind::Credit, 1);
         }
 
@@ -444,7 +455,7 @@ mod tests {
 
         // write 5 entries for account 10 — they occupy circle2 slots 0..4
         for tx_id in 1..=5u64 {
-            idx.insert_tx(tx_id, 1);
+            idx.insert_tx(tx_id);
             idx.insert_entry(tx_id, 10, 1, EntryKind::Credit, 1);
         }
 
@@ -453,7 +464,7 @@ mod tests {
         // but leaves slot 4 (account 10's head entry) intact so the chain
         // starts valid but breaks on the first prev_link follow.
         for tx_id in 6..=12u64 {
-            idx.insert_tx(tx_id, 1);
+            idx.insert_tx(tx_id);
             idx.insert_entry(tx_id, 20, 1, EntryKind::Credit, 1);
         }
 

@@ -16,7 +16,7 @@ pub enum E2EBackend {
     Inline,
 
     /// Each node runs as a separate OS process on the same machine as the test.
-    /// Default mode — fast setup, no Docker required, suitable for CI.
+    /// Default for CI — fast setup, no Docker required.
     Process,
 
     /// Each node runs in a Docker container on the same machine.

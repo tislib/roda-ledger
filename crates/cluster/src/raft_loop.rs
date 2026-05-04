@@ -25,7 +25,7 @@ use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
 use crate::replication::{ReplicationGate, ReplicationLoop};
 use raft::RaftNode;
-use spdlog::{debug, info};
+use spdlog::debug;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;

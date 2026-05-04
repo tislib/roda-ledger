@@ -1,9 +1,9 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use storage::StorageConfig;
 use ledger::transaction::Operation;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use storage::StorageConfig;
 
 fn unique_dir(name: &str) -> String {
     let nanos = std::time::SystemTime::now()

@@ -1,8 +1,8 @@
-use ::proto::ledger as proto;
-use ::proto::ledger::ledger_server::Ledger;
+use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
 use crate::durable::Term;
-use crate::LedgerSlot;
+use ::proto::ledger as proto;
+use ::proto::ledger::ledger_server::Ledger;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
 use spdlog::{trace, warn};
