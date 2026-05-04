@@ -16,7 +16,7 @@ use storage::entities::SYSTEM_ACCOUNT_ID;
 // node loses the election becomes the follower), so this test
 // drives writes against the elected leader, identified via the
 // `Ping` RPC.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_leader_replicates_to_follower() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "basic".to_string(),

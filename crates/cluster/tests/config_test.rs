@@ -87,7 +87,7 @@ fn standalone_default_is_valid() {
 
 /// Standalone (`cluster.is_none()`) boots only the writable client gRPC.
 /// No Node service, no quorum, no replication.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn standalone_serves_writes_with_no_node_grpc() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::standalone())
         .await
@@ -109,7 +109,7 @@ async fn standalone_serves_writes_with_no_node_grpc() {
 /// A single-node cluster (one self-peer in the `cluster.peers` list)
 /// boots straight into Leader without an election round — the
 /// supervisor's `initial_role` short-circuits when `peers.len() == 1`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn single_node_cluster_boots_directly_as_leader() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -142,7 +142,7 @@ async fn single_node_cluster_boots_directly_as_leader() {
 /// follower's slot ages out of `Quorum`'s freshness window and stops
 /// counting toward majority — so `cluster_commit_index` cannot
 /// advance and `WaitLevel::ClusterCommit` correctly times out.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn two_node_cluster_requires_both_for_cluster_commit() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         ..ClusterTestingConfig::cluster(2)
@@ -199,7 +199,7 @@ async fn wait_port_free(port: u16, timeout: Duration) {
 }
 
 /// 3-node cluster tolerates exactly one failure for ClusterCommit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn three_node_cluster_tolerates_one_failure() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -223,7 +223,7 @@ async fn three_node_cluster_tolerates_one_failure() {
 }
 
 /// 5-node cluster tolerates exactly two failures (majority = 3).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn five_node_cluster_tolerates_two_failures() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(5))
         .await
@@ -256,7 +256,7 @@ async fn five_node_cluster_tolerates_two_failures() {
 
 /// In a clustered config with phantom peers, the per-node config files
 /// list the SAME peer set on every real node. Symmetric membership.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_peer_list_is_symmetric_across_nodes() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await

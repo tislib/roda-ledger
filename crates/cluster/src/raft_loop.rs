@@ -80,6 +80,7 @@ impl RaftLoop {
         let consensus = ConsensusLoop::new(
             self.node.clone(),
             self.mirror.clone(),
+            self.ledger.clone(),
             self.config.clone(),
             gate,
             self.rv_rx.take().expect("rv_rx initialized in new"),

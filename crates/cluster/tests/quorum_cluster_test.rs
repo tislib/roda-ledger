@@ -11,7 +11,7 @@ const AMOUNT: u64 = 100;
 /// Leader counts itself toward quorum (slot 0 fed by `on_commit` hook).
 /// In a single-node cluster, `Quorum::get()` advances purely from the
 /// leader's own commits — proving the on-commit hook is wired up.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn leader_counts_itself_in_quorum() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(1))
         .await
@@ -35,7 +35,7 @@ async fn leader_counts_itself_in_quorum() {
 
 /// `cluster_commit_index` (mirrored from Quorum) advances on the leader
 /// as peer acks roll in. Verified via `get_pipeline_index`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_commit_index_advances_under_replication() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -60,7 +60,7 @@ async fn cluster_commit_index_advances_under_replication() {
 /// `Quorum::get()` is monotonically non-decreasing under restart of any
 /// follower. After we restart a follower (its slot atomic resets to 0),
 /// the cached majority does NOT regress.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "flaky"]
 async fn quorum_majority_never_regresses_under_follower_restart() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
@@ -106,7 +106,7 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
 /// After a Leader transition, the new leader's own slot in `Quorum` is
 /// repopulated from its `on_commit` hook within one tick — its first
 /// `submit_and_wait(ClusterCommit)` succeeds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn new_leader_self_slot_repopulated_after_transition() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await

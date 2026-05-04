@@ -9,7 +9,7 @@
 
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn standalone_serves_writes_with_no_node_grpc() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "standalone".to_string(),

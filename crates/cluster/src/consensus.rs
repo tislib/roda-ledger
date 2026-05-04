@@ -33,6 +33,7 @@
 //! `JoinError::is_panic()` and are re-raised, so any election-side
 //! bug aborts the LocalSet thread instead of silently dropping votes.
 
+use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
 use crate::command::RequestVoteMsg;
 use crate::config::Config;
@@ -40,6 +41,8 @@ use crate::durable::DurablePersistence;
 use crate::replication::ReplicationGate;
 use ::proto::node as proto;
 use ::proto::node::node_client::NodeClient;
+use ledger::transaction::Operation;
+use raft::Role::Leader;
 use raft::request_vote::RequestVoteRequest;
 use raft::{NodeId, RaftNode, Role, VoteOutcome};
 use spdlog::{error, info};
@@ -53,16 +56,17 @@ use tonic::transport::{Channel, Error};
 /// Per-RPC timeout for outbound `RequestVote` calls. A peer that
 /// fails to reply within this window is mapped to
 /// `VoteOutcome::Failed`; the round proceeds with the rest.
-const VOTE_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+const VOTE_RPC_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Connect timeout for fresh `NodeClient` dials inside an RV round.
-const VOTE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const VOTE_CONNECT_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Single-task election driver. Built in `RaftLoop::run`, consumed by
 /// [`Self::run`].
 pub(crate) struct ConsensusLoop {
     node: Rc<RefCell<RaftNode<DurablePersistence>>>,
     mirror: Arc<ClusterMirror>,
+    ledger: Arc<LedgerSlot>,
     config: Arc<Config>,
     gate: ReplicationGate,
     rv_rx: mpsc::Receiver<RequestVoteMsg>,
@@ -73,6 +77,7 @@ impl ConsensusLoop {
     pub(crate) fn new(
         node: Rc<RefCell<RaftNode<DurablePersistence>>>,
         mirror: Arc<ClusterMirror>,
+        ledger: Arc<LedgerSlot>,
         config: Arc<Config>,
         gate: ReplicationGate,
         rv_rx: mpsc::Receiver<RequestVoteMsg>,
@@ -82,6 +87,7 @@ impl ConsensusLoop {
             node,
             mirror,
             config,
+            ledger,
             gate,
             rv_rx,
             self_id,
@@ -150,6 +156,14 @@ impl ConsensusLoop {
                         "consensus_loop[{}]: election.handle_votes() done — term={} role={:?}",
                         self_id, post_term, post_role
                     );
+                    if post_role == Leader {
+                        self.ledger.ledger().submit(Operation::Transfer {
+                            from: 0,
+                            to: 0,
+                            amount: 0,
+                            user_ref: 0,
+                        });
+                    }
                     self.mirror.snapshot_from(&self.node.borrow());
                     self.sync_gate_from_role();
                 }
@@ -213,7 +227,7 @@ impl ConsensusLoop {
             })
             .is_err()
         {
-            info!(
+            error!(
                 "consensus_loop[{}]: RequestVote reply dropped (handler gone)",
                 self_id
             );
