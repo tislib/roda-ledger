@@ -8,16 +8,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /usr/src/roda-ledger
 
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto ./proto
-COPY src ./src
-COPY benches ./benches
-COPY tests ./tests
-COPY examples ./examples
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY config.toml ./config.toml
 
 # Build the project with cluster feature in release mode
-RUN cargo build --release --features cluster --bin roda-ledger
+RUN cargo build --release --package cluster --bin roda-server
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -30,7 +26,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary and the default config from the builder stage
-COPY --from=builder /usr/src/roda-ledger/target/release/roda-ledger /app/roda-ledger
+COPY --from=builder /usr/src/roda-ledger/target/release/roda-server /app/roda-server
 COPY --from=builder /usr/src/roda-ledger/config.toml /app/config.toml
 
 # Expose the gRPC port
@@ -44,4 +40,4 @@ RUN mkdir -p /app/data
 VOLUME /app/data
 
 # Run the binary against the configured config.toml
-ENTRYPOINT ["/app/roda-ledger"]
+ENTRYPOINT ["/app/roda-server"]

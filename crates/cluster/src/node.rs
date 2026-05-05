@@ -50,7 +50,8 @@ use crate::raft_loop::{COMMAND_CHANNEL_DEPTH, RaftLoop};
 use crate::server::{NodeServerRuntime, Server};
 use ledger::ledger::Ledger;
 use raft::{RaftConfig, RaftNode, Role};
-use spdlog::{debug, error};
+use spdlog::{debug, error, info};
+use std::process::exit;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -144,12 +145,10 @@ impl ClusterNode {
         let client_thread = spawn_grpc_thread("ledger-grpc", async move {
             if let Err(e) = server.run().await {
                 error!("standalone ledger gRPC server exited: {}", e);
+                exit(1);
             }
         })?;
-        debug!(
-            "standalone: client-facing Ledger gRPC up on {} (dedicated thread)",
-            client_addr
-        );
+        info!("standalone: started: {}", client_addr);
 
         Ok(StandaloneHandles {
             client_thread: Some(client_thread),
@@ -232,6 +231,7 @@ impl ClusterNode {
         let client_thread = spawn_grpc_thread("ledger-grpc", async move {
             if let Err(e) = client_server.run().await {
                 error!("ledger gRPC server exited: {}", e);
+                exit(1);
             }
         })?;
 
@@ -293,9 +293,8 @@ impl ClusterNode {
             }
         })?;
 
-        debug!(
-            "cluster: bring-up complete (node_id={}, peers={}, client={}, node={}; \
-             ledger-grpc on its own thread, node-grpc + raft co-hosted on a LocalSet thread)",
+        info!(
+            "cluster: started (node_id={}, peers={}, client={}, node={};",
             self_id,
             cluster.peers.len(),
             client_addr,
