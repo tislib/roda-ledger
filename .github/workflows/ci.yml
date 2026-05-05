@@ -6,8 +6,15 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
 
 jobs:
   fmt:
@@ -32,7 +39,14 @@ jobs:
         with:
           components: clippy
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy check
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -44,14 +58,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Test ledger
-        run: cargo test -p ledger --release
-      - name: Test cluster
-        run: cargo test -p cluster --release -- --test-threads=1
-      - name: Test raft
-        run: cargo test -p raft --release
-      - name: Test ctl
-        run: cargo test -p ctl --release
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run tests
+        run: cargo nextest run --workspace --cargo-profile ci
       - name: Doctests
-        run: cargo test --doc
+        run: cargo test --doc --profile ci

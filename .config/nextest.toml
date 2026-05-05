@@ -1,0 +1,3 @@
+[[profile.default.overrides]]
+filter = 'package(cluster)'
+test-threads = 1

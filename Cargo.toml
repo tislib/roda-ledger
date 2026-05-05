@@ -90,3 +90,14 @@ inherits = "release"
 debug = 2
 debug-assertions = true
 overflow-checks = true
+
+# Profile used by CI: compiles much faster than release while keeping
+# debug-assertions on for stronger test signal. opt-level = 1 is enough
+# for tests to run quickly without paying for full optimization.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = 0
+incremental = false
+codegen-units = 256
+lto = false
