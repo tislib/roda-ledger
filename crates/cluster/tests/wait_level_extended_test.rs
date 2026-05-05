@@ -119,7 +119,7 @@ async fn wait_level_cluster_commit_blocks_without_quorum() {
     }
 
     let result = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_no_retry(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
         .await;
     assert!(result.is_err());
 }
