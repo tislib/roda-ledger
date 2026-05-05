@@ -98,7 +98,6 @@ impl ConsensusLoop {
         let self_id = self.self_id;
         debug!("consensus_loop[{}]: started", self_id);
 
-        let prev_role = self.node.borrow().role();
         loop {
             let now = Instant::now();
 
@@ -114,6 +113,7 @@ impl ConsensusLoop {
             //    concurrently-dispatched `RequestVote` RPCs.
             let started = self.node.borrow_mut().election().start(now);
             if started {
+                let mut grant_votes_count = 0;
                 let (term_after, role_after) = {
                     let n = self.node.borrow();
                     (n.current_term(), n.role())
@@ -144,7 +144,6 @@ impl ConsensusLoop {
                         self_id,
                         responses.len()
                     );
-                    let mut grant_votes_count = 0;
                     for (_, vote) in responses.iter() {
                         match vote {
                             VoteOutcome::Granted { .. } => {
@@ -159,41 +158,30 @@ impl ConsensusLoop {
                         .borrow_mut()
                         .election()
                         .handle_votes(now, responses);
-                    let (post_term, post_role) = {
-                        let n = self.node.borrow();
-                        (n.current_term(), n.role())
-                    };
-                    debug!(
-                        "consensus_loop[{}]: election.handle_votes() done — term={} role={:?}",
-                        self_id, post_term, post_role
-                    );
-                    if post_role == Leader {
-                        self.ledger.ledger().submit(Operation::NewTerm {
-                            term: post_term,
-                            node_id: self_id,
-                            node_count: self
-                                .config
-                                .cluster
-                                .as_ref()
-                                .map(|c| c.peers.len())
-                                .unwrap_or(0) as u16,
-                            node_voted: grant_votes_count,
-                        });
-                    }
-                    self.mirror.snapshot_from(&self.node.borrow());
-                    self.sync_gate_from_role();
                 }
-            }
-
-            let current_role = self.node.borrow().role();
-            if !started && current_role == Leader && prev_role != Leader {
-                // Node became leader without election (only in single node situation)
-                self.ledger.ledger().submit(Operation::NewTerm {
-                    term: self.node.borrow().current_term(),
-                    node_id: self_id,
-                    node_count: 1, // self
-                    node_voted: 1, // self
-                });
+                let (post_term, post_role) = {
+                    let n = self.node.borrow();
+                    (n.current_term(), n.role())
+                };
+                debug!(
+                    "consensus_loop[{}]: election.handle_votes() done — term={} role={:?}",
+                    self_id, post_term, post_role
+                );
+                if post_role == Leader {
+                    self.ledger.ledger().submit(Operation::NewTerm {
+                        term: post_term,
+                        node_id: self_id,
+                        node_count: self
+                            .config
+                            .cluster
+                            .as_ref()
+                            .map(|c| c.peers.len())
+                            .unwrap_or(0) as u16,
+                        node_voted: grant_votes_count,
+                    });
+                }
+                self.mirror.snapshot_from(&self.node.borrow());
+                self.sync_gate_from_role();
             }
 
             // 3. Sleep until wakeup or inbound RV command, whichever
