@@ -98,6 +98,7 @@ impl ConsensusLoop {
         let self_id = self.self_id;
         debug!("consensus_loop[{}]: started", self_id);
 
+        let prev_role = self.node.borrow().role();
         loop {
             let now = Instant::now();
 
@@ -182,6 +183,17 @@ impl ConsensusLoop {
                     self.mirror.snapshot_from(&self.node.borrow());
                     self.sync_gate_from_role();
                 }
+            }
+
+            let current_role = self.node.borrow().role();
+            if !started && current_role == Leader && prev_role != Leader {
+                // Node became leader without election (only in single node situation)
+                self.ledger.ledger().submit(Operation::NewTerm {
+                    term: self.node.borrow().current_term(),
+                    node_id: self_id,
+                    node_count: 1, // self
+                    node_voted: 1, // self
+                });
             }
 
             // 3. Sleep until wakeup or inbound RV command, whichever
