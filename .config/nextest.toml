@@ -1,0 +1,6 @@
+[test-groups]
+serial-cluster = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(cluster)'
+test-group = 'serial-cluster'

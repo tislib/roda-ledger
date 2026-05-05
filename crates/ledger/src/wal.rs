@@ -61,6 +61,13 @@ pub struct WalRunner {
     retry_count: u64,
     active_segment: Segment,
     buffer: VecDeque<WalEntry>,
+    /// `tx_id` of the most-recently-ingested `TxMetadata`. Used as the
+    /// authoritative tx_id when the closing sub-item of a transaction
+    /// is a structural record (`TxTerm`, `FunctionRegistered`) whose
+    /// `WalEntry::tx_id()` returns 0 — without this, `last_received_tx_id`
+    /// would regress to 0 and `commit_index` would never advance past
+    /// such a transaction.
+    current_tx_id: u64,
     last_received_tx_id: u64,
     segment_start_tx_id: u64,
     wait_strategy: WaitStrategy,
@@ -93,6 +100,7 @@ impl WalRunner {
             retry_count: 0,
             active_segment,
             buffer,
+            current_tx_id: 0,
             last_received_tx_id: 0,
             segment_start_tx_id: 0,
             wait_strategy,
@@ -172,11 +180,17 @@ impl WalRunner {
     /// Append one entry to the active segment buffer and update tx_id bookkeeping.
     fn ingest_entry(&mut self, entry: WalEntry) {
         self.active_segment.append_pending_entry(&entry);
+        if let WalEntry::Metadata(m) = &entry {
+            self.current_tx_id = m.tx_id;
+        }
         self.buffer.push_back(entry);
         if self.move_pending_entry(&entry) {
-            self.last_received_tx_id = entry.tx_id();
+            // Use `current_tx_id` rather than `entry.tx_id()`: structural
+            // sub-items (`TxTerm`, `FunctionRegistered`) carry no tx_id,
+            // so reading from the closing record would regress this to 0.
+            self.last_received_tx_id = self.current_tx_id;
             if self.segment_start_tx_id == 0 {
-                self.segment_start_tx_id = entry.tx_id();
+                self.segment_start_tx_id = self.current_tx_id;
             }
         }
     }

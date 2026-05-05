@@ -16,6 +16,7 @@
 //! runtime is multi-threaded so the parked worker can be replaced while
 //! the join proceeds.
 
+use log::error;
 use std::future::Future;
 use std::thread;
 use tokio::runtime;
@@ -112,7 +113,7 @@ pub(crate) fn join_grpc_threads(
     let join_all = move || {
         for t in owned {
             if let Err(e) = t.join() {
-                panic!("{}: gRPC thread panicked: {:?}", label, e);
+                error!("{}: gRPC thread panicked: {:?}", label, e);
             }
         }
     };
