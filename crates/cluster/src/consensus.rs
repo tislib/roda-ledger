@@ -143,6 +143,16 @@ impl ConsensusLoop {
                         self_id,
                         responses.len()
                     );
+                    let mut grant_votes_count = 0;
+                    for (_, vote) in responses.iter() {
+                        match vote {
+                            VoteOutcome::Granted { .. } => {
+                                grant_votes_count += 1;
+                            }
+                            VoteOutcome::Denied { .. } => {}
+                            VoteOutcome::Failed => {}
+                        }
+                    }
                     let now = Instant::now();
                     self.node
                         .borrow_mut()
@@ -157,11 +167,16 @@ impl ConsensusLoop {
                         self_id, post_term, post_role
                     );
                     if post_role == Leader {
-                        self.ledger.ledger().submit(Operation::Transfer {
-                            from: 0,
-                            to: 0,
-                            amount: 0,
-                            user_ref: 0,
+                        self.ledger.ledger().submit(Operation::NewTerm {
+                            term: post_term,
+                            node_id: self_id,
+                            node_count: self
+                                .config
+                                .cluster
+                                .as_ref()
+                                .map(|c| c.peers.len())
+                                .unwrap_or(0) as u16,
+                            node_voted: grant_votes_count,
                         });
                     }
                     self.mirror.snapshot_from(&self.node.borrow());

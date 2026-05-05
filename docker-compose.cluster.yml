@@ -1,0 +1,47 @@
+services:
+  roda-node1:
+    build: .
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    ports:
+      - "50051:50051"
+    environment:
+      - RODA_CONFIG=/app/config.toml
+    volumes:
+      - ./examples/config/cluster/node1.toml:/app/config.toml:ro
+      - roda_node1_data:/app/data
+    restart: unless-stopped
+
+  roda-node2:
+    build: .
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    ports:
+      - "50052:50051"
+    environment:
+      - RODA_CONFIG=/app/config.toml
+    volumes:
+      - ./examples/config/cluster/node2.toml:/app/config.toml:ro
+      - roda_node2_data:/app/data
+    restart: unless-stopped
+
+  roda-node3:
+    build: .
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    ports:
+      - "50053:50051"
+    environment:
+      - RODA_CONFIG=/app/config.toml
+    volumes:
+      - ./examples/config/cluster/node3.toml:/app/config.toml:ro
+      - roda_node3_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  roda_node1_data:
+  roda_node2_data:
+  roda_node3_data:
