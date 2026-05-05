@@ -23,7 +23,10 @@ fn new_term_advances_commit_index() {
         WaitLevel::Committed,
     );
 
-    assert!(result.tx_id > 0, "tx_id should be assigned by the sequencer");
+    assert!(
+        result.tx_id > 0,
+        "tx_id should be assigned by the sequencer"
+    );
     assert!(
         result.fail_reason.is_success(),
         "NewTerm should not be rejected (got {:?})",
