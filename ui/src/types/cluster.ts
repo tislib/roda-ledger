@@ -4,7 +4,7 @@ export type NodeHealth = 'Up' | 'Stopped' | 'Partitioned' | 'Isolated';
 
 export type ClusterHealth = 'Healthy' | 'Unhealthy';
 
-export type FaultAction = 'stop' | 'start' | 'restart' | 'partition' | 'heal';
+export type FaultAction = 'stop' | 'start' | 'restart' | 'partition' | 'heal' | 'kill';
 
 export interface NodeStatus {
   nodeId: string;
@@ -47,7 +47,7 @@ export interface ElectionEvent {
   reason: ElectionReason;
 }
 
-export type FaultKind = 'stop' | 'start' | 'restart' | 'partition' | 'heal';
+export type FaultKind = 'stop' | 'start' | 'restart' | 'partition' | 'heal' | 'kill';
 
 export interface FaultEvent {
   at: number;

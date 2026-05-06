@@ -103,6 +103,7 @@ const FAULT_KIND_FROM: Record<PbFaultKind, FaultKind> = {
   [PbFaultKind.RESTART]: 'restart',
   [PbFaultKind.PARTITION]: 'partition',
   [PbFaultKind.HEAL]: 'heal',
+  [PbFaultKind.KILL]: 'kill',
 };
 
 const FAULT_KIND_TO: Record<FaultKind, PbFaultKind> = {
@@ -111,6 +112,7 @@ const FAULT_KIND_TO: Record<FaultKind, PbFaultKind> = {
   restart: PbFaultKind.RESTART,
   partition: PbFaultKind.PARTITION,
   heal: PbFaultKind.HEAL,
+  kill: PbFaultKind.KILL,
 };
 
 const LOG_KIND_FROM: Record<PbLogEntryKind, LogEntryKind> = {
