@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useConnections } from '@/lib/connection-store';
 import { useServerInfo } from '@/hooks/useClusterSnapshot';
 import { cn } from '@/lib/cn';
+import { dialog } from '@/lib/dialog';
+import { toast } from '@/lib/toast';
 
 export function ConnectionBar() {
   const { connections, active, setActive, add, update, remove } = useConnections();
@@ -64,37 +66,50 @@ export function ConnectionBar() {
 
       <div className="flex-1 flex items-center gap-1 max-w-2xl">
         {editing ? (
-          <>
-            <input
-              autoFocus
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') onSave();
-                if (e.key === 'Escape') {
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') onSave();
+              if (e.key === 'Escape') {
+                setDraft(active?.url ?? '');
+                setEditing(false);
+              }
+            }}
+            className="flex-1 bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono text-text-primary
+                        focus:outline-none focus:border-accent/60"
+            placeholder="http://host:port"
+          />
+        ) : (
+          <button
+            onClick={() => setEditing(true)}
+            className="flex-1 text-left bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono text-text-secondary
+                        hover:border-border-strong hover:text-text-primary transition-colors"
+            title="Click to edit"
+          >
+            {active?.url ?? '(no connection)'}
+          </button>
+        )}
+
+        {/* Fixed-width slot for Save/Cancel buttons reserved at all times so
+            the layout never shifts when entering or leaving edit mode. */}
+        <div className="flex items-center gap-1 w-[140px] shrink-0 justify-end">
+          {editing ? (
+            <>
+              <button onClick={onSave} className="btn btn-accent">Save</button>
+              <button
+                onClick={() => {
                   setDraft(active?.url ?? '');
                   setEditing(false);
-                }
-              }}
-              className="flex-1 bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono text-text-primary
-                        focus:outline-none focus:border-accent/60"
-              placeholder="http://host:port"
-            />
-            <button onClick={onSave} className="btn btn-accent">Save</button>
-            <button onClick={() => { setDraft(active?.url ?? ''); setEditing(false); }} className="btn">Cancel</button>
-          </>
-        ) : (
-          <>
-            <button
-              onClick={() => setEditing(true)}
-              className="flex-1 text-left bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono text-text-secondary
-                        hover:border-border-strong hover:text-text-primary transition-colors"
-              title="Click to edit"
-            >
-              {active?.url ?? '(no connection)'}
-            </button>
-          </>
-        )}
+                }}
+                className="btn"
+              >
+                Cancel
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
 
       <div ref={menuRef} className="relative">
@@ -125,9 +140,18 @@ export function ConnectionBar() {
                   </div>
                   {connections.length > 1 && (
                     <button
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm(`Remove "${c.label}"?`)) remove(c.id);
+                        const ok = await dialog.confirm({
+                          title: `Remove "${c.label}"?`,
+                          description: c.url,
+                          confirmLabel: 'Remove',
+                          destructive: true,
+                        });
+                        if (ok) {
+                          remove(c.id);
+                          toast.success('Connection removed', c.label);
+                        }
                       }}
                       className="text-text-muted hover:text-health-crashed text-[10px] px-1"
                       title="Remove"
@@ -140,13 +164,29 @@ export function ConnectionBar() {
             </ul>
             <div className="border-t border-border-subtle mt-1 pt-1">
               <button
-                onClick={() => {
-                  const label = prompt('Connection label:');
-                  if (label == null) return;
-                  const url = prompt('Control plane URL:', 'http://localhost:50051');
-                  if (url == null || !url.trim()) return;
-                  add(label, url);
+                onClick={async () => {
                   setMenuOpen(false);
+                  const values = await dialog.prompt({
+                    title: 'Add connection',
+                    description: 'Saves a new entry in your local connection list.',
+                    fields: [
+                      { name: 'label', label: 'label', placeholder: 'staging-1', required: true },
+                      {
+                        name: 'url',
+                        label: 'URL',
+                        placeholder: 'http://localhost:50051',
+                        initial: 'http://localhost:50051',
+                        required: true,
+                      },
+                    ],
+                    confirmLabel: 'Add',
+                  });
+                  if (values) {
+                    const label = values.label ?? '';
+                    const url = values.url ?? '';
+                    add(label, url);
+                    toast.success('Connection added', label);
+                  }
                 }}
                 className="w-full text-left px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-2 hover:text-text-primary"
               >

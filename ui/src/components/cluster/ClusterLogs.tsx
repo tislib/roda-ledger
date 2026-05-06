@@ -136,7 +136,14 @@ export function ClusterLogs() {
                 }
               />
             ) : (
-              <table className="w-full text-xs font-mono">
+              <table className="w-full text-xs font-mono table-fixed">
+                {/* Explicit column widths keep the table stable across pagination. */}
+                <colgroup>
+                  <col style={{ width: '8ch' }} />
+                  <col style={{ width: '6ch' }} />
+                  <col style={{ width: '22ch' }} />
+                  <col />
+                </colgroup>
                 <thead>
                   <tr className="text-text-muted">
                     <th className="text-left px-2 py-1 font-medium">idx</th>
@@ -147,11 +154,17 @@ export function ClusterLogs() {
                 </thead>
                 <tbody>
                   {entries.map((entry) => (
-                    <tr key={entry.index} className="border-t border-border-subtle">
-                      <td className="px-2 py-1.5 text-text-secondary tabular-nums">{entry.index}</td>
-                      <td className="px-2 py-1.5 text-text-secondary tabular-nums">{entry.term}</td>
-                      <td className="px-2 py-1.5 text-text-muted">{entry.kind}</td>
-                      <td className="px-2 py-1.5 text-text-primary truncate max-w-md">
+                    <tr key={entry.index} className="border-t border-border-subtle hover:bg-bg-2/50">
+                      <td className="px-2 py-1.5 text-text-secondary tabular-nums truncate" title={entry.index}>
+                        {entry.index}
+                      </td>
+                      <td className="px-2 py-1.5 text-text-secondary tabular-nums truncate" title={entry.term}>
+                        {entry.term}
+                      </td>
+                      <td className="px-2 py-1.5 text-text-muted truncate" title={entry.kind}>
+                        {entry.kind}
+                      </td>
+                      <td className="px-2 py-1.5 text-text-primary truncate" title={entry.summary}>
                         {entry.summary}
                       </td>
                     </tr>

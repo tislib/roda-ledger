@@ -1,6 +1,8 @@
 import { Outlet, useLocation } from 'react-router-dom';
 import { ConnectionBar } from './components/layout/ConnectionBar';
 import { Sidebar } from './components/layout/Sidebar';
+import { ToastViewport } from './components/shared/ToastViewport';
+import { DialogHost } from './components/shared/Dialog';
 import { useConfigBootstrap } from './lib/connection-store';
 
 export default function App() {
@@ -15,6 +17,8 @@ export default function App() {
           <Outlet />
         </main>
       </div>
+      <ToastViewport />
+      <DialogHost />
     </div>
   );
 }

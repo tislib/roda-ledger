@@ -12,25 +12,33 @@ export interface KV {
   value: string;
 }
 
-export type ScenarioStep =
-  | {
-      kind: 'submitOps';
-      workload: WorkloadKind;
-      rateOpsPerSec: number;
-      durationMs: number;
-      totalOps: number;
-      params: KV[];
-    }
-  | {
-      kind: 'fault';
-      fault: FaultKind;
-      nodeId: string;
-      peerNodeId?: string;
-    }
-  | {
-      kind: 'wait';
-      durationMs: number;
-    };
+interface BaseStep {
+  /** Stable per-step id; lets reorder/edit operations preserve React identity
+   *  so input focus and animation state survive moves. */
+  id: string;
+}
+
+export type ScenarioStep = BaseStep &
+  (
+    | {
+        kind: 'submitOps';
+        workload: WorkloadKind;
+        rateOpsPerSec: number;
+        durationMs: number;
+        totalOps: number;
+        params: KV[];
+      }
+    | {
+        kind: 'fault';
+        fault: FaultKind;
+        nodeId: string;
+        peerNodeId?: string;
+      }
+    | {
+        kind: 'wait';
+        durationMs: number;
+      }
+  );
 
 export interface Scenario {
   /** Local id (for localStorage). Server assigns its own run_id at execution. */

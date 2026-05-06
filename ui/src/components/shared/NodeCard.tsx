@@ -20,10 +20,13 @@ export function NodeCard({ node, scaleMax, selected, onSelect, children }: Props
   const isLeader = node.role === 'Leader';
   const isStopped = node.health === 'Stopped';
   const lagEntries = BigInt(node.lagEntries);
+  const showLag = !isLeader && !isStopped;
 
   return (
     <motion.div
-      layout
+      // `layout="position"` animates only translation, not size — avoids the
+      // sub-pixel jitter that full `layout` measurement causes on every poll.
+      layout="position"
       onClick={onSelect}
       className={cn(
         'pane p-3 flex flex-col gap-2 transition-all duration-150',
@@ -34,22 +37,30 @@ export function NodeCard({ node, scaleMax, selected, onSelect, children }: Props
       )}
     >
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <StatusDot health={node.health} animated={node.role === 'Leader'} />
           <span className="font-mono text-sm text-text-primary">{formatNodeId(node.nodeId)}</span>
-          {(node.health === 'Partitioned' || node.health === 'Isolated') && (
-            <span
-              className="text-[9px] font-mono uppercase tracking-wider text-health-isolated px-1 py-0.5 rounded border border-health-isolated/40"
-              title={node.partitionedPeers.length > 0 ? `partitioned from: ${node.partitionedPeers.map(formatNodeId).join(', ')}` : undefined}
-            >
-              {node.health === 'Isolated' ? 'isolated' : 'partitioned'}
-            </span>
-          )}
-          {node.health === 'Stopped' && (
-            <span className="text-[9px] font-mono uppercase tracking-wider text-health-crashed px-1 py-0.5 rounded border border-health-crashed/40">
-              stopped
-            </span>
-          )}
+          {/* Reserve space for the network/health chip even when empty so the
+              row never shifts on health transitions. */}
+          <span className="min-h-[18px] flex items-center">
+            {(node.health === 'Partitioned' || node.health === 'Isolated') && (
+              <span
+                className="text-[9px] font-mono uppercase tracking-wider text-health-isolated px-1 py-0.5 rounded border border-health-isolated/40"
+                title={
+                  node.partitionedPeers.length > 0
+                    ? `partitioned from: ${node.partitionedPeers.map(formatNodeId).join(', ')}`
+                    : undefined
+                }
+              >
+                {node.health === 'Isolated' ? 'isolated' : 'partitioned'}
+              </span>
+            )}
+            {node.health === 'Stopped' && (
+              <span className="text-[9px] font-mono uppercase tracking-wider text-health-crashed px-1 py-0.5 rounded border border-health-crashed/40">
+                stopped
+              </span>
+            )}
+          </span>
         </div>
         <motion.div
           key={node.role}
@@ -75,14 +86,25 @@ export function NodeCard({ node, scaleMax, selected, onSelect, children }: Props
         <IndexBar label="cluster" value={node.clusterCommitIndex} max={scaleMax} accent="cluster" />
       </div>
 
-      {!isLeader && !isStopped && (
-        <div className="flex items-center justify-between text-[10px] font-mono pt-1 border-t border-border-subtle">
-          <span className="text-text-muted">lag from leader</span>
-          <span className={cn(lagEntries > 5n ? 'text-accent' : 'text-text-secondary')}>
-            {lagEntries.toString()} entries · {formatMs(node.lagMs)}
-          </span>
-        </div>
-      )}
+      {/* Lag panel always rendered; opacity-toggled. Reserves height so cards
+          never resize when a node transitions Leader ↔ Follower or Up ↔ Stopped. */}
+      <div
+        className={cn(
+          'flex items-center justify-between text-[10px] font-mono pt-1 border-t border-border-subtle h-[22px]',
+          showLag ? 'opacity-100' : 'opacity-0 pointer-events-none',
+        )}
+        aria-hidden={!showLag}
+      >
+        <span className="text-text-muted">lag from leader</span>
+        <span
+          className={cn(
+            'tabular-nums',
+            lagEntries > 5n ? 'text-accent' : 'text-text-secondary',
+          )}
+        >
+          {showLag ? `${lagEntries.toString()} entries · ${formatMs(node.lagMs)}` : '—'}
+        </span>
+      </div>
 
       {children && <div className="pt-1 border-t border-border-subtle">{children}</div>}
     </motion.div>

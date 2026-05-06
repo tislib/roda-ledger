@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useClusterSnapshot, useRecentElections } from '@/hooks/useClusterSnapshot';
 import { NodeCard } from '@/components/shared/NodeCard';
-import { EmptyState } from '@/components/shared/EmptyState';
+import { NodeCardGridSkeleton } from '@/components/shared/Skeleton';
 import { ElectionTimeline } from './ElectionTimeline';
 import { cn } from '@/lib/cn';
 
@@ -20,8 +20,21 @@ export function ClusterDashboard() {
     return max.toString();
   }, [snapshot]);
 
+  // First-paint skeleton sized like the eventual layout — banner, grid, sidebar
+  // — so when data lands the page doesn't reflow.
   if (isLoading || !snapshot) {
-    return <EmptyState title="Loading cluster…" />;
+    return (
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <header className="px-6 py-3 border-b border-border-subtle h-[57px]" />
+        <div className="mx-6 mt-3 mb-1 h-9 rounded border border-border-subtle bg-bg-1" />
+        <div className="flex-1 flex overflow-hidden">
+          <div className="flex-1 p-4 overflow-auto">
+            <NodeCardGridSkeleton count={5} />
+          </div>
+          <aside className="w-72 shrink-0 border-l border-border-subtle bg-bg-1" />
+        </div>
+      </div>
+    );
   }
 
   const isUnhealthy = snapshot.clusterHealth === 'Unhealthy';

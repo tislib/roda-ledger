@@ -92,7 +92,7 @@ export function StagedPipeline({ status }: Props) {
                   <div className="text-sm font-medium text-text-primary">{s.label}</div>
                   <div className="text-[11px] text-text-muted">{s.desc}</div>
                 </div>
-                <div className="text-[11px] font-mono text-text-secondary">
+                <div className="text-[11px] font-mono text-text-secondary tabular-nums w-16 text-right shrink-0">
                   {elapsed != null ? `+${formatMs(elapsed)}` : reached ? '—' : ''}
                 </div>
               </motion.div>

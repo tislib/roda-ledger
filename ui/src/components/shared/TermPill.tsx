@@ -15,7 +15,7 @@ export function TermPill({ term, className }: Props) {
       )}
     >
       <span className="text-text-muted">term</span>
-      <span className="relative inline-block min-w-[1.5ch] text-center">
+      <span className="relative inline-block min-w-[3ch] text-center tabular-nums">
         <AnimatePresence mode="popLayout">
           <motion.span
             key={term}
@@ -23,7 +23,7 @@ export function TermPill({ term, className }: Props) {
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: 8, opacity: 0 }}
             transition={{ duration: 0.18, ease: 'easeOut' }}
-            className="text-text-primary inline-block"
+            className="text-text-primary inline-block tabular-nums"
           >
             {term}
           </motion.span>

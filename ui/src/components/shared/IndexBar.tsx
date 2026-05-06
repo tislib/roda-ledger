@@ -15,6 +15,29 @@ const ACCENT_CLASSES = {
   cluster: 'bg-health-up/70',
 } as const;
 
+/**
+ * Compact decimal-string formatter for the right-side value column.
+ * Stays under 5 characters for any positive integer:
+ *   < 1000      -> as-is (e.g. "999")
+ *   < 1_000_000 -> "Nk"  / "N.Nk"
+ *   else        -> "NM"  / "N.NM"
+ */
+function compact(value: string): string {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return value;
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) {
+    const k = n / 1000;
+    return `${k >= 100 ? Math.round(k) : k.toFixed(1).replace(/\.0$/, '')}k`;
+  }
+  if (n < 1_000_000_000) {
+    const m = n / 1_000_000;
+    return `${m >= 100 ? Math.round(m) : m.toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  const b = n / 1_000_000_000;
+  return `${b >= 100 ? Math.round(b) : b.toFixed(1).replace(/\.0$/, '')}B`;
+}
+
 export function IndexBar({ label, value, max, accent = 'leader', className }: Props) {
   const v = BigInt(value || '0');
   const m = BigInt(max || '0') === 0n ? 1n : BigInt(max);
@@ -29,7 +52,12 @@ export function IndexBar({ label, value, max, accent = 'leader', className }: Pr
           style={{ width: `${pct}%` }}
         />
       </div>
-      <span className="text-text-secondary tabular-nums w-10 text-right">{value}</span>
+      <span
+        className="text-text-secondary tabular-nums w-14 text-right truncate"
+        title={value}
+      >
+        {compact(value)}
+      </span>
     </div>
   );
 }

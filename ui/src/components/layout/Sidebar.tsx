@@ -97,12 +97,21 @@ export function Sidebar({ pathname }: Props) {
           <span className="text-text-muted">term</span>
           <TermPill term={term} />
         </div>
-        {snapshot && snapshot.partitions.length > 0 && (
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-text-muted">partitions</span>
-            <span className="font-mono text-health-isolated">{snapshot.partitions.length}</span>
-          </div>
-        )}
+        {/* Always rendered — value is 0 when there are no active partitions —
+            so the sidebar never reflows on partition state changes. */}
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="text-text-muted">partitions</span>
+          <span
+            className={cn(
+              'font-mono tabular-nums',
+              (snapshot?.partitions.length ?? 0) > 0
+                ? 'text-health-isolated'
+                : 'text-text-muted',
+            )}
+          >
+            {snapshot?.partitions.length ?? 0}
+          </span>
+        </div>
       </div>
     </aside>
   );

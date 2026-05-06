@@ -85,9 +85,12 @@ export function ScenarioRunner({ runId, onSelectRun }: Props) {
       {status.recentSteps.length > 0 && (
         <div className="pt-2 border-t border-border-subtle">
           <div className="label mb-1">recent</div>
-          <ul className="space-y-0.5 text-[11px] text-text-secondary font-mono">
-            {status.recentSteps.slice(-5).map((s, i) => (
-              <li key={i} className="truncate">
+          <ul
+            className="space-y-0.5 text-[11px] text-text-secondary font-mono max-h-32 overflow-auto"
+            aria-live="polite"
+          >
+            {status.recentSteps.map((s, i) => (
+              <li key={i} className="truncate" title={s}>
                 {s}
               </li>
             ))}

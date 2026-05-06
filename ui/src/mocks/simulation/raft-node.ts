@@ -22,9 +22,14 @@ export class RaftNodeState {
 
   // Log replication state.
   log: SimLogEntry[] = []; // ordered by index ascending; index = entry.index
-  commitIndex = 0n; // local commit watermark
+  writeIndex = 0n; // local durable extent (count of appended entries)
+  // Three independent staged-pipeline watermarks. Advance at staggered timing
+  // so the Dashboard's IndexBars genuinely move at different rates — not all
+  // aliased to a single value.
+  computeIndex = 0n;
+  commitIndex = 0n;
+  snapshotIndex = 0n;
   clusterCommitIndex = 0n; // quorum-committed (leader-driven)
-  writeIndex = 0n; // local durable extent
 
   // Election timing.
   electionDeadline = 0; // absolute ms; 0 = none scheduled
@@ -54,6 +59,14 @@ export class RaftNodeState {
 
   commitIndexAsString(): string {
     return this.commitIndex.toString();
+  }
+
+  computeIndexAsString(): string {
+    return this.computeIndex.toString();
+  }
+
+  snapshotIndexAsString(): string {
+    return this.snapshotIndex.toString();
   }
 
   clusterCommitIndexAsString(): string {

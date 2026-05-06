@@ -82,10 +82,15 @@ export function ScenarioEditor({ scenarioId, onRun }: Props) {
     setDraft({ ...draft, steps: next });
   };
 
+  const newStepId = () =>
+    `step_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
   const addStep = (kind: 'submitOps' | 'fault' | 'wait') => {
+    const id = newStepId();
     const step: ScenarioStep =
       kind === 'submitOps'
         ? {
+            id,
             kind: 'submitOps',
             workload: 'DepositBurst',
             rateOpsPerSec: 100,
@@ -94,8 +99,8 @@ export function ScenarioEditor({ scenarioId, onRun }: Props) {
             params: [{ key: 'account', value: '1' }, { key: 'amount', value: '100' }],
           }
         : kind === 'fault'
-          ? { kind: 'fault', fault: 'stop', nodeId: '1' }
-          : { kind: 'wait', durationMs: 1000 };
+          ? { id, kind: 'fault', fault: 'stop', nodeId: '1' }
+          : { id, kind: 'wait', durationMs: 1000 };
     setDraft({ ...draft, steps: [...draft.steps, step] });
   };
 
@@ -158,7 +163,7 @@ export function ScenarioEditor({ scenarioId, onRun }: Props) {
         ) : (
           <ul className="space-y-2">
             {draft.steps.map((step, idx) => (
-              <li key={idx} className="pane-tight p-2 space-y-2">
+              <li key={step.id} className="pane-tight p-2 space-y-2">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="font-mono uppercase tracking-wider text-text-muted">
                     {idx + 1}. {step.kind}

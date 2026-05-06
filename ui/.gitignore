@@ -1,0 +1,25 @@
+# Vite + React build artifacts
+node_modules/
+dist/
+.vite/
+
+# Vite caches and local-only state
+*.local
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated proto bindings (regenerated via `npm run gen`).
+# Keeping these out of the tree means PR diffs stay focused on hand-written
+# code; the proto schema is the source of truth in crates/proto/proto.
+src/gen/

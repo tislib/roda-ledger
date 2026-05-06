@@ -4,6 +4,7 @@ import type { ClusterConfig } from '@/types/cluster';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { formatNodeId } from '@/lib/format';
 import { cn } from '@/lib/cn';
+import { toast } from '@/lib/toast';
 
 export function ClusterSettings() {
   const { data, isLoading } = useClusterConfig();
@@ -31,7 +32,9 @@ export function ClusterSettings() {
     if (!dirty) return;
     const result = await updateMutation.mutateAsync(draft);
     if (!result.accepted) {
-      alert(`Config rejected: ${result.error}`);
+      toast.error('Config rejected', result.error);
+    } else {
+      toast.success('Cluster config applied');
     }
   };
 
@@ -39,7 +42,9 @@ export function ClusterSettings() {
     if (!countDirty) return;
     const result = await setCountMutation.mutateAsync(draftCount);
     if (!result.accepted) {
-      alert(`Reconfigure rejected: ${result.error}`);
+      toast.error('Reconfigure rejected', result.error);
+    } else {
+      toast.success(`Cluster size set to ${result.targetCount}`);
     }
   };
 

@@ -2,6 +2,8 @@ import type { Scenario } from '@/types/scenario';
 import { useScenarios, scenarioStore } from '@/lib/scenario-store';
 import { cn } from '@/lib/cn';
 import { formatRelative } from '@/lib/format';
+import { dialog } from '@/lib/dialog';
+import { toast } from '@/lib/toast';
 
 interface Props {
   activeId: string | null;
@@ -54,9 +56,18 @@ export function ScenarioLibrary({ activeId, onSelect, onCreate }: Props) {
                   </button>
                   <button
                     className="btn btn-danger"
-                    onClick={(e) => {
+                    onClick={async (e) => {
                       e.stopPropagation();
-                      if (confirm(`Delete "${s.name}"?`)) scenarioStore.remove(s.id);
+                      const ok = await dialog.confirm({
+                        title: `Delete "${s.name}"?`,
+                        description: 'This removes the scenario from your local library. This cannot be undone.',
+                        confirmLabel: 'Delete',
+                        destructive: true,
+                      });
+                      if (ok) {
+                        scenarioStore.remove(s.id);
+                        toast.success('Scenario deleted');
+                      }
                     }}
                     title="Delete"
                   >

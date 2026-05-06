@@ -7,6 +7,8 @@ import { cn } from '@/lib/cn';
 import { FunctionEditor } from './FunctionEditor';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { formatRelative } from '@/lib/format';
+import { dialog } from '@/lib/dialog';
+import { toast } from '@/lib/toast';
 
 export function MetaModule() {
   const { data: deployed } = useWasmFunctions();
@@ -44,9 +46,19 @@ export function MetaModule() {
     });
   };
 
-  const onUnregister = (name: string) => {
-    if (confirm(`Unregister ${name}?`)) {
-      unregisterMutation.mutate(name);
+  const onUnregister = async (name: string) => {
+    const ok = await dialog.confirm({
+      title: `Unregister ${name}?`,
+      description:
+        'Subsequent Function operations referencing this name will return INVALID_OPERATION.',
+      confirmLabel: 'Unregister',
+      destructive: true,
+    });
+    if (ok) {
+      unregisterMutation.mutate(name, {
+        onSuccess: () => toast.success(`Unregistered ${name}`),
+        onError: (err) => toast.error('Unregister failed', String(err)),
+      });
     }
   };
 

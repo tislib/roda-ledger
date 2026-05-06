@@ -23,11 +23,16 @@ export function ElectionBadge({ events, durationMs = 3000 }: Props) {
     <AnimatePresence>
       {visible && (
         <motion.div
+          role="status"
+          aria-live="polite"
+          aria-atomic
           initial={{ opacity: 0, y: -8 }}
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -8 }}
           transition={{ duration: 0.18 }}
-          className="fixed top-4 right-4 z-50 pane px-3 py-2 flex items-center gap-2 text-xs"
+          // z-[60] sits above the connection menu (z-50) so the badge is
+          // never occluded mid-demo.
+          className="fixed top-14 right-4 z-[60] pane px-3 py-2 flex items-center gap-2 text-xs shadow-lg"
         >
           <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
           <span className="text-text-muted">election complete</span>

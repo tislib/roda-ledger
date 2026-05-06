@@ -359,6 +359,16 @@ export class Simulator {
       } else if (leader.clusterCommitIndex > peer.clusterCommitIndex) {
         peer.clusterCommitIndex = leader.clusterCommitIndex;
       }
+
+      // Compute and snapshot watermarks propagate from the leader to
+      // reachable followers, clamped to what the follower has actually
+      // appended. This produces visibly different IndexBars per node.
+      const peerCompute =
+        leader.computeIndex < peer.writeIndex ? leader.computeIndex : peer.writeIndex;
+      if (peerCompute > peer.computeIndex) peer.computeIndex = peerCompute;
+      const peerSnapshot =
+        leader.snapshotIndex < peer.commitIndex ? leader.snapshotIndex : peer.commitIndex;
+      if (peerSnapshot > peer.snapshotIndex) peer.snapshotIndex = peerSnapshot;
     }
   }
 
@@ -390,6 +400,8 @@ export class Simulator {
           };
           continue;
         }
+        // Advance leader's compute_index when a tx finishes the Computed stage.
+        if (idx > leader.computeIndex) leader.computeIndex = idx;
         tx.status = {
           state: 'Computed',
           submittedAt: status.submittedAt,
@@ -415,6 +427,9 @@ export class Simulator {
 
       if (tx.status.state === 'Committed') {
         if (tx.snapshotEligibleAt != null && now >= tx.snapshotEligibleAt) {
+          // Snapshot stage on the leader; followers advance via heartbeat
+          // propagation in driveLeader (see snapshotIndex propagation below).
+          if (idx > leader.snapshotIndex) leader.snapshotIndex = idx;
           tx.status = {
             state: 'OnSnapshot',
             submittedAt: tx.status.submittedAt,
@@ -736,9 +751,9 @@ export class Simulator {
         health,
         partitionedPeers,
         lastHeartbeatAt: n.lastHeartbeatAt,
-        computeIndex: n.commitIndexAsString(),
+        computeIndex: n.computeIndexAsString(),
         commitIndex: n.commitIndexAsString(),
-        snapshotIndex: n.commitIndexAsString(),
+        snapshotIndex: n.snapshotIndexAsString(),
         clusterCommitIndex: n.clusterCommitIndexAsString(),
         lagEntries: lagEntries.toString(),
         lagMs,

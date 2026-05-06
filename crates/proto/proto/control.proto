@@ -43,7 +43,7 @@ service Control {
   // GetNodeLog returns a paginated window over a single node's Raft log.
   // All entries returned are committed; uncommitted entries are not
   // exposed by the ledger.
-  rpc GetNodeLog(GetNodeLogRequest) returns (GetNodeLogResponse);
+  rpc GetNodeLog(GetNodeLogRequest) returns (GetNodeLogResponse); // check more
 
   // ---- Ledger operations ----
 
@@ -103,9 +103,16 @@ service Control {
 
   // ---- Fault injection ----
 
-  // StopNode shuts down the addressed node (process-equivalent fault).
-  // The cluster reacts via re-election or quorum loss as appropriate.
+  // StopNode shuts down the addressed node gracefully (SIGTERM-equivalent
+  // fault). The cluster reacts via re-election or quorum loss as
+  // appropriate.
   rpc StopNode(StopNodeRequest) returns (StopNodeResponse);
+
+  // KillNode terminates the addressed node abruptly (SIGKILL-equivalent
+  // fault). Unlike StopNode, graceful shutdown is skipped — in-flight
+  // work is dropped and any uncommitted state is lost. Advertised by
+  // CAPABILITY_KILL; servers without that capability return UNIMPLEMENTED.
+  rpc KillNode(KillNodeRequest) returns (KillNodeResponse);
 
   // StartNode brings a stopped node back online. It rejoins and catches
   // up through the normal replication path.
@@ -166,7 +173,20 @@ message GetServerInfoResponse {
 
   // Capability flags advertised by this server. Lets the UI hide controls
   // that the connected backend does not implement.
-  repeated string capabilities = 3;
+  repeated Capability capabilities = 3;
+}
+
+// Capability advertises an optional surface area the server supports.
+// Clients use these to hide UI affordances backed by RPCs the server
+// does not implement (e.g. environments without process control or
+// network manipulation).
+enum Capability {
+  CAPABILITY_UNSPECIFIED       = 0;
+  // Server supports KillNode (abrupt termination) in addition to
+  // graceful StopNode.
+  CAPABILITY_KILL              = 1;
+  // Server supports PartitionPair / HealPartition.
+  CAPABILITY_NETWORK_PARTITION = 2;
 }
 
 // ============================================================
@@ -516,13 +536,7 @@ message GetTransactionStatusResponse {
   TransactionStatus status      = 1;
   // 0 if status != ERROR. See FailReason codes in roda.ledger.v1.
   uint32            fail_reason = 2;
-  // Per-stage timestamps in ms since Unix epoch; 0 if the stage has not
-  // been reached. Lets the UI render exact `+Xms` per stage from a single
-  // fetch.
-  int64             submitted_at_ms = 3;
-  int64             computed_at_ms  = 4;
-  int64             committed_at_ms = 5;
-  int64             snapshot_at_ms  = 6;
+  reserved 3, 4, 5, 6;
 }
 
 // ---- GetPipelineIndex (per-node) ----
@@ -648,6 +662,9 @@ message NodeInfo {
 message StopNodeRequest    { uint64 node_id = 1; }
 message StopNodeResponse   { bool accepted = 1; string error = 2; }
 
+message KillNodeRequest    { uint64 node_id = 1; }
+message KillNodeResponse   { bool accepted = 1; string error = 2; }
+
 message StartNodeRequest   { uint64 node_id = 1; }
 message StartNodeResponse  { bool accepted = 1; string error = 2; }
 
@@ -689,6 +706,7 @@ enum FaultKind {
   FAULT_KIND_RESTART     = 3;
   FAULT_KIND_PARTITION   = 4;
   FAULT_KIND_HEAL        = 5;
+  FAULT_KIND_KILL        = 6;
 }
 
 // ============================================================

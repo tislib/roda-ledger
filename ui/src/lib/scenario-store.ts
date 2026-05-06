@@ -6,6 +6,10 @@ function generateId(): string {
   return `scn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function stepId(): string {
+  return `step_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 const SEED_SCENARIOS: Scenario[] = [
   {
     id: generateId(),
@@ -13,6 +17,7 @@ const SEED_SCENARIOS: Scenario[] = [
     description: 'Constant deposit workload to account 1 for 10 seconds.',
     steps: [
       {
+        id: stepId(),
         kind: 'submitOps',
         workload: 'DepositBurst',
         rateOpsPerSec: 100,
@@ -33,6 +38,7 @@ const SEED_SCENARIOS: Scenario[] = [
     description: '500 transfers, then stop the leader at t=3s, then 500 more.',
     steps: [
       {
+        id: stepId(),
         kind: 'submitOps',
         workload: 'TransferRandom',
         rateOpsPerSec: 200,
@@ -44,9 +50,10 @@ const SEED_SCENARIOS: Scenario[] = [
           { key: 'amount_max', value: '10' },
         ],
       },
-      { kind: 'fault', fault: 'stop', nodeId: '1' },
-      { kind: 'wait', durationMs: 1_500 },
+      { id: stepId(), kind: 'fault', fault: 'stop', nodeId: '1' },
+      { id: stepId(), kind: 'wait', durationMs: 1_500 },
       {
+        id: stepId(),
         kind: 'submitOps',
         workload: 'TransferRandom',
         rateOpsPerSec: 200,
@@ -122,7 +129,8 @@ class ScenarioStore {
     return this.create({
       name: `${source.name} (copy)`,
       description: source.description,
-      steps: source.steps.map((s) => ({ ...s })),
+      // Re-key step ids so the copy doesn't share React identity with the source.
+      steps: source.steps.map((s) => ({ ...s, id: stepId() })),
     });
   }
 
