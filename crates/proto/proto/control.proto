@@ -70,6 +70,11 @@ service Control {
   // follower.
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
 
+  // GetTransactionStatus reports the current pipeline stage of a single
+  // transaction. Mirrors the per-tx polling the UI's result panel does
+  // while watching an op walk Pending → Computed → Committed → OnSnapshot.
+  rpc GetTransactionStatus(GetTransactionStatusRequest) returns (GetTransactionStatusResponse);
+
   // GetPipelineIndex returns the staged pipeline progress observed by
   // a specific node. Drives the per-node pipeline indices on the
   // Cluster Dashboard.
@@ -486,6 +491,38 @@ message TxLinkRecord {
 enum LinkKind {
   LINK_KIND_DUPLICATE = 0;
   LINK_KIND_REVERSAL  = 1;
+}
+
+// ---- GetTransactionStatus ----
+
+// TransactionStatus mirrors `roda.ledger.v1.TransactionStatus`. Stages are
+// strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
+// ERROR is a terminal state reachable only from PENDING. TX_NOT_FOUND
+// signals the transaction was never sequenced (or has been compacted).
+enum TransactionStatus {
+  TRANSACTION_STATUS_PENDING       = 0;
+  TRANSACTION_STATUS_COMPUTED      = 1;
+  TRANSACTION_STATUS_COMMITTED     = 2;
+  TRANSACTION_STATUS_ON_SNAPSHOT   = 3;
+  TRANSACTION_STATUS_ERROR         = 4;
+  TRANSACTION_STATUS_NOT_FOUND     = 5;
+}
+
+message GetTransactionStatusRequest {
+  uint64 tx_id = 1;
+}
+
+message GetTransactionStatusResponse {
+  TransactionStatus status      = 1;
+  // 0 if status != ERROR. See FailReason codes in roda.ledger.v1.
+  uint32            fail_reason = 2;
+  // Per-stage timestamps in ms since Unix epoch; 0 if the stage has not
+  // been reached. Lets the UI render exact `+Xms` per stage from a single
+  // fetch.
+  int64             submitted_at_ms = 3;
+  int64             computed_at_ms  = 4;
+  int64             committed_at_ms = 5;
+  int64             snapshot_at_ms  = 6;
 }
 
 // ---- GetPipelineIndex (per-node) ----

@@ -137,8 +137,9 @@ export class MockClusterClient implements ClusterClient {
   async unregisterFunction(name: string): Promise<SubmitResult> {
     return delay(this.sim.unregisterFunction(name));
   }
-  async exampleFunctions(): Promise<WasmFunction[]> {
-    return delay(this.sim.getExampleSources());
+  /** Mock-only — gracefully cleans up the simulator's tick interval on disconnect. */
+  dispose(): void {
+    this.sim.stop();
   }
 
   // ---- Scenarios ----

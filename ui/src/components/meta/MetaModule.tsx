@@ -1,32 +1,25 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import type { WasmFunction } from '@/types/wasm';
-import { useClusterClient } from '@/lib/cluster-client.runtime';
 import { useWasmFunctions } from '@/hooks/useWasmFunctions';
 import { useRegisterFunction, useUnregisterFunction } from '@/hooks/useInvokeFunction';
-import { qk } from '@/lib/query-keys';
+import { useExampleFunctions } from '@/lib/wasm-examples';
 import { cn } from '@/lib/cn';
 import { FunctionEditor } from './FunctionEditor';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { formatRelative } from '@/lib/format';
 
 export function MetaModule() {
-  const client = useClusterClient();
   const { data: deployed } = useWasmFunctions();
-  const exampleQuery = useQuery({
-    queryKey: qk.wasm.examples(),
-    queryFn: () => client.exampleFunctions(),
-    staleTime: Infinity,
-  });
+  const examples = useExampleFunctions();
   const registerMutation = useRegisterFunction();
   const unregisterMutation = useUnregisterFunction();
 
   const allFunctions = useMemo<WasmFunction[]>(() => {
     const byName = new Map<string, WasmFunction>();
-    for (const e of exampleQuery.data ?? []) byName.set(e.name, e);
+    for (const e of examples) byName.set(e.name, e);
     for (const d of deployed ?? []) byName.set(d.name, d);
     return [...byName.values()];
-  }, [exampleQuery.data, deployed]);
+  }, [examples, deployed]);
 
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [customOpen, setCustomOpen] = useState(false);

@@ -22,13 +22,19 @@ class ConnectionStore {
     const activeId = loadJson<string | null>(STORAGE_KEYS.activeConnectionId, null);
 
     if (connections.length === 0) {
-      const seed: SavedConnection = {
+      const real: SavedConnection = {
         id: generateId(),
-        label: 'Local mock',
+        label: 'Local control plane',
         url: DEFAULT_URL,
         lastUsedAt: Date.now(),
       };
-      this.state = { connections: [seed], activeId: seed.id };
+      const mock: SavedConnection = {
+        id: generateId(),
+        label: 'Offline mock',
+        url: 'mock://local',
+        lastUsedAt: 0,
+      };
+      this.state = { connections: [real, mock], activeId: real.id };
       this.persist();
     } else {
       this.state = {

@@ -5,7 +5,6 @@ import { RouterProvider } from 'react-router-dom';
 
 import { router } from './routes';
 import { ClusterClientProvider } from './lib/cluster-client.context';
-import { MockClusterClient } from './mocks/MockClusterClient';
 import './styles/globals.css';
 
 const queryClient = new QueryClient({
@@ -18,12 +17,10 @@ const queryClient = new QueryClient({
   },
 });
 
-const client = new MockClusterClient();
-
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <ClusterClientProvider client={client}>
+      <ClusterClientProvider>
         <RouterProvider router={router} />
       </ClusterClientProvider>
     </QueryClientProvider>

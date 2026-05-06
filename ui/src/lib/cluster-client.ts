@@ -59,8 +59,6 @@ export interface ClusterClient {
     overrideExisting: boolean,
   ): Promise<SubmitResult>;
   unregisterFunction(name: string): Promise<SubmitResult>;
-  /** Mock-only convenience for the Meta page's example list. */
-  exampleFunctions(): Promise<WasmFunction[]>;
 
   // ---- Scenarios / load ----
   runScenario(scenario: Scenario): Promise<{ runId: string; startedAt: number }>;
