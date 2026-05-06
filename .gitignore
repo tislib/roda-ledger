@@ -24,3 +24,8 @@ data/
 docs/book/
 .DS_Store
 .claude
+
+# UI (Vite + React)
+ui/node_modules/
+ui/dist/
+ui/.vite/

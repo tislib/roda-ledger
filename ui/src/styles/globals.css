@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: rgb(245 165 36 / 0.3);
+  }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: theme('colors.border.DEFAULT');
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: theme('colors.border.strong');
+  }
+}
+
+@layer components {
+  .mono {
+    font-family: theme('fontFamily.mono');
+    font-feature-settings: 'zero', 'ss01';
+  }
+
+  .pane {
+    @apply bg-bg-1 border border-border-subtle rounded-lg;
+  }
+
+  .pane-tight {
+    @apply bg-bg-1 border border-border-subtle rounded-md;
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded
+      border border-border bg-bg-2 text-text-primary
+      hover:bg-bg-3 hover:border-border-strong
+      active:bg-bg-1
+      disabled:opacity-40 disabled:cursor-not-allowed
+      transition-colors duration-100;
+  }
+
+  .btn-danger {
+    @apply hover:border-health-crashed hover:text-health-crashed;
+  }
+
+  .btn-accent {
+    @apply hover:border-accent hover:text-accent;
+  }
+
+  .label {
+    @apply text-[10px] uppercase tracking-wider text-text-muted font-medium;
+  }
+}

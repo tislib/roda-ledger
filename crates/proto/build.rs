@@ -11,4 +11,8 @@ fn main() {
         .file_descriptor_set_path(out_dir.join("node_descriptor.bin"))
         .compile_protos(&["proto/node.proto"], &["proto"])
         .unwrap();
+    tonic_build::configure()
+        .file_descriptor_set_path(out_dir.join("control_descriptor.bin"))
+        .compile_protos(&["proto/control.proto"], &["proto"])
+        .unwrap();
 }
