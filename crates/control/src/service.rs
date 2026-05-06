@@ -5,21 +5,22 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use proto::control::control_server::Control;
 use proto::control::{
-    CancelScenarioRequest, CancelScenarioResponse, ClusterHealth, ClusterMembership, ElectionEvent,
-    EntryKind, FaultKind, GetBalanceRequest, GetBalanceResponse, GetClusterConfigRequest,
-    GetClusterConfigResponse, GetClusterSnapshotRequest, GetClusterSnapshotResponse,
-    GetFaultHistoryRequest, GetFaultHistoryResponse, GetNodeLogRequest, GetNodeLogResponse,
-    GetPipelineIndexRequest, GetPipelineIndexResponse, GetRecentElectionsRequest,
-    GetRecentElectionsResponse, GetScenarioStatusRequest, GetScenarioStatusResponse,
-    GetServerInfoRequest, GetServerInfoResponse, GetTransactionRequest, GetTransactionResponse,
-    GetTransactionStatusRequest, GetTransactionStatusResponse, HealPartitionRequest,
-    HealPartitionResponse, ListScenarioRunsRequest, ListScenarioRunsResponse, LogEntry,
-    LogEntryKind, NodeInfo, NodeRole, NodeStatus, PartitionPair, PartitionPairRequest,
-    PartitionPairResponse, RestartNodeRequest, RestartNodeResponse, RunScenarioRequest,
-    RunScenarioResponse, ScenarioRunSummary, ScenarioState, SetNodeCountRequest,
-    SetNodeCountResponse, StartNodeRequest, StartNodeResponse, StopNodeRequest, StopNodeResponse,
-    SubmitBatchRequest, SubmitBatchResponse, SubmitOperationRequest, SubmitOperationResponse,
-    TransactionStatus, TxEntryRecord, UpdateClusterConfigRequest, UpdateClusterConfigResponse,
+    CancelScenarioRequest, CancelScenarioResponse, Capability, ClusterHealth, ClusterMembership,
+    ElectionEvent, EntryKind, FaultKind, GetBalanceRequest, GetBalanceResponse,
+    GetClusterConfigRequest, GetClusterConfigResponse, GetClusterSnapshotRequest,
+    GetClusterSnapshotResponse, GetFaultHistoryRequest, GetFaultHistoryResponse, GetNodeLogRequest,
+    GetNodeLogResponse, GetPipelineIndexRequest, GetPipelineIndexResponse,
+    GetRecentElectionsRequest, GetRecentElectionsResponse, GetScenarioStatusRequest,
+    GetScenarioStatusResponse, GetServerInfoRequest, GetServerInfoResponse, GetTransactionRequest,
+    GetTransactionResponse, GetTransactionStatusRequest, GetTransactionStatusResponse,
+    HealPartitionRequest, HealPartitionResponse, KillNodeRequest, KillNodeResponse,
+    ListScenarioRunsRequest, ListScenarioRunsResponse, LogEntry, LogEntryKind, NodeInfo, NodeRole,
+    NodeStatus, PartitionPair, PartitionPairRequest, PartitionPairResponse, RestartNodeRequest,
+    RestartNodeResponse, RunScenarioRequest, RunScenarioResponse, ScenarioRunSummary,
+    ScenarioState, SetNodeCountRequest, SetNodeCountResponse, StartNodeRequest, StartNodeResponse,
+    StopNodeRequest, StopNodeResponse, SubmitBatchRequest, SubmitBatchResponse,
+    SubmitOperationRequest, SubmitOperationResponse, TransactionStatus, TxEntryRecord,
+    UpdateClusterConfigRequest, UpdateClusterConfigResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -48,14 +49,11 @@ impl Control for ControlService {
         Ok(Response::new(GetServerInfoResponse {
             version: format!("control-mock-{}", env!("CARGO_PKG_VERSION")),
             api_version: 1,
+            // The mock supports both abrupt KillNode and pairwise partitions,
+            // so it advertises both capabilities.
             capabilities: vec![
-                "cluster".into(),
-                "logs".into(),
-                "provisioning".into(),
-                "faults".into(),
-                "ledger".into(),
-                "meta".into(),
-                "scenarios".into(),
+                Capability::Kill as i32,
+                Capability::NetworkPartition as i32,
             ],
         }))
     }
@@ -414,6 +412,35 @@ impl Control for ControlService {
         Ok(Response::new(res))
     }
 
+    async fn kill_node(
+        &self,
+        req: Request<KillNodeRequest>,
+    ) -> Result<Response<KillNodeResponse>, Status> {
+        // Mock conflates Kill with Stop (no real process to abruptly terminate).
+        // Recorded in fault history as Kill so the UI can distinguish.
+        let id = req.into_inner().node_id;
+        let mut state = self.state.write();
+        let res = match state.nodes.get_mut(&id) {
+            None => KillNodeResponse {
+                accepted: false,
+                error: format!("unknown node {id}"),
+            },
+            Some(n) => {
+                n.health = ProcessHealth::Stopped;
+                n.role = NodeRole::Follower;
+                n.voted_for = None;
+                KillNodeResponse {
+                    accepted: true,
+                    error: String::new(),
+                }
+            }
+        };
+        if res.accepted {
+            state.record_fault(FaultKind::Kill, id, 0, format!("Killed node {id}"));
+        }
+        Ok(Response::new(res))
+    }
+
     async fn restart_node(
         &self,
         req: Request<RestartNodeRequest>,
@@ -649,25 +676,13 @@ impl Control for ControlService {
                 return Ok(Response::new(GetTransactionStatusResponse {
                     status: TransactionStatus::NotFound as i32,
                     fail_reason: 0,
-                    submitted_at_ms: 0,
-                    computed_at_ms: 0,
-                    committed_at_ms: 0,
-                    snapshot_at_ms: 0,
                 }));
             }
             Some(t) => t,
         };
-        let now_ms = epoch_ms_now();
-        let elapsed_to_ms = |i: Option<std::time::Instant>| -> i64 {
-            i.map(|t| now_ms - t.elapsed().as_millis() as i64).unwrap_or(0)
-        };
         Ok(Response::new(GetTransactionStatusResponse {
             status: tx.status as i32,
             fail_reason: tx.fail_reason,
-            submitted_at_ms: now_ms - tx.submitted_at.elapsed().as_millis() as i64,
-            computed_at_ms: elapsed_to_ms(tx.computed_at),
-            committed_at_ms: elapsed_to_ms(tx.committed_at),
-            snapshot_at_ms: elapsed_to_ms(tx.snapshot_at),
         }))
     }
 

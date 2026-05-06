@@ -428,6 +428,16 @@ fn apply_fault(
                 format!("Heal n{node_id} ↔ n{peer_node_id} (scenario)"),
             );
         }
+        FaultKind::Kill => {
+            // Mock conflates Kill with Stop; recorded as Kill so the UI can
+            // distinguish the two in fault history.
+            if let Some(n) = state.nodes.get_mut(&node_id) {
+                n.health = ProcessHealth::Stopped;
+                n.role = NodeRole::Follower;
+                n.voted_for = None;
+            }
+            state.record_fault(kind, node_id, 0, format!("Killed node {node_id} (scenario)"));
+        }
         FaultKind::Unspecified => {
             warn!("ScenarioStep emitted an Unspecified fault — ignored");
         }
