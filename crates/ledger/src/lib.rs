@@ -1,6 +1,7 @@
 pub mod balance;
 pub mod config;
 pub mod dedup;
+pub mod index;
 pub mod ledger;
 pub mod pipeline;
 mod recover;
@@ -13,4 +14,3 @@ pub mod transactor;
 pub mod wait_strategy;
 pub mod wal;
 pub mod wasm_runtime;
-pub mod index;

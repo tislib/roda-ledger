@@ -29,13 +29,17 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("control=info,tonic=info,tower_http=info")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("control=info,tonic=info,tower_http=info")),
+        )
         .init();
 
     let cli = Cli::parse();
-    info!("control mock starting (addr={}, seed_nodes={})", cli.addr, cli.seed_nodes);
+    info!(
+        "control mock starting (addr={}, seed_nodes={})",
+        cli.addr, cli.seed_nodes
+    );
 
     let state = Arc::new(RwLock::new(InMemoryState::new(cli.seed_nodes)));
     let shutdown = CancellationToken::new();

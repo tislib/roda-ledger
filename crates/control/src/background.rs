@@ -12,15 +12,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use proto::control::{
-    submit_operation_request, ElectionReason, FaultKind, NodeRole, ScenarioState,
-    TransactionStatus,
+    ElectionReason, FaultKind, NodeRole, ScenarioState, TransactionStatus, submit_operation_request,
 };
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::state::{
-    canonical_pair, epoch_ms_now, FunctionRecord, InMemoryState, ProcessHealth, SubmittedOp,
+    FunctionRecord, InMemoryState, ProcessHealth, SubmittedOp, canonical_pair, epoch_ms_now,
 };
 
 const TICK_MS: u64 = 250;
@@ -66,7 +65,12 @@ fn advance_pipeline(state: &mut InMemoryState) {
         match tx.status {
             TransactionStatus::Pending if elapsed_ms >= COMPUTE_AFTER_MS => {
                 // Validate + apply.
-                let fail_reason = execute_op(&tx.op, state.cluster_config.max_accounts, &mut state.accounts, &mut state.functions);
+                let fail_reason = execute_op(
+                    &tx.op,
+                    state.cluster_config.max_accounts,
+                    &mut state.accounts,
+                    &mut state.functions,
+                );
                 if fail_reason != 0 {
                     tx.status = TransactionStatus::Error;
                     tx.fail_reason = fail_reason;
@@ -91,7 +95,9 @@ fn advance_pipeline(state: &mut InMemoryState) {
     let computed = count_at_or_beyond(state, |s| {
         matches!(
             s,
-            TransactionStatus::Computed | TransactionStatus::Committed | TransactionStatus::OnSnapshot
+            TransactionStatus::Computed
+                | TransactionStatus::Committed
+                | TransactionStatus::OnSnapshot
         )
     });
     let committed = count_at_or_beyond(state, |s| {
@@ -106,7 +112,7 @@ fn advance_pipeline(state: &mut InMemoryState) {
     let leader_id = leader_id.unwrap_or(0);
     let nodes_snapshot: Vec<u64> = state.nodes.keys().copied().collect();
     for id in nodes_snapshot {
-        let reachable = leader_id != 0 && state.reachable(*&id, leader_id);
+        let reachable = leader_id != 0 && state.reachable(id, leader_id);
         if let Some(n) = state.nodes.get_mut(&id) {
             if n.health == ProcessHealth::Stopped {
                 continue;
@@ -124,10 +130,7 @@ fn advance_pipeline(state: &mut InMemoryState) {
     }
 }
 
-fn count_at_or_beyond(
-    state: &InMemoryState,
-    pred: impl Fn(TransactionStatus) -> bool,
-) -> u64 {
+fn count_at_or_beyond(state: &InMemoryState, pred: impl Fn(TransactionStatus) -> bool) -> u64 {
     state
         .transactions
         .values()
@@ -146,12 +149,7 @@ fn elect_if_needed(state: &mut InMemoryState) {
         .filter(|(_, n)| n.health == ProcessHealth::Up)
         .map(|(id, _)| *id)
         .find(|id| {
-            let peers: Vec<u64> = state
-                .nodes
-                .keys()
-                .copied()
-                .filter(|p| p != id)
-                .collect();
+            let peers: Vec<u64> = state.nodes.keys().copied().filter(|p| p != id).collect();
             // Reachable to at least one peer (mock relaxation; in real Raft would be quorum).
             peers.iter().any(|p| state.reachable(*id, *p)) || peers.is_empty()
         });
@@ -228,10 +226,7 @@ enum ScenarioAction {
     },
 }
 
-fn decide_scenario_action(
-    run: &mut crate::state::RunRecord,
-    now: Instant,
-) -> ScenarioAction {
+fn decide_scenario_action(run: &mut crate::state::RunRecord, now: Instant) -> ScenarioAction {
     let step = match run.scenario.steps.get(run.step_index) {
         Some(s) => s.clone(),
         None => return ScenarioAction::None,
@@ -325,10 +320,7 @@ fn apply_scenario_action(
                     }
                     continue;
                 }
-                let parsed = match crate::state::parse_op(op.clone()) {
-                    Ok(o) => o,
-                    Err(_) => break,
-                };
+                let parsed = crate::state::parse_op(op.clone());
                 let tx_id = state.allocate_tx_id();
                 state.transactions.insert(
                     tx_id,
@@ -371,12 +363,7 @@ fn apply_scenario_action(
     }
 }
 
-fn apply_fault(
-    state: &mut InMemoryState,
-    kind: FaultKind,
-    node_id: u64,
-    peer_node_id: u64,
-) {
+fn apply_fault(state: &mut InMemoryState, kind: FaultKind, node_id: u64, peer_node_id: u64) {
     match kind {
         FaultKind::Stop => {
             if let Some(n) = state.nodes.get_mut(&node_id) {
@@ -384,7 +371,12 @@ fn apply_fault(
                 n.role = NodeRole::Follower;
                 n.voted_for = None;
             }
-            state.record_fault(kind, node_id, 0, format!("Stopped node {node_id} (scenario)"));
+            state.record_fault(
+                kind,
+                node_id,
+                0,
+                format!("Stopped node {node_id} (scenario)"),
+            );
         }
         FaultKind::Start => {
             if let Some(n) = state.nodes.get_mut(&node_id) {
@@ -393,7 +385,12 @@ fn apply_fault(
                 n.voted_for = None;
                 n.last_heartbeat_at_ms = epoch_ms_now();
             }
-            state.record_fault(kind, node_id, 0, format!("Started node {node_id} (scenario)"));
+            state.record_fault(
+                kind,
+                node_id,
+                0,
+                format!("Started node {node_id} (scenario)"),
+            );
         }
         FaultKind::Restart => {
             if let Some(n) = state.nodes.get_mut(&node_id) {
@@ -402,7 +399,12 @@ fn apply_fault(
                 n.voted_for = None;
                 n.last_heartbeat_at_ms = epoch_ms_now();
             }
-            state.record_fault(kind, node_id, 0, format!("Restarted node {node_id} (scenario)"));
+            state.record_fault(
+                kind,
+                node_id,
+                0,
+                format!("Restarted node {node_id} (scenario)"),
+            );
         }
         FaultKind::Partition => {
             if peer_node_id != 0 && peer_node_id != node_id {
@@ -436,7 +438,12 @@ fn apply_fault(
                 n.role = NodeRole::Follower;
                 n.voted_for = None;
             }
-            state.record_fault(kind, node_id, 0, format!("Killed node {node_id} (scenario)"));
+            state.record_fault(
+                kind,
+                node_id,
+                0,
+                format!("Killed node {node_id} (scenario)"),
+            );
         }
         FaultKind::Unspecified => {
             warn!("ScenarioStep emitted an Unspecified fault — ignored");
@@ -444,7 +451,9 @@ fn apply_fault(
     }
 }
 
-fn synthesize_workload_op(s: &proto::control::SubmitOpsStep) -> submit_operation_request::Operation {
+fn synthesize_workload_op(
+    s: &proto::control::SubmitOpsStep,
+) -> submit_operation_request::Operation {
     use proto::control::{Deposit, Function, Transfer};
     let lookup = |k: &str, dflt: &str| -> String {
         s.params
@@ -455,17 +464,21 @@ fn synthesize_workload_op(s: &proto::control::SubmitOpsStep) -> submit_operation
     };
     let parse_u64 = |v: &str| v.parse::<u64>().unwrap_or(0);
     match s.kind() {
-        proto::control::WorkloadKind::DepositBurst => submit_operation_request::Operation::Deposit(Deposit {
-            account: parse_u64(&lookup("account", "1")),
-            amount: parse_u64(&lookup("amount", "100")),
-            user_ref: epoch_ms_now() as u64,
-        }),
-        proto::control::WorkloadKind::TransferPair => submit_operation_request::Operation::Transfer(Transfer {
-            from: parse_u64(&lookup("from", "1")),
-            to: parse_u64(&lookup("to", "2")),
-            amount: parse_u64(&lookup("amount", "10")),
-            user_ref: epoch_ms_now() as u64,
-        }),
+        proto::control::WorkloadKind::DepositBurst => {
+            submit_operation_request::Operation::Deposit(Deposit {
+                account: parse_u64(&lookup("account", "1")),
+                amount: parse_u64(&lookup("amount", "100")),
+                user_ref: epoch_ms_now() as u64,
+            })
+        }
+        proto::control::WorkloadKind::TransferPair => {
+            submit_operation_request::Operation::Transfer(Transfer {
+                from: parse_u64(&lookup("from", "1")),
+                to: parse_u64(&lookup("to", "2")),
+                amount: parse_u64(&lookup("amount", "10")),
+                user_ref: epoch_ms_now() as u64,
+            })
+        }
         proto::control::WorkloadKind::TransferRandom => {
             let count = parse_u64(&lookup("account_count", "5")).max(2);
             let min = parse_u64(&lookup("amount_min", "1"));
@@ -510,7 +523,9 @@ fn execute_op(
     functions: &mut std::collections::BTreeMap<String, FunctionRecord>,
 ) -> u32 {
     match op {
-        SubmittedOp::Deposit { account, amount, .. } => {
+        SubmittedOp::Deposit {
+            account, amount, ..
+        } => {
             if *account >= max_accounts {
                 return 6;
             }
@@ -518,7 +533,9 @@ fn execute_op(
             *cur += *amount as i64;
             0
         }
-        SubmittedOp::Withdrawal { account, amount, .. } => {
+        SubmittedOp::Withdrawal {
+            account, amount, ..
+        } => {
             if *account >= max_accounts {
                 return 6;
             }

@@ -9,12 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proto::control::{
-    submit_operation_request, ClusterConfig, Deposit, ElectionEvent, ElectionReason, FaultEvent,
-    FaultKind, Function, NodeHealth as PbNodeHealth, NodeRole, Scenario,
-    ScenarioState as PbScenarioState, TransactionStatus as PbTransactionStatus, Transfer,
-    Withdrawal,
+    ClusterConfig, Deposit, ElectionEvent, ElectionReason, FaultEvent, FaultKind, Function,
+    NodeHealth as PbNodeHealth, NodeRole, Scenario, ScenarioState as PbScenarioState,
+    TransactionStatus as PbTransactionStatus, Transfer, Withdrawal, submit_operation_request,
 };
-use tonic::Status;
 
 /// Process-level health. Network state (Partitioned/Isolated) is derived at
 /// snapshot time from the partition matrix and the node's reachable peers.
@@ -307,8 +305,8 @@ pub fn epoch_ms_now() -> i64 {
 /// Convert a proto `submit_operation_request::Operation` into the internal
 /// `SubmittedOp`. Used by both the service (for direct submissions) and the
 /// background scenario runner.
-pub fn parse_op(o: submit_operation_request::Operation) -> Result<SubmittedOp, Status> {
-    Ok(match o {
+pub fn parse_op(o: submit_operation_request::Operation) -> SubmittedOp {
+    match o {
         submit_operation_request::Operation::Deposit(Deposit {
             account,
             amount,
@@ -353,5 +351,5 @@ pub fn parse_op(o: submit_operation_request::Operation) -> Result<SubmittedOp, S
                 user_ref,
             }
         }
-    })
+    }
 }

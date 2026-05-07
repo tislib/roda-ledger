@@ -25,8 +25,8 @@ use proto::control::{
 use tonic::{Request, Response, Status};
 
 use crate::state::{
-    canonical_pair, epoch_ms_now, parse_op, InMemoryState, NodeRecord, ProcessHealth, SubmittedOp,
-    TxRecord,
+    InMemoryState, NodeRecord, ProcessHealth, SubmittedOp, TxRecord, canonical_pair, epoch_ms_now,
+    parse_op,
 };
 
 #[derive(Clone)]
@@ -51,10 +51,7 @@ impl Control for ControlService {
             api_version: 1,
             // The mock supports both abrupt KillNode and pairwise partitions,
             // so it advertises both capabilities.
-            capabilities: vec![
-                Capability::Kill as i32,
-                Capability::NetworkPartition as i32,
-            ],
+            capabilities: vec![Capability::Kill as i32, Capability::NetworkPartition as i32],
         }))
     }
 
@@ -131,14 +128,9 @@ impl Control for ControlService {
         &self,
         req: Request<GetRecentElectionsRequest>,
     ) -> Result<Response<GetRecentElectionsResponse>, Status> {
-        let limit = req.into_inner().limit.max(1).min(256) as usize;
+        let limit = req.into_inner().limit.clamp(1, 256) as usize;
         let state = self.state.read();
-        let events: Vec<ElectionEvent> = state
-            .elections
-            .iter()
-            .take(limit)
-            .cloned()
-            .collect();
+        let events: Vec<ElectionEvent> = state.elections.iter().take(limit).cloned().collect();
         Ok(Response::new(GetRecentElectionsResponse { events }))
     }
 
@@ -151,11 +143,7 @@ impl Control for ControlService {
         if !state.nodes.contains_key(&r.node_id) {
             return Err(Status::not_found(format!("unknown node {}", r.node_id)));
         }
-        let limit = if r.limit == 0 {
-            100
-        } else {
-            r.limit.min(1000)
-        } as usize;
+        let limit = if r.limit == 0 { 100 } else { r.limit.min(1000) } as usize;
         let from_index = r.from_index;
 
         // Synthetic log: every committed transaction is one entry, indexed by tx_id.
@@ -170,10 +158,13 @@ impl Control for ControlService {
         let oldest_retained_index = state
             .transactions
             .values()
-            .filter(|t| matches!(
-                TransactionStatus::try_from(t.status as i32).unwrap_or(TransactionStatus::Pending),
-                TransactionStatus::Committed | TransactionStatus::OnSnapshot
-            ))
+            .filter(|t| {
+                matches!(
+                    TransactionStatus::try_from(t.status as i32)
+                        .unwrap_or(TransactionStatus::Pending),
+                    TransactionStatus::Committed | TransactionStatus::OnSnapshot
+                )
+            })
             .map(|t| t.tx_id)
             .min()
             .unwrap_or(0);
@@ -221,7 +212,7 @@ impl Control for ControlService {
             })
             .collect();
         Ok(Response::new(GetClusterConfigResponse {
-            config: Some(state.cluster_config.clone()),
+            config: Some(state.cluster_config),
             membership: Some(ClusterMembership {
                 nodes,
                 target_count: state.target_node_count,
@@ -539,17 +530,14 @@ impl Control for ControlService {
         req: Request<SubmitOperationRequest>,
     ) -> Result<Response<SubmitOperationResponse>, Status> {
         let mut state = self.state.write();
-        let term = state
-            .current_leader()
-            .map(|n| n.current_term)
-            .unwrap_or(0);
+        let term = state.current_leader().map(|n| n.current_term).unwrap_or(0);
         if state.cluster_health_unhealthy() {
             return Err(Status::failed_precondition(
                 "cluster is unhealthy: no current leader",
             ));
         }
         let op = match req.into_inner().operation {
-            Some(o) => parse_op(o)?,
+            Some(o) => parse_op(o),
             None => return Err(Status::invalid_argument("operation field is required")),
         };
         let tx_id = state.allocate_tx_id();
@@ -578,10 +566,7 @@ impl Control for ControlService {
         req: Request<SubmitBatchRequest>,
     ) -> Result<Response<SubmitBatchResponse>, Status> {
         let mut state = self.state.write();
-        let term = state
-            .current_leader()
-            .map(|n| n.current_term)
-            .unwrap_or(0);
+        let term = state.current_leader().map(|n| n.current_term).unwrap_or(0);
         if state.cluster_health_unhealthy() {
             return Err(Status::failed_precondition(
                 "cluster is unhealthy: no current leader",
@@ -591,7 +576,7 @@ impl Control for ControlService {
         let mut results = Vec::with_capacity(ops_in.len());
         for sor in ops_in {
             let op = match sor.operation {
-                Some(o) => parse_op(o)?,
+                Some(o) => parse_op(o),
                 None => return Err(Status::invalid_argument("operation field is required")),
             };
             let tx_id = state.allocate_tx_id();
@@ -630,10 +615,13 @@ impl Control for ControlService {
         let last_snapshot_tx_id = state
             .transactions
             .values()
-            .filter(|t| matches!(
-                TransactionStatus::try_from(t.status as i32).unwrap_or(TransactionStatus::Pending),
-                TransactionStatus::OnSnapshot
-            ))
+            .filter(|t| {
+                matches!(
+                    TransactionStatus::try_from(t.status as i32)
+                        .unwrap_or(TransactionStatus::Pending),
+                    TransactionStatus::OnSnapshot
+                )
+            })
             .map(|t| t.tx_id)
             .max()
             .unwrap_or(0);
@@ -785,10 +773,12 @@ impl Control for ControlService {
                 accepted: false,
                 error: format!("unknown run_id {run_id}"),
             })),
-            Some(r) if r.state != ScenarioState::Running => Ok(Response::new(CancelScenarioResponse {
-                accepted: false,
-                error: format!("scenario is {:?}", r.state),
-            })),
+            Some(r) if r.state != ScenarioState::Running => {
+                Ok(Response::new(CancelScenarioResponse {
+                    accepted: false,
+                    error: format!("scenario is {:?}", r.state),
+                }))
+            }
             Some(r) => {
                 r.cancel_requested = true;
                 Ok(Response::new(CancelScenarioResponse {
@@ -807,7 +797,7 @@ impl Control for ControlService {
         let limit = if limit == 0 { 32 } else { limit.min(256) } as usize;
         let state = self.state.read();
         let mut runs: Vec<_> = state.scenario_runs.values().collect();
-        runs.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
+        runs.sort_by_key(|r| std::cmp::Reverse(r.started_at_ms));
         let runs = runs
             .into_iter()
             .take(limit)
@@ -845,13 +835,17 @@ fn summarize_op(op: &SubmittedOp) -> String {
 
 fn synthesize_entries(op: &SubmittedOp) -> Vec<TxEntryRecord> {
     match op {
-        SubmittedOp::Deposit { account, amount, .. } => vec![TxEntryRecord {
+        SubmittedOp::Deposit {
+            account, amount, ..
+        } => vec![TxEntryRecord {
             account_id: *account,
             amount: *amount,
             kind: EntryKind::Credit as i32,
             computed_balance: *amount as i64,
         }],
-        SubmittedOp::Withdrawal { account, amount, .. } => vec![TxEntryRecord {
+        SubmittedOp::Withdrawal {
+            account, amount, ..
+        } => vec![TxEntryRecord {
             account_id: *account,
             amount: *amount,
             kind: EntryKind::Debit as i32,
