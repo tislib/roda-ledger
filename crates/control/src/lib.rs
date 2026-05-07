@@ -12,6 +12,7 @@
 //! against a real server while the production control plane is built out.
 
 pub mod background;
+pub mod provisioner;
 pub mod runner;
 pub mod server;
 pub mod service;

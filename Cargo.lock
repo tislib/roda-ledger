@@ -464,6 +464,8 @@ dependencies = [
  "prost",
  "prost-types",
  "proto",
+ "rand 0.8.5",
+ "spdlog-rs",
  "testing",
  "thiserror 1.0.69",
  "tokio",

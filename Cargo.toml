@@ -53,7 +53,7 @@ rand = "0.8"
 bytes = "1.7"
 
 # --- CLI parsing (for the binary) ---
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # --- test / bench ---
 tempfile = "3"

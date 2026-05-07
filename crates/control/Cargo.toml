@@ -30,6 +30,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 parking_lot.workspace = true
+rand.workspace = true
+spdlog-rs.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

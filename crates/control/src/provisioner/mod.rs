@@ -38,6 +38,8 @@ use async_trait::async_trait;
 
 use proto::control::ClusterConfig;
 
+pub mod process;
+
 /// What a provisioner can do beyond the always-on lifecycle / graceful
 /// shutdown / network-up baseline. Implementations declare these up
 /// front so the runner can refuse a scenario before provisioning when

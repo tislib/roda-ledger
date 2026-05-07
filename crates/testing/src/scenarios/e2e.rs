@@ -18,12 +18,13 @@ pub fn all() -> Vec<Scenario> {
     ]
 }
 
-/// Submit a single deposit, wait until it is committed cluster-wide,
-/// and assert the ledger reflects it.
+/// Submit a single deposit, wait until it lands on snapshot, and
+/// assert the ledger reflects it. Snapshot is the queryable level —
+/// `get_balance` returns the new value only after a tx reaches it.
 fn single_deposit_committed() -> Scenario {
     Scenario::new("single_deposit_committed")
         .with_description(
-            "One deposit submitted to the leader, waited to commit, balance asserted.",
+            "One deposit submitted to the leader, waited to snapshot, balance asserted.",
         )
         .with_steps(vec![
             Step::new(Action::Submit(Submit {
@@ -32,7 +33,7 @@ fn single_deposit_committed() -> Scenario {
                     amount: 100,
                     user_ref: 1,
                 },
-                wait: WaitLevel::Committed,
+                wait: WaitLevel::OnSnapshot,
                 retry: None,
             }))
             .with_label("deposit 100 into account 1"),
@@ -57,7 +58,7 @@ fn transfer_chain() -> Scenario {
                     amount: 1000,
                     user_ref: 1,
                 },
-                wait: WaitLevel::Committed,
+                wait: WaitLevel::OnSnapshot,
                 retry: None,
             })),
             Step::new(Action::Submit(Submit {
@@ -67,7 +68,7 @@ fn transfer_chain() -> Scenario {
                     amount: 250,
                     user_ref: 2,
                 },
-                wait: WaitLevel::Committed,
+                wait: WaitLevel::OnSnapshot,
                 retry: None,
             })),
             Step::new(Action::AssertBalance(AssertBalance {
@@ -97,7 +98,7 @@ fn kill_then_restart_recovers() -> Scenario {
                     amount: 50,
                     user_ref: 1,
                 },
-                wait: WaitLevel::Committed,
+                wait: WaitLevel::OnSnapshot,
                 retry: None,
             })),
             Step::new(Action::KillNode(KillNode {

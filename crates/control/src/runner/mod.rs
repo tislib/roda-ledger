@@ -13,8 +13,6 @@
 //! tx_id` bindings so later `TxRef::UserRef` references resolve, and
 //! awaits async-branch tasks at end-of-scenario.
 
-pub mod provisioner;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +28,7 @@ use testing::scenario::{
     SubmitBatch, SubmitOp, TxRef, TxStatus, WaitForLevel, WaitLevel,
 };
 
-pub use provisioner::{Capabilities, ProvisionConfig, Provisioner, ProvisionerError};
+pub use crate::provisioner::{Capabilities, ProvisionConfig, Provisioner, ProvisionerError};
 
 /// Per-`run` state. Each top-level `run()` and each spawned branch
 /// gets its own — bindings are scoped to the task that produced them.
