@@ -9,3 +9,9 @@ pub mod node {
     pub const FILE_DESCRIPTOR_SET: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/node_descriptor.bin"));
 }
+
+pub mod control {
+    tonic::include_proto!("roda.control.v1");
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/control_descriptor.bin"));
+}

@@ -24,3 +24,5 @@ data/
 docs/book/
 .DS_Store
 .claude
+
+# UI artifacts are ignored by ui/.gitignore

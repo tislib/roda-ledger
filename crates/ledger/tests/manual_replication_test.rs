@@ -4,7 +4,6 @@
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
 use ledger::transaction::{Operation, WaitLevel};
 use ledger::wait_strategy::WaitStrategy;
-use ledger::wal_tail::decode_records;
 use spdlog::Level;
 use std::sync::{
     Arc, Mutex,
@@ -12,6 +11,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use storage::decode_records;
 use storage::entities::SYSTEM_ACCOUNT_ID;
 
 const BATCHES: u64 = 20;

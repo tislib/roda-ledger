@@ -8,6 +8,7 @@ members = [
     "crates/client",
     "crates/cluster",
     "crates/cluster-test-utils",
+    "crates/control",
     "crates/ctl",
     "crates/testing",
 ]
@@ -68,6 +69,7 @@ raft = { path = "crates/raft" }
 client = { path = "crates/client" }
 cluster = { path = "crates/cluster" }
 cluster-test-utils = { path = "crates/cluster-test-utils" }
+control = { path = "crates/control" }
 ctl = { path = "crates/ctl" }
 testing = { path = "crates/testing" }
 

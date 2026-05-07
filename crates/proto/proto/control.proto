@@ -1,0 +1,846 @@
+syntax = "proto3";
+
+package roda.control.v1;
+
+// Control is the operational/management surface for a roda-ledger
+// cluster. The operational UI talks to this service to monitor cluster
+// health, paginate Raft logs, reconfigure membership and cluster-wide
+// ledger settings, inject faults for demos and tests, run load
+// scenarios, and submit/query ledger operations.
+//
+// The Control service mirrors a subset of `roda.ledger.v1` for client
+// convenience and adds per-node targeting on the read paths
+// (GetBalance, GetTransaction, GetPipelineIndex). Submits and batches
+// have no per-node target — writes go to the leader. Node-to-node
+// replication lives in `roda.node.v1`.
+//
+// All RPCs are unary. Timestamps are int64 milliseconds since the Unix
+// epoch. Node IDs and account IDs are uint64. All RPCs are idempotent
+// where the underlying state allows; the exceptions are SetNodeCount
+// and UpdateClusterConfig, which mutate persistent cluster state and
+// may complete asynchronously.
+service Control {
+
+  // GetServerInfo identifies the server and its capabilities. UI clients
+  // call this immediately after pointing at a new control plane URL to
+  // confirm the URL hosts a roda-ledger control plane and to negotiate
+  // a compatible API version.
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
+  // ---- Cluster monitoring ----
+
+  // GetClusterSnapshot returns the full per-node state plus cluster-level
+  // health and leadership. Primary feed for the Dashboard view; safe to
+  // poll at sub-second cadence.
+  rpc GetClusterSnapshot(GetClusterSnapshotRequest) returns (GetClusterSnapshotResponse);
+
+  // GetRecentElections returns recent role transitions and elections,
+  // newest first. Drives the Dashboard election timeline.
+  rpc GetRecentElections(GetRecentElectionsRequest) returns (GetRecentElectionsResponse);
+
+  // ---- Logs ----
+
+  // GetNodeLog returns a paginated window over a single node's Raft log.
+  // All entries returned are committed; uncommitted entries are not
+  // exposed by the ledger.
+  rpc GetNodeLog(GetNodeLogRequest) returns (GetNodeLogResponse); // check more
+
+  // ---- Ledger operations ----
+
+  // SubmitOperation submits a single financial operation to the cluster.
+  // Mirrors `roda.ledger.v1.Ledger.SubmitOperation`. Returns immediately
+  // with a transaction_id once the operation is sequenced. Use
+  // GetTransaction or GetPipelineIndex to poll for finality.
+  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
+
+  // SubmitBatch submits multiple operations in a single round trip.
+  // Mirrors `roda.ledger.v1.Ledger.SubmitBatch`. Operations are sequenced
+  // and executed in the order provided; each operation is independent
+  // and atomic on its own. There is no batch-level atomicity.
+  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
+
+  // GetBalance returns the current balance for a single account, observed
+  // from the addressed node. The per-node target lets the UI inspect
+  // followers (e.g. "did the partitioned follower see this credit?").
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+
+  // GetTransaction retrieves the full details of a transaction as known
+  // to the addressed node. Useful for debugging replication lag — the
+  // same tx_id may resolve on the leader but be missing on a partitioned
+  // follower.
+  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+
+  // GetTransactionStatus reports the current pipeline stage of a single
+  // transaction. Mirrors the per-tx polling the UI's result panel does
+  // while watching an op walk Pending → Computed → Committed → OnSnapshot.
+  rpc GetTransactionStatus(GetTransactionStatusRequest) returns (GetTransactionStatusResponse);
+
+  // GetPipelineIndex returns the staged pipeline progress observed by
+  // a specific node. Drives the per-node pipeline indices on the
+  // Cluster Dashboard.
+  rpc GetPipelineIndex(GetPipelineIndexRequest) returns (GetPipelineIndexResponse);
+
+  // ---- Provisioning ----
+
+  // GetClusterConfig returns the current cluster-wide ledger configuration
+  // and the read-only node membership list (system-assigned ids/addresses).
+  rpc GetClusterConfig(GetClusterConfigRequest) returns (GetClusterConfigResponse);
+
+  // UpdateClusterConfig changes cluster-wide ledger configuration. All
+  // nodes share these settings. The cluster may be transiently unhealthy
+  // while the change is applied. Returns once the change has been accepted;
+  // clients should re-poll GetClusterSnapshot to observe the cluster
+  // reaching steady state.
+  rpc UpdateClusterConfig(UpdateClusterConfigRequest) returns (UpdateClusterConfigResponse);
+
+  // SetNodeCount changes the desired number of nodes in the cluster.
+  // Increasing the count provisions new nodes (system-assigned id and
+  // address); decreasing it removes nodes. Operator does not pick which
+  // nodes to remove or which addresses to assign — the cluster does.
+  // Returns immediately; the membership change applies asynchronously
+  // through the cluster's normal reconfiguration flow.
+  rpc SetNodeCount(SetNodeCountRequest) returns (SetNodeCountResponse);
+
+  // ---- Fault injection ----
+
+  // StopNode shuts down the addressed node gracefully (SIGTERM-equivalent
+  // fault). The cluster reacts via re-election or quorum loss as
+  // appropriate.
+  rpc StopNode(StopNodeRequest) returns (StopNodeResponse);
+
+  // KillNode terminates the addressed node abruptly (SIGKILL-equivalent
+  // fault). Unlike StopNode, graceful shutdown is skipped — in-flight
+  // work is dropped and any uncommitted state is lost. Advertised by
+  // CAPABILITY_KILL; servers without that capability return UNIMPLEMENTED.
+  rpc KillNode(KillNodeRequest) returns (KillNodeResponse);
+
+  // StartNode brings a stopped node back online. It rejoins and catches
+  // up through the normal replication path.
+  rpc StartNode(StartNodeRequest) returns (StartNodeResponse);
+
+  // RestartNode is the convenience equivalent of StopNode + StartNode
+  // executed atomically at the cluster level.
+  rpc RestartNode(RestartNodeRequest) returns (RestartNodeResponse);
+
+  // PartitionPair drops the network link between two specific nodes in
+  // both directions. Idempotent — partitioning the same pair twice is a
+  // no-op.
+  rpc PartitionPair(PartitionPairRequest) returns (PartitionPairResponse);
+
+  // HealPartition restores a previously-partitioned pair. Idempotent.
+  rpc HealPartition(HealPartitionRequest) returns (HealPartitionResponse);
+
+  // GetFaultHistory returns a chronological log of fault-injection
+  // actions taken against the cluster, newest first. Drives the Fault
+  // Injection page's history panel.
+  rpc GetFaultHistory(GetFaultHistoryRequest) returns (GetFaultHistoryResponse);
+
+  // ---- Load / Simulations ----
+
+  // RunScenario submits a scenario for the cluster to execute. Returns
+  // a run_id immediately; the scenario runs asynchronously. Poll
+  // GetScenarioStatus for progress and final results.
+  rpc RunScenario(RunScenarioRequest) returns (RunScenarioResponse);
+
+  // GetScenarioStatus returns the current state, progress, and
+  // accumulated metrics for a scenario run. Safe to poll at sub-second
+  // cadence while the scenario is RUNNING.
+  rpc GetScenarioStatus(GetScenarioStatusRequest) returns (GetScenarioStatusResponse);
+
+  // CancelScenario stops a running scenario. Already-submitted operations
+  // continue to drain through the pipeline; no new operations are issued
+  // and no further fault steps execute.
+  rpc CancelScenario(CancelScenarioRequest) returns (CancelScenarioResponse);
+
+  // ListScenarioRuns returns recent scenario runs with summary metrics.
+  // Used by the run history panel.
+  rpc ListScenarioRuns(ListScenarioRunsRequest) returns (ListScenarioRunsResponse);
+}
+
+// ============================================================
+// Server info
+// ============================================================
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  // Human-readable build identifier (semver, git short SHA, or build tag).
+  string version = 1;
+
+  // Highest API version this server speaks. Bump when wire-incompatible
+  // changes are introduced. Clients reject if their minimum is greater.
+  uint32 api_version = 2;
+
+  // Capability flags advertised by this server. Lets the UI hide controls
+  // that the connected backend does not implement.
+  repeated Capability capabilities = 3;
+}
+
+// Capability advertises an optional surface area the server supports.
+// Clients use these to hide UI affordances backed by RPCs the server
+// does not implement (e.g. environments without process control or
+// network manipulation).
+enum Capability {
+  CAPABILITY_UNSPECIFIED       = 0;
+  // Server supports KillNode (abrupt termination) in addition to
+  // graceful StopNode.
+  CAPABILITY_KILL              = 1;
+  // Server supports PartitionPair / HealPartition.
+  CAPABILITY_NETWORK_PARTITION = 2;
+}
+
+// ============================================================
+// Cluster snapshot
+// ============================================================
+
+message GetClusterSnapshotRequest {}
+
+message GetClusterSnapshotResponse {
+  // Time the snapshot was taken on the server, ms since Unix epoch.
+  int64 taken_at_ms = 1;
+
+  // Cluster-level health. UNHEALTHY whenever there is no stable leader.
+  ClusterHealth cluster_health = 2;
+
+  // Current leader node id. 0 if there is no leader (e.g. mid-election
+  // or quorum loss).
+  uint64 leader_node_id = 3;
+
+  // Current cluster term. Monotonically non-decreasing across snapshots
+  // unless the cluster has been reset.
+  uint64 current_term = 4;
+
+  // Per-node state. Always returned in ascending node_id order.
+  repeated NodeStatus nodes = 5;
+
+  // Currently-active partitions (canonical pairs, lower id first).
+  repeated PartitionPair partitions = 6;
+}
+
+enum ClusterHealth {
+  CLUSTER_HEALTH_UNSPECIFIED = 0;
+  CLUSTER_HEALTH_HEALTHY     = 1;  // stable leader; quorum reachable
+  CLUSTER_HEALTH_UNHEALTHY   = 2;  // no leader, mid-election, or quorum lost
+}
+
+message NodeStatus {
+  // Stable, system-assigned identity.
+  uint64 node_id = 1;
+  string address = 2;
+
+  // Current Raft role.
+  NodeRole role = 3;
+
+  // Current term as observed by this node.
+  uint64 current_term = 4;
+
+  // Node voted for, in current term. 0 if not voted.
+  uint64 voted_for = 5;
+
+  // Operational health, distinct from Raft role:
+  //   UP          — running and reachable
+  //   STOPPED     — process is down (operator-stopped or crashed)
+  //   PARTITIONED — running, but has lost reachability to one or more peers
+  //                 (see partitioned_peers)
+  //   ISOLATED    — running, but has lost reachability to ALL peers
+  NodeHealth health = 6;
+
+  // Peers this node has lost reachability to. Populated when health is
+  // PARTITIONED or ISOLATED. Empty otherwise.
+  repeated uint64 partitioned_peers = 7;
+
+  // Last successful heartbeat received as follower (or sent as leader),
+  // ms since Unix epoch. 0 if none yet.
+  int64 last_heartbeat_at_ms = 8;
+
+  // Pipeline indices observed by this node. See `roda.ledger.v1
+  // .GetPipelineIndexResponse` for the meaning of each index.
+  uint64 compute_index        = 9;
+  uint64 commit_index         = 10;
+  uint64 snapshot_index       = 11;
+  uint64 cluster_commit_index = 12;
+
+  // Replication lag relative to the current leader.
+  // For followers: how far behind the leader's cluster_commit_index this
+  //                node's commit_index is, in entries.
+  // For the leader and standalone nodes: 0.
+  uint64 lag_entries = 13;
+
+  // Replication lag in ms — wall-clock time since the leader's last
+  // successful interaction with this follower. 0 for the leader.
+  int64 lag_ms = 14;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED  = 0;
+  NODE_ROLE_INITIALIZING = 1;
+  NODE_ROLE_FOLLOWER     = 2;
+  NODE_ROLE_CANDIDATE    = 3;
+  NODE_ROLE_LEADER       = 4;
+}
+
+enum NodeHealth {
+  NODE_HEALTH_UNSPECIFIED = 0;
+  NODE_HEALTH_UP          = 1;
+  NODE_HEALTH_STOPPED     = 2;
+  NODE_HEALTH_PARTITIONED = 3;
+  NODE_HEALTH_ISOLATED    = 4;
+}
+
+// PartitionPair is canonicalized: node_a < node_b.
+message PartitionPair {
+  uint64 node_a = 1;
+  uint64 node_b = 2;
+}
+
+// ============================================================
+// Recent elections / role transitions
+// ============================================================
+
+message GetRecentElectionsRequest {
+  // Maximum events to return. 0 = server default (typically 16). Capped at 256.
+  uint32 limit = 1;
+}
+
+message GetRecentElectionsResponse {
+  // Newest first.
+  repeated ElectionEvent events = 1;
+}
+
+message ElectionEvent {
+  int64  at_ms          = 1;
+  uint64 term           = 2;
+  // 0 = no winner yet (split vote or ongoing election).
+  uint64 winner_node_id = 3;
+  ElectionReason reason = 4;
+}
+
+enum ElectionReason {
+  ELECTION_REASON_UNSPECIFIED  = 0;
+  ELECTION_REASON_TIMEOUT      = 1;  // follower election deadline expired
+  ELECTION_REASON_LEADER_CRASH = 2;  // leader observed down
+  ELECTION_REASON_SPLIT_VOTE   = 3;  // re-election after a split-vote round
+  ELECTION_REASON_BOOTSTRAP    = 4;  // first leader elected at cluster start
+}
+
+// ============================================================
+// Node log pagination
+// ============================================================
+
+message GetNodeLogRequest {
+  uint64 node_id = 1;
+
+  // Inclusive starting log index. 0 = start at the lowest index the node
+  // still retains.
+  uint64 from_index = 2;
+
+  // Maximum entries to return. 0 = server default (typically 100).
+  // Hard-capped at 1000.
+  uint32 limit = 3;
+}
+
+message GetNodeLogResponse {
+  // Entries in ascending index order.
+  repeated LogEntry entries = 1;
+
+  // The total number of committed entries currently in this node's log,
+  // for "X of Y" pagination labels.
+  uint64 total_count = 2;
+
+  // The next from_index a client should pass to fetch the page after this
+  // one. 0 if no more entries exist past this page.
+  uint64 next_from_index = 3;
+
+  // The lowest index the node currently retains. Lower indices have been
+  // compacted into snapshots and are no longer addressable.
+  uint64 oldest_retained_index = 4;
+}
+
+message LogEntry {
+  uint64       index   = 1;
+  uint64       term    = 2;
+  LogEntryKind kind    = 3;
+  // Human-readable one-liner describing the entry.
+  string       summary = 4;
+}
+
+enum LogEntryKind {
+  LOG_ENTRY_KIND_UNSPECIFIED          = 0;
+  LOG_ENTRY_KIND_TX_METADATA          = 1;
+  LOG_ENTRY_KIND_TX_ENTRY             = 2;
+  LOG_ENTRY_KIND_TX_TERM              = 3;
+  LOG_ENTRY_KIND_SEGMENT_HEADER       = 4;
+  LOG_ENTRY_KIND_SEGMENT_SEALED       = 5;
+  LOG_ENTRY_KIND_LINK                 = 6;
+  LOG_ENTRY_KIND_FUNCTION_REGISTERED  = 7;
+  LOG_ENTRY_KIND_FUNCTION_UNREGISTERED = 8;
+}
+
+// ============================================================
+// Ledger operations
+// ============================================================
+//
+// These messages mirror `roda.ledger.v1` for client convenience. The
+// shapes are deliberately wire-compatible field-for-field so the same
+// data-plane semantics apply. Composite operations (proto field 4 in
+// the ledger service) were removed in favour of WASM Function ops and
+// are not surfaced here.
+
+// SubmitOperationRequest wraps one of the supported operation types.
+// Exactly one operation field must be set. Setting zero or more than
+// one is an error.
+message SubmitOperationRequest {
+  oneof operation {
+    Deposit    deposit    = 1;
+    Withdrawal withdrawal = 2;
+    Transfer   transfer   = 3;
+    // 4 reserved (previously Composite; removed in favour of WASM
+    // Function operations).
+    Function   function   = 5;
+  }
+  reserved 4;
+}
+
+message SubmitOperationResponse {
+  // Monotonically increasing, globally ordered transaction ID.
+  uint64 transaction_id = 1;
+  // Current leader term at the moment of the reply.
+  uint64 term           = 2;
+}
+
+message SubmitBatchRequest {
+  // Operations to submit, in order. Each is independent and atomic on
+  // its own — failure of one does not affect others.
+  repeated SubmitOperationRequest operations = 1;
+}
+
+message SubmitBatchResponse {
+  // One result per input operation, same order.
+  repeated SubmitOperationResponse results = 1;
+  // Current leader term at the moment of the reply.
+  uint64 term = 2;
+}
+
+// Deposit credits an account from the system source. The system source
+// (SYSTEM_SOURCE) absorbs the corresponding debit to maintain the
+// zero-sum invariant. Deposits never fail due to insufficient funds.
+message Deposit {
+  uint64 account  = 1;
+  uint64 amount   = 2;
+  uint64 user_ref = 3;
+}
+
+// Withdrawal debits an account to the system sink. The system sink
+// (SYSTEM_SINK) absorbs the corresponding credit to maintain the
+// zero-sum invariant. Fails with INSUFFICIENT_FUNDS if balance < amount.
+message Withdrawal {
+  uint64 account  = 1;
+  uint64 amount   = 2;
+  uint64 user_ref = 3;
+}
+
+// Transfer moves funds between two accounts atomically. No value enters
+// or leaves the system. Fails with INSUFFICIENT_FUNDS if from < amount.
+message Transfer {
+  uint64 from     = 1;
+  uint64 to       = 2;
+  uint64 amount   = 3;
+  uint64 user_ref = 4;
+}
+
+// Function invokes a registered WASM function. The function ABI is
+// fixed-arity: exactly 8 i64 positional parameters. Short lists are
+// zero-padded; entries beyond the first 8 are dropped.
+message Function {
+  string         name     = 1;
+  repeated int64 params   = 2;
+  uint64         user_ref = 3;
+}
+
+// ---- GetBalance ----
+
+message GetBalanceRequest {
+  // Account to query. Returns 0 if never touched.
+  uint64 account_id = 1;
+  // Node to query. The same account observed from different nodes may
+  // disagree if those nodes are at different replication watermarks.
+  uint64 node_id    = 2;
+}
+
+message GetBalanceResponse {
+  // Current balance in minor units, observed by the addressed node.
+  // Reflects only transactions the node has applied through ON_SNAPSHOT.
+  int64  balance             = 1;
+  // All transactions up to and including this ID are reflected in the
+  // returned balance. The actual last snapshot ID may be slightly higher.
+  uint64 last_snapshot_tx_id = 2;
+}
+
+// ---- GetTransaction ----
+
+message GetTransactionRequest {
+  uint64 tx_id   = 1;
+  // Node to query. Lets clients confirm replication state per node
+  // (e.g. is the entry on a partitioned follower yet?).
+  uint64 node_id = 2;
+}
+
+message GetTransactionResponse {
+  uint64                 tx_id   = 1;
+  repeated TxEntryRecord entries = 2;
+  repeated TxLinkRecord  links   = 3;
+}
+
+message TxEntryRecord {
+  uint64    account_id       = 1;
+  uint64    amount           = 2;
+  EntryKind kind             = 3;
+  int64     computed_balance = 4;
+}
+
+enum EntryKind {
+  ENTRY_KIND_CREDIT = 0;
+  ENTRY_KIND_DEBIT  = 1;
+}
+
+message TxLinkRecord {
+  uint64   to_tx_id = 1;
+  LinkKind kind     = 2;
+}
+
+enum LinkKind {
+  LINK_KIND_DUPLICATE = 0;
+  LINK_KIND_REVERSAL  = 1;
+}
+
+// ---- GetTransactionStatus ----
+
+// TransactionStatus mirrors `roda.ledger.v1.TransactionStatus`. Stages are
+// strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
+// ERROR is a terminal state reachable only from PENDING. TX_NOT_FOUND
+// signals the transaction was never sequenced (or has been compacted).
+enum TransactionStatus {
+  TRANSACTION_STATUS_PENDING       = 0;
+  TRANSACTION_STATUS_COMPUTED      = 1;
+  TRANSACTION_STATUS_COMMITTED     = 2;
+  TRANSACTION_STATUS_ON_SNAPSHOT   = 3;
+  TRANSACTION_STATUS_ERROR         = 4;
+  TRANSACTION_STATUS_NOT_FOUND     = 5;
+}
+
+message GetTransactionStatusRequest {
+  uint64 tx_id = 1;
+}
+
+message GetTransactionStatusResponse {
+  TransactionStatus status      = 1;
+  // 0 if status != ERROR. See FailReason codes in roda.ledger.v1.
+  uint32            fail_reason = 2;
+  reserved 3, 4, 5, 6;
+}
+
+// ---- GetPipelineIndex (per-node) ----
+
+message GetPipelineIndexRequest {
+  // Node whose pipeline indices should be reported. Distinct from the
+  // ledger.v1 version, which always reports the responding server's own
+  // indices — here the caller chooses which node's view to read.
+  uint64 node_id = 1;
+}
+
+message GetPipelineIndexResponse {
+  // Highest transaction_id processed by the Transactor on this node.
+  uint64 compute_index        = 1;
+  // Highest transaction_id flushed to WAL on this node.
+  uint64 commit_index          = 2;
+  // Highest transaction_id applied to the balance cache on this node.
+  uint64 snapshot_index       = 3;
+  // Current term as observed by this node.
+  uint64 term                 = 4;
+  // Highest transaction_id known quorum-committed. On followers this is
+  // the most recent watermark advertised by the leader, clamped to the
+  // follower's commit_index.
+  uint64 cluster_commit_index = 5;
+  // True iff this node is currently the cluster leader.
+  bool   is_leader            = 6;
+}
+
+// ============================================================
+// Provisioning — cluster config and membership
+// ============================================================
+
+message GetClusterConfigRequest {}
+
+message GetClusterConfigResponse {
+  ClusterConfig    config     = 1;
+  ClusterMembership membership = 2;
+}
+
+message UpdateClusterConfigRequest {
+  // Operator-edited config. Server validates each field and rejects the
+  // request atomically if any are out of range.
+  ClusterConfig config = 1;
+}
+
+message UpdateClusterConfigResponse {
+  // True if the config was accepted and is being applied. False if the
+  // change was rejected; `error` carries the reason.
+  bool   accepted = 1;
+  string error    = 2;
+}
+
+message SetNodeCountRequest {
+  // Desired number of nodes in the cluster. Must be >= 1. Values < 3
+  // are accepted but produce a server-side warning recorded in the
+  // fault history; consensus may not work as expected at that size.
+  uint32 target_count = 1;
+}
+
+message SetNodeCountResponse {
+  bool   accepted     = 1;
+  string error        = 2;
+  // Resulting target count after this call. Actual membership converges
+  // asynchronously; clients should poll GetClusterConfig to observe.
+  uint32 target_count = 3;
+  uint32 current_count = 4;
+}
+
+// ClusterConfig is the cluster-wide ledger and replication configuration
+// shared by every node. Per-node settings (data directory, listen
+// address, election timer) are set at deploy time and are not exposed
+// here.
+message ClusterConfig {
+  // ---- Ledger ----
+
+  // Upper bound on the number of distinct accounts the ledger will
+  // accept. Must be > 0.
+  uint64 max_accounts = 1;
+
+  // Sequencer input queue capacity (operations awaiting compute).
+  uint64 queue_size = 2;
+
+  // ---- Storage ----
+
+  // Transactions per WAL segment before rotation. Also sets the
+  // duplicate-detection window (entries are deduplicated within
+  // 2 × this value).
+  uint64 transaction_count_per_segment = 3;
+
+  // Write a snapshot every N sealed segments. 0 disables snapshotting.
+  uint32 snapshot_frequency = 4;
+
+  // ---- Replication ----
+
+  // Idle replication poll cadence in ms (heartbeat-equivalent when no
+  // new WAL bytes are pending).
+  uint64 replication_poll_ms = 5;
+
+  // Maximum WAL bytes per AppendEntries RPC.
+  uint64 append_entries_max_bytes = 6;
+}
+
+// ClusterMembership is read-only metadata about the current cluster
+// shape. Operators change membership via SetNodeCount, not by editing
+// this message.
+message ClusterMembership {
+  repeated NodeInfo nodes = 1;
+
+  // The desired count last set by SetNodeCount. Equals nodes.size() at
+  // steady state; differs while a reconfiguration is in flight.
+  uint32 target_count = 2;
+}
+
+message NodeInfo {
+  uint64 node_id = 1;
+  string address = 2;
+}
+
+// ============================================================
+// Fault injection
+// ============================================================
+
+message StopNodeRequest    { uint64 node_id = 1; }
+message StopNodeResponse   { bool accepted = 1; string error = 2; }
+
+message KillNodeRequest    { uint64 node_id = 1; }
+message KillNodeResponse   { bool accepted = 1; string error = 2; }
+
+message StartNodeRequest   { uint64 node_id = 1; }
+message StartNodeResponse  { bool accepted = 1; string error = 2; }
+
+message RestartNodeRequest { uint64 node_id = 1; }
+message RestartNodeResponse{ bool accepted = 1; string error = 2; }
+
+message PartitionPairRequest  { uint64 node_a = 1; uint64 node_b = 2; }
+message PartitionPairResponse { bool accepted = 1; string error = 2; }
+
+message HealPartitionRequest  { uint64 node_a = 1; uint64 node_b = 2; }
+message HealPartitionResponse { bool accepted = 1; string error = 2; }
+
+message GetFaultHistoryRequest {
+  // Maximum events to return. 0 = server default (typically 64). Capped at 1000.
+  uint32 limit = 1;
+}
+
+message GetFaultHistoryResponse {
+  // Newest first.
+  repeated FaultEvent events = 1;
+}
+
+message FaultEvent {
+  int64        at_ms       = 1;
+  FaultKind    kind        = 2;
+  // Primary node this event targets. 0 if the event is not node-scoped
+  // (currently unused; reserved for future cluster-wide events).
+  uint64       node_id     = 3;
+  // Secondary node, only set for partition / heal events.
+  uint64       peer_node_id = 4;
+  // Free-form description for the UI's history panel.
+  string       description = 5;
+}
+
+enum FaultKind {
+  FAULT_KIND_UNSPECIFIED = 0;
+  FAULT_KIND_STOP        = 1;
+  FAULT_KIND_START       = 2;
+  FAULT_KIND_RESTART     = 3;
+  FAULT_KIND_PARTITION   = 4;
+  FAULT_KIND_HEAL        = 5;
+  FAULT_KIND_KILL        = 6;
+}
+
+// ============================================================
+// Load / Simulations
+// ============================================================
+
+message RunScenarioRequest {
+  Scenario scenario = 1;
+}
+
+message RunScenarioResponse {
+  // Server-assigned run identifier. Pass to GetScenarioStatus / CancelScenario.
+  string run_id     = 1;
+  int64  started_at_ms = 2;
+}
+
+message GetScenarioStatusRequest {
+  string run_id = 1;
+}
+
+message GetScenarioStatusResponse {
+  string         run_id          = 1;
+  ScenarioState  state           = 2;
+
+  // 0..=100, integer percent. Approximate; based on duration / step count.
+  uint32         progress_pct    = 3;
+
+  // Cumulative metrics observed during the run.
+  uint64         ops_submitted   = 4;
+  uint64         ops_succeeded   = 5;
+  uint64         ops_failed      = 6;
+  // Approximate operation latency observed by the runner (ms).
+  uint64         latency_p50_ms  = 7;
+  uint64         latency_p99_ms  = 8;
+
+  int64          started_at_ms   = 9;
+  // 0 if still running.
+  int64          ended_at_ms     = 10;
+
+  // Set when state is FAILED.
+  string         error           = 11;
+
+  // Last few step descriptions executed, newest last. Lets the UI show
+  // a live "what's happening now" line during a run.
+  repeated string recent_steps   = 12;
+}
+
+enum ScenarioState {
+  SCENARIO_STATE_UNSPECIFIED = 0;
+  SCENARIO_STATE_QUEUED      = 1;
+  SCENARIO_STATE_RUNNING     = 2;
+  SCENARIO_STATE_COMPLETED   = 3;
+  SCENARIO_STATE_CANCELED    = 4;
+  SCENARIO_STATE_FAILED      = 5;
+}
+
+message CancelScenarioRequest  { string run_id = 1; }
+message CancelScenarioResponse { bool accepted = 1; string error = 2; }
+
+message ListScenarioRunsRequest {
+  // Maximum runs to return. 0 = server default (typically 32). Capped at 256.
+  uint32 limit = 1;
+}
+
+message ListScenarioRunsResponse {
+  // Newest first.
+  repeated ScenarioRunSummary runs = 1;
+}
+
+message ScenarioRunSummary {
+  string         run_id        = 1;
+  string         scenario_name = 2;
+  ScenarioState  state         = 3;
+  int64          started_at_ms = 4;
+  int64          ended_at_ms   = 5;
+  uint64         ops_submitted = 6;
+  uint64         ops_succeeded = 7;
+  uint64         ops_failed    = 8;
+}
+
+// Scenario describes a sequence of steps the cluster will execute when
+// RunScenario is called. Steps run in the order given. The scenario
+// name is descriptive; a fresh run_id is assigned per run.
+message Scenario {
+  string name        = 1;
+  string description = 2;
+  repeated ScenarioStep steps = 3;
+}
+
+// ScenarioStep is one of: a workload submission, a fault, or a wait.
+message ScenarioStep {
+  oneof step {
+    SubmitOpsStep   submit_ops   = 1;
+    FaultStep       fault        = 2;
+    WaitStep        wait         = 3;
+  }
+}
+
+// SubmitOpsStep generates ledger operations against the cluster. The
+// cluster's runner submits at the configured rate for the configured
+// duration (or until total_ops is reached, whichever comes first).
+message SubmitOpsStep {
+  WorkloadKind kind        = 1;
+  // Operations per second. 0 = unbounded (cluster runs as fast as it can).
+  uint32       rate_ops_s  = 2;
+  // Total wall-clock duration in ms. 0 = bounded only by total_ops.
+  uint32       duration_ms = 3;
+  // Cap on total operations. 0 = bounded only by duration_ms.
+  uint64       total_ops   = 4;
+  // Workload-specific parameters (free-form key/value).
+  repeated KV  params      = 5;
+}
+
+enum WorkloadKind {
+  WORKLOAD_KIND_UNSPECIFIED        = 0;
+  WORKLOAD_KIND_DEPOSIT_BURST      = 1;  // params: account, amount
+  WORKLOAD_KIND_TRANSFER_PAIR      = 2;  // params: from, to, amount
+  WORKLOAD_KIND_TRANSFER_RANDOM    = 3;  // params: account_count, amount_min, amount_max
+  WORKLOAD_KIND_FUNCTION_INVOCATION = 4; // params: name, p0..p7
+  WORKLOAD_KIND_MIXED              = 5;  // params: weights for each op kind
+}
+
+message FaultStep {
+  FaultKind kind         = 1;
+  uint64    node_id      = 2;
+  // Only used for PARTITION / HEAL.
+  uint64    peer_node_id = 3;
+}
+
+message WaitStep {
+  uint32 duration_ms = 1;
+}
+
+message KV {
+  string key   = 1;
+  string value = 2;
+}
