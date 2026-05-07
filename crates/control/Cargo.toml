@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 proto.workspace = true
+# Cluster-aware gRPC client used by ScenarioRunner.
+client.workspace = true
 # Scenario primitives + built-in catalogue. `testing`'s default feature
 # set is empty; the legacy harness deps (cluster, ledger,
 # libtest-mimic, etc.) only enter the build when the `harness` feature
@@ -18,6 +20,7 @@ proto.workspace = true
 # scenario layer.
 testing.workspace = true
 tonic.workspace = true
+async-trait = "0.1"
 tonic-web = "0.12"
 tonic-reflection = "0.12"
 prost.workspace = true
