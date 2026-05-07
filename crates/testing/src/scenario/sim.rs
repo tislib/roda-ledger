@@ -284,6 +284,7 @@ mod tests {
             Step::new(Action::SubmitBatch(SubmitBatch {
                 wait: WaitLevel::None,
                 retry: None,
+                rate: 0,
                 kind: BatchKind::Dynamic {
                     base: vec![SubmitOp::Deposit {
                         account: 7,
@@ -378,7 +379,9 @@ mod tests {
                 max_account: 10,
             })),
         ]);
-        Simulator::new().run(&s).expect("zero-sum invariant must hold");
+        Simulator::new()
+            .run(&s)
+            .expect("zero-sum invariant must hold");
     }
 
     #[test]

@@ -149,6 +149,11 @@ pub struct Submit {
 pub struct SubmitBatch {
     pub wait: WaitLevel,
     pub retry: Option<RetryConfig>,
+    /// Throttle dispatch to at most this many ops per second. `0`
+    /// disables throttling — submit as fast as the cluster accepts.
+    /// When `wait != WaitLevel::None`, the actual achieved rate is
+    /// bounded by the cluster's response time as well as this cap.
+    pub rate: u32,
     pub kind: BatchKind,
 }
 
@@ -340,6 +345,7 @@ mod tests {
             Action::SubmitBatch(SubmitBatch {
                 wait: WaitLevel::None,
                 retry: None,
+                rate: 0,
                 kind: BatchKind::Dynamic {
                     base: vec![SubmitOp::Deposit {
                         account: 1,

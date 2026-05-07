@@ -21,6 +21,12 @@ pub enum NodeSelector {
     Leader,
     /// Any reachable node — the runner picks.
     Any,
+    /// The node most recently killed (or stopped) by a `KillNode` /
+    /// `StopNode` step in the current run-context. Lets a follow-up
+    /// `StartNode` bring the same node back without the scenario
+    /// knowing the cluster index ahead of time. Scoped per-task —
+    /// each `AsyncBranch` has its own kill history.
+    LastKilled,
 }
 
 /// Pipeline level a submission should wait for before the step returns.

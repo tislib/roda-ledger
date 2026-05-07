@@ -24,11 +24,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use control::provisioner::process::ProcessProvisioner;
-use control::runner::{ProvisionConfig, ScenarioRunner};
+use control::runner::{ProvisionConfig, ScenarioRunner, Snapshot};
 use proto::control::ClusterConfig;
 use testing::scenario::Scenario;
 use testing::scenarios;
@@ -74,6 +74,10 @@ enum Command {
     RunAll {
         #[arg(long, value_enum)]
         group: Option<Group>,
+        /// Print the full metrics report for each scenario instead of
+        /// the one-line summary. Auto-enabled for `--group load`.
+        #[arg(long)]
+        report: bool,
     },
 }
 
@@ -99,12 +103,16 @@ async fn main() -> ExitCode {
             };
             run_one(&bin, name, cli.nodes, cli.verbose).await
         }
-        Command::RunAll { group } => {
+        Command::RunAll { group, report } => {
             let bin = match resolve_server_bin(cli.server_bin.as_deref()) {
                 Ok(p) => p,
                 Err(e) => return fail(&e),
             };
-            run_many(&bin, group, cli.nodes, cli.verbose).await
+            // Load runs are about measurements — always print the
+            // full report there, even if the user didn't pass the
+            // flag.
+            let render_report = report || matches!(group, Some(Group::Load));
+            run_many(&bin, group, cli.nodes, cli.verbose, render_report).await
         }
     }
 }
@@ -160,9 +168,11 @@ async fn run_one(server_bin: &Path, name: &str, nodes: u32, verbose: bool) -> Ex
 
     let outcome = run_scenario(server_bin, &scenario, nodes, verbose).await;
     print_outcome_block(&outcome);
-    match outcome {
-        Outcome::Passed { .. } => ExitCode::SUCCESS,
-        Outcome::Failed { .. } => ExitCode::FAILURE,
+    println!();
+    print_report_blocks(&outcome.metrics);
+    match outcome.passed {
+        true => ExitCode::SUCCESS,
+        false => ExitCode::FAILURE,
     }
 }
 
@@ -175,6 +185,7 @@ async fn run_many(
     group: Option<Group>,
     nodes: u32,
     verbose: bool,
+    render_report: bool,
 ) -> ExitCode {
     let scenarios = collect(group);
     if scenarios.is_empty() {
@@ -182,7 +193,10 @@ async fn run_many(
     }
 
     let total = scenarios.len();
-    println!("=== running {total} scenarios ({} nodes/cluster) ===", nodes);
+    println!(
+        "=== running {total} scenarios ({} nodes/cluster) ===",
+        nodes
+    );
     println!();
 
     let label_width: usize = 70;
@@ -196,23 +210,24 @@ async fn run_many(
         io::stdout().flush().ok();
 
         let outcome = run_scenario(server_bin, scenario, nodes, verbose).await;
-        total_elapsed += outcome.elapsed();
-        match &outcome {
-            Outcome::Passed { elapsed } => {
-                println!("PASSED ({:.2}s)", elapsed.as_secs_f64());
+        total_elapsed += outcome.elapsed;
+        if outcome.passed {
+            println!("PASSED ({:.2}s)", outcome.elapsed.as_secs_f64());
+        } else {
+            println!("FAILED ({:.2}s)", outcome.elapsed.as_secs_f64());
+            if let Some(err) = &outcome.error {
+                println!("       {err}");
             }
-            Outcome::Failed { elapsed, error } => {
-                println!("FAILED ({:.2}s)", elapsed.as_secs_f64());
-                println!("       {error}");
-            }
+        }
+        if render_report {
+            println!();
+            print_report_blocks(&outcome.metrics);
+            println!();
         }
         results.push((scenario.name.clone(), outcome));
     }
 
-    let passed = results
-        .iter()
-        .filter(|(_, o)| matches!(o, Outcome::Passed { .. }))
-        .count();
+    let passed = results.iter().filter(|(_, o)| o.passed).count();
     let failed = results.len() - passed;
 
     println!();
@@ -226,8 +241,9 @@ async fn run_many(
         println!();
         println!("failures:");
         for (name, outcome) in &results {
-            if let Outcome::Failed { error, .. } = outcome {
-                println!("  - {name}: {error}");
+            if !outcome.passed {
+                let err = outcome.error.as_deref().unwrap_or("(no error message)");
+                println!("  - {name}: {err}");
             }
         }
         ExitCode::FAILURE
@@ -240,17 +256,11 @@ async fn run_many(
 // Core runner
 // ============================================================
 
-enum Outcome {
-    Passed { elapsed: Duration },
-    Failed { elapsed: Duration, error: String },
-}
-
-impl Outcome {
-    fn elapsed(&self) -> Duration {
-        match self {
-            Outcome::Passed { elapsed } | Outcome::Failed { elapsed, .. } => *elapsed,
-        }
-    }
+struct Outcome {
+    passed: bool,
+    elapsed: Duration,
+    error: Option<String>,
+    metrics: Snapshot,
 }
 
 async fn run_scenario(
@@ -259,35 +269,78 @@ async fn run_scenario(
     nodes: u32,
     verbose: bool,
 ) -> Outcome {
-    let provisioner = Arc::new(
-        ProcessProvisioner::new(server_bin.to_path_buf()).quiet(!verbose),
-    );
+    let provisioner = Arc::new(ProcessProvisioner::new(server_bin.to_path_buf()).quiet(!verbose));
     let runner = ScenarioRunner::new(provisioner);
     let config = default_config(nodes);
 
-    let start = Instant::now();
-    let result = runner.run(scenario, &config).await;
-    let elapsed = start.elapsed();
-
-    match result {
-        Ok(()) => Outcome::Passed { elapsed },
-        Err(e) => Outcome::Failed {
-            elapsed,
-            error: e.to_string(),
-        },
+    let report = runner.run(scenario, &config).await;
+    Outcome {
+        passed: report.result.is_ok(),
+        elapsed: report.elapsed,
+        error: report.result.err().map(|e| e.to_string()),
+        metrics: report.metrics,
     }
 }
 
 fn print_outcome_block(outcome: &Outcome) {
-    match outcome {
-        Outcome::Passed { elapsed } => {
-            println!("result:  PASSED");
-            println!("elapsed: {:.2}s", elapsed.as_secs_f64());
+    if outcome.passed {
+        println!("result:  PASSED");
+    } else {
+        println!("result:  FAILED");
+    }
+    println!("elapsed: {:.2}s", outcome.elapsed.as_secs_f64());
+    if let Some(err) = &outcome.error {
+        println!("error:   {err}");
+    }
+}
+
+// ============================================================
+// Metrics report rendering
+// ============================================================
+
+fn print_report_blocks(metrics: &Snapshot) {
+    let throughput = metrics.throughput_stats();
+    println!("throughput (cluster_commit):");
+    if throughput.samples < 2 {
+        println!("  (no samples — scenario was too short to measure)");
+    } else {
+        println!(
+            "  ops total:    {} (cluster_commit advanced over {:.2}s)",
+            throughput.ops_total,
+            throughput.duration.as_secs_f64()
+        );
+        println!("  avg ops/s:    {:>8.1}", throughput.avg_ops_per_sec);
+        println!("  min ops/s:    {:>8.1}", throughput.min_ops_per_sec);
+        println!("  max ops/s:    {:>8.1}", throughput.max_ops_per_sec);
+        println!("  samples:      {}", throughput.samples);
+    }
+
+    println!();
+    println!("submit latency (waiting submits only):");
+    match metrics.latency_stats() {
+        None => println!("  (no waiting submits in this scenario)"),
+        Some(l) => {
+            println!("  samples:    {}", l.samples);
+            println!("  min:        {:>10.2}ms", l.min.as_secs_f64() * 1000.0);
+            println!("  avg:        {:>10.2}ms", l.avg.as_secs_f64() * 1000.0);
+            println!("  p50:        {:>10.2}ms", l.p50.as_secs_f64() * 1000.0);
+            println!("  p99:        {:>10.2}ms", l.p99.as_secs_f64() * 1000.0);
+            println!("  max:        {:>10.2}ms", l.max.as_secs_f64() * 1000.0);
         }
-        Outcome::Failed { elapsed, error } => {
-            println!("result:  FAILED");
-            println!("elapsed: {:.2}s", elapsed.as_secs_f64());
-            println!("error:   {error}");
+    }
+
+    let lags = metrics.node_lag_stats();
+    println!();
+    println!("per-node lag (vs cluster_commit):");
+    if lags.is_empty() {
+        println!("  (no samples)");
+    } else {
+        for l in &lags {
+            let role = if l.is_leader_at_end { " [leader]" } else { "" };
+            println!(
+                "  node[{}]: max {} ops behind, final {} ops behind{}",
+                l.node_idx, l.max_lag, l.final_lag, role
+            );
         }
     }
 }
@@ -365,6 +418,5 @@ fn configure_logging(verbose: bool) {
     } else {
         spdlog::Level::Critical
     };
-    spdlog::default_logger()
-        .set_level_filter(spdlog::LevelFilter::MoreSevereEqual(level));
+    spdlog::default_logger().set_level_filter(spdlog::LevelFilter::MoreSevereEqual(level));
 }

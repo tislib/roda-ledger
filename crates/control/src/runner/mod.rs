@@ -12,23 +12,32 @@
 //! dispatches each to the right collaborator, tracks `user_ref →
 //! tx_id` bindings so later `TxRef::UserRef` references resolve, and
 //! awaits async-branch tasks at end-of-scenario.
+//!
+//! While the scenario runs, a [`MetricsCollector`] gathers per-node
+//! pipeline samples (every 100 ms) and per-submit latencies (only
+//! for waiting submits). The collector's snapshot is returned inside
+//! [`RunReport`] regardless of pass/fail so callers always see what
+//! landed before a failure.
+
+pub mod metrics;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::ClusterClient;
 use proto::ledger as proto_ledger;
 use tokio::task::JoinHandle;
 
 use testing::scenario::{
-    Action, AssertBalance, AssertBalanceSum, AssertLeader, AssertPipelineCaughtUp,
-    AssertTxStatus, AsyncBranch, BatchKind, GetBalance, GetPipelineIndex, HealPartition,
-    NodeSelector, PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit,
-    SubmitBatch, SubmitOp, TxRef, TxStatus, WaitForLevel, WaitLevel,
+    Action, AssertBalance, AssertBalanceSum, AssertLeader, AssertPipelineCaughtUp, AssertTxStatus,
+    AsyncBranch, BatchKind, GetBalance, GetPipelineIndex, HealPartition, NodeSelector,
+    PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit, SubmitBatch, SubmitOp,
+    TxRef, TxStatus, WaitForLevel, WaitLevel,
 };
 
 pub use crate::provisioner::{Capabilities, ProvisionConfig, Provisioner, ProvisionerError};
+pub use metrics::{MetricsCollector, NodePipelineSnap, Sample, Snapshot};
 
 /// Per-`run` state. Each top-level `run()` and each spawned branch
 /// gets its own — bindings are scoped to the task that produced them.
@@ -36,6 +45,10 @@ pub use crate::provisioner::{Capabilities, ProvisionConfig, Provisioner, Provisi
 struct RunCtx {
     /// `user_ref → tx_id`, populated by `Submit` / `SubmitBatch`.
     bindings: HashMap<u64, u64>,
+    /// Cluster index of the most recent `KillNode` / `StopNode`.
+    /// Resolves `NodeSelector::LastKilled`. Reset per task; siblings
+    /// in concurrent branches don't share kill state.
+    last_killed: Option<usize>,
     /// Pending branch tasks, awaited at end-of-scenario.
     branches: Vec<JoinHandle<Result<(), RunError>>>,
 }
@@ -95,7 +108,9 @@ pub enum RunError {
     #[error("async branch panicked or was canceled: {0}")]
     BranchPanic(String),
 
-    #[error("scenario uses {requirement} but provisioner does not support it (capabilities: {capabilities:?})")]
+    #[error(
+        "scenario uses {requirement} but provisioner does not support it (capabilities: {capabilities:?})"
+    )]
     UnsupportedCapability {
         requirement: &'static str,
         capabilities: Capabilities,
@@ -108,6 +123,24 @@ pub enum RunError {
 pub struct ScenarioRunner {
     provisioner: Arc<dyn Provisioner>,
 }
+
+/// Aggregate result of a single `run()` call. Carries the scenario's
+/// pass/fail outcome plus everything the metrics collector gathered
+/// during execution. The `result` field is `Err` when the scenario
+/// hit any [`RunError`] — partial metrics from the work that
+/// happened before the failure are still in `metrics`, useful for
+/// post-mortems.
+#[derive(Debug)]
+pub struct RunReport {
+    pub elapsed: Duration,
+    pub result: Result<(), RunError>,
+    pub metrics: Snapshot,
+}
+
+/// How often the background poller probes every node's pipeline
+/// indices. Small enough to capture short scenarios; loose enough
+/// not to congest the cluster on long ones.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 impl ScenarioRunner {
     pub fn new(provisioner: Arc<dyn Provisioner>) -> Self {
@@ -123,30 +156,72 @@ impl ScenarioRunner {
     /// a doomed run. Cluster teardown is the provisioner's `Drop`
     /// responsibility, fired when the runner (and any cloned `Arc`s)
     /// goes out of scope; there is no explicit destroy step here.
-    pub async fn run(
-        &self,
-        scenario: &Scenario,
-        config: &ProvisionConfig,
-    ) -> Result<(), RunError> {
+    ///
+    /// Always returns a [`RunReport`]. Inspect `report.result` for
+    /// pass/fail; `report.metrics` holds whatever the background
+    /// poller gathered before the run ended.
+    pub async fn run(&self, scenario: &Scenario, config: &ProvisionConfig) -> RunReport {
         let caps = self.provisioner.capabilities();
-        check_capabilities(scenario, caps)?;
+        if let Err(e) = check_capabilities(scenario, caps) {
+            return RunReport {
+                elapsed: Duration::ZERO,
+                result: Err(e),
+                metrics: Snapshot::default(),
+            };
+        }
 
-        let urls = self.provisioner.provision(config).await?;
-        let client = ClusterClient::connect(&urls)
-            .await
-            .map_err(|e| RunError::Connect(e.to_string()))?;
+        let provision_started = Instant::now();
+        let urls = match self.provisioner.provision(config).await {
+            Ok(u) => u,
+            Err(e) => {
+                return RunReport {
+                    elapsed: provision_started.elapsed(),
+                    result: Err(RunError::Provisioner(e)),
+                    metrics: Snapshot::default(),
+                };
+            }
+        };
+        let client = match ClusterClient::connect(&urls).await {
+            Ok(c) => c,
+            Err(e) => {
+                return RunReport {
+                    elapsed: provision_started.elapsed(),
+                    result: Err(RunError::Connect(e.to_string())),
+                    metrics: Snapshot::default(),
+                };
+            }
+        };
 
-        self.execute(&client, scenario).await
+        // Bookend with explicit samples so the throughput delta
+        // covers the full run — short bursts can complete entirely
+        // between two periodic samples otherwise.
+        let collector = Arc::new(MetricsCollector::new());
+        collector.snapshot_now(&client).await;
+        let poller = metrics::spawn_poller(client.clone(), collector.clone(), POLL_INTERVAL);
+
+        let started = collector.start();
+        let exec_result = self.execute(&client, scenario, &collector).await;
+        let elapsed = started.elapsed();
+
+        poller.abort();
+        collector.snapshot_now(&client).await;
+
+        RunReport {
+            elapsed,
+            result: exec_result,
+            metrics: collector.snapshot(),
+        }
     }
 
     async fn execute(
         &self,
         client: &ClusterClient,
         scenario: &Scenario,
+        metrics: &Arc<MetricsCollector>,
     ) -> Result<(), RunError> {
         let mut ctx = RunCtx::default();
         for step in &scenario.steps {
-            self.dispatch(client, &mut ctx, step).await?;
+            self.dispatch(client, metrics, &mut ctx, step).await?;
         }
         ctx.join_all().await
     }
@@ -154,14 +229,15 @@ impl ScenarioRunner {
     async fn dispatch(
         &self,
         client: &ClusterClient,
+        metrics: &Arc<MetricsCollector>,
         ctx: &mut RunCtx,
         step: &Step,
     ) -> Result<(), RunError> {
         match &step.action {
-            Action::Submit(s) => self.run_submit(client, ctx, s).await,
-            Action::SubmitBatch(s) => self.run_submit_batch(client, ctx, s).await,
+            Action::Submit(s) => self.run_submit(client, metrics, ctx, s).await,
+            Action::SubmitBatch(s) => self.run_submit_batch(client, metrics, ctx, s).await,
             Action::AsyncBranch(b) => {
-                let handle = self.spawn_branch(client, b);
+                let handle = self.spawn_branch(client, metrics, b);
                 ctx.branches.push(handle);
                 Ok(())
             }
@@ -170,23 +246,40 @@ impl ScenarioRunner {
                 Ok(())
             }
             Action::WaitForLevel(w) => self.run_wait_for_level(client, ctx, w).await,
-            Action::GetBalance(g) => self.run_get_balance(client, g).await,
-            Action::GetPipelineIndex(g) => self.run_get_pipeline_index(client, g).await,
-            Action::AssertBalance(a) => self.run_assert_balance(client, a).await,
-            Action::AssertBalanceSum(a) => self.run_assert_balance_sum(client, a).await,
+            Action::GetBalance(g) => self.run_get_balance(client, ctx.last_killed, g).await,
+            Action::GetPipelineIndex(g) => {
+                self.run_get_pipeline_index(client, ctx.last_killed, g)
+                    .await
+            }
+            Action::AssertBalance(a) => self.run_assert_balance(client, ctx.last_killed, a).await,
+            Action::AssertBalanceSum(a) => {
+                self.run_assert_balance_sum(client, ctx.last_killed, a)
+                    .await
+            }
             Action::AssertPipelineCaughtUp(a) => {
-                self.run_assert_pipeline_caught_up(client, a).await
+                self.run_assert_pipeline_caught_up(client, ctx.last_killed, a)
+                    .await
             }
             Action::AssertTxStatus(a) => self.run_assert_tx_status(client, ctx, a).await,
-            Action::AssertLeader(a) => self.run_assert_leader(client, a).await,
-            Action::StopNode(s) => self.run_provisioner_node(client, &s.node, ProvFault::Stop).await,
-            Action::KillNode(s) => self.run_provisioner_node(client, &s.node, ProvFault::Kill).await,
-            Action::StartNode(s) => self.run_provisioner_node(client, &s.node, ProvFault::Start).await,
-            Action::RestartNode(s) => {
-                self.run_provisioner_node(client, &s.node, ProvFault::Restart).await
+            Action::AssertLeader(a) => self.run_assert_leader(client, ctx.last_killed, a).await,
+            Action::StopNode(s) => {
+                self.run_provisioner_node(client, ctx, &s.node, ProvFault::Stop)
+                    .await
             }
-            Action::PartitionPair(p) => self.run_partition_pair(client, p).await,
-            Action::HealPartition(h) => self.run_heal_partition(client, h).await,
+            Action::KillNode(s) => {
+                self.run_provisioner_node(client, ctx, &s.node, ProvFault::Kill)
+                    .await
+            }
+            Action::StartNode(s) => {
+                self.run_provisioner_node(client, ctx, &s.node, ProvFault::Start)
+                    .await
+            }
+            Action::RestartNode(s) => {
+                self.run_provisioner_node(client, ctx, &s.node, ProvFault::Restart)
+                    .await
+            }
+            Action::PartitionPair(p) => self.run_partition_pair(client, ctx.last_killed, p).await,
+            Action::HealPartition(h) => self.run_heal_partition(client, ctx.last_killed, h).await,
             Action::RegisterFunction(r) => {
                 client
                     .register_function(&r.name, &r.binary, r.override_existing)
@@ -195,7 +288,10 @@ impl ScenarioRunner {
                 Ok(())
             }
             Action::UnregisterFunction(u) => {
-                client.unregister_function(&u.name).await.map_err(client_err)?;
+                client
+                    .unregister_function(&u.name)
+                    .await
+                    .map_err(client_err)?;
                 Ok(())
             }
             // Action is `#[non_exhaustive]`. Adding a variant upstream
@@ -213,11 +309,16 @@ impl ScenarioRunner {
     async fn run_submit(
         &self,
         client: &ClusterClient,
+        metrics: &Arc<MetricsCollector>,
         ctx: &mut RunCtx,
         s: &Submit,
     ) -> Result<(), RunError> {
         let user_ref = user_ref_of(&s.op);
+        let started = Instant::now();
         let tx_id = self.do_submit(client, &s.op, s.wait, s.retry).await?;
+        if s.wait != WaitLevel::None {
+            metrics.record_submit_latency(started.elapsed());
+        }
         ctx.bindings.insert(user_ref, tx_id);
         Ok(())
     }
@@ -225,6 +326,7 @@ impl ScenarioRunner {
     async fn run_submit_batch(
         &self,
         client: &ClusterClient,
+        metrics: &Arc<MetricsCollector>,
         ctx: &mut RunCtx,
         s: &SubmitBatch,
     ) -> Result<(), RunError> {
@@ -234,8 +336,28 @@ impl ScenarioRunner {
         // throughput, especially since the runner does not yet need
         // to drive multi-op heterogeneous batches with different
         // wait semantics per op.
-        for op in expand_batch(&s.kind) {
+        let ops = expand_batch(&s.kind);
+        // Rate throttle: when `s.rate > 0`, schedule op `i` to start
+        // no earlier than `i / rate` seconds after the first op. With
+        // `wait != WaitLevel::None` the cluster's response time is
+        // an additional ceiling on achieved throughput.
+        let rate_start = if s.rate > 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        for (i, op) in ops.into_iter().enumerate() {
+            if let (Some(start), Some(target)) = (rate_start, rate_target_delay(i, s.rate)) {
+                let elapsed = start.elapsed();
+                if elapsed < target {
+                    tokio::time::sleep(target - elapsed).await;
+                }
+            }
+            let started = Instant::now();
             let tx_id = self.do_submit(client, &op, s.wait, s.retry).await?;
+            if s.wait != WaitLevel::None {
+                metrics.record_submit_latency(started.elapsed());
+            }
             ctx.bindings.insert(user_ref_of(&op), tx_id);
         }
         Ok(())
@@ -271,16 +393,18 @@ impl ScenarioRunner {
     fn spawn_branch(
         &self,
         client: &ClusterClient,
+        metrics: &Arc<MetricsCollector>,
         branch: &AsyncBranch,
     ) -> JoinHandle<Result<(), RunError>> {
         let provisioner = self.provisioner.clone();
         let client = client.clone();
+        let metrics = metrics.clone();
         let steps = branch.steps.clone();
         tokio::spawn(async move {
             let runner = ScenarioRunner::new(provisioner);
             let mut ctx = RunCtx::default();
             for step in &steps {
-                runner.dispatch(&client, &mut ctx, step).await?;
+                runner.dispatch(&client, &metrics, &mut ctx, step).await?;
             }
             ctx.join_all().await
         })
@@ -296,6 +420,7 @@ impl ScenarioRunner {
         ctx: &RunCtx,
         w: &WaitForLevel,
     ) -> Result<(), RunError> {
+        let _node = self.resolve_node_idx(client, &w.node, ctx.last_killed)?;
         let tx = resolve_tx(ctx, &w.tx)?;
         let target = pipeline_to_status_threshold(w.level);
         let timeout = Duration::from_secs(30);
@@ -322,9 +447,10 @@ impl ScenarioRunner {
     async fn run_get_balance(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         g: &GetBalance,
     ) -> Result<(), RunError> {
-        let idx = self.resolve_node_idx(client, &g.node)?;
+        let idx = self.resolve_node_idx(client, &g.node, last_killed)?;
         client
             .node(idx)
             .get_balance(g.account)
@@ -336,9 +462,10 @@ impl ScenarioRunner {
     async fn run_get_pipeline_index(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         g: &GetPipelineIndex,
     ) -> Result<(), RunError> {
-        let idx = self.resolve_node_idx(client, &g.node)?;
+        let idx = self.resolve_node_idx(client, &g.node, last_killed)?;
         client
             .node(idx)
             .get_pipeline_index()
@@ -354,9 +481,10 @@ impl ScenarioRunner {
     async fn run_assert_balance(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         a: &AssertBalance,
     ) -> Result<(), RunError> {
-        let idx = self.resolve_node_idx(client, &a.node)?;
+        let idx = self.resolve_node_idx(client, &a.node, last_killed)?;
         let bal = client
             .node(idx)
             .get_balance(a.account)
@@ -374,9 +502,10 @@ impl ScenarioRunner {
     async fn run_assert_balance_sum(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         a: &AssertBalanceSum,
     ) -> Result<(), RunError> {
-        let idx = self.resolve_node_idx(client, &a.node)?;
+        let idx = self.resolve_node_idx(client, &a.node, last_killed)?;
         let account_ids: Vec<u64> = (0..=a.max_account).collect();
         let balances = client
             .node(idx)
@@ -396,9 +525,10 @@ impl ScenarioRunner {
     async fn run_assert_pipeline_caught_up(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         a: &AssertPipelineCaughtUp,
     ) -> Result<(), RunError> {
-        let idx = self.resolve_node_idx(client, &a.node)?;
+        let idx = self.resolve_node_idx(client, &a.node, last_killed)?;
         let pi = client
             .node(idx)
             .get_pipeline_index()
@@ -437,11 +567,12 @@ impl ScenarioRunner {
     async fn run_assert_leader(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         a: &AssertLeader,
     ) -> Result<(), RunError> {
         match &a.expected {
             Some(sel) => {
-                let idx = self.resolve_node_idx(client, sel)?;
+                let idx = self.resolve_node_idx(client, sel, last_killed)?;
                 let pi = client
                     .node(idx)
                     .get_pipeline_index()
@@ -477,13 +608,20 @@ impl ScenarioRunner {
     async fn run_provisioner_node(
         &self,
         client: &ClusterClient,
+        ctx: &mut RunCtx,
         sel: &NodeSelector,
         fault: ProvFault,
     ) -> Result<(), RunError> {
-        let idx = self.resolve_node_idx(client, sel)?;
+        let idx = self.resolve_node_idx(client, sel, ctx.last_killed)?;
         match fault {
-            ProvFault::Stop => self.provisioner.stop_node(idx).await?,
-            ProvFault::Kill => self.provisioner.kill_node(idx).await?,
+            ProvFault::Stop => {
+                self.provisioner.stop_node(idx).await?;
+                ctx.last_killed = Some(idx);
+            }
+            ProvFault::Kill => {
+                self.provisioner.kill_node(idx).await?;
+                ctx.last_killed = Some(idx);
+            }
             ProvFault::Start => self.provisioner.start_node(idx).await?,
             ProvFault::Restart => self.provisioner.restart_node(idx).await?,
         }
@@ -493,10 +631,11 @@ impl ScenarioRunner {
     async fn run_partition_pair(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         p: &PartitionPair,
     ) -> Result<(), RunError> {
-        let a = self.resolve_node_idx(client, &p.a)?;
-        let b = self.resolve_node_idx(client, &p.b)?;
+        let a = self.resolve_node_idx(client, &p.a, last_killed)?;
+        let b = self.resolve_node_idx(client, &p.b, last_killed)?;
         self.provisioner.partition_pair(a, b).await?;
         Ok(())
     }
@@ -504,10 +643,11 @@ impl ScenarioRunner {
     async fn run_heal_partition(
         &self,
         client: &ClusterClient,
+        last_killed: Option<usize>,
         h: &HealPartition,
     ) -> Result<(), RunError> {
-        let a = self.resolve_node_idx(client, &h.a)?;
-        let b = self.resolve_node_idx(client, &h.b)?;
+        let a = self.resolve_node_idx(client, &h.a, last_killed)?;
+        let b = self.resolve_node_idx(client, &h.b, last_killed)?;
         self.provisioner.heal_partition(a, b).await?;
         Ok(())
     }
@@ -520,11 +660,13 @@ impl ScenarioRunner {
     /// `ClusterClient`'s node list. `Id(_)` is rejected — it's not
     /// addressable in the current happy-path scenarios and a real
     /// node-id-to-index mapping needs more topology metadata than the
-    /// runner currently has.
+    /// runner currently has. `LastKilled` reads from `last_killed`,
+    /// which is per-task state populated by `KillNode` / `StopNode`.
     fn resolve_node_idx(
         &self,
         client: &ClusterClient,
         sel: &NodeSelector,
+        last_killed: Option<usize>,
     ) -> Result<usize, RunError> {
         match sel {
             NodeSelector::Index(idx) => {
@@ -548,6 +690,9 @@ impl ScenarioRunner {
                 } else {
                     Err(RunError::UnresolvableNode(sel.clone()))
                 }
+            }
+            NodeSelector::LastKilled => {
+                last_killed.ok_or_else(|| RunError::UnresolvableNode(sel.clone()))
             }
             NodeSelector::Id(_) => Err(RunError::UnresolvableNode(sel.clone())),
         }
@@ -678,6 +823,17 @@ fn tx_status_to_i32(s: TxStatus) -> i32 {
     }
 }
 
+/// Target delay for the `i`-th op in a `SubmitBatch` with the given
+/// rate. `rate == 0` disables throttling (returns `None`); otherwise
+/// returns `i / rate` seconds.
+fn rate_target_delay(op_index: usize, rate: u32) -> Option<Duration> {
+    if rate == 0 {
+        None
+    } else {
+        Some(Duration::from_secs_f64(op_index as f64 / rate as f64))
+    }
+}
+
 fn retry_params(retry: Option<RetryConfig>) -> (u32, u32) {
     match retry {
         Some(r) => (r.max_retries.saturating_add(1), r.backoff_ms),
@@ -737,8 +893,8 @@ fn check_capabilities(scenario: &Scenario, caps: Capabilities) -> Result<(), Run
 #[cfg(test)]
 mod tests {
     use testing::scenario::{
-        Action, AsyncBranch, HealPartition, KillNode, NodeSelector as Sel, PartitionPair,
-        Scenario, Step, StopNode,
+        Action, AsyncBranch, HealPartition, KillNode, NodeSelector as Sel, PartitionPair, Scenario,
+        Step, StopNode,
     };
 
     use super::*;
@@ -762,7 +918,10 @@ mod tests {
             node: Sel::Index(0),
         }))]);
         let err = check_capabilities(&s, Capabilities::none()).expect_err("should refuse");
-        assert!(matches!(err, RunError::UnsupportedCapability { .. }), "got {err:?}");
+        assert!(
+            matches!(err, RunError::UnsupportedCapability { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -778,7 +937,10 @@ mod tests {
             })),
         ]);
         let err = check_capabilities(&s, Capabilities::none()).expect_err("should refuse");
-        assert!(matches!(err, RunError::UnsupportedCapability { .. }), "got {err:?}");
+        assert!(
+            matches!(err, RunError::UnsupportedCapability { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -791,7 +953,38 @@ mod tests {
             }))],
         }))]);
         let err = check_capabilities(&s, Capabilities::none()).expect_err("should refuse");
-        assert!(matches!(err, RunError::UnsupportedCapability { .. }), "got {err:?}");
+        assert!(
+            matches!(err, RunError::UnsupportedCapability { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rate_target_delay_zero_disables_throttle() {
+        assert_eq!(super::rate_target_delay(0, 0), None);
+        assert_eq!(super::rate_target_delay(999, 0), None);
+    }
+
+    #[test]
+    fn rate_target_delay_at_10_ops_per_sec() {
+        assert_eq!(super::rate_target_delay(0, 10), Some(Duration::ZERO));
+        assert_eq!(
+            super::rate_target_delay(5, 10),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            super::rate_target_delay(10, 10),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn rate_target_delay_at_1000_ops_per_sec() {
+        // 1ms per op, 100 ops → 100ms
+        assert_eq!(
+            super::rate_target_delay(100, 1000),
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[test]

@@ -117,10 +117,7 @@ impl Provisioner for ProcessProvisioner {
         }
     }
 
-    async fn provision(
-        &self,
-        config: &ProvisionConfig,
-    ) -> Result<Vec<String>, ProvisionerError> {
+    async fn provision(&self, config: &ProvisionConfig) -> Result<Vec<String>, ProvisionerError> {
         // Fast path: identical config and a cluster already running.
         {
             let state = self.state.lock();
@@ -383,11 +380,7 @@ async fn wait_all_ready(urls: &[String]) -> Result<(), ProvisionerError> {
 /// Always emits a `[cluster]` block — even single-node clusters take
 /// the clustered code path so `is_leader` and `current_leader_index`
 /// behave consistently.
-fn render_config_toml(
-    node: &NodePlan,
-    all: &[NodePlan],
-    cluster: &ClusterConfig,
-) -> String {
+fn render_config_toml(node: &NodePlan, all: &[NodePlan], cluster: &ClusterConfig) -> String {
     let mut peers = String::new();
     for p in all {
         peers.push_str(&format!(

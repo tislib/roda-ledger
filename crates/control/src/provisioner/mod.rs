@@ -145,10 +145,7 @@ pub trait Provisioner: Send + Sync {
     /// with a different config applies the diff. Implementations
     /// decide whether changes can be applied online (e.g. node count
     /// adjustment) or require a brief unhealthy window.
-    async fn provision(
-        &self,
-        config: &ProvisionConfig,
-    ) -> Result<Vec<String>, ProvisionerError>;
+    async fn provision(&self, config: &ProvisionConfig) -> Result<Vec<String>, ProvisionerError>;
 
     // ---- Per-node faults (idx into provision()'s result) ----
 

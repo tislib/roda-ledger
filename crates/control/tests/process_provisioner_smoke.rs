@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use control::provisioner::process::ProcessProvisioner;
-use control::runner::ScenarioRunner;
 use control::runner::ProvisionConfig;
+use control::runner::ScenarioRunner;
 use proto::control::ClusterConfig;
 use testing::scenarios;
 
@@ -63,8 +63,8 @@ async fn process_provisioner_runs_single_deposit_committed() {
         .find(|s| s.name == "single_deposit_committed")
         .expect("seed catalogue must contain single_deposit_committed");
 
-    runner
-        .run(&scenario, &smoke_config(1))
-        .await
+    let report = runner.run(&scenario, &smoke_config(1)).await;
+    report
+        .result
         .expect("scenario should pass against real roda-server cluster");
 }
