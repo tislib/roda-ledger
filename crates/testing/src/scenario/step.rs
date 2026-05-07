@@ -411,9 +411,7 @@ mod tests {
                 binary: vec![],
                 override_existing: false,
             }),
-            Action::UnregisterFunction(UnregisterFunction {
-                name: "f".into(),
-            }),
+            Action::UnregisterFunction(UnregisterFunction { name: "f".into() }),
         ];
         for a in &actions {
             assert!(!a.kind_name().is_empty(), "kind_name returned empty");

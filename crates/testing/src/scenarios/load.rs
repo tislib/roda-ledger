@@ -25,22 +25,24 @@ fn deposit_burst_1k() -> Scenario {
         .with_steps(vec![
             Step::new(Action::AsyncBranch(AsyncBranch {
                 name: Some("burst".into()),
-                steps: vec![Step::new(Action::SubmitBatch(SubmitBatch {
-                    wait: WaitLevel::None,
-                    retry: Some(RetryConfig {
-                        max_retries: 5,
-                        backoff_ms: 50,
-                    }),
-                    kind: BatchKind::Dynamic {
-                        base: vec![SubmitOp::Deposit {
-                            account: 1,
-                            amount: 1,
-                            user_ref: 1,
-                        }],
-                        repeat: 1000,
-                    },
-                }))
-                .with_label("1k deposits")],
+                steps: vec![
+                    Step::new(Action::SubmitBatch(SubmitBatch {
+                        wait: WaitLevel::None,
+                        retry: Some(RetryConfig {
+                            max_retries: 5,
+                            backoff_ms: 50,
+                        }),
+                        kind: BatchKind::Dynamic {
+                            base: vec![SubmitOp::Deposit {
+                                account: 1,
+                                amount: 1,
+                                user_ref: 1,
+                            }],
+                            repeat: 1000,
+                        },
+                    }))
+                    .with_label("1k deposits"),
+                ],
             })),
             // Implicit join at end-of-scenario; small grace period so
             // the cluster has settled before asserting.

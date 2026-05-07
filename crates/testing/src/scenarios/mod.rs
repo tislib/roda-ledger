@@ -26,6 +26,7 @@ pub fn list() -> Vec<Scenario> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::sim::Simulator;
 
     #[test]
     fn list_is_non_empty_and_unique() {
@@ -49,5 +50,28 @@ mod tests {
             );
             assert!(!s.steps.is_empty(), "scenario `{}` has no steps", s.name);
         }
+    }
+
+    /// Runs every scenario through the in-memory simulator and reports
+    /// any whose assertion math doesn't line up with their submissions.
+    /// This catches obvious authoring bugs (off-by-one in a Dynamic
+    /// batch, wrong expected balance, transferring from the wrong
+    /// account) without needing a real cluster. Fault injection,
+    /// timing, and pipeline state are out of scope — see
+    /// `crate::scenario::sim` for what is and isn't modeled.
+    #[test]
+    fn every_scenario_simulates_cleanly() {
+        let mut failures = Vec::new();
+        for scenario in list() {
+            let mut sim = Simulator::new();
+            if let Err(e) = sim.run(&scenario) {
+                failures.push(format!("`{}`: {}", scenario.name, e));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "scenario validation failures:\n  - {}",
+            failures.join("\n  - ")
+        );
     }
 }

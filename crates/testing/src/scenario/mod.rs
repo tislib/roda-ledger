@@ -16,6 +16,7 @@
 //! definitions; a translation layer to/from `proto::control` belongs
 //! in the runner, not here.
 
+pub mod sim;
 pub mod step;
 pub mod types;
 
