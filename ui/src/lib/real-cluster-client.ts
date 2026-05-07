@@ -20,6 +20,7 @@ import {
   GetServerInfoRequestSchema,
   GetTransactionStatusRequestSchema,
   HealPartitionRequestSchema,
+  KillNodeRequestSchema,
   ListScenarioRunsRequestSchema,
   PartitionPairRequestSchema,
   RestartNodeRequestSchema,
@@ -76,7 +77,9 @@ export class RealClusterClient implements ClusterClient {
     return {
       version: resp.version,
       apiVersion: resp.apiVersion,
-      capabilities: resp.capabilities.map((c) => Capability[c] ?? 'UNSPECIFIED'),
+      capabilities: resp.capabilities.map(
+        (c) => (Capability[c] as 'KILL' | 'NETWORK_PARTITION' | 'UNSPECIFIED') ?? 'UNSPECIFIED',
+      ),
     };
   }
 
@@ -161,6 +164,12 @@ export class RealClusterClient implements ClusterClient {
   async stopNode(nodeId: string) {
     const resp = await this.client.stopNode(
       create(StopNodeRequestSchema, { nodeId: stringToU64(nodeId) }),
+    );
+    return { accepted: resp.accepted, error: resp.error };
+  }
+  async killNode(nodeId: string) {
+    const resp = await this.client.killNode(
+      create(KillNodeRequestSchema, { nodeId: stringToU64(nodeId) }),
     );
     return { accepted: resp.accepted, error: resp.error };
   }

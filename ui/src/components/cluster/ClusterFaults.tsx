@@ -2,11 +2,13 @@ import { useState } from 'react';
 import { useClusterSnapshot } from '@/hooks/useClusterSnapshot';
 import {
   useFaultHistory,
+  useKillNode,
   usePartitionPair,
   useRestartNode,
   useStartNode,
   useStopNode,
 } from '@/hooks/useFaults';
+import { useHasCapability } from '@/hooks/useCapabilities';
 import { EmptyState } from '@/components/shared/EmptyState';
 import { RoleBadge } from '@/components/shared/RoleBadge';
 import { StatusDot } from '@/components/shared/StatusDot';
@@ -17,9 +19,12 @@ export function ClusterFaults() {
   const { data: snapshot } = useClusterSnapshot();
   const { data: history } = useFaultHistory(64);
   const stop = useStopNode();
+  const kill = useKillNode();
   const start = useStartNode();
   const restart = useRestartNode();
   const partition = usePartitionPair();
+  const canKill = useHasCapability('KILL');
+  const canPartition = useHasCapability('NETWORK_PARTITION');
 
   const [partA, setPartA] = useState('1');
   const [partB, setPartB] = useState('2');
@@ -58,12 +63,23 @@ export function ClusterFaults() {
                     </div>
                     <div className="flex items-center gap-1">
                       <button
-                        className="btn btn-danger"
+                        className="btn"
                         onClick={() => stop.mutate(n.nodeId)}
                         disabled={isStopped || stop.isPending}
+                        title="Graceful shutdown (SIGTERM-equivalent)"
                       >
                         Stop
                       </button>
+                      {canKill && (
+                        <button
+                          className="btn btn-danger"
+                          onClick={() => kill.mutate(n.nodeId)}
+                          disabled={isStopped || kill.isPending}
+                          title="Abrupt termination (SIGKILL-equivalent) — drops in-flight work"
+                        >
+                          Kill
+                        </button>
+                      )}
                       <button
                         className="btn"
                         onClick={() => start.mutate(n.nodeId)}
@@ -85,66 +101,68 @@ export function ClusterFaults() {
             </ul>
           </section>
 
-          <section className="pane p-4 space-y-3">
-            <div className="label">Partition pair</div>
-            <div className="grid grid-cols-2 gap-2">
-              <select
-                value={partA}
-                onChange={(e) => setPartA(e.target.value)}
-                className="bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono"
-              >
-                {snapshot.nodes.map((n) => (
-                  <option key={n.nodeId} value={n.nodeId}>
-                    {formatNodeId(n.nodeId)}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={partB}
-                onChange={(e) => setPartB(e.target.value)}
-                className="bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono"
-              >
-                {snapshot.nodes.map((n) => (
-                  <option key={n.nodeId} value={n.nodeId}>
-                    {formatNodeId(n.nodeId)}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <button
-              className={cn('btn w-full justify-center', !isPartitioned && 'btn-accent')}
-              disabled={partA === partB || partition.isPending}
-              onClick={() =>
-                partition.mutate({ a: partA, b: partB, heal: isPartitioned })
-              }
-            >
-              {isPartitioned
-                ? `Heal ${formatNodeId(partA)} ↔ ${formatNodeId(partB)}`
-                : `Partition ${formatNodeId(partA)} ⇎ ${formatNodeId(partB)}`}
-            </button>
-
-            {snapshot.partitions.length > 0 && (
-              <div className="space-y-1 pt-2 border-t border-border-subtle">
-                <div className="label">Active partitions</div>
-                {snapshot.partitions.map(([a, b]) => (
-                  <div
-                    key={`${a}-${b}`}
-                    className="flex items-center justify-between text-[11px] font-mono"
-                  >
-                    <span className="text-health-isolated">
-                      {formatNodeId(a)} ⇎ {formatNodeId(b)}
-                    </span>
-                    <button
-                      className="btn"
-                      onClick={() => partition.mutate({ a, b, heal: true })}
-                    >
-                      Heal
-                    </button>
-                  </div>
-                ))}
+          {canPartition && (
+            <section className="pane p-4 space-y-3">
+              <div className="label">Partition pair</div>
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={partA}
+                  onChange={(e) => setPartA(e.target.value)}
+                  className="bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono"
+                >
+                  {snapshot.nodes.map((n) => (
+                    <option key={n.nodeId} value={n.nodeId}>
+                      {formatNodeId(n.nodeId)}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={partB}
+                  onChange={(e) => setPartB(e.target.value)}
+                  className="bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono"
+                >
+                  {snapshot.nodes.map((n) => (
+                    <option key={n.nodeId} value={n.nodeId}>
+                      {formatNodeId(n.nodeId)}
+                    </option>
+                  ))}
+                </select>
               </div>
-            )}
-          </section>
+              <button
+                className={cn('btn w-full justify-center', !isPartitioned && 'btn-accent')}
+                disabled={partA === partB || partition.isPending}
+                onClick={() =>
+                  partition.mutate({ a: partA, b: partB, heal: isPartitioned })
+                }
+              >
+                {isPartitioned
+                  ? `Heal ${formatNodeId(partA)} ↔ ${formatNodeId(partB)}`
+                  : `Partition ${formatNodeId(partA)} ⇎ ${formatNodeId(partB)}`}
+              </button>
+
+              {snapshot.partitions.length > 0 && (
+                <div className="space-y-1 pt-2 border-t border-border-subtle">
+                  <div className="label">Active partitions</div>
+                  {snapshot.partitions.map(([a, b]) => (
+                    <div
+                      key={`${a}-${b}`}
+                      className="flex items-center justify-between text-[11px] font-mono"
+                    >
+                      <span className="text-health-isolated">
+                        {formatNodeId(a)} ⇎ {formatNodeId(b)}
+                      </span>
+                      <button
+                        className="btn"
+                        onClick={() => partition.mutate({ a, b, heal: true })}
+                      >
+                        Heal
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
         </div>
 
         <aside className="w-80 shrink-0 border-l border-border-subtle bg-bg-1 overflow-auto">

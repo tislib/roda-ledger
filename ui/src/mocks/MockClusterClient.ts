@@ -75,6 +75,9 @@ export class MockClusterClient implements ClusterClient {
   async stopNode(nodeId: string) {
     return delay(this.sim.applyFault('stop', nodeId));
   }
+  async killNode(nodeId: string) {
+    return delay(this.sim.applyFault('kill', nodeId));
+  }
   async startNode(nodeId: string) {
     return delay(this.sim.applyFault('start', nodeId));
   }

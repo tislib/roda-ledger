@@ -78,7 +78,9 @@ const DEFAULT_CONFIG: ClusterConfig = {
 const SERVER_INFO: ServerInfo = {
   version: 'mock-0.1.0',
   apiVersion: 1,
-  capabilities: ['cluster', 'logs', 'provisioning', 'faults', 'meta', 'scenarios'],
+  // Mock supports both abrupt Kill and pairwise partitions, so it advertises
+  // both Capability values defined in the proto.
+  capabilities: ['KILL', 'NETWORK_PARTITION'],
 };
 
 function nodeAddress(nodeId: string): string {
@@ -604,6 +606,19 @@ export class Simulator {
         node.votesReceived.clear();
         node.electionDeadline = rollElectionDeadline(now);
         description = `Restarted node ${nodeId}`;
+        break;
+      }
+      case 'kill': {
+        // Mock conflates Kill with Stop (no real process to abruptly terminate).
+        // Recorded as Kill so the UI can distinguish in fault history.
+        if (!node) return { accepted: false, error: `unknown node ${nodeId}` };
+        node.health = 'Stopped';
+        node.role = 'Follower';
+        node.currentLeader = null;
+        node.votedFor = null;
+        node.votesReceived.clear();
+        node.electionDeadline = 0;
+        description = `Killed node ${nodeId}`;
         break;
       }
       case 'partition': {

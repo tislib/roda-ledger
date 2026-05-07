@@ -77,8 +77,15 @@ export interface ClusterConfig {
   appendEntriesMaxBytes: string;
 }
 
+/**
+ * Optional surface area the server advertises. The UI hides controls
+ * backed by RPCs the server does not implement (e.g. Kill button, pairwise
+ * partition controls).
+ */
+export type Capability = 'UNSPECIFIED' | 'KILL' | 'NETWORK_PARTITION';
+
 export interface ServerInfo {
   version: string;
   apiVersion: number;
-  capabilities: string[];
+  capabilities: Capability[];
 }

@@ -13,7 +13,7 @@ const WORKLOAD_OPTIONS: WorkloadKind[] = [
   'Mixed',
 ];
 
-const FAULT_OPTIONS: FaultKind[] = ['stop', 'start', 'restart', 'partition', 'heal'];
+const FAULT_OPTIONS: FaultKind[] = ['stop', 'kill', 'start', 'restart', 'partition', 'heal'];
 
 interface Props {
   scenarioId: string;

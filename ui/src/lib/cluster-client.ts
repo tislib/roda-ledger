@@ -40,6 +40,8 @@ export interface ClusterClient {
 
   // ---- Fault injection ----
   stopNode(nodeId: string): Promise<{ accepted: boolean; error: string }>;
+  /** Abrupt termination. Only available when the server advertises `CAPABILITY_KILL`. */
+  killNode(nodeId: string): Promise<{ accepted: boolean; error: string }>;
   startNode(nodeId: string): Promise<{ accepted: boolean; error: string }>;
   restartNode(nodeId: string): Promise<{ accepted: boolean; error: string }>;
   partitionPair(a: string, b: string): Promise<{ accepted: boolean; error: string }>;

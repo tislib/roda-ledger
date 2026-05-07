@@ -24,6 +24,18 @@ export function useStopNode() {
   });
 }
 
+export function useKillNode() {
+  const client = useClusterClient();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (nodeId: string) => client.killNode(nodeId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.cluster.snapshot() });
+      qc.invalidateQueries({ queryKey: qk.cluster.faults() });
+    },
+  });
+}
+
 export function useStartNode() {
   const client = useClusterClient();
   const qc = useQueryClient();
