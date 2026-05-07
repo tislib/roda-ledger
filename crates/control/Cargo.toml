@@ -11,6 +11,12 @@ path = "src/lib.rs"
 
 [dependencies]
 proto.workspace = true
+# Scenario primitives + built-in catalogue. `testing`'s default feature
+# set is empty; the legacy harness deps (cluster, ledger,
+# libtest-mimic, etc.) only enter the build when the `harness` feature
+# is explicitly enabled, so control inherits only the lightweight
+# scenario layer.
+testing.workspace = true
 tonic.workspace = true
 tonic-web = "0.12"
 tonic-reflection = "0.12"

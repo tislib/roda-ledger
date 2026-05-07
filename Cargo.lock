@@ -462,6 +462,7 @@ dependencies = [
  "prost",
  "prost-types",
  "proto",
+ "testing",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

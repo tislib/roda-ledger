@@ -24,8 +24,7 @@ pub enum NodeSelector {
 }
 
 /// Pipeline level a submission should wait for before the step returns.
-/// Mirrors `proto::ledger::WaitLevel`, kept as a plain Rust enum to keep
-/// the scenario API proto-free.
+/// `None` means fire-and-forget.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WaitLevel {
     #[default]
@@ -35,17 +34,31 @@ pub enum WaitLevel {
     OnSnapshot,
 }
 
-/// Refer to a transaction by absolute id or by a binding name set
-/// earlier in the scenario (e.g. by a `SubmitStep` with `bind_tx_id`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Pipeline level used by *waits* on already-submitted transactions.
+/// Distinct from `WaitLevel` because there is no "wait for nothing" —
+/// waits always have a concrete target level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineLevel {
+    Computed,
+    Committed,
+    OnSnapshot,
+}
+
+/// Refer to a transaction by the `user_ref` an earlier `Submit` step
+/// carried. The runner maps `user_ref → tx_id` internally on submission
+/// completion. Single-variant enum so additional reference forms can
+/// be added later (e.g. `Latest`) without breaking call sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxRef {
-    Id(u64),
-    Bound(String),
+    UserRef(u64),
 }
 
 /// One submittable operation. Mirrors the `roda.ledger.v1` operation
 /// shapes; intentionally not the proto type so the scenario module
 /// stays decoupled from wire generation.
+///
+/// `user_ref` is both the idempotency key (cluster-side dedup) and the
+/// scenario-side identity used by `TxRef::UserRef` references.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmitOp {
     Deposit {
@@ -72,8 +85,7 @@ pub enum SubmitOp {
 }
 
 /// Terminal-or-pipeline transaction status. Mirrors
-/// `proto::control::TransactionStatus`; same proto-decoupling rationale
-/// as the other types here.
+/// `proto::control::TransactionStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxStatus {
     Pending,
@@ -82,4 +94,15 @@ pub enum TxStatus {
     OnSnapshot,
     Error,
     NotFound,
+}
+
+/// Per-`Submit` retry configuration. The runner re-issues the submit up
+/// to `max_retries` additional times after the first failure, with a
+/// constant `backoff_ms` delay between attempts. Kept deliberately
+/// minimal — extra knobs (jitter, exponential backoff, retry-on
+/// classification) get added when a real scenario needs them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryConfig {
+    pub max_retries: u32,
+    pub backoff_ms: u32,
 }
