@@ -12,6 +12,7 @@
 //! against a real server while the production control plane is built out.
 
 pub mod background;
+pub mod scenario;
 pub mod server;
 pub mod service;
 pub mod state;
