@@ -38,6 +38,10 @@ use super::Scenario;
 use super::step::{Action, BatchKind, Step};
 use super::types::SubmitOp;
 
+/// System account id. Mirrors the ledger's SYSTEM_SOURCE / SYSTEM_SINK.
+/// Deposits debit it; withdrawals credit it; transfers don't touch it.
+pub const SYSTEM_ACCOUNT: u64 = 0;
+
 /// In-memory ledger simulator.
 #[derive(Debug, Default)]
 pub struct Simulator {
@@ -91,9 +95,22 @@ impl Simulator {
                 }
                 Ok(())
             }
+            Action::AssertBalanceSum(a) => {
+                // Inclusive scan over [0, max_account]. Double-entry
+                // bookkeeping guarantees this is 0 if the scenario's
+                // submissions are well-formed (SYSTEM_ACCOUNT absorbs
+                // the counter-leg of every deposit/withdraw).
+                let total: i64 = (0..=a.max_account).map(|id| self.balance(id)).sum();
+                if total != 0 {
+                    return Err(SimError::NotZeroSum {
+                        max_account: a.max_account,
+                        total,
+                    });
+                }
+                Ok(())
+            }
             // Categories deliberately not modeled — see module docs.
-            Action::AssertBalanceSum(_)
-            | Action::AssertPipelineCaughtUp(_)
+            Action::AssertPipelineCaughtUp(_)
             | Action::AssertTxStatus(_)
             | Action::AssertLeader(_)
             | Action::Wait(_)
@@ -116,23 +133,26 @@ impl Simulator {
             SubmitOp::Deposit {
                 account, amount, ..
             } => {
-                *self.accounts.entry(*account).or_insert(0) += *amount as i64;
+                let amt = *amount as i64;
+                *self.accounts.entry(*account).or_insert(0) += amt;
+                *self.accounts.entry(SYSTEM_ACCOUNT).or_insert(0) -= amt;
             }
             SubmitOp::Withdraw {
                 account, amount, ..
             } => {
-                // Allowed to drive negative — the ledger's
-                // insufficient-funds check is unhappy-path territory
-                // and outside the simulator's scope. A scenario
-                // depending on a withdraw being rejected will surface
-                // via its later `AssertBalance` instead.
-                *self.accounts.entry(*account).or_insert(0) -= *amount as i64;
+                // Allowed to drive the user account negative — the
+                // ledger's insufficient-funds check is unhappy-path
+                // territory and outside the simulator's scope.
+                let amt = *amount as i64;
+                *self.accounts.entry(*account).or_insert(0) -= amt;
+                *self.accounts.entry(SYSTEM_ACCOUNT).or_insert(0) += amt;
             }
             SubmitOp::Transfer {
                 from, to, amount, ..
             } => {
-                *self.accounts.entry(*from).or_insert(0) -= *amount as i64;
-                *self.accounts.entry(*to).or_insert(0) += *amount as i64;
+                let amt = *amount as i64;
+                *self.accounts.entry(*from).or_insert(0) -= amt;
+                *self.accounts.entry(*to).or_insert(0) += amt;
             }
             SubmitOp::Function { .. } => {
                 // WASM ops are opaque to the simulator.
@@ -167,6 +187,10 @@ pub enum SimError {
         expected: i64,
         actual: i64,
     },
+    NotZeroSum {
+        max_account: u64,
+        total: i64,
+    },
 }
 
 impl fmt::Display for SimError {
@@ -179,6 +203,10 @@ impl fmt::Display for SimError {
             } => write!(
                 f,
                 "AssertBalance failed for account {account}: expected {expected}, got {actual}"
+            ),
+            SimError::NotZeroSum { max_account, total } => write!(
+                f,
+                "AssertBalanceSum failed: total over accounts [0, {max_account}] is {total}, expected 0 (zero-sum invariant)"
             ),
         }
     }
@@ -193,8 +221,8 @@ impl std::error::Error for SimError {}
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Action, AssertBalance, AsyncBranch, BatchKind, NodeSelector, Scenario, Step, Submit,
-        SubmitBatch, SubmitOp, WaitLevel,
+        Action, AssertBalance, AssertBalanceSum, AsyncBranch, BatchKind, NodeSelector, Scenario,
+        Step, Submit, SubmitBatch, SubmitOp, WaitLevel,
     };
     use super::*;
 
@@ -272,6 +300,85 @@ mod tests {
             })),
         ]);
         Simulator::new().run(&s).expect("3 * 50 = 150");
+    }
+
+    #[test]
+    fn deposit_debits_system_account() {
+        let s = Scenario::new("double_entry").with_steps(vec![Step::new(Action::Submit(Submit {
+            op: SubmitOp::Deposit {
+                account: 1,
+                amount: 100,
+                user_ref: 1,
+            },
+            wait: WaitLevel::Committed,
+            retry: None,
+        }))]);
+        let mut sim = Simulator::new();
+        sim.run(&s).expect("scenario should pass");
+        assert_eq!(sim.balance(1), 100, "user account credited");
+        assert_eq!(
+            sim.balance(SYSTEM_ACCOUNT),
+            -100,
+            "system account holds the counter-leg"
+        );
+    }
+
+    #[test]
+    fn withdraw_credits_system_account() {
+        let s = Scenario::new("withdraw").with_steps(vec![
+            Step::new(Action::Submit(Submit {
+                op: SubmitOp::Deposit {
+                    account: 1,
+                    amount: 100,
+                    user_ref: 1,
+                },
+                wait: WaitLevel::Committed,
+                retry: None,
+            })),
+            Step::new(Action::Submit(Submit {
+                op: SubmitOp::Withdraw {
+                    account: 1,
+                    amount: 30,
+                    user_ref: 2,
+                },
+                wait: WaitLevel::Committed,
+                retry: None,
+            })),
+        ]);
+        let mut sim = Simulator::new();
+        sim.run(&s).expect("scenario should pass");
+        assert_eq!(sim.balance(1), 70);
+        assert_eq!(sim.balance(SYSTEM_ACCOUNT), -70);
+    }
+
+    #[test]
+    fn assert_balance_sum_passes_for_well_formed_scenario() {
+        let s = Scenario::new("zero_sum").with_steps(vec![
+            Step::new(Action::Submit(Submit {
+                op: SubmitOp::Deposit {
+                    account: 1,
+                    amount: 100,
+                    user_ref: 1,
+                },
+                wait: WaitLevel::Committed,
+                retry: None,
+            })),
+            Step::new(Action::Submit(Submit {
+                op: SubmitOp::Transfer {
+                    from: 1,
+                    to: 2,
+                    amount: 40,
+                    user_ref: 2,
+                },
+                wait: WaitLevel::Committed,
+                retry: None,
+            })),
+            Step::new(Action::AssertBalanceSum(AssertBalanceSum {
+                node: NodeSelector::Leader,
+                max_account: 10,
+            })),
+        ]);
+        Simulator::new().run(&s).expect("zero-sum invariant must hold");
     }
 
     #[test]
