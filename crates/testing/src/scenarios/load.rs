@@ -45,6 +45,7 @@ fn deposit_burst_1k() -> Scenario {
                                 user_ref: 1,
                             }],
                             repeat: 1000,
+                            batch_size: 0,
                         },
                     }))
                     .with_label("1k deposits"),
@@ -94,6 +95,7 @@ fn sustained_transfer_load() -> Scenario {
                             user_ref: 1_000,
                         }],
                         repeat: 200,
+                        batch_size: 0,
                     },
                 }))],
             })),
@@ -111,6 +113,7 @@ fn sustained_transfer_load() -> Scenario {
                             user_ref: 2_000,
                         }],
                         repeat: 200,
+                        batch_size: 0,
                     },
                 }))],
             })),
@@ -152,6 +155,7 @@ fn load_sustained_2min() -> Scenario {
                         user_ref: 1,
                     }],
                     repeat: TOTAL_OPS as u32,
+                    batch_size: 0,
                 },
             }))
             .with_label("60k deposits at 500 ops/s"),
@@ -166,17 +170,20 @@ fn load_sustained_2min() -> Scenario {
         ])
 }
 
-/// One unrated burst of 10_000 deposits — the cluster soaks up the
-/// queue as fast as it can. The report's per-interval throughput
-/// shows the soak rate, latencies (if waiting submits were used)
-/// surface contention.
+/// 1M deposits, dispatched as 1000 batches of 1000 ops each (one
+/// `submit_batch` RPC per outer iteration). Amortizes per-RPC gRPC
+/// framing across 1000 ops so the run exercises the cluster's commit
+/// path, not the runner's per-op tonic round-trip cost.
 fn load_spike() -> Scenario {
-    const TOTAL_OPS: u64 = 100_000;
+    const BATCH_SIZE: u32 = 1_000;
+    const REPEAT: u32 = 10_000;
+    // base.len() * batch_size * repeat — last user_ref offset is
+    // `(BATCH_SIZE * REPEAT) - 1`, so the last emitted user_ref is
+    // `1 + (BATCH_SIZE * REPEAT) - 1 = BATCH_SIZE * REPEAT`.
+    const TOTAL_OPS: u64 = (BATCH_SIZE as u64) * (REPEAT as u64);
 
     Scenario::new("load_spike")
-        .with_description(
-            "10k-op spike at full speed; observe peak throughput and recovery in the report.",
-        )
+        .with_description("1M-op spike at full speed via 1000 batches of 1000 deposits.")
         .with_steps(vec![
             Step::new(Action::SubmitBatch(SubmitBatch {
                 wait: WaitLevel::None,
@@ -188,10 +195,11 @@ fn load_spike() -> Scenario {
                         amount: 1,
                         user_ref: 1,
                     }],
-                    repeat: TOTAL_OPS as u32,
+                    repeat: REPEAT,
+                    batch_size: BATCH_SIZE,
                 },
             }))
-            .with_label("10k deposits, no rate cap"),
+            .with_label("1k batches × 1k deposits"),
             // Drain so the report measures the full burst settling,
             // not just submission.
             Step::new(Action::WaitForLevel(WaitForLevel {

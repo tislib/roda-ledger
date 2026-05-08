@@ -221,8 +221,7 @@ async fn run_many(
             // summary block. Doesn't fit on one line, so we break the
             // dot-padded format used for terse runs.
             println!("=== [{}/{total}] {} ===", i + 1, scenario.name);
-            let outcome =
-                run_scenario(server_bin, scenario, nodes, verbose, true).await;
+            let outcome = run_scenario(server_bin, scenario, nodes, verbose, true).await;
             total_elapsed += outcome.elapsed;
             print_outcome_block(&outcome);
             println!();
@@ -463,9 +462,7 @@ fn is_load_scenario(name: &str) -> bool {
 // `crates/ledger/src/bin/load.rs`.
 // ============================================================
 
-fn spawn_progress_ticker(
-    metrics: Arc<MetricsCollector>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_progress_ticker(metrics: Arc<MetricsCollector>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sec: u32 = 0;
         let mut last_committed: u64 = 0;
@@ -579,29 +576,67 @@ fn fmt_dur(d: Duration) -> String {
 fn print_summary_box(outcome: &Outcome) {
     let tput = outcome.metrics.throughput_stats();
     let lat = outcome.metrics.latency_stats();
-    let elapsed_secs = outcome.elapsed.as_secs_f64();
-    let avg_tps = if elapsed_secs > 0.0 {
-        tput.ops_total as f64 / elapsed_secs
-    } else {
-        0.0
-    };
+    // Report the active-commit window, not the full scenario wall-clock.
+    // `tput.duration` runs from the last pre-movement metrics sample to
+    // the first post-movement sample (i.e., it covers exactly the
+    // window where `cluster_commit` advanced from its starting value
+    // to its final value), and `tput.avg_ops_per_sec` is the rate over
+    // that window — the cluster's actual commit throughput, not
+    // committed-ops divided by total elapsed (which would be diluted
+    // by provisioner setup, runner startup, and the post-burst
+    // OnSnapshot drain wait).
+    let active_secs = tput.duration.as_secs_f64();
     let total_submitted = outcome.metrics.submit_latencies.len();
 
     println!("  ╔══════════════════════════════════════════════╗");
     println!("  ║              LOAD TEST SUMMARY               ║");
     println!("  ╠══════════════════════════════════════════════╣");
-    println!("  ║  Duration      : {:>10.2}s                 ║", elapsed_secs);
-    println!("  ║  Submitted     : {:>10}                  ║", total_submitted);
-    println!("  ║  Committed     : {:>10}                  ║", tput.ops_total);
-    println!("  ║  Avg TPS       : {:>10.0}                  ║", avg_tps);
-    println!("  ║  Peak TPS      : {:>10.0}                  ║", tput.max_ops_per_sec);
+    println!(
+        "  ║  Wall clock    : {:>10.2}s                 ║",
+        outcome.elapsed.as_secs_f64()
+    );
+    println!(
+        "  ║  Commit window : {:>10.2}s                 ║",
+        active_secs
+    );
+    println!(
+        "  ║  Submitted     : {:>10}                  ║",
+        total_submitted
+    );
+    println!(
+        "  ║  Committed     : {:>10}                  ║",
+        tput.ops_total
+    );
+    println!(
+        "  ║  Avg TPS       : {:>10.0}                  ║",
+        tput.avg_ops_per_sec
+    );
+    println!(
+        "  ║  Peak TPS      : {:>10.0}                  ║",
+        tput.max_ops_per_sec
+    );
     println!("  ╠══════════════════════════════════════════════╣");
     if let Some(l) = lat {
-        println!("  ║  P50  Latency  : {:>10}                  ║", fmt_dur(l.p50));
-        println!("  ║  P99  Latency  : {:>10}                  ║", fmt_dur(l.p99));
-        println!("  ║  P999 Latency  : {:>10}                  ║", fmt_dur(l.p999));
-        println!("  ║  Min  Latency  : {:>10}                  ║", fmt_dur(l.min));
-        println!("  ║  Max  Latency  : {:>10}                  ║", fmt_dur(l.max));
+        println!(
+            "  ║  P50  Latency  : {:>10}                  ║",
+            fmt_dur(l.p50)
+        );
+        println!(
+            "  ║  P99  Latency  : {:>10}                  ║",
+            fmt_dur(l.p99)
+        );
+        println!(
+            "  ║  P999 Latency  : {:>10}                  ║",
+            fmt_dur(l.p999)
+        );
+        println!(
+            "  ║  Min  Latency  : {:>10}                  ║",
+            fmt_dur(l.min)
+        );
+        println!(
+            "  ║  Max  Latency  : {:>10}                  ║",
+            fmt_dur(l.max)
+        );
         println!("  ║  Samples       : {:>10}                  ║", l.samples);
     } else {
         println!("  ║  No submit latencies captured              ║");

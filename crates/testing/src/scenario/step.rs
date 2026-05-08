@@ -162,12 +162,23 @@ pub struct SubmitBatch {
 pub enum BatchKind {
     /// A literal list. Submitted once, in declared order.
     Static(Vec<SubmitOp>),
-    /// Repeat `base` `repeat` times. The runner expands the base list
-    /// per iteration; ensuring `user_ref` uniqueness across iterations
-    /// is the runner's responsibility (typically by treating each
-    /// base op's `user_ref` as a starting offset and incrementing per
-    /// expansion).
-    Dynamic { base: Vec<SubmitOp>, repeat: u32 },
+    /// Repeat `base` to produce `repeat * batch_size` copies in total.
+    ///
+    /// `batch_size` controls the on-wire grouping:
+    /// - `0` or `1` → one RPC per `base` copy (legacy per-op submission).
+    ///   Total ops = `base.len() * repeat`.
+    /// - `>= 2` → one batched RPC per outer iteration, carrying
+    ///   `base.len() * batch_size` ops. Total ops =
+    ///   `base.len() * batch_size * repeat`.
+    ///
+    /// In both modes the runner offsets each emitted op's `user_ref` by
+    /// the cumulative `iter * base.len()` so every emitted op has a
+    /// unique `user_ref` across the whole batch.
+    Dynamic {
+        base: Vec<SubmitOp>,
+        repeat: u32,
+        batch_size: u32,
+    },
 }
 
 // ============================================================
@@ -353,6 +364,7 @@ mod tests {
                         user_ref: 1,
                     }],
                     repeat: 10,
+                    batch_size: 0,
                 },
             }),
             Action::AsyncBranch(AsyncBranch {

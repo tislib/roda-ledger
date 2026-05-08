@@ -167,8 +167,14 @@ impl Simulator {
                     self.apply_op(op);
                 }
             }
-            BatchKind::Dynamic { base, repeat } => {
-                for _ in 0..*repeat {
+            BatchKind::Dynamic {
+                base,
+                repeat,
+                batch_size,
+            } => {
+                let inner = (*batch_size).max(1) as u64;
+                let outer = *repeat as u64;
+                for _ in 0..(outer * inner) {
                     for op in base {
                         self.apply_op(op);
                     }
@@ -292,6 +298,7 @@ mod tests {
                         user_ref: 1,
                     }],
                     repeat: 50,
+                    batch_size: 0,
                 },
             })),
             Step::new(Action::AssertBalance(AssertBalance {

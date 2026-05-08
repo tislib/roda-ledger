@@ -176,6 +176,7 @@ fn basic_crash_recovery_1m_tx() -> Scenario {
             kind: BatchKind::Dynamic {
                 base,
                 repeat: BATCHES_PER_RESTART as u32,
+                batch_size: 0,
             },
         })));
 

@@ -322,12 +322,24 @@ impl ReplicationLoop {
                     if unsafe_truncate {
                         error!(
                             "replication_loop/f[{}]: AE Reject UNSAFE TRUNCATE — after={} < pre_cluster_commit={} (silent clamp): pre(local_commit={} local_write={}) ledger(commit_id={} compute_id={}) — Raft Leader Completeness violated upstream",
-                            self_id, after, pre_cluster_commit, pre_local_commit, pre_local_write, lcid, lcomp
+                            self_id,
+                            after,
+                            pre_cluster_commit,
+                            pre_local_commit,
+                            pre_local_write,
+                            lcid,
+                            lcomp
                         );
                     } else {
                         info!(
                             "replication_loop/f[{}]: AE Reject reseed: after={} pre(cluster_commit={} local_commit={} local_write={}) ledger(commit_id={} compute_id={})",
-                            self_id, after, pre_cluster_commit, pre_local_commit, pre_local_write, lcid, lcomp
+                            self_id,
+                            after,
+                            pre_cluster_commit,
+                            pre_local_commit,
+                            pre_local_write,
+                            lcid,
+                            lcomp
                         );
                     }
                     if let Err(e) = self.reseed_ledger(after) {

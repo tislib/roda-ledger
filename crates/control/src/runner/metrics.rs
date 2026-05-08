@@ -92,7 +92,10 @@ impl MetricsCollector {
     /// submits it captures the round-trip plus pipeline-stage wait.
     pub fn record_submit_latency(&self, latency: Duration) {
         let at = self.start.elapsed();
-        self.inner.lock().submit_latencies.push(LatencyPoint { at, latency });
+        self.inner
+            .lock()
+            .submit_latencies
+            .push(LatencyPoint { at, latency });
     }
 
     /// Push one pipeline sample. Called from the background poller.
@@ -229,9 +232,58 @@ impl Snapshot {
                 .unwrap_or(0)
         };
 
+        // Trim the measurement window to the active commit phase: from
+        // the last pre-movement sample (cc == min_cc) to the first
+        // post-movement sample (cc == max_cc). Without this trim the
+        // average spans warmup (provisioner is still bringing the
+        // cluster up, runner hasn't fired its first RPC yet, so
+        // cluster_commit isn't moving) and drain (the load step is
+        // done, the report is just waiting on the OnSnapshot wait
+        // step). Both phases have zero ops/sec and would drag
+        // `avg_ops_per_sec` far below the cluster's real commit rate.
+        let min_cc = cc(&self.samples[0]);
+        let max_cc = cc(self.samples.last().unwrap());
+
+        if max_cc <= min_cc {
+            // Cluster never advanced past the starting commit index —
+            // either no submits landed or the run was too short.
+            return ThroughputStats {
+                samples: self.samples.len(),
+                ops_total: 0,
+                duration: Duration::ZERO,
+                avg_ops_per_sec: 0.0,
+                min_ops_per_sec: 0.0,
+                max_ops_per_sec: 0.0,
+            };
+        }
+
+        // `start_idx` is the last sample whose `cc` was still at the
+        // baseline — i.e., the timestamp of the first non-zero commit
+        // delta is between `start_idx` and `start_idx + 1`. Using
+        // `start_idx`'s timestamp as the time origin is conservative
+        // (slightly longer duration, slightly lower TPS) but is
+        // honest: that's the latest moment we observed zero progress.
+        let start_idx = self
+            .samples
+            .iter()
+            .rposition(|s| cc(s) == min_cc)
+            .unwrap_or(0);
+        // `end_idx` is the first sample where `cc` had already
+        // reached its final value — symmetric reasoning.
+        let end_idx = self
+            .samples
+            .iter()
+            .position(|s| cc(s) == max_cc)
+            .unwrap_or(self.samples.len() - 1);
+        let active = if end_idx > start_idx {
+            &self.samples[start_idx..=end_idx]
+        } else {
+            &self.samples[..]
+        };
+
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
-        for w in self.samples.windows(2) {
+        for w in active.windows(2) {
             let prev = &w[0];
             let curr = &w[1];
             let delta_cc = cc(curr).saturating_sub(cc(prev)) as f64;
@@ -253,10 +305,12 @@ impl Snapshot {
             max = 0.0;
         }
 
-        let first = self.samples.first().unwrap();
-        let last = self.samples.last().unwrap();
-        let ops_total = cc(last).saturating_sub(cc(first));
-        let duration = last.at.saturating_sub(first.at);
+        let ops_total = max_cc.saturating_sub(min_cc);
+        let duration = active
+            .last()
+            .unwrap()
+            .at
+            .saturating_sub(active.first().unwrap().at);
         let avg = if duration.as_secs_f64() > 0.0 {
             ops_total as f64 / duration.as_secs_f64()
         } else {
@@ -278,8 +332,7 @@ impl Snapshot {
         if self.submit_latencies.is_empty() {
             return None;
         }
-        let mut sorted: Vec<Duration> =
-            self.submit_latencies.iter().map(|p| p.latency).collect();
+        let mut sorted: Vec<Duration> = self.submit_latencies.iter().map(|p| p.latency).collect();
         sorted.sort();
         let n = sorted.len();
         let total: Duration = sorted.iter().sum();

@@ -203,8 +203,7 @@ impl ScenarioRunner {
         // covers the full run — short bursts can complete entirely
         // between two periodic samples otherwise.
         metrics.snapshot_now(&client).await;
-        let poller =
-            metrics::spawn_poller(client.clone(), metrics.clone(), POLL_INTERVAL);
+        let poller = metrics::spawn_poller(client.clone(), metrics.clone(), POLL_INTERVAL);
 
         let started = metrics.start();
         let exec_result = self.execute(&client, scenario, &metrics).await;
@@ -335,17 +334,29 @@ impl ScenarioRunner {
         ctx: &mut RunCtx,
         s: &SubmitBatch,
     ) -> Result<(), RunError> {
-        // Submit each expanded op individually. The cluster client's
-        // homogeneous batch APIs (`deposit_batch_and_wait` etc.) are
-        // a worthwhile optimization later — for now correctness over
-        // throughput, especially since the runner does not yet need
-        // to drive multi-op heterogeneous batches with different
-        // wait semantics per op.
+        // Batched-RPC fast path. When `BatchKind::Dynamic { batch_size > 0 }`,
+        // dispatch one `submit_batch` RPC per outer iteration carrying
+        // `base.len() * batch_size` ops. Amortizes the ~55 µs per-RPC tonic
+        // framing across many ops; without this, 1M ops sequential would
+        // take ~55 s at the gRPC layer regardless of how fast the ledger is.
+        if let BatchKind::Dynamic {
+            base,
+            repeat,
+            batch_size,
+        } = &s.kind
+        {
+            if *batch_size > 0 {
+                return self
+                    .run_submit_batched(client, metrics, ctx, s, base, *repeat, *batch_size)
+                    .await;
+            }
+        }
+
+        // Per-op path: submit each expanded op individually. Used for
+        // `BatchKind::Static` and `Dynamic { batch_size: 0 }` — preserves
+        // existing behavior for scenarios that need rate-throttled or
+        // mixed-variant submission.
         let ops = expand_batch(&s.kind);
-        // Rate throttle: when `s.rate > 0`, schedule op `i` to start
-        // no earlier than `i / rate` seconds after the first op. With
-        // `wait != WaitLevel::None` the cluster's response time is
-        // an additional ceiling on achieved throughput.
         let rate_start = if s.rate > 0 {
             Some(std::time::Instant::now())
         } else {
@@ -364,6 +375,57 @@ impl ScenarioRunner {
                 metrics.record_submit_latency(started.elapsed());
             }
             ctx.bindings.insert(user_ref_of(&op), tx_id);
+        }
+        Ok(())
+    }
+
+    async fn run_submit_batched(
+        &self,
+        client: &ClusterClient,
+        metrics: &Arc<MetricsCollector>,
+        ctx: &mut RunCtx,
+        s: &SubmitBatch,
+        base: &[SubmitOp],
+        repeat: u32,
+        batch_size: u32,
+    ) -> Result<(), RunError> {
+        let stride = base.len() as u64;
+        let rate_start = if s.rate > 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut chunk: Vec<SubmitOp> = Vec::with_capacity(base.len() * batch_size as usize);
+        let mut global_iter: u64 = 0;
+        for batch_idx in 0..repeat {
+            // Rate throttle is per-op-rate; convert to per-batch:
+            // batch `batch_idx` should start no earlier than
+            // `(batch_idx * batch_size) / rate` seconds after the first.
+            if let (Some(start), Some(target)) = (
+                rate_start,
+                rate_target_delay((batch_idx as usize) * (batch_size as usize), s.rate),
+            ) {
+                let elapsed = start.elapsed();
+                if elapsed < target {
+                    tokio::time::sleep(target - elapsed).await;
+                }
+            }
+            chunk.clear();
+            for _ in 0..batch_size {
+                let offset = global_iter * stride;
+                for op in base {
+                    chunk.push(with_user_ref_offset(op.clone(), offset));
+                }
+                global_iter += 1;
+            }
+            let started = Instant::now();
+            let tx_ids = submit_batch_once(client, &chunk, s.wait).await?;
+            if s.wait != WaitLevel::None {
+                metrics.record_submit_latency(started.elapsed());
+            }
+            for (op, tx_id) in chunk.iter().zip(tx_ids.iter()) {
+                ctx.bindings.insert(user_ref_of(op), *tx_id);
+            }
         }
         Ok(())
     }
@@ -768,15 +830,28 @@ fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
     }
 }
 
-/// Expand `BatchKind` into a flat `Vec<SubmitOp>`. For `Dynamic`,
-/// each iteration's user_refs are offset by `iter * base.len()`.
+/// Expand `BatchKind` into a flat `Vec<SubmitOp>`. Used by the per-op
+/// fallback path (`Static`, or `Dynamic { batch_size: 0 }`); the
+/// batched path in `run_submit_batched` builds chunks itself without
+/// allocating the full flattened vector.
+///
+/// For `Dynamic`, each emitted op's `user_ref` is offset by
+/// `iter * base.len()` so all emitted user_refs are unique. When
+/// `batch_size > 0` the total iteration count is `repeat * batch_size`;
+/// when `batch_size == 0` it falls back to legacy `repeat`-only.
 fn expand_batch(kind: &BatchKind) -> Vec<SubmitOp> {
     match kind {
         BatchKind::Static(ops) => ops.clone(),
-        BatchKind::Dynamic { base, repeat } => {
+        BatchKind::Dynamic {
+            base,
+            repeat,
+            batch_size,
+        } => {
+            let inner = (*batch_size).max(1) as u64;
+            let total_iters = (*repeat as u64) * inner;
             let stride = base.len() as u64;
-            let mut out = Vec::with_capacity(base.len() * (*repeat as usize));
-            for iter in 0..*repeat as u64 {
+            let mut out = Vec::with_capacity(base.len() * total_iters as usize);
+            for iter in 0..total_iters {
                 let offset = iter * stride;
                 for op in base {
                     out.push(with_user_ref_offset(op.clone(), offset));
@@ -1066,5 +1141,50 @@ async fn submit_once(
                 "Function submit with WaitLevel::None is not supported by ClusterClient".into(),
             )),
         }
+    }
+}
+
+/// Send a homogeneous batch as a single `submit_batch` RPC. Returns one
+/// transaction id per op, in input order.
+///
+/// Today this only supports all-Deposit batches, because the cluster
+/// client's other batch APIs either don't exist (Withdraw, Function) or
+/// drop the per-op `user_ref` on the wire (`transfer_batch_and_wait`
+/// hardcodes user_ref = 0), which breaks `user_ref → tx_id` bindings.
+/// `BatchKind::Dynamic { batch_size: 0 }` keeps any of those scenarios
+/// working through the per-op fallback path.
+async fn submit_batch_once(
+    client: &ClusterClient,
+    ops: &[SubmitOp],
+    wait: WaitLevel,
+) -> Result<Vec<u64>, RunError> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut deposits: Vec<(u64, u64, u64)> = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            SubmitOp::Deposit {
+                account,
+                amount,
+                user_ref,
+            } => deposits.push((*account, *amount, *user_ref)),
+            _ => {
+                return Err(RunError::Client(
+                    "BatchKind::Dynamic { batch_size > 0 } only supports Deposit ops today; \
+                     use batch_size: 0 for other variants"
+                        .into(),
+                ));
+            }
+        }
+    }
+    if let Some(wl) = wait_to_proto(wait) {
+        let results = client
+            .deposit_batch_and_wait(&deposits, wl)
+            .await
+            .map_err(client_err)?;
+        Ok(results.into_iter().map(|r| r.tx_id).collect())
+    } else {
+        client.deposit_batch(&deposits).await.map_err(client_err)
     }
 }
