@@ -4,22 +4,23 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use proto::control::control_server::ControlServer;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use crate::cluster_handle::ClusterHandle;
+use crate::event_store::EventStore;
 use crate::service::ControlService;
-use crate::state::InMemoryState;
 
 pub async fn serve(
     addr: SocketAddr,
-    state: Arc<RwLock<InMemoryState>>,
+    handle: Arc<ClusterHandle>,
+    events: Arc<EventStore>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let service = ControlService::new(state.clone());
+    let service = ControlService::new(handle, events);
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::control::FILE_DESCRIPTOR_SET)

@@ -34,6 +34,13 @@ service Control {
   // poll at sub-second cadence.
   rpc GetClusterSnapshot(GetClusterSnapshotRequest) returns (GetClusterSnapshotResponse);
 
+  // WatchClusterSnapshot is the server-streaming variant of
+  // GetClusterSnapshot. The server emits a snapshot at most every
+  // `interval_ms` (clamped to a sane range), driven by a server-side
+  // tick. Client should consume in a loop and stop the stream by
+  // dropping the iterator. Preferred over polling for the Dashboard.
+  rpc WatchClusterSnapshot(WatchClusterSnapshotRequest) returns (stream GetClusterSnapshotResponse);
+
   // GetRecentElections returns recent role transitions and elections,
   // newest first. Drives the Dashboard election timeline.
   rpc GetRecentElections(GetRecentElectionsRequest) returns (GetRecentElectionsResponse);
@@ -101,6 +108,17 @@ service Control {
   // through the cluster's normal reconfiguration flow.
   rpc SetNodeCount(SetNodeCountRequest) returns (SetNodeCountResponse);
 
+  // ResetCluster destroys all current cluster state and reinitializes
+  // a fresh cluster with the same node count and current ClusterConfig.
+  //   - All running cluster nodes are stopped.
+  //   - All on-disk data (WALs, snapshots, balances) is wiped.
+  //   - The control plane's ephemeral history (fault log, scenario
+  //     runs, submission records) is cleared.
+  //   - A fresh cluster is provisioned. Returns once the new cluster is
+  //     accepting requests.
+  // Destructive — typically gated by an operator confirmation dialog.
+  rpc ResetCluster(ResetClusterRequest) returns (ResetClusterResponse);
+
   // ---- Fault injection ----
 
   // StopNode shuts down the addressed node gracefully (SIGTERM-equivalent
@@ -135,7 +153,35 @@ service Control {
   // Injection page's history panel.
   rpc GetFaultHistory(GetFaultHistoryRequest) returns (GetFaultHistoryResponse);
 
-  // ---- Load / Simulations ----
+  // ---- Meta (WASM extensions) ----
+
+  // RegisterFunction installs a compiled WASM module under a snake_case
+  // name. The binary must export `execute(i64 x 8) -> i32`. Mirrors
+  // `roda.ledger.v1.Ledger.RegisterFunction`. Used by the Meta module's
+  // Deploy button.
+  rpc RegisterFunction(RegisterFunctionRequest) returns (RegisterFunctionResponse);
+
+  // UnregisterFunction removes the handler for `name`. Subsequent
+  // Function operations against the name return INVALID_OPERATION.
+  rpc UnregisterFunction(UnregisterFunctionRequest) returns (UnregisterFunctionResponse);
+
+  // ListFunctions returns metadata for every currently-registered function.
+  rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
+
+  // WatchFunctions streams the registered function set whenever the
+  // server thinks it has changed (or at most every `interval_ms` as a
+  // heartbeat). Removes the polling flicker the Meta module sees when
+  // the underlying ListFunctions occasionally returns transient
+  // empties during normal cluster activity.
+  rpc WatchFunctions(WatchFunctionsRequest) returns (stream ListFunctionsResponse);
+
+  // ---- Testing (load + e2e scenarios) ----
+
+  // ListAvailableScenarios returns the server's built-in scenario
+  // catalogue — the same set CI runs. The UI's Testing module reads
+  // this to populate its catalog; users select a scenario by name and
+  // call RunScenario.
+  rpc ListAvailableScenarios(ListAvailableScenariosRequest) returns (ListAvailableScenariosResponse);
 
   // RunScenario submits a scenario for the cluster to execute. Returns
   // a run_id immediately; the scenario runs asynchronously. Poll
@@ -194,6 +240,12 @@ enum Capability {
 // ============================================================
 
 message GetClusterSnapshotRequest {}
+
+message WatchClusterSnapshotRequest {
+  // Server-side emit cadence in ms. 0 = server default (250). Clamped
+  // server-side to [50, 5000].
+  uint32 interval_ms = 1;
+}
 
 message GetClusterSnapshotResponse {
   // Time the snapshot was taken on the server, ms since Unix epoch.
@@ -605,6 +657,13 @@ message SetNodeCountResponse {
   uint32 current_count = 4;
 }
 
+message ResetClusterRequest {}
+
+message ResetClusterResponse {
+  bool   accepted = 1;
+  string error    = 2;
+}
+
 // ClusterConfig is the cluster-wide ledger and replication configuration
 // shared by every node. Per-node settings (data directory, listen
 // address, election timer) are set at deploy time and are not exposed
@@ -699,6 +758,55 @@ message FaultEvent {
   string       description = 5;
 }
 
+// ============================================================
+// Meta (WASM extensions)
+// ============================================================
+
+message RegisterFunctionRequest {
+  string name              = 1;
+  // Compiled WASM module bytes; must export execute(i64 x 8) -> i32.
+  bytes  binary            = 2;
+  // If false and `name` already registered, the call returns
+  // accepted=false with `error = "ALREADY_EXISTS"`.
+  bool   override_existing = 3;
+}
+
+message RegisterFunctionResponse {
+  bool   accepted = 1;
+  string error    = 2;
+  // Monotonic per-name version stamped on the WAL record.
+  uint32 version  = 3;
+}
+
+message UnregisterFunctionRequest {
+  string name = 1;
+}
+
+message UnregisterFunctionResponse {
+  bool   accepted = 1;
+  string error    = 2;
+  // Version stamped on the unregister record.
+  uint32 version  = 3;
+}
+
+message ListFunctionsRequest {}
+
+message WatchFunctionsRequest {
+  // Heartbeat cadence in ms. 0 = server default (1000). Clamped
+  // server-side to [200, 10000].
+  uint32 interval_ms = 1;
+}
+
+message ListFunctionsResponse {
+  repeated FunctionInfo functions = 1;
+}
+
+message FunctionInfo {
+  string name    = 1;
+  uint32 version = 2;
+  uint32 crc32c  = 3;
+}
+
 enum FaultKind {
   FAULT_KIND_UNSPECIFIED = 0;
   FAULT_KIND_STOP        = 1;
@@ -710,8 +818,35 @@ enum FaultKind {
 }
 
 // ============================================================
-// Load / Simulations
+// Testing (load + e2e scenarios)
 // ============================================================
+
+// ScenarioCategory groups built-in scenarios for UI navigation.
+// E2E: assertion-style tests (verify cluster behaviour).
+// LOAD: throughput / soak runs.
+enum ScenarioCategory {
+  SCENARIO_CATEGORY_UNSPECIFIED = 0;
+  SCENARIO_CATEGORY_E2E         = 1;
+  SCENARIO_CATEGORY_LOAD        = 2;
+}
+
+// AvailableScenario is one entry in the server's built-in catalogue.
+// Users run it by name via RunScenario.
+message AvailableScenario {
+  string           name        = 1;
+  string           description = 2;
+  ScenarioCategory category    = 3;
+  // Number of steps in the scenario, for the catalog list.
+  uint32           step_count  = 4;
+}
+
+message ListAvailableScenariosRequest {}
+
+message ListAvailableScenariosResponse {
+  // Stable order: e2e first, then load (matches the catalogue's own
+  // declared order in `testing::scenarios::list`).
+  repeated AvailableScenario scenarios = 1;
+}
 
 message RunScenarioRequest {
   Scenario scenario = 1;

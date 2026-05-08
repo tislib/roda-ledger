@@ -26,10 +26,12 @@ tonic-reflection = "0.12"
 prost.workspace = true
 prost-types.workspace = true
 tokio.workspace = true
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 parking_lot.workspace = true
+arc-swap.workspace = true
 rand.workspace = true
 spdlog-rs.workspace = true
 clap.workspace = true

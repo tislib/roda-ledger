@@ -102,6 +102,19 @@ impl ProcessProvisioner {
     /// When `true`, discard each child server's stdout / stderr.
     /// Useful for keeping the parent process's output clean (e.g.
     /// when the parent is itself rendering scenario progress).
+    /// Force a fresh provision on the next `provision()` call by clearing
+    /// the cached last_config + tearing down current nodes + removing the
+    /// cluster temp dir. After this returns, the next `provision()` call
+    /// will go through the cold-provision path even with an identical
+    /// config (which is what `ResetCluster` needs).
+    pub fn reset_for_full_reprovision(&self) {
+        let mut state = self.state.lock();
+        teardown_existing(&mut state);
+        if let Some(dir) = state.cluster_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     pub fn quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
         self

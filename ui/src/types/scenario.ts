@@ -1,5 +1,14 @@
 import type { FaultKind } from './cluster';
 
+export type ScenarioCategory = 'E2E' | 'Load' | 'Unspecified';
+
+export interface AvailableScenario {
+  name: string;
+  description: string;
+  category: ScenarioCategory;
+  stepCount: number;
+}
+
 export type WorkloadKind =
   | 'DepositBurst'
   | 'TransferPair'

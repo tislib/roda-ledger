@@ -474,6 +474,7 @@ name = "control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "clap",
  "client",
@@ -487,6 +488,7 @@ dependencies = [
  "testing",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tonic-reflection",

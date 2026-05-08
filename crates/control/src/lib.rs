@@ -1,22 +1,24 @@
-//! Control plane in-memory mock for the operational UI.
+//! Control plane backed by a real cluster.
 //!
 //! Implements `roda.control.v1.Control` over a tonic gRPC server with
-//! `tonic-web` for browser compatibility (so `@connectrpc/connect-web` can
-//! reach it from a Vite dev server). State is held entirely in memory
-//! behind a single `parking_lot::RwLock`; a 250 ms background tick advances
-//! the staged-pipeline watermarks, drives election fallback when the
-//! current leader is stopped, and runs scenarios.
+//! `tonic-web` for browser compatibility (so `@connectrpc/connect-web`
+//! can reach it from a Vite dev server). State is split between a
+//! long-lived [`cluster_handle::ClusterHandle`] (provisioner +
+//! [`client::ClusterClient`]) and an in-memory [`event_store::EventStore`]
+//! for ephemeral history (faults, scenario runs, recent submissions).
 //!
-//! This crate intentionally has no dependency on `ledger`, `raft`, or
-//! `cluster`. It exists to make the UI's control-plane RPCs round-trip
-//! against a real server while the production control plane is built out.
+//! The cluster outlives individual scenario runs — `RunScenario` drives
+//! [`runner::ScenarioRunner::run_against_existing`] against the live
+//! `ClusterClient` rather than re-provisioning. `UpdateClusterConfig`
+//! and `SetNodeCount` reprovision via the underlying `ProcessProvisioner`.
 
-pub mod background;
+pub mod cluster_handle;
+pub mod event_store;
 pub mod provisioner;
 pub mod runner;
 pub mod server;
 pub mod service;
-pub mod state;
 
+pub use cluster_handle::ClusterHandle;
+pub use event_store::EventStore;
 pub use server::serve;
-pub use state::InMemoryState;

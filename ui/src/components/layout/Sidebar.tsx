@@ -8,7 +8,7 @@ const TOP_LEVEL = [
   { to: '/cluster', label: 'Cluster' },
   { to: '/ledger', label: 'Ledger' },
   { to: '/meta', label: 'Meta' },
-  { to: '/load', label: 'Load / Simulations' },
+  { to: '/testing', label: 'Testing' },
 ];
 
 const CLUSTER_SUBNAV = [

@@ -7,6 +7,7 @@
  * else operates on `@/types/*`.
  */
 import type {
+  AvailableScenario as PbAvailableScenario,
   ClusterConfig as PbClusterConfig,
   ClusterMembership as PbMembership,
   ElectionEvent as PbElectionEvent,
@@ -28,6 +29,7 @@ import {
   LogEntryKind as PbLogEntryKind,
   NodeHealth as PbNodeHealth,
   NodeRole as PbNodeRole,
+  ScenarioCategory as PbScenarioCategory,
   ScenarioState as PbScenarioState,
   TransactionStatus as PbTxStatus,
   WorkloadKind as PbWorkloadKind,
@@ -47,7 +49,9 @@ import type {
 import type { LogEntry, LogEntryKind } from '@/types/log';
 import type { Operation, TransactionStatus } from '@/types/transaction';
 import type {
+  AvailableScenario,
   Scenario,
+  ScenarioCategory,
   ScenarioRunStatus,
   ScenarioRunSummary,
   ScenarioState,
@@ -126,6 +130,21 @@ const LOG_KIND_FROM: Record<PbLogEntryKind, LogEntryKind> = {
   [PbLogEntryKind.FUNCTION_REGISTERED]: 'FunctionRegistered',
   [PbLogEntryKind.FUNCTION_UNREGISTERED]: 'FunctionUnregistered',
 };
+
+const SCENARIO_CATEGORY_FROM: Record<PbScenarioCategory, ScenarioCategory> = {
+  [PbScenarioCategory.UNSPECIFIED]: 'Unspecified',
+  [PbScenarioCategory.E2E]: 'E2E',
+  [PbScenarioCategory.LOAD]: 'Load',
+};
+
+export function availableScenarioFromPb(pb: PbAvailableScenario): AvailableScenario {
+  return {
+    name: pb.name,
+    description: pb.description,
+    category: SCENARIO_CATEGORY_FROM[pb.category] ?? 'Unspecified',
+    stepCount: pb.stepCount,
+  };
+}
 
 const SCENARIO_STATE_FROM: Record<PbScenarioState, ScenarioState> = {
   [PbScenarioState.UNSPECIFIED]: 'Failed',

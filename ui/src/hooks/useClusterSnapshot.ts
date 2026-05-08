@@ -4,11 +4,18 @@ import { qk } from '@/lib/query-keys';
 
 export function useClusterSnapshot(intervalMs = 500) {
   const client = useClusterClient();
+  // If the active client supports streaming, the App-level
+  // `useClusterSnapshotStream` is feeding the cache live — disable the
+  // polling loop. Otherwise (e.g. mock://local), poll as before.
+  const streaming = typeof client.watchClusterSnapshot === 'function';
   return useQuery({
     queryKey: qk.cluster.snapshot(),
     queryFn: () => client.getClusterSnapshot(),
-    refetchInterval: intervalMs,
+    refetchInterval: streaming ? false : intervalMs,
     placeholderData: (prev) => prev,
+    // Streams may not have emitted yet; do an initial fetch so the page
+    // doesn't stay blank while waiting for the first frame.
+    enabled: true,
   });
 }
 

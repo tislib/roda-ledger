@@ -199,6 +199,28 @@ impl ScenarioRunner {
             }
         };
 
+        self.run_against_existing(scenario, client, metrics).await
+    }
+
+    /// Run against a cluster the caller already owns. Skips provision
+    /// + connect — the gRPC server uses this so its single long-lived
+    /// `ClusterHandle` carries the cluster across many runs. The
+    /// provisioner is still used for fault-injection steps.
+    pub async fn run_against_existing(
+        &self,
+        scenario: &Scenario,
+        client: ClusterClient,
+        metrics: Arc<MetricsCollector>,
+    ) -> RunReport {
+        let caps = self.provisioner.capabilities();
+        if let Err(e) = check_capabilities(scenario, caps) {
+            return RunReport {
+                elapsed: Duration::ZERO,
+                result: Err(e),
+                metrics: metrics.snapshot(),
+            };
+        }
+
         // Bookend with explicit samples so the throughput delta
         // covers the full run — short bursts can complete entirely
         // between two periodic samples otherwise.

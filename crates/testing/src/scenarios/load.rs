@@ -199,7 +199,7 @@ fn load_spike() -> Scenario {
                     batch_size: BATCH_SIZE,
                 },
             }))
-            .with_label("1k batches × 1k deposits"),
+            .with_label("10k batches × 1k deposits"),
             // Drain so the report measures the full burst settling,
             // not just submission.
             Step::new(Action::WaitForLevel(WaitForLevel {

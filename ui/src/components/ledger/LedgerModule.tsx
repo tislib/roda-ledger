@@ -3,6 +3,7 @@ import { useClusterSnapshot } from '@/hooks/useClusterSnapshot';
 import { ResultPanel } from '@/components/shared/ResultPanel';
 import { TxList } from './TxList';
 import { DepositForm, FunctionInvokeForm, TransferForm, WithdrawalForm } from './forms';
+import { BalanceLookup } from './BalanceLookup';
 
 export function LedgerModule() {
   const { data: snapshot } = useClusterSnapshot();
@@ -37,6 +38,7 @@ export function LedgerModule() {
           <WithdrawalForm onTxSubmitted={recordSubmit} />
           <TransferForm onTxSubmitted={recordSubmit} />
           <FunctionInvokeForm onTxSubmitted={recordSubmit} />
+          <BalanceLookup />
         </div>
 
         <div className="col-span-5 space-y-3">
