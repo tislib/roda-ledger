@@ -171,7 +171,7 @@ fn load_sustained_2min() -> Scenario {
 /// shows the soak rate, latencies (if waiting submits were used)
 /// surface contention.
 fn load_spike() -> Scenario {
-    const TOTAL_OPS: u64 = 10_000;
+    const TOTAL_OPS: u64 = 100_000;
 
     Scenario::new("load_spike")
         .with_description(

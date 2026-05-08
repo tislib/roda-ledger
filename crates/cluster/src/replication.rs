@@ -287,6 +287,14 @@ impl ReplicationLoop {
         } else {
             LogEntryRange::new(req.from_tx_id, req.to_tx_id - req.from_tx_id + 1, req.term)
         };
+        // Capture pre-validate raft state so the Reject branch below can
+        // detect a silent cluster_commit_index clamp inside
+        // validate_append_entries_request — that's the canary for
+        // "leader asked to truncate below committed", which would mean
+        // our reseed-watermark is unsafe.
+        let pre_cluster_commit = self.node.borrow().cluster_commit_index();
+        let pre_local_commit = self.node.borrow().commit_index();
+        let pre_local_write = self.node.borrow().write_index();
         let decision = self.node.borrow_mut().validate_append_entries_request(
             now,
             req.leader_id,
@@ -308,10 +316,20 @@ impl ReplicationLoop {
                     self_id, reason, truncate_after
                 );
                 if let Some(after) = truncate_after {
-                    debug!(
-                        "replication_loop/f[{}]: AE Reject reseed ledger after={}",
-                        self_id, after
-                    );
+                    let lcid = self.ledger.ledger().last_commit_id();
+                    let lcomp = self.ledger.ledger().last_compute_id();
+                    let unsafe_truncate = after < pre_cluster_commit;
+                    if unsafe_truncate {
+                        error!(
+                            "replication_loop/f[{}]: AE Reject UNSAFE TRUNCATE — after={} < pre_cluster_commit={} (silent clamp): pre(local_commit={} local_write={}) ledger(commit_id={} compute_id={}) — Raft Leader Completeness violated upstream",
+                            self_id, after, pre_cluster_commit, pre_local_commit, pre_local_write, lcid, lcomp
+                        );
+                    } else {
+                        info!(
+                            "replication_loop/f[{}]: AE Reject reseed: after={} pre(cluster_commit={} local_commit={} local_write={}) ledger(commit_id={} compute_id={})",
+                            self_id, after, pre_cluster_commit, pre_local_commit, pre_local_write, lcid, lcomp
+                        );
+                    }
                     if let Err(e) = self.reseed_ledger(after) {
                         error!(
                             "replication_loop/f[{}]: reseed_ledger({}) failed: {}",
