@@ -37,7 +37,9 @@ use testing::scenario::{
 };
 
 pub use crate::provisioner::{Capabilities, ProvisionConfig, Provisioner, ProvisionerError};
-pub use metrics::{MetricsCollector, NodePipelineSnap, Sample, Snapshot};
+pub use metrics::{
+    LatencyPoint, MetricsCollector, NodePipelineSnap, PerSecondStats, Sample, Snapshot,
+};
 
 /// Per-`run` state. Each top-level `run()` and each spawned branch
 /// gets its own — bindings are scoped to the task that produced them.
@@ -160,13 +162,18 @@ impl ScenarioRunner {
     /// Always returns a [`RunReport`]. Inspect `report.result` for
     /// pass/fail; `report.metrics` holds whatever the background
     /// poller gathered before the run ended.
-    pub async fn run(&self, scenario: &Scenario, config: &ProvisionConfig) -> RunReport {
+    pub async fn run(
+        &self,
+        scenario: &Scenario,
+        config: &ProvisionConfig,
+        metrics: Arc<MetricsCollector>,
+    ) -> RunReport {
         let caps = self.provisioner.capabilities();
         if let Err(e) = check_capabilities(scenario, caps) {
             return RunReport {
                 elapsed: Duration::ZERO,
                 result: Err(e),
-                metrics: Snapshot::default(),
+                metrics: metrics.snapshot(),
             };
         }
 
@@ -177,7 +184,7 @@ impl ScenarioRunner {
                 return RunReport {
                     elapsed: provision_started.elapsed(),
                     result: Err(RunError::Provisioner(e)),
-                    metrics: Snapshot::default(),
+                    metrics: metrics.snapshot(),
                 };
             }
         };
@@ -187,7 +194,7 @@ impl ScenarioRunner {
                 return RunReport {
                     elapsed: provision_started.elapsed(),
                     result: Err(RunError::Connect(e.to_string())),
-                    metrics: Snapshot::default(),
+                    metrics: metrics.snapshot(),
                 };
             }
         };
@@ -195,21 +202,21 @@ impl ScenarioRunner {
         // Bookend with explicit samples so the throughput delta
         // covers the full run — short bursts can complete entirely
         // between two periodic samples otherwise.
-        let collector = Arc::new(MetricsCollector::new());
-        collector.snapshot_now(&client).await;
-        let poller = metrics::spawn_poller(client.clone(), collector.clone(), POLL_INTERVAL);
+        metrics.snapshot_now(&client).await;
+        let poller =
+            metrics::spawn_poller(client.clone(), metrics.clone(), POLL_INTERVAL);
 
-        let started = collector.start();
-        let exec_result = self.execute(&client, scenario, &collector).await;
+        let started = metrics.start();
+        let exec_result = self.execute(&client, scenario, &metrics).await;
         let elapsed = started.elapsed();
 
         poller.abort();
-        collector.snapshot_now(&client).await;
+        metrics.snapshot_now(&client).await;
 
         RunReport {
             elapsed,
             result: exec_result,
-            metrics: collector.snapshot(),
+            metrics: metrics.snapshot(),
         }
     }
 
@@ -316,9 +323,7 @@ impl ScenarioRunner {
         let user_ref = user_ref_of(&s.op);
         let started = Instant::now();
         let tx_id = self.do_submit(client, &s.op, s.wait, s.retry).await?;
-        if s.wait != WaitLevel::None {
-            metrics.record_submit_latency(started.elapsed());
-        }
+        metrics.record_submit_latency(started.elapsed());
         ctx.bindings.insert(user_ref, tx_id);
         Ok(())
     }

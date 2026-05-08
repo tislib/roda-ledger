@@ -1,9 +1,10 @@
 use clap::Parser;
-use roda_latency_tracker::latency_measurer::LatencyMeasurer;
-use roda_ledger::ledger::{Ledger, LedgerConfig};
-use roda_ledger::transaction::{Operation, WaitLevel};
 use spdlog::Level::Info;
+use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use std::time::{Duration, Instant};
+use ledger::config::LedgerConfig;
+use ledger::ledger::Ledger;
+use ledger::transaction::{Operation, WaitLevel};
 
 #[derive(Parser, Debug)]
 #[command(name = "load", about = "Load generator for roda-ledger")]

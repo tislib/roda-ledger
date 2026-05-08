@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use control::provisioner::process::ProcessProvisioner;
-use control::runner::{ProvisionConfig, ScenarioRunner, Snapshot};
+use control::runner::{
+    LatencyPoint, MetricsCollector, ProvisionConfig, Sample, ScenarioRunner, Snapshot,
+};
 use proto::control::ClusterConfig;
 use testing::scenario::Scenario;
 use testing::scenarios;
@@ -158,6 +160,8 @@ async fn run_one(server_bin: &Path, name: &str, nodes: u32, verbose: bool) -> Ex
         }
     };
 
+    let is_load = is_load_scenario(name);
+
     println!("=== {} ===", scenario.name);
     if !scenario.description.is_empty() {
         println!("  description: {}", scenario.description);
@@ -166,10 +170,16 @@ async fn run_one(server_bin: &Path, name: &str, nodes: u32, verbose: bool) -> Ex
     println!("  nodes:       {nodes}");
     println!();
 
-    let outcome = run_scenario(server_bin, &scenario, nodes, verbose).await;
+    let outcome = run_scenario(server_bin, &scenario, nodes, verbose, is_load).await;
     print_outcome_block(&outcome);
     println!();
-    print_report_blocks(&outcome.metrics);
+    if is_load {
+        print_summary_box(&outcome);
+        println!();
+        print_node_lag_block(&outcome.metrics);
+    } else {
+        print_report_blocks(&outcome.metrics);
+    }
     match outcome.passed {
         true => ExitCode::SUCCESS,
         false => ExitCode::FAILURE,
@@ -204,12 +214,32 @@ async fn run_many(
     let mut total_elapsed = Duration::ZERO;
 
     for (i, scenario) in scenarios.iter().enumerate() {
+        let is_load = is_load_scenario(&scenario.name);
+
+        if is_load {
+            // Streaming load output — print header, run live table, then
+            // summary block. Doesn't fit on one line, so we break the
+            // dot-padded format used for terse runs.
+            println!("=== [{}/{total}] {} ===", i + 1, scenario.name);
+            let outcome =
+                run_scenario(server_bin, scenario, nodes, verbose, true).await;
+            total_elapsed += outcome.elapsed;
+            print_outcome_block(&outcome);
+            println!();
+            print_summary_box(&outcome);
+            println!();
+            print_node_lag_block(&outcome.metrics);
+            println!();
+            results.push((scenario.name.clone(), outcome));
+            continue;
+        }
+
         let label = format!("[{}/{total}] {}", i + 1, scenario.name);
         let dots = ".".repeat(label_width.saturating_sub(label.chars().count() + 1));
         print!("{label} {dots} ");
         io::stdout().flush().ok();
 
-        let outcome = run_scenario(server_bin, scenario, nodes, verbose).await;
+        let outcome = run_scenario(server_bin, scenario, nodes, verbose, false).await;
         total_elapsed += outcome.elapsed;
         if outcome.passed {
             println!("PASSED ({:.2}s)", outcome.elapsed.as_secs_f64());
@@ -268,12 +298,27 @@ async fn run_scenario(
     scenario: &Scenario,
     nodes: u32,
     verbose: bool,
+    streaming: bool,
 ) -> Outcome {
     let provisioner = Arc::new(ProcessProvisioner::new(server_bin.to_path_buf()).quiet(!verbose));
     let runner = ScenarioRunner::new(provisioner);
     let config = default_config(nodes);
 
-    let report = runner.run(scenario, &config).await;
+    let metrics = Arc::new(MetricsCollector::new());
+    let ticker = if streaming {
+        print_table_header();
+        Some(spawn_progress_ticker(metrics.clone()))
+    } else {
+        None
+    };
+
+    let report = runner.run(scenario, &config, metrics).await;
+
+    if let Some(handle) = ticker {
+        handle.abort();
+        print_table_footer();
+    }
+
     Outcome {
         passed: report.result.is_ok(),
         elapsed: report.elapsed,
@@ -406,6 +451,177 @@ fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
 fn fail(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::FAILURE
+}
+
+fn is_load_scenario(name: &str) -> bool {
+    scenarios::load::all().iter().any(|s| s.name == name)
+}
+
+// ============================================================
+// Live progress ticker — prints one table row per second while a
+// load scenario runs. Mirrors the layout of
+// `crates/ledger/src/bin/load.rs`.
+// ============================================================
+
+fn spawn_progress_ticker(
+    metrics: Arc<MetricsCollector>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sec: u32 = 0;
+        let mut last_committed: u64 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sec += 1;
+            let snap = metrics.snapshot();
+            let row = compute_progress_row(&snap, sec, last_committed);
+            print_table_row(&row);
+            last_committed = row.total_committed;
+        }
+    })
+}
+
+struct ProgressRow {
+    second: u32,
+    tps: u64,
+    total_committed: u64,
+    p50: Duration,
+    p99: Duration,
+    in_flight: u64,
+}
+
+fn compute_progress_row(snap: &Snapshot, sec: u32, prev_committed: u64) -> ProgressRow {
+    let cc = |s: &Sample| {
+        s.per_node
+            .iter()
+            .map(|n| n.cluster_commit)
+            .max()
+            .unwrap_or(0)
+    };
+    let total_committed = snap.samples.last().map(cc).unwrap_or(prev_committed);
+
+    let window_start = Duration::from_secs((sec - 1) as u64);
+    let window_end = Duration::from_secs(sec as u64);
+
+    let mut window: Vec<Duration> = snap
+        .submit_latencies
+        .iter()
+        .filter(|p: &&LatencyPoint| p.at >= window_start && p.at < window_end)
+        .map(|p| p.latency)
+        .collect();
+    window.sort();
+    let (p50, p99) = if window.is_empty() {
+        (Duration::ZERO, Duration::ZERO)
+    } else {
+        let n = window.len();
+        let p_idx = |q: usize| ((n * q) / 100).min(n - 1);
+        (window[p_idx(50)], window[p_idx(99)])
+    };
+
+    let submitted_so_far = snap
+        .submit_latencies
+        .iter()
+        .filter(|p| p.at < window_end)
+        .count() as u64;
+
+    ProgressRow {
+        second: sec,
+        tps: total_committed.saturating_sub(prev_committed),
+        total_committed,
+        p50,
+        p99,
+        in_flight: submitted_so_far.saturating_sub(total_committed),
+    }
+}
+
+fn print_table_header() {
+    println!();
+    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!(
+        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} |",
+        "#", "time", "TPS", "TPC", "P50", "P99", "in-flight"
+    );
+    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+}
+
+fn print_table_footer() {
+    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+}
+
+fn print_table_row(row: &ProgressRow) {
+    println!(
+        "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} |",
+        row.second,
+        row.second,
+        row.tps,
+        row.total_committed,
+        fmt_dur(row.p50),
+        fmt_dur(row.p99),
+        row.in_flight,
+    );
+}
+
+fn fmt_dur(d: Duration) -> String {
+    let ns = d.as_nanos() as u64;
+    if ns >= 1_000_000 {
+        format!("{:.1}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.1}µs", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+// ============================================================
+// Summary box — printed after a load scenario finishes.
+// Layout mirrors `crates/ledger/src/bin/load.rs`.
+// ============================================================
+
+fn print_summary_box(outcome: &Outcome) {
+    let tput = outcome.metrics.throughput_stats();
+    let lat = outcome.metrics.latency_stats();
+    let elapsed_secs = outcome.elapsed.as_secs_f64();
+    let avg_tps = if elapsed_secs > 0.0 {
+        tput.ops_total as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    let total_submitted = outcome.metrics.submit_latencies.len();
+
+    println!("  ╔══════════════════════════════════════════════╗");
+    println!("  ║              LOAD TEST SUMMARY               ║");
+    println!("  ╠══════════════════════════════════════════════╣");
+    println!("  ║  Duration      : {:>10.2}s                 ║", elapsed_secs);
+    println!("  ║  Submitted     : {:>10}                  ║", total_submitted);
+    println!("  ║  Committed     : {:>10}                  ║", tput.ops_total);
+    println!("  ║  Avg TPS       : {:>10.0}                  ║", avg_tps);
+    println!("  ║  Peak TPS      : {:>10.0}                  ║", tput.max_ops_per_sec);
+    println!("  ╠══════════════════════════════════════════════╣");
+    if let Some(l) = lat {
+        println!("  ║  P50  Latency  : {:>10}                  ║", fmt_dur(l.p50));
+        println!("  ║  P99  Latency  : {:>10}                  ║", fmt_dur(l.p99));
+        println!("  ║  P999 Latency  : {:>10}                  ║", fmt_dur(l.p999));
+        println!("  ║  Min  Latency  : {:>10}                  ║", fmt_dur(l.min));
+        println!("  ║  Max  Latency  : {:>10}                  ║", fmt_dur(l.max));
+        println!("  ║  Samples       : {:>10}                  ║", l.samples);
+    } else {
+        println!("  ║  No submit latencies captured              ║");
+    }
+    println!("  ╚══════════════════════════════════════════════╝");
+}
+
+fn print_node_lag_block(metrics: &Snapshot) {
+    let lags = metrics.node_lag_stats();
+    if lags.is_empty() {
+        return;
+    }
+    println!("per-node lag (vs cluster_commit):");
+    for l in &lags {
+        let role = if l.is_leader_at_end { " [leader]" } else { "" };
+        println!(
+            "  node[{}]: max {} ops behind, final {} ops behind{}",
+            l.node_idx, l.max_lag, l.final_lag, role
+        );
+    }
 }
 
 /// Tame the in-process `spdlog-rs` output (used by `client` /

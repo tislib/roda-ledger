@@ -51,10 +51,21 @@ pub struct NodePipelineSnap {
     pub is_leader: bool,
 }
 
+/// One observed submit-RPC round-trip time, stamped with when the
+/// submit call returned (relative to the collector's start). The
+/// timestamp lets the CLI bucket latencies into per-second windows
+/// for the streaming progress table; without it we'd only know the
+/// run-wide distribution.
+#[derive(Clone, Copy, Debug)]
+pub struct LatencyPoint {
+    pub at: Duration,
+    pub latency: Duration,
+}
+
 #[derive(Default)]
 struct CollectorInner {
     samples: Vec<Sample>,
-    submit_latencies: Vec<Duration>,
+    submit_latencies: Vec<LatencyPoint>,
 }
 
 /// Shared metrics sink. The runner clones the `Arc` into spawned
@@ -73,11 +84,15 @@ impl MetricsCollector {
         }
     }
 
-    /// Push one observed submit latency. Only called for waiting
-    /// submits; fire-and-forget is excluded since there's no
-    /// observable end at the submit site.
+    /// Push one observed submit latency. Stamped with `now -
+    /// collector.start` so the CLI can bucket latencies into the
+    /// per-second progress table. Recorded for every submit
+    /// (waiting or fire-and-forget) — for fire-and-forget it
+    /// captures the submission RPC's round-trip time; for waiting
+    /// submits it captures the round-trip plus pipeline-stage wait.
     pub fn record_submit_latency(&self, latency: Duration) {
-        self.inner.lock().submit_latencies.push(latency);
+        let at = self.start.elapsed();
+        self.inner.lock().submit_latencies.push(LatencyPoint { at, latency });
     }
 
     /// Push one pipeline sample. Called from the background poller.
@@ -127,7 +142,7 @@ impl Default for MetricsCollector {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub samples: Vec<Sample>,
-    pub submit_latencies: Vec<Duration>,
+    pub submit_latencies: Vec<LatencyPoint>,
 }
 
 /// Throughput aggregate computed from `cluster_commit` deltas
@@ -161,6 +176,27 @@ pub struct LatencyStats {
     pub avg: Duration,
     pub p50: Duration,
     pub p99: Duration,
+    pub p999: Duration,
+}
+
+/// One row of the streaming progress table. Mirrors the columns of
+/// `crates/ledger/src/bin/load.rs`'s output: per-1-second TPS, TPC,
+/// latency percentiles, in-flight count.
+#[derive(Clone, Copy, Debug)]
+pub struct PerSecondStats {
+    /// 1-based second index since run start.
+    pub second: u32,
+    /// `cluster_commit` advanced by this many ops in the window.
+    pub tps: f64,
+    /// `cluster_commit` watermark at the end of the window.
+    pub total_committed: u64,
+    /// Latency distribution restricted to submits that *returned*
+    /// during this window.
+    pub p50_latency: Option<Duration>,
+    pub p99_latency: Option<Duration>,
+    pub latency_samples: u64,
+    /// `submitted_count - committed` at window close.
+    pub in_flight: u64,
 }
 
 /// Per-node lag relative to the cluster-wide `cluster_commit`
@@ -242,7 +278,8 @@ impl Snapshot {
         if self.submit_latencies.is_empty() {
             return None;
         }
-        let mut sorted = self.submit_latencies.clone();
+        let mut sorted: Vec<Duration> =
+            self.submit_latencies.iter().map(|p| p.latency).collect();
         sorted.sort();
         let n = sorted.len();
         let total: Duration = sorted.iter().sum();
@@ -259,7 +296,89 @@ impl Snapshot {
             avg,
             p50: sorted[p_index(50)],
             p99: sorted[p_index(99)],
+            p999: sorted[((n * 999) / 1000).min(n - 1)],
         })
+    }
+
+    /// Bucket samples + latencies into 1-second windows for the live
+    /// progress table. One row per elapsed second. Returns an empty
+    /// vec for runs shorter than a second.
+    pub fn per_second_stats(&self) -> Vec<PerSecondStats> {
+        let mut out = Vec::new();
+        if self.samples.is_empty() {
+            return out;
+        }
+
+        let cc = |s: &Sample| {
+            s.per_node
+                .iter()
+                .map(|n| n.cluster_commit)
+                .max()
+                .unwrap_or(0)
+        };
+
+        let total_secs = self.samples.last().unwrap().at.as_secs();
+        let mut prev_committed: u64 = self.samples.first().map(cc).unwrap_or(0);
+
+        for sec in 1..=total_secs {
+            let window_start = Duration::from_secs(sec - 1);
+            let window_end = Duration::from_secs(sec);
+
+            // Last cluster_commit watermark observed in this window.
+            // Falls back to the previous tick's value if no sample
+            // happened to land in this second (e.g. cluster paused).
+            let committed = self
+                .samples
+                .iter()
+                .filter(|s| s.at >= window_start && s.at < window_end)
+                .last()
+                .map(cc)
+                .unwrap_or(prev_committed);
+
+            let tps = committed.saturating_sub(prev_committed) as f64;
+
+            // Latency distribution within this 1-sec window.
+            let mut window_latencies: Vec<Duration> = self
+                .submit_latencies
+                .iter()
+                .filter(|p| p.at >= window_start && p.at < window_end)
+                .map(|p| p.latency)
+                .collect();
+            window_latencies.sort();
+
+            let (p50, p99) = if window_latencies.is_empty() {
+                (None, None)
+            } else {
+                let n = window_latencies.len();
+                let p_idx = |q: usize| ((n * q) / 100).min(n - 1);
+                (
+                    Some(window_latencies[p_idx(50)]),
+                    Some(window_latencies[p_idx(99)]),
+                )
+            };
+
+            // Submitted by end of this window — count of latency
+            // points stamped at < window_end.
+            let submitted_by_end = self
+                .submit_latencies
+                .iter()
+                .filter(|p| p.at < window_end)
+                .count() as u64;
+            let in_flight = submitted_by_end.saturating_sub(committed);
+
+            out.push(PerSecondStats {
+                second: sec as u32,
+                tps,
+                total_committed: committed,
+                p50_latency: p50,
+                p99_latency: p99,
+                in_flight,
+                latency_samples: window_latencies.len() as u64,
+            });
+
+            prev_committed = committed;
+        }
+        out
     }
 
     /// One entry per node observed in any sample, with worst-seen
