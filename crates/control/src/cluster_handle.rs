@@ -175,8 +175,7 @@ impl ClusterHandle {
         new_config: Option<ClusterConfig>,
         new_count: Option<u32>,
     ) -> Result<(), HandleError> {
-        let cfg = new_config
-            .unwrap_or_else(|| (*self.config.load_full()).clone());
+        let cfg = new_config.unwrap_or_else(|| (*self.config.load_full()).clone());
         let count = new_count.unwrap_or_else(|| self.node_count());
         if count == 0 {
             return Err(HandleError::Invalid("node_count must be >= 1".into()));
@@ -198,10 +197,7 @@ impl ClusterHandle {
         self.config.store(Arc::new(cfg));
         self.node_addrs.store(urls_arc);
         self.node_count.store(count, Ordering::Release);
-        info!(
-            node_count = count,
-            "cluster reprovisioned"
-        );
+        info!(node_count = count, "cluster reprovisioned");
         Ok(())
     }
 }

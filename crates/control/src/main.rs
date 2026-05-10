@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use control::{
-    ClusterHandle, EventStore, server,
-};
+use control::{ClusterHandle, EventStore, server};
 use proto::control::ClusterConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -82,7 +80,8 @@ async fn main() -> anyhow::Result<()> {
         signal_shutdown.cancel();
     });
 
-    let serve_result = server::serve(cli.addr, handle.clone(), events.clone(), shutdown.clone()).await;
+    let serve_result =
+        server::serve(cli.addr, handle.clone(), events.clone(), shutdown.clone()).await;
     shutdown.cancel();
 
     // Drop the handle here so the provisioner tears the cluster down

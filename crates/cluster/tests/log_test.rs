@@ -115,7 +115,10 @@ async fn get_log_paginates_without_duplicates() {
     }
 
     let expected: Vec<u64> = (1..=n).collect();
-    assert_eq!(seen, expected, "all tx ids retrieved exactly once, in order");
+    assert_eq!(
+        seen, expected,
+        "all tx ids retrieved exactly once, in order"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

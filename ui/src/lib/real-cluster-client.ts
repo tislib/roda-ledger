@@ -19,7 +19,6 @@ import { createGrpcWebTransport } from '@connectrpc/connect-web';
 import { Capability, Control } from '@/gen/control_pb';
 import {
   CancelScenarioRequestSchema,
-  GetBalanceRequestSchema,
   GetClusterConfigRequestSchema,
   GetClusterSnapshotRequestSchema,
   GetFaultHistoryRequestSchema,
@@ -30,22 +29,26 @@ import {
   HealPartitionRequestSchema,
   KillNodeRequestSchema,
   ListAvailableScenariosRequestSchema,
-  ListFunctionsRequestSchema,
   ListScenarioRunsRequestSchema,
   PartitionPairRequestSchema,
-  RegisterFunctionRequestSchema,
   ResetClusterRequestSchema,
   RestartNodeRequestSchema,
   RunScenarioRequestSchema,
   SetNodeCountRequestSchema,
   StartNodeRequestSchema,
   StopNodeRequestSchema,
-  UnregisterFunctionRequestSchema,
   UpdateClusterConfigRequestSchema,
   WatchClusterSnapshotRequestSchema,
   WatchFunctionsRequestSchema,
 } from '@/gen/control_pb';
-import { Ledger, GetStatusRequestSchema } from '@/gen/ledger_pb';
+import {
+  Ledger,
+  GetBalanceRequestSchema,
+  GetStatusRequestSchema,
+  ListFunctionsRequestSchema,
+  RegisterFunctionRequestSchema,
+  UnregisterFunctionRequestSchema,
+} from '@/gen/ledger_pb';
 import type { ClusterClient } from './cluster-client';
 import type {
   ClusterConfig,
@@ -150,7 +153,7 @@ export class RealClusterClient implements ClusterClient {
     nodeId: string,
     opts?: { fromTxId?: string; toTxId?: string; limit?: number },
   ): Promise<WalLogPage> {
-    const resp = await this.client.getNodeWalLog(
+    const resp = await this.control.getNodeWalLog(
       create(GetNodeWalLogRequestSchema, {
         nodeId: stringToU64(nodeId),
         fromTxId: stringToU64(opts?.fromTxId ?? '0'),
@@ -207,7 +210,7 @@ export class RealClusterClient implements ClusterClient {
   }
 
   async resetCluster(): Promise<{ accepted: boolean; error: string }> {
-    const resp = await this.client.resetCluster(create(ResetClusterRequestSchema, {}));
+    const resp = await this.control.resetCluster(create(ResetClusterRequestSchema, {}));
     return { accepted: resp.accepted, error: resp.error };
   }
 
@@ -313,12 +316,18 @@ export class RealClusterClient implements ClusterClient {
   }
 
   // ---- Meta / WASM ----
+  //
+  // Function-registry RPCs flow through the in-process Ledger proxy on
+  // the same control-plane port — the proxy forwards them to the
+  // current leader for register/unregister and round-robins for the
+  // unary list. The streaming `WatchFunctions` lives on the Control
+  // service since `ledger.proto` has no streaming RPCs.
 
   async listFunctions(): Promise<WasmFunction[]> {
-    const resp = await this.client.listFunctions(create(ListFunctionsRequestSchema, {}));
-    // The control plane returns name + version + crc only. Example
-    // sources live client-side in `wasm-examples.ts` and the Meta
-    // module merges them with the deployed list at render time.
+    const resp = await this.ledger.listFunctions(create(ListFunctionsRequestSchema, {}));
+    // The cluster returns name + version + crc only. Example sources
+    // live client-side in `wasm-examples.ts` and the Meta module
+    // merges them with the deployed list at render time.
     return resp.functions.map((f) => ({
       name: f.name,
       deployedAt: 0,
@@ -342,26 +351,23 @@ export class RealClusterClient implements ClusterClient {
     overrideExisting: boolean,
   ): Promise<SubmitResult> {
     const binary = base64ToBytes(source);
-    const resp = await this.client.registerFunction(
+    // `roda.ledger.v1.Ledger.RegisterFunction` returns `{ version,
+    // crc32c }` and surfaces failures as a `tonic::Status` (the
+    // Connect client throws). No accepted/error envelope here.
+    await this.ledger.registerFunction(
       create(RegisterFunctionRequestSchema, {
         name,
         binary,
         overrideExisting,
       }),
     );
-    if (!resp.accepted) {
-      throw new Error(resp.error || 'register failed');
-    }
     return { txId: '0', failReason: 0 };
   }
 
   async unregisterFunction(name: string): Promise<SubmitResult> {
-    const resp = await this.client.unregisterFunction(
+    await this.ledger.unregisterFunction(
       create(UnregisterFunctionRequestSchema, { name }),
     );
-    if (!resp.accepted) {
-      throw new Error(resp.error || 'unregister failed');
-    }
     return { txId: '0', failReason: 0 };
   }
 
@@ -371,11 +377,14 @@ export class RealClusterClient implements ClusterClient {
     accountId: string,
     nodeId: string,
   ): Promise<{ balance: string; lastSnapshotTxId: string }> {
-    const resp = await this.client.getBalance(
+    // `ledger.proto`'s GetBalance has no per-node target — the proxy
+    // honors the `node-selector` request metadata header to pin the
+    // call to a specific peer instead.
+    const resp = await this.ledger.getBalance(
       create(GetBalanceRequestSchema, {
         accountId: stringToU64(accountId),
-        nodeId: stringToU64(nodeId),
       }),
+      { headers: { 'node-selector': nodeId } },
     );
     return {
       balance: resp.balance.toString(),
@@ -386,7 +395,7 @@ export class RealClusterClient implements ClusterClient {
   // ---- Scenarios ----
 
   async listAvailableScenarios(): Promise<AvailableScenario[]> {
-    const resp = await this.client.listAvailableScenarios(
+    const resp = await this.control.listAvailableScenarios(
       create(ListAvailableScenariosRequestSchema, {}),
     );
     return resp.scenarios.map(availableScenarioFromPb);
@@ -421,7 +430,7 @@ export class RealClusterClient implements ClusterClient {
   // ---- Server streams ----
 
   async *watchClusterSnapshot(intervalMs: number): AsyncIterable<ClusterSnapshot> {
-    const stream = this.client.watchClusterSnapshot(
+    const stream = this.control.watchClusterSnapshot(
       create(WatchClusterSnapshotRequestSchema, { intervalMs }),
     );
     for await (const msg of stream) {
@@ -430,7 +439,7 @@ export class RealClusterClient implements ClusterClient {
   }
 
   async *watchFunctions(intervalMs: number): AsyncIterable<WasmFunction[]> {
-    const stream = this.client.watchFunctions(
+    const stream = this.control.watchFunctions(
       create(WatchFunctionsRequestSchema, { intervalMs }),
     );
     for await (const resp of stream) {

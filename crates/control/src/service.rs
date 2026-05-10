@@ -16,46 +16,35 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use proto::control::control_server::Control;
 use proto::control::{
-    AvailableScenario, CancelScenarioRequest, CancelScenarioResponse, Capability, ClusterHealth, FunctionInfo,
-    ListFunctionsRequest, ListFunctionsResponse, RegisterFunctionRequest, RegisterFunctionResponse,
-    UnregisterFunctionRequest, UnregisterFunctionResponse, WatchClusterSnapshotRequest,
-    WatchFunctionsRequest,
-    ClusterMembership, ElectionEvent, EntryKind, FaultEvent, FaultKind, GetBalanceRequest,
-    GetBalanceResponse, GetClusterConfigRequest, GetClusterConfigResponse,
-    GetClusterSnapshotRequest, GetClusterSnapshotResponse, GetFaultHistoryRequest,
-    GetFaultHistoryResponse, GetNodeLogRequest, GetNodeLogResponse, GetNodeWalLogRequest,
-    GetNodeWalLogResponse, GetPipelineIndexRequest,
-    GetPipelineIndexResponse, GetRecentElectionsRequest, GetRecentElectionsResponse,
-    GetScenarioStatusRequest, GetScenarioStatusResponse, GetServerInfoRequest,
-    GetServerInfoResponse, GetTransactionRequest, GetTransactionResponse,
-    GetTransactionStatusRequest, GetTransactionStatusResponse, HealPartitionRequest,
-    HealPartitionResponse, KillNodeRequest, KillNodeResponse, ListAvailableScenariosRequest,
+    AvailableScenario, CancelScenarioRequest, CancelScenarioResponse, Capability, ClusterHealth,
+    ClusterMembership, ElectionEvent, FaultEvent, FaultKind, FunctionEntry, FunctionListUpdate,
+    GetClusterConfigRequest, GetClusterConfigResponse, GetClusterSnapshotRequest,
+    GetClusterSnapshotResponse, GetFaultHistoryRequest, GetFaultHistoryResponse, GetNodeLogRequest,
+    GetNodeLogResponse, GetNodeWalLogRequest, GetNodeWalLogResponse, GetRecentElectionsRequest,
+    GetRecentElectionsResponse, GetScenarioStatusRequest, GetScenarioStatusResponse,
+    GetServerInfoRequest, GetServerInfoResponse, HealPartitionRequest, HealPartitionResponse,
+    KillNodeRequest, KillNodeResponse, ListAvailableScenariosRequest,
     ListAvailableScenariosResponse, ListScenarioRunsRequest, ListScenarioRunsResponse, NodeInfo,
     NodeRole, NodeStatus, PartitionPair as PbPartitionPair, PartitionPairRequest,
     PartitionPairResponse, ResetClusterRequest, ResetClusterResponse, RestartNodeRequest,
     RestartNodeResponse, RunScenarioRequest, RunScenarioResponse, ScenarioCategory,
     ScenarioRunSummary, ScenarioState, SetNodeCountRequest, SetNodeCountResponse, StartNodeRequest,
-    StartNodeResponse, StopNodeRequest, StopNodeResponse, SubmitBatchRequest, SubmitBatchResponse,
-    SubmitOperationRequest, SubmitOperationResponse, TransactionStatus, TxEntryRecord,
-    TxLinkRecord, UpdateClusterConfigRequest, UpdateClusterConfigResponse,
-    submit_operation_request::Operation as PbOp,
+    StartNodeResponse, StopNodeRequest, StopNodeResponse, UpdateClusterConfigRequest,
+    UpdateClusterConfigResponse, WatchClusterSnapshotRequest, WatchFunctionsRequest,
 };
 use proto::ledger as proto_ledger;
 use tonic::{Request, Response, Status};
 use tracing::warn;
 
 use crate::cluster_handle::ClusterHandle;
-use crate::event_store::{
-    EventStore, ScenarioRunRecord, SubmissionRecord, SubmittedOpKind, epoch_ms_now,
-};
+use crate::event_store::{EventStore, ScenarioRunRecord, epoch_ms_now};
 use crate::provisioner::Provisioner;
 use crate::runner::{MetricsCollector, ScenarioRunner};
-use client::ClusterClient;
 
 #[derive(Clone)]
 pub struct ControlService {
@@ -88,19 +77,21 @@ async fn build_snapshot(svc: &ControlService) -> GetClusterSnapshotResponse {
     }
 }
 
-async fn build_function_list(svc: &ControlService) -> ListFunctionsResponse {
+async fn build_function_list(svc: &ControlService) -> FunctionListUpdate {
     match svc.handle.client().list_functions().await {
-        Ok(infos) => ListFunctionsResponse {
+        Ok(infos) => FunctionListUpdate {
             functions: infos
                 .into_iter()
-                .map(|f| FunctionInfo {
+                .map(|f| FunctionEntry {
                     name: f.name,
                     version: f.version as u32,
                     crc32c: f.crc32c,
                 })
                 .collect(),
         },
-        Err(_) => ListFunctionsResponse { functions: Vec::new() },
+        Err(_) => FunctionListUpdate {
+            functions: Vec::new(),
+        },
     }
 }
 
@@ -109,7 +100,7 @@ impl Control for ControlService {
     type WatchClusterSnapshotStream =
         Pin<Box<dyn Stream<Item = Result<GetClusterSnapshotResponse, Status>> + Send>>;
     type WatchFunctionsStream =
-        Pin<Box<dyn Stream<Item = Result<ListFunctionsResponse, Status>> + Send>>;
+        Pin<Box<dyn Stream<Item = Result<FunctionListUpdate, Status>> + Send>>;
     async fn get_server_info(
         &self,
         _req: Request<GetServerInfoRequest>,
@@ -214,7 +205,11 @@ impl Control for ControlService {
 
         // Cluster term = leader's term when there is one, else the
         // highest term any node reported (covers mid-election states).
-        let current_term = if leader_term > 0 { leader_term } else { max_term };
+        let current_term = if leader_term > 0 {
+            leader_term
+        } else {
+            max_term
+        };
         Ok(Response::new(GetClusterSnapshotResponse {
             taken_at_ms: now_ms,
             cluster_health: cluster_health as i32,
@@ -257,7 +252,7 @@ impl Control for ControlService {
             0 => 1_000,
             n => n.clamp(200, 10_000),
         };
-        let (tx, rx) = mpsc::channel::<Result<ListFunctionsResponse, Status>>(4);
+        let (tx, rx) = mpsc::channel::<Result<FunctionListUpdate, Status>>(4);
         let svc = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms as u64));
@@ -281,11 +276,7 @@ impl Control for ControlService {
                 // entries flicker out and back. Only emit empty if the
                 // previous emission was also empty (or this is the
                 // first frame against a genuinely empty cluster).
-                if sig.is_empty()
-                    && last_signature
-                        .as_ref()
-                        .is_some_and(|prev| !prev.is_empty())
-                {
+                if sig.is_empty() && last_signature.as_ref().is_some_and(|prev| !prev.is_empty()) {
                     continue;
                 }
                 let changed = last_signature.as_ref() != Some(&sig);
@@ -401,9 +392,10 @@ impl Control for ControlService {
         req: Request<GetNodeWalLogRequest>,
     ) -> Result<Response<GetNodeWalLogResponse>, Status> {
         let r = req.into_inner();
-        let idx = self.handle.idx_for_node_id(r.node_id).ok_or_else(|| {
-            Status::not_found(format!("unknown node_id={}", r.node_id))
-        })?;
+        let idx = self
+            .handle
+            .idx_for_node_id(r.node_id)
+            .ok_or_else(|| Status::not_found(format!("unknown node_id={}", r.node_id)))?;
         let addrs = self.handle.node_addrs();
         let url = addrs
             .get(idx)
@@ -417,9 +409,7 @@ impl Control for ControlService {
         let client = client::NodeClient::connect_url(&url)
             .await
             .map_err(|e| Status::unavailable(format!("connect {}: {}", url, e)))?;
-        let page = client
-            .get_log(r.from_tx_id, r.to_tx_id, r.limit)
-            .await?;
+        let page = client.get_log(r.from_tx_id, r.to_tx_id, r.limit).await?;
         Ok(Response::new(GetNodeWalLogResponse {
             records: page
                 .records
@@ -524,7 +514,9 @@ impl Control for ControlService {
         // `reprovision` with the current (unchanged) config goes through
         // the cold-provision path and brings up a fresh cluster with new
         // data dirs. Then clear the control plane's session state.
-        self.handle.process_provisioner().reset_for_full_reprovision();
+        self.handle
+            .process_provisioner()
+            .reset_for_full_reprovision();
         match self.handle.reprovision(None, None).await {
             Ok(()) => {
                 self.events.reset();
@@ -700,230 +692,6 @@ impl Control for ControlService {
         Ok(Response::new(GetFaultHistoryResponse { events }))
     }
 
-    async fn submit_operation(
-        &self,
-        req: Request<SubmitOperationRequest>,
-    ) -> Result<Response<SubmitOperationResponse>, Status> {
-        let op = match req.into_inner().operation {
-            Some(o) => o,
-            None => return Err(Status::invalid_argument("operation field is required")),
-        };
-        let client = self.handle.client();
-        let (tx_id, kind, user_ref) = submit_one(&client, op).await?;
-        self.events.record_submission(SubmissionRecord {
-            tx_id,
-            user_ref,
-            kind,
-            at_epoch_ms: epoch_ms_now(),
-        });
-        Ok(Response::new(SubmitOperationResponse {
-            transaction_id: tx_id,
-            term: 0,
-        }))
-    }
-
-    async fn submit_batch(
-        &self,
-        req: Request<SubmitBatchRequest>,
-    ) -> Result<Response<SubmitBatchResponse>, Status> {
-        let ops = req.into_inner().operations;
-        let client = self.handle.client();
-        let mut results = Vec::with_capacity(ops.len());
-        // Forward each op individually. For a fast batched path the
-        // scenario runner uses `client.deposit_batch`; this RPC is
-        // primarily used by the UI for ad-hoc submissions and
-        // correctness > throughput here.
-        for sor in ops {
-            let op = match sor.operation {
-                Some(o) => o,
-                None => return Err(Status::invalid_argument("operation field is required")),
-            };
-            let (tx_id, kind, user_ref) = submit_one(&client, op).await?;
-            self.events.record_submission(SubmissionRecord {
-                tx_id,
-                user_ref,
-                kind,
-                at_epoch_ms: epoch_ms_now(),
-            });
-            results.push(SubmitOperationResponse {
-                transaction_id: tx_id,
-                term: 0,
-            });
-        }
-        Ok(Response::new(SubmitBatchResponse { results, term: 0 }))
-    }
-
-    async fn get_balance(
-        &self,
-        req: Request<GetBalanceRequest>,
-    ) -> Result<Response<GetBalanceResponse>, Status> {
-        let r = req.into_inner();
-        let client = self.handle.client();
-        match client.get_balance(r.account_id).await {
-            Ok(b) => Ok(Response::new(GetBalanceResponse {
-                balance: b.balance,
-                last_snapshot_tx_id: b.last_snapshot_tx_id,
-            })),
-            Err(s) => Err(s),
-        }
-    }
-
-    async fn get_transaction(
-        &self,
-        req: Request<GetTransactionRequest>,
-    ) -> Result<Response<GetTransactionResponse>, Status> {
-        let r = req.into_inner();
-        let client = self.handle.client();
-        match client.get_transaction(r.tx_id).await {
-            Ok(tx) => {
-                let entries: Vec<TxEntryRecord> = tx
-                    .entries
-                    .into_iter()
-                    .map(|e| TxEntryRecord {
-                        account_id: e.account_id,
-                        amount: e.amount,
-                        kind: kind_to_proto(e.kind),
-                        computed_balance: e.computed_balance,
-                    })
-                    .collect();
-                let links: Vec<TxLinkRecord> = tx
-                    .links
-                    .into_iter()
-                    .map(|l| TxLinkRecord {
-                        to_tx_id: l.to_tx_id,
-                        kind: l.kind,
-                    })
-                    .collect();
-                Ok(Response::new(GetTransactionResponse {
-                    tx_id: tx.tx_id,
-                    entries,
-                    links,
-                }))
-            }
-            Err(s) if s.code() == tonic::Code::NotFound => Ok(Response::new(
-                GetTransactionResponse {
-                    tx_id: r.tx_id,
-                    entries: Vec::new(),
-                    links: Vec::new(),
-                },
-            )),
-            Err(s) => Err(s),
-        }
-    }
-
-    async fn get_transaction_status(
-        &self,
-        req: Request<GetTransactionStatusRequest>,
-    ) -> Result<Response<GetTransactionStatusResponse>, Status> {
-        let tx_id = req.into_inner().tx_id;
-        let client = self.handle.client();
-        match client.get_transaction_status(tx_id).await {
-            Ok((status, fail_reason)) => Ok(Response::new(GetTransactionStatusResponse {
-                status,
-                fail_reason,
-            })),
-            Err(s) if s.code() == tonic::Code::NotFound => {
-                Ok(Response::new(GetTransactionStatusResponse {
-                    status: TransactionStatus::NotFound as i32,
-                    fail_reason: 0,
-                }))
-            }
-            Err(s) => Err(s),
-        }
-    }
-
-    async fn get_pipeline_index(
-        &self,
-        req: Request<GetPipelineIndexRequest>,
-    ) -> Result<Response<GetPipelineIndexResponse>, Status> {
-        let r = req.into_inner();
-        let client = self.handle.client();
-        let idx = self
-            .handle
-            .idx_for_node_id(r.node_id)
-            .ok_or_else(|| Status::not_found(format!("unknown node {}", r.node_id)))?;
-        match client.node(idx).get_pipeline_index().await {
-            Ok(pi) => Ok(Response::new(GetPipelineIndexResponse {
-                compute_index: pi.compute,
-                commit_index: pi.commit,
-                snapshot_index: pi.snapshot,
-                term: 0,
-                cluster_commit_index: pi.cluster_commit,
-                is_leader: pi.is_leader,
-            })),
-            Err(s) => Err(s),
-        }
-    }
-
-    async fn register_function(
-        &self,
-        req: Request<RegisterFunctionRequest>,
-    ) -> Result<Response<RegisterFunctionResponse>, Status> {
-        let r = req.into_inner();
-        if r.binary.is_empty() {
-            return Ok(Response::new(RegisterFunctionResponse {
-                accepted: false,
-                error: "binary is empty".into(),
-                version: 0,
-            }));
-        }
-        match self
-            .handle
-            .client()
-            .register_function(&r.name, &r.binary, r.override_existing)
-            .await
-        {
-            Ok((version, _crc)) => Ok(Response::new(RegisterFunctionResponse {
-                accepted: true,
-                error: String::new(),
-                version: version as u32,
-            })),
-            Err(e) => Ok(Response::new(RegisterFunctionResponse {
-                accepted: false,
-                error: e.to_string(),
-                version: 0,
-            })),
-        }
-    }
-
-    async fn unregister_function(
-        &self,
-        req: Request<UnregisterFunctionRequest>,
-    ) -> Result<Response<UnregisterFunctionResponse>, Status> {
-        let name = req.into_inner().name;
-        match self.handle.client().unregister_function(&name).await {
-            Ok(version) => Ok(Response::new(UnregisterFunctionResponse {
-                accepted: true,
-                error: String::new(),
-                version: version as u32,
-            })),
-            Err(e) => Ok(Response::new(UnregisterFunctionResponse {
-                accepted: false,
-                error: e.to_string(),
-                version: 0,
-            })),
-        }
-    }
-
-    async fn list_functions(
-        &self,
-        _req: Request<ListFunctionsRequest>,
-    ) -> Result<Response<ListFunctionsResponse>, Status> {
-        match self.handle.client().list_functions().await {
-            Ok(infos) => Ok(Response::new(ListFunctionsResponse {
-                functions: infos
-                    .into_iter()
-                    .map(|f| FunctionInfo {
-                        name: f.name,
-                        version: f.version as u32,
-                        crc32c: f.crc32c,
-                    })
-                    .collect(),
-            })),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
-    }
-
     async fn list_available_scenarios(
         &self,
         _req: Request<ListAvailableScenariosRequest>,
@@ -1014,22 +782,20 @@ impl Control for ControlService {
         req: Request<GetScenarioStatusRequest>,
     ) -> Result<Response<GetScenarioStatusResponse>, Status> {
         let run_id = req.into_inner().run_id;
-        let resp = self
-            .events
-            .get_run(&run_id, |r| GetScenarioStatusResponse {
-                run_id: r.run_id.clone(),
-                state: r.state as i32,
-                progress_pct: 0,
-                ops_submitted: r.ops_total,
-                ops_succeeded: r.ops_total,
-                ops_failed: 0,
-                latency_p50_ms: 0,
-                latency_p99_ms: 0,
-                started_at_ms: r.started_at_epoch_ms,
-                ended_at_ms: r.finished_at_epoch_ms.unwrap_or(0),
-                error: r.error_message.clone().unwrap_or_default(),
-                recent_steps: Vec::new(),
-            });
+        let resp = self.events.get_run(&run_id, |r| GetScenarioStatusResponse {
+            run_id: r.run_id.clone(),
+            state: r.state as i32,
+            progress_pct: 0,
+            ops_submitted: r.ops_total,
+            ops_succeeded: r.ops_total,
+            ops_failed: 0,
+            latency_p50_ms: 0,
+            latency_p99_ms: 0,
+            started_at_ms: r.started_at_epoch_ms,
+            ended_at_ms: r.finished_at_epoch_ms.unwrap_or(0),
+            error: r.error_message.clone().unwrap_or_default(),
+            recent_steps: Vec::new(),
+        });
         match resp {
             Some(r) => Ok(Response::new(r)),
             None => Err(Status::not_found(format!("unknown run_id {run_id}"))),
@@ -1153,98 +919,6 @@ fn ledger_record_to_control(r: proto_ledger::WalLogRecord) -> proto::control::Wa
         None => None,
     };
     c::WalLogRecordC { entry }
-}
-
-fn kind_to_proto(kind: i32) -> i32 {
-    // Client uses raw i32 from proto::ledger; the control proto's
-    // EntryKind happens to be the same shape (Credit=0, Debit=1) so
-    // we normalize via known variants and default unknown to Credit.
-    match kind {
-        x if x == proto_ledger::EntryKind::Debit as i32 => EntryKind::Debit as i32,
-        _ => EntryKind::Credit as i32,
-    }
-}
-
-/// Submit one operation against the live cluster, returning
-/// (tx_id, kind, user_ref) for event-store recording.
-async fn submit_one(
-    client: &ClusterClient,
-    op: PbOp,
-) -> Result<(u64, SubmittedOpKind, u64), Status> {
-    match op {
-        PbOp::Deposit(d) => {
-            let tx = client
-                .deposit(d.account, d.amount, d.user_ref)
-                .await
-                .map_err(map_client_err)?;
-            Ok((
-                tx,
-                SubmittedOpKind::Deposit {
-                    account: d.account,
-                    amount: d.amount,
-                },
-                d.user_ref,
-            ))
-        }
-        PbOp::Withdrawal(w) => {
-            let tx = client
-                .withdraw(w.account, w.amount, w.user_ref)
-                .await
-                .map_err(map_client_err)?;
-            Ok((
-                tx,
-                SubmittedOpKind::Withdrawal {
-                    account: w.account,
-                    amount: w.amount,
-                },
-                w.user_ref,
-            ))
-        }
-        PbOp::Transfer(t) => {
-            let tx = client
-                .transfer(t.from, t.to, t.amount, t.user_ref)
-                .await
-                .map_err(map_client_err)?;
-            Ok((
-                tx,
-                SubmittedOpKind::Transfer {
-                    from: t.from,
-                    to: t.to,
-                    amount: t.amount,
-                },
-                t.user_ref,
-            ))
-        }
-        PbOp::Function(f) => {
-            // ClusterClient only exposes a waiting form for function
-            // submits. Use Computed (cheapest) and translate the
-            // SubmitResult back into the fire-and-forget shape.
-            let mut params = [0i64; 8];
-            for (i, v) in f.params.iter().take(8).enumerate() {
-                params[i] = *v;
-            }
-            let res = client
-                .submit_function_and_wait(
-                    &f.name,
-                    params,
-                    f.user_ref,
-                    proto_ledger::WaitLevel::Computed,
-                )
-                .await
-                .map_err(map_client_err)?;
-            Ok((
-                res.tx_id,
-                SubmittedOpKind::Function {
-                    name: f.name.clone(),
-                },
-                f.user_ref,
-            ))
-        }
-    }
-}
-
-fn map_client_err(s: tonic::Status) -> Status {
-    Status::new(s.code(), s.message().to_string())
 }
 
 /// Look up a scenario by name from the seed catalogues. Mirrors the

@@ -2,28 +2,29 @@
 //!
 //! The control plane process exposes `roda.ledger.v1.Ledger` on the same
 //! port as the operational `Control` service and forwards each call to
-//! one of the ledger nodes it was provisioned with.
+//! the live cluster.
 //!
-//! Routing is delegated to [`client::ClusterClient`], so the proxy
-//! inherits the cluster client's leader discovery, leader rotation on
-//! `not a leader` rejections, round-robin reads, and exponential
-//! backoff. The proxy adds two things on top of that:
+//! Routing is delegated to [`client::ClusterClient`] (held by the
+//! [`ClusterHandle`]), so the proxy inherits the cluster client's leader
+//! discovery, leader rotation on `not a leader` rejections, round-robin
+//! reads, and exponential backoff. Membership changes (`SetNodeCount`,
+//! `UpdateClusterConfig`, `ResetCluster`) reprovision the cluster
+//! through `ClusterHandle::reprovision`, which atomically swaps in a
+//! fresh `ClusterClient` — the proxy's next [`ClusterHandle::client`]
+//! call picks up the new cluster automatically, so there is no
+//! membership-state to maintain here.
+//!
+//! The proxy adds two things on top of `ClusterClient`:
 //!
 //! - **Per-node pinning** — if the request carries a `node-selector`
 //!   metadata header (decimal node_id), the call goes to that specific
 //!   peer with no retry, regardless of role. The server's response is
 //!   surfaced verbatim so the caller can see exactly what that node
 //!   returned.
-//! - **Hot-swappable membership** — [`LedgerProxy::sync_peers`]
-//!   rebuilds the inner [`ClusterClient`] when the operator changes
-//!   cluster size. Existing peers whose `(node_id, url)` is unchanged
-//!   keep their long-lived tonic channel; new peers lazily-connect;
-//!   removed peers' channels are dropped when the previous
-//!   `ClusterClient` is freed.
-//!
-//! Each Ledger handler takes a single [`ProxyState`] snapshot at the
-//! start of dispatch via [`ArcSwap::load_full`], so a concurrent
-//! membership swap can't shift state under an in-flight RPC.
+//! - **Raw metadata forwarding** — the caller's request metadata is
+//!   passed through to the peer (with `node-selector` stripped), so
+//!   future cross-cutting headers (auth, tracing) ride along without
+//!   touching the proxy.
 
 // Body messages are passed into closures that may run multiple times
 // (per-attempt retry inside `ClusterClient`). Using `.clone()` uniformly
@@ -31,114 +32,42 @@
 // the body is a `Copy` scalar wrapper or a heap-backed message.
 #![allow(clippy::clone_on_copy)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use ::proto::ledger as pb;
 use ::proto::ledger::ledger_client::LedgerClient;
 use ::proto::ledger::ledger_server::Ledger;
-use arc_swap::ArcSwap;
 use client::{ClusterClient, NodeClient};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+
+use crate::cluster_handle::ClusterHandle;
 
 /// Metadata key callers set to pin an RPC to a specific node id. The
-/// value is a decimal `u64` matching one of the provisioned peers'
-/// `node_id`s. Unknown ids return `INVALID_ARGUMENT`.
+/// value is a decimal `u64` matching one of the cluster's `node_id`s
+/// (1-based, position in the cluster's node list). Unknown ids return
+/// `INVALID_ARGUMENT`.
 pub const NODE_SELECTOR_METADATA_KEY: &str = "node-selector";
 
-/// Convenience tuple — what the operator hands us per peer.
-pub type PeerSpec = (u64, String);
-
-/// Hot-swappable inner state shared by every clone of [`LedgerProxy`].
-///
-/// `cluster` owns the per-peer tonic channels and the leader/RR cursors
-/// that drive routing. `node_id_to_index` maps the `node-selector`
-/// header value to a position in `cluster`'s node list — the cluster
-/// client itself is identity-agnostic, so the proxy keeps this map
-/// alongside.
-struct ProxyState {
-    cluster: ClusterClient,
-    node_id_to_index: HashMap<u64, usize>,
-    /// `(node_id, url)` for every peer in the cluster, in node-list
-    /// order. Used when [`LedgerProxy::sync_peers`] diffs the desired
-    /// peers against the current state to decide which `NodeClient`s
-    /// can be reused verbatim.
-    peer_meta: Vec<PeerSpec>,
-}
-
-/// Ledger proxy. Cheap to clone — the underlying state lives in `Arc`s.
+/// Ledger proxy. Cheap to clone — holds only an `Arc<ClusterHandle>`
+/// and the `ClusterClient` is fetched on every RPC via the handle's
+/// lock-free `ArcSwap` load.
 #[derive(Clone)]
 pub struct LedgerProxy {
-    state: Arc<ArcSwap<ProxyState>>,
+    handle: Arc<ClusterHandle>,
 }
 
 impl LedgerProxy {
-    /// Build a proxy from a non-empty list of `(node_id, url)` peers.
-    /// Channels connect lazily on the first RPC.
-    pub fn new(peers: Vec<PeerSpec>) -> Result<Self, tonic::transport::Error> {
-        assert!(!peers.is_empty(), "LedgerProxy requires at least one peer");
-        let state = build_state(&peers, None)?;
-        Ok(Self {
-            state: Arc::new(ArcSwap::from_pointee(state)),
-        })
+    pub fn new(handle: Arc<ClusterHandle>) -> Self {
+        Self { handle }
     }
 
-    /// Take a snapshot of the current proxy state. The returned `Arc`
-    /// keeps the snapshot alive even if a concurrent `sync_peers`
-    /// swaps in a fresh state, so an in-flight RPC keeps its
-    /// `ClusterClient` reference valid.
-    fn snapshot(&self) -> Arc<ProxyState> {
-        self.state.load_full()
-    }
-
-    /// Current number of provisioned peers.
-    pub fn peer_count(&self) -> usize {
-        self.snapshot().cluster.node_count()
-    }
-
-    /// Replace the peer list with `desired`. Existing peers whose
-    /// `(node_id, url)` still appear in `desired` are reused —
-    /// their long-lived tonic channels survive the swap. New entries
-    /// lazily-connect; removed ones have their channels dropped when
-    /// the old `ProxyState` is freed.
-    ///
-    /// Refuses an empty target list so a stray `SetNodeCount(0)` can't
-    /// leave the proxy with no routes.
-    pub fn sync_peers(&self, desired: &[PeerSpec]) -> Result<(), tonic::transport::Error> {
-        if desired.is_empty() {
-            warn!("ledger-proxy: refusing to swap to an empty peer list — keeping current list");
-            return Ok(());
-        }
-        let prev = self.snapshot();
-        let next = build_state(desired, Some(&prev))?;
-        let added = desired
-            .iter()
-            .filter(|(_, url)| !prev.peer_meta.iter().any(|(_, u)| u == url))
-            .count();
-        let removed = prev
-            .peer_meta
-            .iter()
-            .filter(|(_, url)| !desired.iter().any(|(_, u)| u == url))
-            .count();
-        info!(
-            "ledger-proxy: peer list synced — was={}, now={} (added={}, removed={})",
-            prev.peer_meta.len(),
-            desired.len(),
-            added,
-            removed
-        );
-        self.state.store(Arc::new(next));
-        Ok(())
-    }
-
-    /// Resolve the optional `node-selector` metadata to a peer index in
-    /// `state.cluster`. Returns `Err(Status::invalid_argument)` if the
-    /// header is malformed or names an unknown node.
+    /// Resolve the optional `node-selector` metadata to a peer index
+    /// in the current cluster client. Returns `Err(Status::invalid_argument)`
+    /// if the header is malformed or names an unknown node.
     #[allow(clippy::result_large_err)]
     fn parse_node_selector(
-        state: &ProxyState,
+        handle: &ClusterHandle,
         metadata: &tonic::metadata::MetadataMap,
     ) -> Result<Option<usize>, Status> {
         let raw = match metadata.get(NODE_SELECTOR_METADATA_KEY) {
@@ -151,7 +80,7 @@ impl LedgerProxy {
         let id: u64 = s
             .parse()
             .map_err(|_| Status::invalid_argument(format!("node-selector '{s}' is not a u64")))?;
-        let idx = state.node_id_to_index.get(&id).copied().ok_or_else(|| {
+        let idx = handle.idx_for_node_id(id).ok_or_else(|| {
             Status::invalid_argument(format!("unknown node-selector node_id {id}"))
         })?;
         Ok(Some(idx))
@@ -165,22 +94,29 @@ impl LedgerProxy {
         md
     }
 
-    /// Run `op` against the peer at `idx` of `state.cluster`. No retry —
-    /// pinned calls surface the addressed node's response verbatim.
-    async fn with_pinned<F, Fut, T>(state: &ProxyState, idx: usize, op: F) -> Result<T, Status>
+    /// Run `op` against the peer at `idx` of the current cluster
+    /// client. No retry — pinned calls surface the addressed node's
+    /// response verbatim.
+    async fn with_pinned<F, Fut, T>(cluster: &ClusterClient, idx: usize, op: F) -> Result<T, Status>
     where
         F: FnOnce(LedgerClient<Channel>) -> Fut,
         Fut: Future<Output = Result<T, Status>>,
     {
-        let nc = state.cluster.node(idx);
-        op(nc.ledger_client()).await
+        if idx >= cluster.node_count() {
+            return Err(Status::invalid_argument(format!(
+                "node index {idx} out of range (cluster has {})",
+                cluster.node_count()
+            )));
+        }
+        op(cluster.node(idx).ledger_client()).await
     }
 
     /// Dispatch a write-style RPC. Honors `node-selector`; otherwise
-    /// delegates to [`ClusterClient::with_leader_retry`].
+    /// delegates to [`ClusterClient::leader`]'s `with_leader_retry`
+    /// (leader cache, rotation on `not a leader`, exponential backoff).
     async fn dispatch_write<F, Fut, T>(
         op_name: &'static str,
-        state: Arc<ProxyState>,
+        cluster: Arc<ClusterClient>,
         md: tonic::metadata::MetadataMap,
         pinned_idx: Option<usize>,
         op: F,
@@ -192,10 +128,9 @@ impl LedgerProxy {
     {
         if let Some(idx) = pinned_idx {
             let md = md.clone();
-            return Self::with_pinned(&state, idx, move |c| op(c, md)).await;
+            return Self::with_pinned(&cluster, idx, move |c| op(c, md)).await;
         }
-        state
-            .cluster
+        cluster
             .leader()
             .with_leader_retry(op_name, move |nc: NodeClient| {
                 let md = md.clone();
@@ -206,10 +141,11 @@ impl LedgerProxy {
     }
 
     /// Dispatch a read-style RPC. Honors `node-selector`; otherwise
-    /// delegates to [`ClusterClient::with_read_retry`].
+    /// delegates to [`ClusterClient::with_read_retry`] (round-robin +
+    /// retry across peers).
     async fn dispatch_read<F, Fut, T>(
         op_name: &'static str,
-        state: Arc<ProxyState>,
+        cluster: Arc<ClusterClient>,
         md: tonic::metadata::MetadataMap,
         pinned_idx: Option<usize>,
         op: F,
@@ -221,10 +157,9 @@ impl LedgerProxy {
     {
         if let Some(idx) = pinned_idx {
             let md = md.clone();
-            return Self::with_pinned(&state, idx, move |c| op(c, md)).await;
+            return Self::with_pinned(&cluster, idx, move |c| op(c, md)).await;
         }
-        state
-            .cluster
+        cluster
             .with_read_retry(op_name, move |nc: NodeClient| {
                 let md = md.clone();
                 let op = op.clone();
@@ -232,37 +167,6 @@ impl LedgerProxy {
             })
             .await
     }
-}
-
-/// Build a fresh [`ProxyState`] from `peers`, reusing existing
-/// [`NodeClient`]s from `prev` whenever a `(node_id, url)` is
-/// unchanged so their tonic channels survive the swap.
-fn build_state(
-    peers: &[PeerSpec],
-    prev: Option<&ProxyState>,
-) -> Result<ProxyState, tonic::transport::Error> {
-    use client::RetryConfig;
-    let mut nodes = Vec::with_capacity(peers.len());
-    let mut node_id_to_index = HashMap::with_capacity(peers.len());
-    for (idx, (node_id, url)) in peers.iter().enumerate() {
-        let nc = match prev.and_then(|p| {
-            p.peer_meta
-                .iter()
-                .position(|(id, u)| id == node_id && u == url)
-                .map(|i| p.cluster.node(i).clone())
-        }) {
-            Some(existing) => existing,
-            None => NodeClient::connect_lazy(url)?,
-        };
-        nodes.push(nc);
-        node_id_to_index.insert(*node_id, idx);
-    }
-    let cluster = ClusterClient::from_nodes(nodes, RetryConfig::default());
-    Ok(ProxyState {
-        cluster,
-        node_id_to_index,
-        peer_meta: peers.to_vec(),
-    })
 }
 
 /// Build a fresh outbound `Request<T>` carrying `md` + `body`. Helper
@@ -281,11 +185,11 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::SubmitOperationRequest>,
     ) -> Result<Response<pb::SubmitOperationResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_write("submit_operation", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_write("submit_operation", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.submit_operation(outbound(md, body)).await }
         })
@@ -296,11 +200,11 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::SubmitAndWaitRequest>,
     ) -> Result<Response<pb::SubmitAndWaitResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_write("submit_and_wait", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_write("submit_and_wait", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.submit_and_wait(outbound(md, body)).await }
         })
@@ -311,11 +215,11 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::SubmitBatchRequest>,
     ) -> Result<Response<pb::SubmitBatchResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_write("submit_batch", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_write("submit_batch", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.submit_batch(outbound(md, body)).await }
         })
@@ -326,13 +230,13 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::SubmitBatchAndWaitRequest>,
     ) -> Result<Response<pb::SubmitBatchAndWaitResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
+        let cluster = self.handle.client();
         Self::dispatch_write(
             "submit_batch_and_wait",
-            state,
+            cluster,
             md,
             pinned,
             move |mut c, md| {
@@ -347,11 +251,11 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetBalanceRequest>,
     ) -> Result<Response<pb::GetBalanceResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_read("get_balance", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_read("get_balance", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.get_balance(outbound(md, body)).await }
         })
@@ -362,11 +266,11 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetBalancesRequest>,
     ) -> Result<Response<pb::GetBalancesResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_read("get_balances", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_read("get_balances", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.get_balances(outbound(md, body)).await }
         })
@@ -377,13 +281,13 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetStatusRequest>,
     ) -> Result<Response<pb::GetStatusResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
+        let cluster = self.handle.client();
         Self::dispatch_read(
             "get_transaction_status",
-            state,
+            cluster,
             md,
             pinned,
             move |mut c, md| {
@@ -398,13 +302,13 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetStatusesRequest>,
     ) -> Result<Response<pb::GetStatusesResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
+        let cluster = self.handle.client();
         Self::dispatch_read(
             "get_transaction_statuses",
-            state,
+            cluster,
             md,
             pinned,
             move |mut c, md| {
@@ -419,13 +323,13 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::WaitForTransactionRequest>,
     ) -> Result<Response<pb::WaitForTransactionResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
+        let cluster = self.handle.client();
         Self::dispatch_read(
             "wait_for_transaction",
-            state,
+            cluster,
             md,
             pinned,
             move |mut c, md| {
@@ -440,14 +344,20 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetPipelineIndexRequest>,
     ) -> Result<Response<pb::GetPipelineIndexResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_read("get_pipeline_index", state, md, pinned, move |mut c, md| {
-            let body = body.clone();
-            async move { c.get_pipeline_index(outbound(md, body)).await }
-        })
+        let cluster = self.handle.client();
+        Self::dispatch_read(
+            "get_pipeline_index",
+            cluster,
+            md,
+            pinned,
+            move |mut c, md| {
+                let body = body.clone();
+                async move { c.get_pipeline_index(outbound(md, body)).await }
+            },
+        )
         .await
     }
 
@@ -455,11 +365,11 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetTransactionRequest>,
     ) -> Result<Response<pb::GetTransactionResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_read("get_transaction", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_read("get_transaction", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.get_transaction(outbound(md, body)).await }
         })
@@ -470,13 +380,13 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::GetAccountHistoryRequest>,
     ) -> Result<Response<pb::GetAccountHistoryResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
+        let cluster = self.handle.client();
         Self::dispatch_read(
             "get_account_history",
-            state,
+            cluster,
             md,
             pinned,
             move |mut c, md| {
@@ -491,14 +401,20 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::RegisterFunctionRequest>,
     ) -> Result<Response<pb::RegisterFunctionResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_write("register_function", state, md, pinned, move |mut c, md| {
-            let body = body.clone();
-            async move { c.register_function(outbound(md, body)).await }
-        })
+        let cluster = self.handle.client();
+        Self::dispatch_write(
+            "register_function",
+            cluster,
+            md,
+            pinned,
+            move |mut c, md| {
+                let body = body.clone();
+                async move { c.register_function(outbound(md, body)).await }
+            },
+        )
         .await
     }
 
@@ -506,13 +422,13 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::UnregisterFunctionRequest>,
     ) -> Result<Response<pb::UnregisterFunctionResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
+        let cluster = self.handle.client();
         Self::dispatch_write(
             "unregister_function",
-            state,
+            cluster,
             md,
             pinned,
             move |mut c, md| {
@@ -527,13 +443,43 @@ impl Ledger for LedgerProxy {
         &self,
         request: Request<pb::ListFunctionsRequest>,
     ) -> Result<Response<pb::ListFunctionsResponse>, Status> {
-        let state = self.snapshot();
-        let pinned = LedgerProxy::parse_node_selector(&state, request.metadata())?;
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
         let md = LedgerProxy::forward_metadata(&request);
         let body = request.into_inner();
-        Self::dispatch_read("list_functions", state, md, pinned, move |mut c, md| {
+        let cluster = self.handle.client();
+        Self::dispatch_read("list_functions", cluster, md, pinned, move |mut c, md| {
             let body = body.clone();
             async move { c.list_functions(outbound(md, body)).await }
+        })
+        .await
+    }
+
+    async fn get_log(
+        &self,
+        request: Request<pb::GetLogRequest>,
+    ) -> Result<Response<pb::GetLogResponse>, Status> {
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
+        let md = LedgerProxy::forward_metadata(&request);
+        let body = request.into_inner();
+        let cluster = self.handle.client();
+        Self::dispatch_read("get_log", cluster, md, pinned, move |mut c, md| {
+            let body = body.clone();
+            async move { c.get_log(outbound(md, body)).await }
+        })
+        .await
+    }
+
+    async fn get_terms(
+        &self,
+        request: Request<pb::GetTermsRequest>,
+    ) -> Result<Response<pb::GetTermsResponse>, Status> {
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
+        let md = LedgerProxy::forward_metadata(&request);
+        let body = request.into_inner();
+        let cluster = self.handle.client();
+        Self::dispatch_read("get_terms", cluster, md, pinned, move |mut c, md| {
+            let body = body.clone();
+            async move { c.get_terms(outbound(md, body)).await }
         })
         .await
     }

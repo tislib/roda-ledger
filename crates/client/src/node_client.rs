@@ -809,12 +809,7 @@ impl NodeClient {
 
     /// Read raw WAL records over [from_tx_id, to_tx_id] from this node's
     /// local committed WAL. Server hard-cap is 10,000; paginate via next_tx_id.
-    pub async fn get_log(
-        &self,
-        from_tx_id: u64,
-        to_tx_id: u64,
-        limit: u32,
-    ) -> Result<LogPage> {
+    pub async fn get_log(&self, from_tx_id: u64, to_tx_id: u64, limit: u32) -> Result<LogPage> {
         self.with_retry("get_log", || async {
             let mut client = self.inner.clone();
             trace!(

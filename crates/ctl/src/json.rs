@@ -1,6 +1,6 @@
 use storage::entities::TxLinkKind;
-use storage::entities::{decode_tag, encode_tag};
 use storage::entities::*;
+use storage::entities::{decode_tag, encode_tag};
 use storage::wal_serializer::serialize_wal_records;
 use storage::{WAL_MAGIC, WAL_VERSION};
 
