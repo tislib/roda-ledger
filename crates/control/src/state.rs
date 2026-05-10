@@ -4,14 +4,19 @@
 //! `service` module takes write or read locks per RPC; the `background`
 //! task takes a write lock once per tick. Lock granularity is intentionally
 //! coarse — for a CRUD mock the simplicity is worth more than the throughput.
+//!
+//! Ledger data-plane state (transactions, balances, function registry)
+//! lives on the real ledger nodes the control plane proxies to. The
+//! state here is **only** the operational/orchestration shape:
+//! membership, partitions, election + fault history, scenario runs,
+//! and per-node mocked Raft observations.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proto::control::{
-    ClusterConfig, Deposit, ElectionEvent, ElectionReason, FaultEvent, FaultKind, Function,
-    NodeHealth as PbNodeHealth, NodeRole, Scenario, ScenarioState as PbScenarioState,
-    TransactionStatus as PbTransactionStatus, Transfer, Withdrawal, submit_operation_request,
+    ClusterConfig, ElectionEvent, ElectionReason, FaultEvent, FaultKind, NodeRole, Scenario,
+    ScenarioState as PbScenarioState,
 };
 
 /// Process-level health. Network state (Partitioned/Isolated) is derived at
@@ -57,52 +62,15 @@ impl NodeRecord {
             cluster_commit_index: 0,
         }
     }
-}
 
-#[derive(Clone, Debug)]
-pub enum SubmittedOp {
-    Deposit {
-        account: u64,
-        amount: u64,
-        user_ref: u64,
-    },
-    Withdrawal {
-        account: u64,
-        amount: u64,
-        user_ref: u64,
-    },
-    Transfer {
-        from: u64,
-        to: u64,
-        amount: u64,
-        user_ref: u64,
-    },
-    Function {
-        name: String,
-        params: [i64; 8],
-        user_ref: u64,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub struct TxRecord {
-    pub tx_id: u64,
-    pub op: SubmittedOp,
-    pub status: PbTransactionStatus,
-    pub fail_reason: u32,
-    pub submitted_at: Instant,
-    pub computed_at: Option<Instant>,
-    pub committed_at: Option<Instant>,
-    pub snapshot_at: Option<Instant>,
-}
-
-#[derive(Clone, Debug)]
-pub struct FunctionRecord {
-    pub name: String,
-    pub binary: Vec<u8>,
-    pub deployed_at: Instant,
-    pub version: u32,
-    pub crc32c: u32,
+    /// Build a `NodeRecord` for a peer the control plane was provisioned
+    /// with. The peer's gRPC address is recorded verbatim so the UI can
+    /// display the connection target.
+    pub fn from_peer(node_id: u64, address: String, role: NodeRole, term: u64) -> Self {
+        let mut n = Self::fresh(node_id, role, term);
+        n.address = address;
+        n
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,11 +101,7 @@ pub struct InMemoryState {
     pub partitions: BTreeSet<(u64, u64)>,
     pub elections: VecDeque<ElectionEvent>,
     pub faults: VecDeque<FaultEvent>,
-    pub transactions: BTreeMap<u64, TxRecord>,
-    pub accounts: HashMap<u64, i64>,
-    pub functions: BTreeMap<String, FunctionRecord>,
     pub scenario_runs: BTreeMap<String, RunRecord>,
-    pub next_tx_id: u64,
     pub next_run_seq: u64,
     pub started_at: Instant,
 }
@@ -163,13 +127,6 @@ impl InMemoryState {
             reason: ElectionReason::Bootstrap as i32,
         });
 
-        // Seed accounts that the demo defaults to.
-        let mut accounts = HashMap::new();
-        accounts.insert(1, 1_000_000);
-        accounts.insert(2, 500_000);
-        accounts.insert(3, 250_000);
-        accounts.insert(99, 0);
-
         Self {
             nodes,
             target_node_count: count,
@@ -177,11 +134,48 @@ impl InMemoryState {
             partitions: BTreeSet::new(),
             elections,
             faults: VecDeque::with_capacity(256),
-            transactions: BTreeMap::new(),
-            accounts,
-            functions: BTreeMap::new(),
             scenario_runs: BTreeMap::new(),
-            next_tx_id: 1,
+            next_run_seq: 1,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Build an `InMemoryState` whose membership tracks the explicit
+    /// peer set the control plane was provisioned with. The first peer
+    /// (lowest-id) is seeded as Leader so writes have somewhere to go;
+    /// the proxy's leader-rotation logic learns the real leader as
+    /// soon as the first write attempt completes.
+    pub fn from_peers(peers: &[(u64, String)]) -> Self {
+        if peers.is_empty() {
+            return Self::new(1);
+        }
+        let mut nodes = BTreeMap::new();
+        let mut sorted: Vec<&(u64, String)> = peers.iter().collect();
+        sorted.sort_by_key(|(id, _)| *id);
+        let leader_id = sorted[0].0;
+        for (id, addr) in &sorted {
+            let role = if *id == leader_id {
+                NodeRole::Leader
+            } else {
+                NodeRole::Follower
+            };
+            nodes.insert(*id, NodeRecord::from_peer(*id, addr.clone(), role, 1));
+        }
+        let mut elections = VecDeque::with_capacity(64);
+        elections.push_back(ElectionEvent {
+            at_ms: epoch_ms_now(),
+            term: 1,
+            winner_node_id: leader_id,
+            reason: ElectionReason::Bootstrap as i32,
+        });
+        Self {
+            nodes,
+            target_node_count: peers.len() as u32,
+            cluster_config: default_cluster_config(),
+            partitions: BTreeSet::new(),
+            elections,
+            faults: VecDeque::with_capacity(256),
+            scenario_runs: BTreeMap::new(),
             next_run_seq: 1,
             started_at: Instant::now(),
         }
@@ -208,7 +202,11 @@ impl InMemoryState {
         !self.partitions.contains(&pair)
     }
 
-    pub fn derive_node_health(&self, node: &NodeRecord) -> (PbNodeHealth, Vec<u64>) {
+    pub fn derive_node_health(
+        &self,
+        node: &NodeRecord,
+    ) -> (proto::control::NodeHealth, Vec<u64>) {
+        use proto::control::NodeHealth as PbNodeHealth;
         if node.health == ProcessHealth::Stopped {
             return (PbNodeHealth::Stopped, Vec::new());
         }
@@ -267,12 +265,6 @@ impl InMemoryState {
         }
     }
 
-    pub fn allocate_tx_id(&mut self) -> u64 {
-        let id = self.next_tx_id;
-        self.next_tx_id += 1;
-        id
-    }
-
     pub fn allocate_run_id(&mut self) -> String {
         let seq = self.next_run_seq;
         self.next_run_seq += 1;
@@ -300,56 +292,4 @@ pub fn epoch_ms_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
     dur.as_millis() as i64
-}
-
-/// Convert a proto `submit_operation_request::Operation` into the internal
-/// `SubmittedOp`. Used by both the service (for direct submissions) and the
-/// background scenario runner.
-pub fn parse_op(o: submit_operation_request::Operation) -> SubmittedOp {
-    match o {
-        submit_operation_request::Operation::Deposit(Deposit {
-            account,
-            amount,
-            user_ref,
-        }) => SubmittedOp::Deposit {
-            account,
-            amount,
-            user_ref,
-        },
-        submit_operation_request::Operation::Withdrawal(Withdrawal {
-            account,
-            amount,
-            user_ref,
-        }) => SubmittedOp::Withdrawal {
-            account,
-            amount,
-            user_ref,
-        },
-        submit_operation_request::Operation::Transfer(Transfer {
-            from,
-            to,
-            amount,
-            user_ref,
-        }) => SubmittedOp::Transfer {
-            from,
-            to,
-            amount,
-            user_ref,
-        },
-        submit_operation_request::Operation::Function(Function {
-            name,
-            params,
-            user_ref,
-        }) => {
-            let mut p = [0i64; 8];
-            for (i, v) in params.into_iter().take(8).enumerate() {
-                p[i] = v;
-            }
-            SubmittedOp::Function {
-                name,
-                params: p,
-                user_ref,
-            }
-        }
-    }
 }

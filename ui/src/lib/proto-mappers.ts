@@ -12,14 +12,12 @@ import type {
   ElectionEvent as PbElectionEvent,
   FaultEvent as PbFaultEvent,
   GetClusterSnapshotResponse,
-  GetTransactionStatusResponse,
   LogEntry as PbLogEntry,
   NodeStatus as PbNodeStatus,
   ScenarioRunSummary as PbRunSummary,
   GetScenarioStatusResponse as PbScenarioStatus,
   Scenario as PbScenario,
   ScenarioStep as PbScenarioStep,
-  SubmitOperationRequest,
 } from '@/gen/control_pb';
 import {
   ClusterHealth as PbClusterHealth,
@@ -29,9 +27,16 @@ import {
   NodeHealth as PbNodeHealth,
   NodeRole as PbNodeRole,
   ScenarioState as PbScenarioState,
-  TransactionStatus as PbTxStatus,
   WorkloadKind as PbWorkloadKind,
 } from '@/gen/control_pb';
+// Ledger data-plane operations are served via the Ledger gRPC proxy on
+// the same control-plane port — request/response shapes come from
+// `ledger_pb`, not `control_pb`.
+import type {
+  GetStatusResponse as PbStatusResponse,
+  SubmitOperationRequest,
+} from '@/gen/ledger_pb';
+import { TransactionStatus as PbTxStatus } from '@/gen/ledger_pb';
 
 import type {
   ClusterHealth,
@@ -257,10 +262,10 @@ const TX_STATE_FROM: Record<PbTxStatus, TransactionStatus['state']> = {
   [PbTxStatus.COMMITTED]: 'Committed',
   [PbTxStatus.ON_SNAPSHOT]: 'OnSnapshot',
   [PbTxStatus.ERROR]: 'Error',
-  [PbTxStatus.NOT_FOUND]: 'NotFound',
+  [PbTxStatus.TX_NOT_FOUND]: 'NotFound',
 };
 
-export function txStatusFromPb(pb: GetTransactionStatusResponse): TransactionStatus {
+export function txStatusFromPb(pb: PbStatusResponse): TransactionStatus {
   const state = TX_STATE_FROM[pb.status];
   // The control-plane API no longer surfaces per-stage timestamps; the UI
   // just records the moment the response was observed and uses 0 for stages
@@ -304,11 +309,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
   switch (op.kind) {
     case 'Deposit':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'deposit',
           value: {
-            $typeName: 'roda.control.v1.Deposit',
+            $typeName: 'roda.ledger.v1.Deposit',
             account: stringToU64(op.account),
             amount: stringToU64(op.amount),
             userRef: stringToU64(op.userRef),
@@ -317,11 +322,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
       };
     case 'Withdrawal':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'withdrawal',
           value: {
-            $typeName: 'roda.control.v1.Withdrawal',
+            $typeName: 'roda.ledger.v1.Withdrawal',
             account: stringToU64(op.account),
             amount: stringToU64(op.amount),
             userRef: stringToU64(op.userRef),
@@ -330,11 +335,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
       };
     case 'Transfer':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'transfer',
           value: {
-            $typeName: 'roda.control.v1.Transfer',
+            $typeName: 'roda.ledger.v1.Transfer',
             from: stringToU64(op.from),
             to: stringToU64(op.to),
             amount: stringToU64(op.amount),
@@ -344,11 +349,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
       };
     case 'Function':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'function',
           value: {
-            $typeName: 'roda.control.v1.Function',
+            $typeName: 'roda.ledger.v1.Function',
             name: op.name,
             params: op.params.map((p) => BigInt(p)),
             userRef: stringToU64(op.userRef),

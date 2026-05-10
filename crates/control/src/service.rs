@@ -6,28 +6,21 @@ use parking_lot::RwLock;
 use proto::control::control_server::Control;
 use proto::control::{
     CancelScenarioRequest, CancelScenarioResponse, Capability, ClusterHealth, ClusterMembership,
-    ElectionEvent, EntryKind, FaultKind, GetBalanceRequest, GetBalanceResponse,
-    GetClusterConfigRequest, GetClusterConfigResponse, GetClusterSnapshotRequest,
-    GetClusterSnapshotResponse, GetFaultHistoryRequest, GetFaultHistoryResponse, GetNodeLogRequest,
-    GetNodeLogResponse, GetPipelineIndexRequest, GetPipelineIndexResponse,
-    GetRecentElectionsRequest, GetRecentElectionsResponse, GetScenarioStatusRequest,
-    GetScenarioStatusResponse, GetServerInfoRequest, GetServerInfoResponse, GetTransactionRequest,
-    GetTransactionResponse, GetTransactionStatusRequest, GetTransactionStatusResponse,
-    HealPartitionRequest, HealPartitionResponse, KillNodeRequest, KillNodeResponse,
-    ListScenarioRunsRequest, ListScenarioRunsResponse, LogEntry, LogEntryKind, NodeInfo, NodeRole,
-    NodeStatus, PartitionPair, PartitionPairRequest, PartitionPairResponse, RestartNodeRequest,
-    RestartNodeResponse, RunScenarioRequest, RunScenarioResponse, ScenarioRunSummary,
-    ScenarioState, SetNodeCountRequest, SetNodeCountResponse, StartNodeRequest, StartNodeResponse,
-    StopNodeRequest, StopNodeResponse, SubmitBatchRequest, SubmitBatchResponse,
-    SubmitOperationRequest, SubmitOperationResponse, TransactionStatus, TxEntryRecord,
+    ElectionEvent, FaultKind, GetClusterConfigRequest, GetClusterConfigResponse,
+    GetClusterSnapshotRequest, GetClusterSnapshotResponse, GetFaultHistoryRequest,
+    GetFaultHistoryResponse, GetNodeLogRequest, GetNodeLogResponse, GetRecentElectionsRequest,
+    GetRecentElectionsResponse, GetScenarioStatusRequest, GetScenarioStatusResponse,
+    GetServerInfoRequest, GetServerInfoResponse, HealPartitionRequest, HealPartitionResponse,
+    KillNodeRequest, KillNodeResponse, ListScenarioRunsRequest, ListScenarioRunsResponse,
+    NodeInfo, NodeRole, NodeStatus, PartitionPair, PartitionPairRequest, PartitionPairResponse,
+    RestartNodeRequest, RestartNodeResponse, RunScenarioRequest, RunScenarioResponse,
+    ScenarioRunSummary, ScenarioState, SetNodeCountRequest, SetNodeCountResponse,
+    StartNodeRequest, StartNodeResponse, StopNodeRequest, StopNodeResponse,
     UpdateClusterConfigRequest, UpdateClusterConfigResponse,
 };
 use tonic::{Request, Response, Status};
 
-use crate::state::{
-    InMemoryState, NodeRecord, ProcessHealth, SubmittedOp, TxRecord, canonical_pair, epoch_ms_now,
-    parse_op,
-};
+use crate::state::{InMemoryState, NodeRecord, ProcessHealth, canonical_pair, epoch_ms_now};
 
 #[derive(Clone)]
 pub struct ControlService {
@@ -47,10 +40,10 @@ impl Control for ControlService {
         _req: Request<GetServerInfoRequest>,
     ) -> Result<Response<GetServerInfoResponse>, Status> {
         Ok(Response::new(GetServerInfoResponse {
-            version: format!("control-mock-{}", env!("CARGO_PKG_VERSION")),
+            version: format!("control-{}", env!("CARGO_PKG_VERSION")),
             api_version: 1,
-            // The mock supports both abrupt KillNode and pairwise partitions,
-            // so it advertises both capabilities.
+            // Mock supports both abrupt KillNode and pairwise partitions, so
+            // both capabilities are advertised.
             capabilities: vec![Capability::Kill as i32, Capability::NetworkPartition as i32],
         }))
     }
@@ -143,58 +136,16 @@ impl Control for ControlService {
         if !state.nodes.contains_key(&r.node_id) {
             return Err(Status::not_found(format!("unknown node {}", r.node_id)));
         }
-        let limit = if r.limit == 0 { 100 } else { r.limit.min(1000) } as usize;
-        let from_index = r.from_index;
-
-        // Synthetic log: every committed transaction is one entry, indexed by tx_id.
-        let entries_iter = state.transactions.values().filter(|t| {
-            matches!(
-                TransactionStatus::try_from(t.status as i32).unwrap_or(TransactionStatus::Pending),
-                TransactionStatus::Committed | TransactionStatus::OnSnapshot
-            )
-        });
-
-        let total_count: u64 = entries_iter.clone().count() as u64;
-        let oldest_retained_index = state
-            .transactions
-            .values()
-            .filter(|t| {
-                matches!(
-                    TransactionStatus::try_from(t.status as i32)
-                        .unwrap_or(TransactionStatus::Pending),
-                    TransactionStatus::Committed | TransactionStatus::OnSnapshot
-                )
-            })
-            .map(|t| t.tx_id)
-            .min()
-            .unwrap_or(0);
-
-        let mut entries: Vec<LogEntry> = entries_iter
-            .filter(|t| t.tx_id >= from_index.max(1))
-            .take(limit)
-            .map(|t| LogEntry {
-                index: t.tx_id,
-                term: state.current_leader().map(|n| n.current_term).unwrap_or(1),
-                kind: match t.op {
-                    SubmittedOp::Function { .. } => LogEntryKind::FunctionRegistered as i32,
-                    _ => LogEntryKind::TxEntry as i32,
-                },
-                summary: summarize_op(&t.op),
-            })
-            .collect();
-        entries.sort_by_key(|e| e.index);
-
-        let next_from_index = if entries.len() == limit {
-            entries.last().map(|e| e.index + 1).unwrap_or(0)
-        } else {
-            0
-        };
-
+        // Ledger data lives on the cluster nodes; the control plane's
+        // mocked log surface is empty. The UI's node-log panel uses
+        // this only for cluster monitoring, not for ledger replay.
+        let _ = r.from_index;
+        let _ = r.limit;
         Ok(Response::new(GetNodeLogResponse {
-            entries,
-            total_count,
-            next_from_index,
-            oldest_retained_index,
+            entries: Vec::new(),
+            total_count: 0,
+            next_from_index: 0,
+            oldest_retained_index: 0,
         }))
     }
 
@@ -525,176 +476,6 @@ impl Control for ControlService {
         Ok(Response::new(GetFaultHistoryResponse { events }))
     }
 
-    async fn submit_operation(
-        &self,
-        req: Request<SubmitOperationRequest>,
-    ) -> Result<Response<SubmitOperationResponse>, Status> {
-        let mut state = self.state.write();
-        let term = state.current_leader().map(|n| n.current_term).unwrap_or(0);
-        if state.cluster_health_unhealthy() {
-            return Err(Status::failed_precondition(
-                "cluster is unhealthy: no current leader",
-            ));
-        }
-        let op = match req.into_inner().operation {
-            Some(o) => parse_op(o),
-            None => return Err(Status::invalid_argument("operation field is required")),
-        };
-        let tx_id = state.allocate_tx_id();
-        let now = std::time::Instant::now();
-        state.transactions.insert(
-            tx_id,
-            TxRecord {
-                tx_id,
-                op,
-                status: TransactionStatus::Pending,
-                fail_reason: 0,
-                submitted_at: now,
-                computed_at: None,
-                committed_at: None,
-                snapshot_at: None,
-            },
-        );
-        Ok(Response::new(SubmitOperationResponse {
-            transaction_id: tx_id,
-            term,
-        }))
-    }
-
-    async fn submit_batch(
-        &self,
-        req: Request<SubmitBatchRequest>,
-    ) -> Result<Response<SubmitBatchResponse>, Status> {
-        let mut state = self.state.write();
-        let term = state.current_leader().map(|n| n.current_term).unwrap_or(0);
-        if state.cluster_health_unhealthy() {
-            return Err(Status::failed_precondition(
-                "cluster is unhealthy: no current leader",
-            ));
-        }
-        let ops_in = req.into_inner().operations;
-        let mut results = Vec::with_capacity(ops_in.len());
-        for sor in ops_in {
-            let op = match sor.operation {
-                Some(o) => parse_op(o),
-                None => return Err(Status::invalid_argument("operation field is required")),
-            };
-            let tx_id = state.allocate_tx_id();
-            let now = std::time::Instant::now();
-            state.transactions.insert(
-                tx_id,
-                TxRecord {
-                    tx_id,
-                    op,
-                    status: TransactionStatus::Pending,
-                    fail_reason: 0,
-                    submitted_at: now,
-                    computed_at: None,
-                    committed_at: None,
-                    snapshot_at: None,
-                },
-            );
-            results.push(SubmitOperationResponse {
-                transaction_id: tx_id,
-                term,
-            });
-        }
-        Ok(Response::new(SubmitBatchResponse { results, term }))
-    }
-
-    async fn get_balance(
-        &self,
-        req: Request<GetBalanceRequest>,
-    ) -> Result<Response<GetBalanceResponse>, Status> {
-        let r = req.into_inner();
-        let state = self.state.read();
-        if !state.nodes.contains_key(&r.node_id) {
-            return Err(Status::not_found(format!("unknown node {}", r.node_id)));
-        }
-        let balance = state.accounts.get(&r.account_id).copied().unwrap_or(0);
-        let last_snapshot_tx_id = state
-            .transactions
-            .values()
-            .filter(|t| {
-                matches!(
-                    TransactionStatus::try_from(t.status as i32)
-                        .unwrap_or(TransactionStatus::Pending),
-                    TransactionStatus::OnSnapshot
-                )
-            })
-            .map(|t| t.tx_id)
-            .max()
-            .unwrap_or(0);
-        Ok(Response::new(GetBalanceResponse {
-            balance,
-            last_snapshot_tx_id,
-        }))
-    }
-
-    async fn get_transaction(
-        &self,
-        req: Request<GetTransactionRequest>,
-    ) -> Result<Response<GetTransactionResponse>, Status> {
-        let r = req.into_inner();
-        let state = self.state.read();
-        let node = state
-            .nodes
-            .get(&r.node_id)
-            .ok_or_else(|| Status::not_found(format!("unknown node {}", r.node_id)))?;
-        let tx = state.transactions.get(&r.tx_id);
-        let entries = match tx {
-            Some(tx) if tx.tx_id <= node.commit_index => synthesize_entries(&tx.op),
-            _ => Vec::new(),
-        };
-        Ok(Response::new(GetTransactionResponse {
-            tx_id: r.tx_id,
-            entries,
-            links: Vec::new(),
-        }))
-    }
-
-    async fn get_transaction_status(
-        &self,
-        req: Request<GetTransactionStatusRequest>,
-    ) -> Result<Response<GetTransactionStatusResponse>, Status> {
-        let tx_id = req.into_inner().tx_id;
-        let state = self.state.read();
-        let tx = match state.transactions.get(&tx_id) {
-            None => {
-                return Ok(Response::new(GetTransactionStatusResponse {
-                    status: TransactionStatus::NotFound as i32,
-                    fail_reason: 0,
-                }));
-            }
-            Some(t) => t,
-        };
-        Ok(Response::new(GetTransactionStatusResponse {
-            status: tx.status as i32,
-            fail_reason: tx.fail_reason,
-        }))
-    }
-
-    async fn get_pipeline_index(
-        &self,
-        req: Request<GetPipelineIndexRequest>,
-    ) -> Result<Response<GetPipelineIndexResponse>, Status> {
-        let r = req.into_inner();
-        let state = self.state.read();
-        let node = state
-            .nodes
-            .get(&r.node_id)
-            .ok_or_else(|| Status::not_found(format!("unknown node {}", r.node_id)))?;
-        let is_leader = matches!(node.role, NodeRole::Leader);
-        Ok(Response::new(GetPipelineIndexResponse {
-            compute_index: node.compute_index,
-            commit_index: node.commit_index,
-            snapshot_index: node.snapshot_index,
-            term: node.current_term,
-            cluster_commit_index: node.cluster_commit_index,
-            is_leader,
-        }))
-    }
-
     async fn run_scenario(
         &self,
         req: Request<RunScenarioRequest>,
@@ -707,7 +488,6 @@ impl Control for ControlService {
         let run_id = state.allocate_run_id();
         let now = std::time::Instant::now();
         let started_at_ms = epoch_ms_now();
-        let scenario_name = scenario.name.clone();
         state.scenario_runs.insert(
             run_id.clone(),
             crate::state::RunRecord {
@@ -730,7 +510,6 @@ impl Control for ControlService {
                 recent_steps: Default::default(),
             },
         );
-        let _ = scenario_name;
         Ok(Response::new(RunScenarioResponse {
             run_id,
             started_at_ms,
@@ -813,60 +592,5 @@ impl Control for ControlService {
             })
             .collect();
         Ok(Response::new(ListScenarioRunsResponse { runs }))
-    }
-}
-
-fn summarize_op(op: &SubmittedOp) -> String {
-    match op {
-        SubmittedOp::Deposit {
-            account, amount, ..
-        } => format!("Deposit {amount} → acct {account}"),
-        SubmittedOp::Withdrawal {
-            account, amount, ..
-        } => format!("Withdraw {amount} from acct {account}"),
-        SubmittedOp::Transfer {
-            from, to, amount, ..
-        } => format!("Transfer {amount} from acct {from} → acct {to}"),
-        SubmittedOp::Function { name, params, .. } => {
-            format!("Invoke fn '{name}' (params={params:?})")
-        }
-    }
-}
-
-fn synthesize_entries(op: &SubmittedOp) -> Vec<TxEntryRecord> {
-    match op {
-        SubmittedOp::Deposit {
-            account, amount, ..
-        } => vec![TxEntryRecord {
-            account_id: *account,
-            amount: *amount,
-            kind: EntryKind::Credit as i32,
-            computed_balance: *amount as i64,
-        }],
-        SubmittedOp::Withdrawal {
-            account, amount, ..
-        } => vec![TxEntryRecord {
-            account_id: *account,
-            amount: *amount,
-            kind: EntryKind::Debit as i32,
-            computed_balance: -(*amount as i64),
-        }],
-        SubmittedOp::Transfer {
-            from, to, amount, ..
-        } => vec![
-            TxEntryRecord {
-                account_id: *from,
-                amount: *amount,
-                kind: EntryKind::Debit as i32,
-                computed_balance: -(*amount as i64),
-            },
-            TxEntryRecord {
-                account_id: *to,
-                amount: *amount,
-                kind: EntryKind::Credit as i32,
-                computed_balance: *amount as i64,
-            },
-        ],
-        SubmittedOp::Function { .. } => Vec::new(),
     }
 }
