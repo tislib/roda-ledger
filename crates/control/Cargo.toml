@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 proto.workspace = true
+client.workspace = true
 tonic.workspace = true
 tonic-web = "0.12"
 tonic-reflection = "0.12"

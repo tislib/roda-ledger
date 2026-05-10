@@ -458,6 +458,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "clap",
+ "client",
  "http",
  "parking_lot",
  "prost",

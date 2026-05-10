@@ -21,6 +21,6 @@ pub mod server;
 pub mod service;
 pub mod state;
 
-pub use ledger_proxy::{LedgerProxy, NODE_SELECTOR_METADATA_KEY, Peer};
+pub use ledger_proxy::{LedgerProxy, NODE_SELECTOR_METADATA_KEY, PeerSpec};
 pub use server::serve;
 pub use state::InMemoryState;

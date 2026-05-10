@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use control::{LedgerProxy, Peer, server, state::InMemoryState};
+use control::{LedgerProxy, server, state::InMemoryState};
 use parking_lot::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -103,16 +103,14 @@ async fn main() -> anyhow::Result<()> {
         let state = Arc::new(RwLock::new(InMemoryState::new(cli.seed_nodes)));
         (state, None)
     } else {
-        let state = Arc::new(RwLock::new(InMemoryState::from_peers(&cli.peers)));
-        let mut peers = Vec::with_capacity(cli.peers.len());
         for (id, url) in &cli.peers {
-            let p = Peer::connect_lazy(*id, url.clone()).map_err(|e| {
-                anyhow::anyhow!("failed to build peer endpoint for {url}: {e}")
-            })?;
             info!("ledger proxy peer: node_id={id} url={url}");
-            peers.push(p);
         }
-        (state, Some(LedgerProxy::new(peers)))
+        let state = Arc::new(RwLock::new(InMemoryState::from_peers(&cli.peers)));
+        let proxy = LedgerProxy::new(cli.peers.clone()).map_err(|e| {
+            anyhow::anyhow!("failed to build Ledger proxy ClusterClient: {e}")
+        })?;
+        (state, Some(proxy))
     };
 
     let shutdown = CancellationToken::new();
