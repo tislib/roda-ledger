@@ -107,9 +107,8 @@ async fn main() -> anyhow::Result<()> {
             info!("ledger proxy peer: node_id={id} url={url}");
         }
         let state = Arc::new(RwLock::new(InMemoryState::from_peers(&cli.peers)));
-        let proxy = LedgerProxy::new(cli.peers.clone()).map_err(|e| {
-            anyhow::anyhow!("failed to build Ledger proxy ClusterClient: {e}")
-        })?;
+        let proxy = LedgerProxy::new(cli.peers.clone())
+            .map_err(|e| anyhow::anyhow!("failed to build Ledger proxy ClusterClient: {e}"))?;
         (state, Some(proxy))
     };
 

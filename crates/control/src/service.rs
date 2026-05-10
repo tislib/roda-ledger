@@ -11,12 +11,12 @@ use proto::control::{
     GetFaultHistoryResponse, GetNodeLogRequest, GetNodeLogResponse, GetRecentElectionsRequest,
     GetRecentElectionsResponse, GetScenarioStatusRequest, GetScenarioStatusResponse,
     GetServerInfoRequest, GetServerInfoResponse, HealPartitionRequest, HealPartitionResponse,
-    KillNodeRequest, KillNodeResponse, ListScenarioRunsRequest, ListScenarioRunsResponse,
-    NodeInfo, NodeRole, NodeStatus, PartitionPair, PartitionPairRequest, PartitionPairResponse,
+    KillNodeRequest, KillNodeResponse, ListScenarioRunsRequest, ListScenarioRunsResponse, NodeInfo,
+    NodeRole, NodeStatus, PartitionPair, PartitionPairRequest, PartitionPairResponse,
     RestartNodeRequest, RestartNodeResponse, RunScenarioRequest, RunScenarioResponse,
-    ScenarioRunSummary, ScenarioState, SetNodeCountRequest, SetNodeCountResponse,
-    StartNodeRequest, StartNodeResponse, StopNodeRequest, StopNodeResponse,
-    UpdateClusterConfigRequest, UpdateClusterConfigResponse,
+    ScenarioRunSummary, ScenarioState, SetNodeCountRequest, SetNodeCountResponse, StartNodeRequest,
+    StartNodeResponse, StopNodeRequest, StopNodeResponse, UpdateClusterConfigRequest,
+    UpdateClusterConfigResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -59,9 +59,7 @@ impl ControlService {
             .map(|n| (n.node_id, peer_url_from_address(&n.address)))
             .collect();
         if let Err(e) = proxy.sync_peers(&desired) {
-            tracing::warn!(
-                "ledger-proxy: failed to sync peers after membership change: {e}"
-            );
+            tracing::warn!("ledger-proxy: failed to sync peers after membership change: {e}");
         }
     }
 }

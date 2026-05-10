@@ -202,10 +202,7 @@ impl InMemoryState {
         !self.partitions.contains(&pair)
     }
 
-    pub fn derive_node_health(
-        &self,
-        node: &NodeRecord,
-    ) -> (proto::control::NodeHealth, Vec<u64>) {
+    pub fn derive_node_health(&self, node: &NodeRecord) -> (proto::control::NodeHealth, Vec<u64>) {
         use proto::control::NodeHealth as PbNodeHealth;
         if node.health == ProcessHealth::Stopped {
             return (PbNodeHealth::Stopped, Vec::new());
