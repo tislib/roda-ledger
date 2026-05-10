@@ -57,41 +57,6 @@ service Control {
   // targeting so the UI can compare WAL contents across followers.
   rpc GetNodeWalLog(GetNodeWalLogRequest) returns (GetNodeWalLogResponse);
 
-  // ---- Ledger operations ----
-
-  // SubmitOperation submits a single financial operation to the cluster.
-  // Mirrors `roda.ledger.v1.Ledger.SubmitOperation`. Returns immediately
-  // with a transaction_id once the operation is sequenced. Use
-  // GetTransaction or GetPipelineIndex to poll for finality.
-  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
-
-  // SubmitBatch submits multiple operations in a single round trip.
-  // Mirrors `roda.ledger.v1.Ledger.SubmitBatch`. Operations are sequenced
-  // and executed in the order provided; each operation is independent
-  // and atomic on its own. There is no batch-level atomicity.
-  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
-
-  // GetBalance returns the current balance for a single account, observed
-  // from the addressed node. The per-node target lets the UI inspect
-  // followers (e.g. "did the partitioned follower see this credit?").
-  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
-
-  // GetTransaction retrieves the full details of a transaction as known
-  // to the addressed node. Useful for debugging replication lag — the
-  // same tx_id may resolve on the leader but be missing on a partitioned
-  // follower.
-  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
-
-  // GetTransactionStatus reports the current pipeline stage of a single
-  // transaction. Mirrors the per-tx polling the UI's result panel does
-  // while watching an op walk Pending → Computed → Committed → OnSnapshot.
-  rpc GetTransactionStatus(GetTransactionStatusRequest) returns (GetTransactionStatusResponse);
-
-  // GetPipelineIndex returns the staged pipeline progress observed by
-  // a specific node. Drives the per-node pipeline indices on the
-  // Cluster Dashboard.
-  rpc GetPipelineIndex(GetPipelineIndexRequest) returns (GetPipelineIndexResponse);
-
   // ---- Provisioning ----
 
   // GetClusterConfig returns the current cluster-wide ledger configuration
@@ -115,12 +80,14 @@ service Control {
 
   // ResetCluster destroys all current cluster state and reinitializes
   // a fresh cluster with the same node count and current ClusterConfig.
-  //   - All running cluster nodes are stopped.
-  //   - All on-disk data (WALs, snapshots, balances) is wiped.
-  //   - The control plane's ephemeral history (fault log, scenario
-  //     runs, submission records) is cleared.
-  //   - A fresh cluster is provisioned. Returns once the new cluster is
-  //     accepting requests.
+  //
+  // - All running cluster nodes are stopped.
+  // - All on-disk data (WALs, snapshots, balances) is wiped.
+  // - The control plane's ephemeral history (fault log, scenario
+  //   runs, submission records) is cleared.
+  // - A fresh cluster is provisioned. Returns once the new cluster is
+  //   accepting requests.
+  //
   // Destructive — typically gated by an operator confirmation dialog.
   rpc ResetCluster(ResetClusterRequest) returns (ResetClusterResponse);
 
@@ -160,25 +127,14 @@ service Control {
 
   // ---- Meta (WASM extensions) ----
 
-  // RegisterFunction installs a compiled WASM module under a snake_case
-  // name. The binary must export `execute(i64 x 8) -> i32`. Mirrors
-  // `roda.ledger.v1.Ledger.RegisterFunction`. Used by the Meta module's
-  // Deploy button.
-  rpc RegisterFunction(RegisterFunctionRequest) returns (RegisterFunctionResponse);
-
-  // UnregisterFunction removes the handler for `name`. Subsequent
-  // Function operations against the name return INVALID_OPERATION.
-  rpc UnregisterFunction(UnregisterFunctionRequest) returns (UnregisterFunctionResponse);
-
-  // ListFunctions returns metadata for every currently-registered function.
-  rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
-
   // WatchFunctions streams the registered function set whenever the
   // server thinks it has changed (or at most every `interval_ms` as a
-  // heartbeat). Removes the polling flicker the Meta module sees when
-  // the underlying ListFunctions occasionally returns transient
-  // empties during normal cluster activity.
-  rpc WatchFunctions(WatchFunctionsRequest) returns (stream ListFunctionsResponse);
+  // heartbeat). Unary register/unregister/list calls are exposed via
+  // the proxied `roda.ledger.v1.Ledger` service on this same port; the
+  // streaming watch is control-only because the Ledger surface has no
+  // streaming RPCs and the UI's Meta module relies on push updates to
+  // hide the polling flicker around `ListFunctions`.
+  rpc WatchFunctions(WatchFunctionsRequest) returns (stream FunctionListUpdate);
 
   // ---- Testing (load + e2e scenarios) ----
 
@@ -529,185 +485,6 @@ enum LogEntryKind {
 // the ledger service) were removed in favour of WASM Function ops and
 // are not surfaced here.
 
-// SubmitOperationRequest wraps one of the supported operation types.
-// Exactly one operation field must be set. Setting zero or more than
-// one is an error.
-message SubmitOperationRequest {
-  oneof operation {
-    Deposit    deposit    = 1;
-    Withdrawal withdrawal = 2;
-    Transfer   transfer   = 3;
-    // 4 reserved (previously Composite; removed in favour of WASM
-    // Function operations).
-    Function   function   = 5;
-  }
-  reserved 4;
-}
-
-message SubmitOperationResponse {
-  // Monotonically increasing, globally ordered transaction ID.
-  uint64 transaction_id = 1;
-  // Current leader term at the moment of the reply.
-  uint64 term           = 2;
-}
-
-message SubmitBatchRequest {
-  // Operations to submit, in order. Each is independent and atomic on
-  // its own — failure of one does not affect others.
-  repeated SubmitOperationRequest operations = 1;
-}
-
-message SubmitBatchResponse {
-  // One result per input operation, same order.
-  repeated SubmitOperationResponse results = 1;
-  // Current leader term at the moment of the reply.
-  uint64 term = 2;
-}
-
-// Deposit credits an account from the system source. The system source
-// (SYSTEM_SOURCE) absorbs the corresponding debit to maintain the
-// zero-sum invariant. Deposits never fail due to insufficient funds.
-message Deposit {
-  uint64 account  = 1;
-  uint64 amount   = 2;
-  uint64 user_ref = 3;
-}
-
-// Withdrawal debits an account to the system sink. The system sink
-// (SYSTEM_SINK) absorbs the corresponding credit to maintain the
-// zero-sum invariant. Fails with INSUFFICIENT_FUNDS if balance < amount.
-message Withdrawal {
-  uint64 account  = 1;
-  uint64 amount   = 2;
-  uint64 user_ref = 3;
-}
-
-// Transfer moves funds between two accounts atomically. No value enters
-// or leaves the system. Fails with INSUFFICIENT_FUNDS if from < amount.
-message Transfer {
-  uint64 from     = 1;
-  uint64 to       = 2;
-  uint64 amount   = 3;
-  uint64 user_ref = 4;
-}
-
-// Function invokes a registered WASM function. The function ABI is
-// fixed-arity: exactly 8 i64 positional parameters. Short lists are
-// zero-padded; entries beyond the first 8 are dropped.
-message Function {
-  string         name     = 1;
-  repeated int64 params   = 2;
-  uint64         user_ref = 3;
-}
-
-// ---- GetBalance ----
-
-message GetBalanceRequest {
-  // Account to query. Returns 0 if never touched.
-  uint64 account_id = 1;
-  // Node to query. The same account observed from different nodes may
-  // disagree if those nodes are at different replication watermarks.
-  uint64 node_id    = 2;
-}
-
-message GetBalanceResponse {
-  // Current balance in minor units, observed by the addressed node.
-  // Reflects only transactions the node has applied through ON_SNAPSHOT.
-  int64  balance             = 1;
-  // All transactions up to and including this ID are reflected in the
-  // returned balance. The actual last snapshot ID may be slightly higher.
-  uint64 last_snapshot_tx_id = 2;
-}
-
-// ---- GetTransaction ----
-
-message GetTransactionRequest {
-  uint64 tx_id   = 1;
-  // Node to query. Lets clients confirm replication state per node
-  // (e.g. is the entry on a partitioned follower yet?).
-  uint64 node_id = 2;
-}
-
-message GetTransactionResponse {
-  uint64                 tx_id   = 1;
-  repeated TxEntryRecord entries = 2;
-  repeated TxLinkRecord  links   = 3;
-}
-
-message TxEntryRecord {
-  uint64    account_id       = 1;
-  uint64    amount           = 2;
-  EntryKind kind             = 3;
-  int64     computed_balance = 4;
-}
-
-enum EntryKind {
-  ENTRY_KIND_CREDIT = 0;
-  ENTRY_KIND_DEBIT  = 1;
-}
-
-message TxLinkRecord {
-  uint64   to_tx_id = 1;
-  LinkKind kind     = 2;
-}
-
-enum LinkKind {
-  LINK_KIND_DUPLICATE = 0;
-  LINK_KIND_REVERSAL  = 1;
-}
-
-// ---- GetTransactionStatus ----
-
-// TransactionStatus mirrors `roda.ledger.v1.TransactionStatus`. Stages are
-// strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
-// ERROR is a terminal state reachable only from PENDING. TX_NOT_FOUND
-// signals the transaction was never sequenced (or has been compacted).
-enum TransactionStatus {
-  TRANSACTION_STATUS_PENDING       = 0;
-  TRANSACTION_STATUS_COMPUTED      = 1;
-  TRANSACTION_STATUS_COMMITTED     = 2;
-  TRANSACTION_STATUS_ON_SNAPSHOT   = 3;
-  TRANSACTION_STATUS_ERROR         = 4;
-  TRANSACTION_STATUS_NOT_FOUND     = 5;
-}
-
-message GetTransactionStatusRequest {
-  uint64 tx_id = 1;
-}
-
-message GetTransactionStatusResponse {
-  TransactionStatus status      = 1;
-  // 0 if status != ERROR. See FailReason codes in roda.ledger.v1.
-  uint32            fail_reason = 2;
-  reserved 3, 4, 5, 6;
-}
-
-// ---- GetPipelineIndex (per-node) ----
-
-message GetPipelineIndexRequest {
-  // Node whose pipeline indices should be reported. Distinct from the
-  // ledger.v1 version, which always reports the responding server's own
-  // indices — here the caller chooses which node's view to read.
-  uint64 node_id = 1;
-}
-
-message GetPipelineIndexResponse {
-  // Highest transaction_id processed by the Transactor on this node.
-  uint64 compute_index        = 1;
-  // Highest transaction_id flushed to WAL on this node.
-  uint64 commit_index          = 2;
-  // Highest transaction_id applied to the balance cache on this node.
-  uint64 snapshot_index       = 3;
-  // Current term as observed by this node.
-  uint64 term                 = 4;
-  // Highest transaction_id known quorum-committed. On followers this is
-  // the most recent watermark advertised by the leader, clamped to the
-  // follower's commit_index.
-  uint64 cluster_commit_index = 5;
-  // True iff this node is currently the cluster leader.
-  bool   is_leader            = 6;
-}
-
 // ============================================================
 // Provisioning — cluster config and membership
 // ============================================================
@@ -853,46 +630,24 @@ message FaultEvent {
 // Meta (WASM extensions)
 // ============================================================
 
-message RegisterFunctionRequest {
-  string name              = 1;
-  // Compiled WASM module bytes; must export execute(i64 x 8) -> i32.
-  bytes  binary            = 2;
-  // If false and `name` already registered, the call returns
-  // accepted=false with `error = "ALREADY_EXISTS"`.
-  bool   override_existing = 3;
-}
-
-message RegisterFunctionResponse {
-  bool   accepted = 1;
-  string error    = 2;
-  // Monotonic per-name version stamped on the WAL record.
-  uint32 version  = 3;
-}
-
-message UnregisterFunctionRequest {
-  string name = 1;
-}
-
-message UnregisterFunctionResponse {
-  bool   accepted = 1;
-  string error    = 2;
-  // Version stamped on the unregister record.
-  uint32 version  = 3;
-}
-
-message ListFunctionsRequest {}
-
 message WatchFunctionsRequest {
   // Heartbeat cadence in ms. 0 = server default (1000). Clamped
   // server-side to [200, 10000].
   uint32 interval_ms = 1;
 }
 
-message ListFunctionsResponse {
-  repeated FunctionInfo functions = 1;
+// FunctionListUpdate is the server-streamed event carrying the current
+// set of registered functions. The shape mirrors
+// `roda.ledger.v1.ListFunctionsResponse` so the UI can reuse the same
+// row renderer for the unary list and the streaming watch.
+message FunctionListUpdate {
+  repeated FunctionEntry functions = 1;
 }
 
-message FunctionInfo {
+// FunctionEntry mirrors `roda.ledger.v1.FunctionInfo`. Lives in
+// control.proto so the streaming-only WatchFunctions RPC has no cross-
+// proto type dependency.
+message FunctionEntry {
   string name    = 1;
   uint32 version = 2;
   uint32 crc32c  = 3;

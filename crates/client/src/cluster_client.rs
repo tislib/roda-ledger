@@ -192,7 +192,11 @@ impl ClusterClient {
     /// Run `op` against round-robin-selected nodes, retrying on any
     /// `tonic::Status` error. Each retry advances the rotation by one,
     /// so a single broken node can't trap the read forever.
-    async fn with_read_retry<F, Fut, T>(&self, op_name: &str, op: F) -> Result<T>
+    ///
+    /// Public for callers (e.g. the control-plane Ledger proxy) that
+    /// want to reuse the cluster's read-RR + retry policy while
+    /// issuing raw tonic RPCs against `NodeClient::ledger_client()`.
+    pub async fn with_read_retry<F, Fut, T>(&self, op_name: &str, op: F) -> Result<T>
     where
         F: Fn(NodeClient) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -479,7 +483,11 @@ impl ClusterLeaderClient {
     /// `leader-node-index` metadata hint if the server included it)
     /// and retry. On any other `tonic::Status` error, retry against
     /// the same node with exponential backoff.
-    async fn with_leader_retry<F, Fut, T>(&self, op_name: &str, op: F) -> Result<T>
+    ///
+    /// Public for callers (e.g. the control-plane Ledger proxy) that
+    /// want to reuse the cluster's leader-discovery + retry policy
+    /// while issuing raw tonic RPCs against `NodeClient::ledger_client()`.
+    pub async fn with_leader_retry<F, Fut, T>(&self, op_name: &str, op: F) -> Result<T>
     where
         F: Fn(NodeClient) -> Fut,
         Fut: Future<Output = Result<T>>,
