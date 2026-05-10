@@ -40,19 +40,24 @@ export function MetaModule() {
   const deployedNames = new Set((deployed ?? []).map((d) => d.name));
 
   const onDeploy = (fn: WasmFunction) => {
-    // Examples ship with illustrative Rust source for display; the
-    // browser can't compile that, so the actual binary deployed is the
-    // precompiled noop WASM. The function still registers under the
-    // example's name and is invokable from Ledger — it just returns 0
-    // regardless of params. Real semantics need a separate wasm upload.
+    // Examples that ship a precompiled binary (`wasmBase64`) deploy
+    // the real WASM — the displayed Rust source above is a faithful
+    // pseudocode of what the binary does. Re-deploying overrides the
+    // existing version so iterating on the canonical example is a
+    // single click. Examples without bytes fall back to the noop stub
+    // since the browser can't compile Rust; they register under their
+    // name and return 0 regardless of params.
+    const wasm = fn.wasmBase64 ?? NOOP_WASM_BASE64;
+    const isStub = !fn.wasmBase64;
     registerMutation.mutate(
       {
         name: fn.name,
-        source: NOOP_WASM_BASE64,
-        overrideExisting: false,
+        source: wasm,
+        overrideExisting: !isStub,
       },
       {
-        onSuccess: () => toast.success(`Deployed ${fn.name}`, 'Stub WASM (returns 0)'),
+        onSuccess: () =>
+          toast.success(`Deployed ${fn.name}`, isStub ? 'Stub WASM (returns 0)' : 'Real WASM'),
         onError: (err) => toast.error('Deploy failed', String(err)),
       },
     );

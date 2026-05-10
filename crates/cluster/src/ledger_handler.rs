@@ -1,11 +1,12 @@
 use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
-use crate::durable::Term;
+use crate::durable::{Term, Vote};
 use ::proto::ledger as proto;
 use ::proto::ledger::ledger_server::Ledger;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
 use spdlog::{trace, warn};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
@@ -24,16 +25,25 @@ pub struct LedgerHandler {
     /// status / wait responses. Reads go through `Term`'s internal
     /// RwLock + AtomicU64 — independent of the raft mutex.
     term: Arc<Term>,
+    /// Shared durable vote log. Read by `GetTerms` to surface this
+    /// node's per-term vote decisions for election observability.
+    vote: Arc<Vote>,
 }
 
 impl LedgerHandler {
     /// Construct a role-aware handler. Writability is decided at every
     /// RPC by reading `mirror.is_leader()`.
-    pub fn new(ledger_slot: Arc<LedgerSlot>, mirror: Arc<ClusterMirror>, term: Arc<Term>) -> Self {
+    pub fn new(
+        ledger_slot: Arc<LedgerSlot>,
+        mirror: Arc<ClusterMirror>,
+        term: Arc<Term>,
+        vote: Arc<Vote>,
+    ) -> Self {
         Self {
             ledger_slot,
             mirror,
             term,
+            vote,
         }
     }
 
@@ -504,7 +514,179 @@ impl Ledger for LedgerHandler {
             .collect();
         Ok(Response::new(proto::ListFunctionsResponse { functions }))
     }
+
+    async fn get_log(
+        &self,
+        request: Request<proto::GetLogRequest>,
+    ) -> Result<Response<proto::GetLogResponse>, Status> {
+        let req = request.into_inner();
+        if req.to_tx_id != 0 && req.to_tx_id < req.from_tx_id {
+            return Err(Status::invalid_argument(
+                "to_tx_id must be 0 (unbounded) or >= from_tx_id",
+            ));
+        }
+        let limit = if req.limit == 0 {
+            DEFAULT_LOG_LIMIT
+        } else {
+            req.limit.min(MAX_LOG_RECORDS)
+        };
+        let to_tx_id = if req.to_tx_id == 0 {
+            u64::MAX
+        } else {
+            req.to_tx_id
+        };
+
+        // Snapshot commit watermark; never return uncommitted bytes.
+        let last_commit = self.ledger_slot.ledger().last_commit_id();
+
+        let mut tailer = self.ledger_slot.ledger().wal_tailer();
+        let mut buf = vec![0u8; (limit as usize) * storage::WAL_RECORD_SIZE];
+        let mut next_from = req.from_tx_id;
+        let mut emitted: Vec<storage::entities::WalEntry> = Vec::with_capacity(limit as usize);
+        // Index past the last whole-tx boundary; truncate here on overflow.
+        let mut last_whole_tx_end: usize = 0;
+
+        'outer: loop {
+            let n = tailer.tail(next_from, &mut buf) as usize;
+            if n == 0 {
+                break;
+            }
+            let entries = storage::decode_records(&buf[..n]);
+            if entries.is_empty() {
+                break;
+            }
+            let mut chunk_max_tx = next_from;
+
+            for e in entries {
+                let tx = e.tx_id();
+                if tx != 0 {
+                    chunk_max_tx = chunk_max_tx.max(tx);
+                }
+
+                if tx != 0 && tx > to_tx_id {
+                    break 'outer;
+                }
+                if tx != 0 && last_commit > 0 && tx > last_commit {
+                    break 'outer;
+                }
+
+                // Metadata / structural records mark whole-tx boundaries.
+                match e {
+                    storage::entities::WalEntry::Metadata(_)
+                    | storage::entities::WalEntry::SegmentHeader(_)
+                    | storage::entities::WalEntry::SegmentSealed(_) => {
+                        last_whole_tx_end = emitted.len();
+                    }
+                    _ => {}
+                }
+
+                emitted.push(e);
+                if emitted.len() >= limit as usize {
+                    break 'outer;
+                }
+            }
+
+            let advanced = chunk_max_tx.saturating_add(1);
+            if advanced <= next_from {
+                break;
+            }
+            next_from = advanced;
+        }
+
+        // Roll back to last whole-tx boundary on overflow; if a single tx
+        // exceeds limit (last_whole_tx_end == 0), emit the whole run.
+        let truncate_to = if emitted.len() < limit as usize {
+            emitted.len()
+        } else if last_whole_tx_end > 0 {
+            last_whole_tx_end
+        } else {
+            emitted.len()
+        };
+        emitted.truncate(truncate_to);
+
+        let next_tx_id = emitted
+            .last()
+            .map(|e| e.tx_id())
+            .filter(|&tx| tx > 0 && tx < to_tx_id)
+            .map(|tx| tx + 1)
+            .unwrap_or(0);
+
+        let records = emitted
+            .into_iter()
+            .map(crate::mapping::wal_entry_to_proto)
+            .collect();
+
+        Ok(Response::new(proto::GetLogResponse {
+            records,
+            next_tx_id,
+            last_commit_tx_id: last_commit,
+        }))
+    }
+
+    async fn get_terms(
+        &self,
+        request: Request<proto::GetTermsRequest>,
+    ) -> Result<Response<proto::GetTermsResponse>, Status> {
+        let req = request.into_inner();
+        let from_term = req.from_term;
+        let limit = if req.limit == 0 {
+            DEFAULT_TERMS_LIMIT
+        } else {
+            req.limit.min(MAX_TERMS_RECORDS)
+        } as usize;
+
+        // Fetch one extra row from each log so we can compute `next_term`
+        // after the merge without re-scanning.
+        let fetch = limit.saturating_add(1);
+        let term_records = self
+            .term
+            .list_records(from_term, fetch)
+            .map_err(|e| Status::internal(format!("term log scan failed: {e}")))?;
+        let vote_records = self
+            .vote
+            .list_records(from_term, fetch)
+            .map_err(|e| Status::internal(format!("vote log scan failed: {e}")))?;
+
+        let mut by_term: BTreeMap<u64, proto::TermInfo> = BTreeMap::new();
+        for rec in term_records {
+            let entry = by_term.entry(rec.term).or_insert(proto::TermInfo {
+                term: rec.term,
+                start_tx_id: 0,
+                voted_for: 0,
+                has_term_record: false,
+                has_vote_record: false,
+            });
+            entry.start_tx_id = rec.start_tx_id;
+            entry.has_term_record = true;
+        }
+        for rec in vote_records {
+            let entry = by_term.entry(rec.term).or_insert(proto::TermInfo {
+                term: rec.term,
+                start_tx_id: 0,
+                voted_for: 0,
+                has_term_record: false,
+                has_vote_record: false,
+            });
+            entry.voted_for = rec.voted_for;
+            entry.has_vote_record = true;
+        }
+
+        let mut iter = by_term.into_iter();
+        let terms: Vec<proto::TermInfo> = iter.by_ref().take(limit).map(|(_, info)| info).collect();
+        let next_term = iter.next().map(|(t, _)| t).unwrap_or(0);
+
+        Ok(Response::new(proto::GetTermsResponse {
+            terms,
+            current_term: self.current_term(),
+            next_term,
+        }))
+    }
 }
+
+const MAX_LOG_RECORDS: u32 = 10_000;
+const DEFAULT_LOG_LIMIT: u32 = 1_000;
+const MAX_TERMS_RECORDS: u32 = 10_000;
+const DEFAULT_TERMS_LIMIT: u32 = 1_000;
 
 /// Map `register_function` / `unregister_function` [`std::io::Error`] kinds
 /// to a canonical `tonic::Status`. Keeps the handler branches uniform.

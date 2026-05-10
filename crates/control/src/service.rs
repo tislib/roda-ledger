@@ -28,7 +28,8 @@ use proto::control::{
     ClusterMembership, ElectionEvent, EntryKind, FaultEvent, FaultKind, GetBalanceRequest,
     GetBalanceResponse, GetClusterConfigRequest, GetClusterConfigResponse,
     GetClusterSnapshotRequest, GetClusterSnapshotResponse, GetFaultHistoryRequest,
-    GetFaultHistoryResponse, GetNodeLogRequest, GetNodeLogResponse, GetPipelineIndexRequest,
+    GetFaultHistoryResponse, GetNodeLogRequest, GetNodeLogResponse, GetNodeWalLogRequest,
+    GetNodeWalLogResponse, GetPipelineIndexRequest,
     GetPipelineIndexResponse, GetRecentElectionsRequest, GetRecentElectionsResponse,
     GetScenarioStatusRequest, GetScenarioStatusResponse, GetServerInfoRequest,
     GetServerInfoResponse, GetTransactionRequest, GetTransactionResponse,
@@ -133,7 +134,8 @@ impl Control for ControlService {
 
         let mut nodes: Vec<NodeStatus> = Vec::with_capacity(n);
         let mut leader_id: u64 = 0;
-        let max_term: u64 = 0;
+        let mut leader_term: u64 = 0;
+        let mut max_term: u64 = 0;
         let mut max_cluster_commit: u64 = 0;
 
         for i in 0..n {
@@ -143,6 +145,10 @@ impl Control for ControlService {
                 Ok(pi) => {
                     if pi.is_leader {
                         leader_id = node_id;
+                        leader_term = pi.term;
+                    }
+                    if pi.term > max_term {
+                        max_term = pi.term;
                     }
                     if pi.cluster_commit > max_cluster_commit {
                         max_cluster_commit = pi.cluster_commit;
@@ -155,7 +161,7 @@ impl Control for ControlService {
                         } else {
                             NodeRole::Follower as i32
                         },
-                        current_term: 0, // not exposed by client today
+                        current_term: pi.term,
                         voted_for: 0,
                         health: proto::control::NodeHealth::Up as i32,
                         partitioned_peers: Vec::new(),
@@ -200,21 +206,20 @@ impl Control for ControlService {
             }
         }
 
-        let any_down = nodes
+        let alive = nodes
             .iter()
-            .any(|n| n.health == proto::control::NodeHealth::Stopped as i32);
-        let cluster_health = if leader_id == 0 || any_down {
-            ClusterHealth::Unhealthy
-        } else {
-            ClusterHealth::Healthy
-        };
+            .filter(|n| n.health == proto::control::NodeHealth::Up as i32)
+            .count();
+        let cluster_health = derive_cluster_health(leader_id, alive, nodes.len());
 
-        let _ = max_term; // reserved for when client surfaces term
+        // Cluster term = leader's term when there is one, else the
+        // highest term any node reported (covers mid-election states).
+        let current_term = if leader_term > 0 { leader_term } else { max_term };
         Ok(Response::new(GetClusterSnapshotResponse {
             taken_at_ms: now_ms,
             cluster_health: cluster_health as i32,
             leader_node_id: leader_id,
-            current_term: 0,
+            current_term,
             nodes,
             partitions: Vec::new(),
         }))
@@ -297,12 +302,85 @@ impl Control for ControlService {
 
     async fn get_recent_elections(
         &self,
-        _req: Request<GetRecentElectionsRequest>,
+        req: Request<GetRecentElectionsRequest>,
     ) -> Result<Response<GetRecentElectionsResponse>, Status> {
-        // No real Raft event stream today; UI shows an empty timeline.
-        Ok(Response::new(GetRecentElectionsResponse {
-            events: Vec::<ElectionEvent>::new(),
-        }))
+        const DEFAULT_LIMIT: u32 = 16;
+        const MAX_LIMIT: u32 = 256;
+        let r = req.into_inner();
+        let limit = if r.limit == 0 {
+            DEFAULT_LIMIT
+        } else {
+            r.limit.min(MAX_LIMIT)
+        };
+
+        // Pick a node to ask: prefer the leader (its vote.log records
+        // identify each prior term's winner from its own POV), fall back
+        // to any reachable node so the timeline isn't blank during an
+        // ongoing election.
+        let client = self.handle.client();
+        let n = client.node_count();
+        let mut leader_idx: Option<usize> = None;
+        let mut fallback_idx: Option<usize> = None;
+        for i in 0..n {
+            match client.node(i).get_pipeline_index().await {
+                Ok(pi) => {
+                    if pi.is_leader && leader_idx.is_none() {
+                        leader_idx = Some(i);
+                    }
+                    if fallback_idx.is_none() {
+                        fallback_idx = Some(i);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        let target = match leader_idx.or(fallback_idx) {
+            Some(i) => i,
+            None => {
+                return Ok(Response::new(GetRecentElectionsResponse {
+                    events: Vec::new(),
+                }));
+            }
+        };
+
+        // Pull all terms (paginate forward from the most-recent boundary
+        // when the cluster has more than `limit` records).
+        let mut all: Vec<proto_ledger::TermInfo> = Vec::new();
+        let mut from_term: u64 = 0;
+        loop {
+            match client.node(target).get_terms(from_term, MAX_LIMIT).await {
+                Ok(page) => {
+                    all.extend(page.terms);
+                    if page.next_term == 0 {
+                        break;
+                    }
+                    from_term = page.next_term;
+                    if all.len() >= MAX_LIMIT as usize {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Newest first, capped to caller's limit.
+        all.sort_by(|a, b| b.term.cmp(&a.term));
+        all.truncate(limit as usize);
+
+        let events: Vec<ElectionEvent> = all
+            .into_iter()
+            .map(|ti| ElectionEvent {
+                at_ms: 0,
+                term: ti.term,
+                winner_node_id: ti.voted_for,
+                reason: proto::control::ElectionReason::Unspecified as i32,
+                voted_for: ti.voted_for,
+                start_tx_id: ti.start_tx_id,
+                has_term_record: ti.has_term_record,
+                has_vote_record: ti.has_vote_record,
+            })
+            .collect();
+        Ok(Response::new(GetRecentElectionsResponse { events }))
     }
 
     async fn get_node_log(
@@ -315,6 +393,41 @@ impl Control for ControlService {
             total_count: 0,
             next_from_index: 0,
             oldest_retained_index: 0,
+        }))
+    }
+
+    async fn get_node_wal_log(
+        &self,
+        req: Request<GetNodeWalLogRequest>,
+    ) -> Result<Response<GetNodeWalLogResponse>, Status> {
+        let r = req.into_inner();
+        let idx = self.handle.idx_for_node_id(r.node_id).ok_or_else(|| {
+            Status::not_found(format!("unknown node_id={}", r.node_id))
+        })?;
+        let addrs = self.handle.node_addrs();
+        let url = addrs
+            .get(idx)
+            .ok_or_else(|| Status::internal("node index out of range"))?
+            .clone();
+        let url = if url.starts_with("http://") || url.starts_with("https://") {
+            url
+        } else {
+            format!("http://{}", url)
+        };
+        let client = client::NodeClient::connect_url(&url)
+            .await
+            .map_err(|e| Status::unavailable(format!("connect {}: {}", url, e)))?;
+        let page = client
+            .get_log(r.from_tx_id, r.to_tx_id, r.limit)
+            .await?;
+        Ok(Response::new(GetNodeWalLogResponse {
+            records: page
+                .records
+                .into_iter()
+                .map(ledger_record_to_control)
+                .collect(),
+            next_tx_id: page.next_tx_id,
+            last_commit_tx_id: page.last_commit_tx_id,
         }))
     }
 
@@ -987,6 +1100,61 @@ fn validate_cluster_config(cfg: &proto::control::ClusterConfig) -> Option<String
     None
 }
 
+fn ledger_record_to_control(r: proto_ledger::WalLogRecord) -> proto::control::WalLogRecordC {
+    use proto::control as c;
+    use proto_ledger::wal_log_record::Entry as L;
+    let entry = match r.entry {
+        Some(L::Metadata(m)) => Some(c::wal_log_record_c::Entry::Metadata(c::WalTxMetadataC {
+            tx_id: m.tx_id,
+            fail_reason: m.fail_reason,
+            sub_item_count: m.sub_item_count,
+            crc32c: m.crc32c,
+            timestamp: m.timestamp,
+            user_ref: m.user_ref,
+            tag: m.tag,
+        })),
+        Some(L::TxEntry(e)) => Some(c::wal_log_record_c::Entry::TxEntry(c::WalTxEntryC {
+            tx_id: e.tx_id,
+            account_id: e.account_id,
+            amount: e.amount,
+            kind: e.kind as u32,
+            computed_balance: e.computed_balance,
+        })),
+        Some(L::Link(l)) => Some(c::wal_log_record_c::Entry::Link(c::WalTxLinkC {
+            tx_id: l.tx_id,
+            to_tx_id: l.to_tx_id,
+            kind: l.kind as u32,
+        })),
+        Some(L::Term(t)) => Some(c::wal_log_record_c::Entry::Term(c::WalTxTermC {
+            term: t.term,
+            node_id: t.node_id,
+            node_count: t.node_count,
+            node_voted: t.node_voted,
+        })),
+        Some(L::FunctionRegistered(f)) => Some(c::wal_log_record_c::Entry::FunctionRegistered(
+            c::WalFunctionRegisteredC {
+                name: f.name,
+                version: f.version,
+                crc32c: f.crc32c,
+            },
+        )),
+        Some(L::SegmentHeader(h)) => Some(c::wal_log_record_c::Entry::SegmentHeader(
+            c::WalSegmentHeaderC {
+                segment_id: h.segment_id,
+            },
+        )),
+        Some(L::SegmentSealed(s)) => Some(c::wal_log_record_c::Entry::SegmentSealed(
+            c::WalSegmentSealedC {
+                segment_id: s.segment_id,
+                last_tx_id: s.last_tx_id,
+                record_count: s.record_count,
+            },
+        )),
+        None => None,
+    };
+    c::WalLogRecordC { entry }
+}
+
 fn kind_to_proto(kind: i32) -> i32 {
     // Client uses raw i32 from proto::ledger; the control proto's
     // EntryKind happens to be the same shape (Credit=0, Debit=1) so
@@ -1093,4 +1261,59 @@ fn lookup_scenario(name: &str) -> Option<testing::scenario::Scenario> {
 #[allow(dead_code)]
 fn _unused_marker(_: PbPartitionPair) {
     warn!("partition pair type referenced for trait bounds only");
+}
+
+/// Cluster health rule: stable leader + quorum reachable.
+/// `total` is the configured cluster size; quorum is `total/2 + 1`.
+/// `leader_id == 0` means no leader observed.
+fn derive_cluster_health(leader_id: u64, alive: usize, total: usize) -> ClusterHealth {
+    let quorum = total / 2 + 1;
+    if leader_id == 0 || alive < quorum {
+        ClusterHealth::Unhealthy
+    } else {
+        ClusterHealth::Healthy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn four_node_one_follower_down_is_healthy() {
+        // The reported bug: 4-node cluster, 1 follower killed → 3 alive,
+        // quorum is 3, leader still present → must be Healthy.
+        assert_eq!(derive_cluster_health(2, 3, 4), ClusterHealth::Healthy);
+    }
+
+    #[test]
+    fn quorum_lost_is_unhealthy() {
+        // 4 nodes, only 2 alive (quorum needs 3), even with a leader.
+        assert_eq!(derive_cluster_health(2, 2, 4), ClusterHealth::Unhealthy);
+    }
+
+    #[test]
+    fn no_leader_is_unhealthy_even_with_full_cluster() {
+        assert_eq!(derive_cluster_health(0, 4, 4), ClusterHealth::Unhealthy);
+    }
+
+    #[test]
+    fn three_node_one_down_is_healthy() {
+        assert_eq!(derive_cluster_health(1, 2, 3), ClusterHealth::Healthy);
+    }
+
+    #[test]
+    fn five_node_two_down_is_healthy() {
+        assert_eq!(derive_cluster_health(1, 3, 5), ClusterHealth::Healthy);
+    }
+
+    #[test]
+    fn five_node_three_down_is_unhealthy() {
+        assert_eq!(derive_cluster_health(1, 2, 5), ClusterHealth::Unhealthy);
+    }
+
+    #[test]
+    fn all_healthy_is_healthy() {
+        assert_eq!(derive_cluster_health(1, 4, 4), ClusterHealth::Healthy);
+    }
 }

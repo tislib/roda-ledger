@@ -21,6 +21,7 @@ import type {
   Scenario as PbScenario,
   ScenarioStep as PbScenarioStep,
   SubmitOperationRequest,
+  WalLogRecordC as PbWalLogRecordC,
 } from '@/gen/control_pb';
 import {
   ClusterHealth as PbClusterHealth,
@@ -46,7 +47,7 @@ import type {
   NodeStatus,
   Role,
 } from '@/types/cluster';
-import type { LogEntry, LogEntryKind } from '@/types/log';
+import type { LogEntry, LogEntryKind, WalLogRecord } from '@/types/log';
 import type { Operation, TransactionStatus } from '@/types/transaction';
 import type {
   AvailableScenario,
@@ -205,6 +206,10 @@ export function electionFromPb(pb: PbElectionEvent): ElectionEvent {
     term: u64ToString(pb.term),
     winnerNodeId: pb.winnerNodeId === 0n ? null : u64ToString(pb.winnerNodeId),
     reason: ELECTION_REASON_FROM[pb.reason] ?? 'timeout',
+    votedFor: pb.votedFor === 0n ? null : u64ToString(pb.votedFor),
+    startTxId: pb.startTxId === 0n ? null : u64ToString(pb.startTxId),
+    hasTermRecord: pb.hasTermRecord,
+    hasVoteRecord: pb.hasVoteRecord,
   };
 }
 
@@ -231,6 +236,66 @@ export function logEntryFromPb(pb: PbLogEntry): LogEntry {
     kind: LOG_KIND_FROM[pb.kind] ?? 'TxEntry',
     summary: pb.summary,
   };
+}
+
+export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
+  const e = pb.entry;
+  if (!e) return null;
+  switch (e.case) {
+    case 'metadata':
+      return {
+        kind: 'metadata',
+        txId: u64ToString(e.value.txId),
+        failReason: e.value.failReason,
+        subItemCount: e.value.subItemCount,
+        crc32c: e.value.crc32c,
+        timestamp: u64ToString(e.value.timestamp),
+        userRef: u64ToString(e.value.userRef),
+        tag: e.value.tag,
+      };
+    case 'txEntry':
+      return {
+        kind: 'tx_entry',
+        txId: u64ToString(e.value.txId),
+        accountId: u64ToString(e.value.accountId),
+        amount: u64ToString(e.value.amount),
+        entryKind: e.value.kind === 1 ? 'DEBIT' : 'CREDIT',
+        computedBalance: e.value.computedBalance.toString(),
+      };
+    case 'link':
+      return {
+        kind: 'link',
+        txId: u64ToString(e.value.txId),
+        toTxId: u64ToString(e.value.toTxId),
+        linkKind: e.value.kind === 1 ? 'REVERSAL' : 'DUPLICATE',
+      };
+    case 'term':
+      return {
+        kind: 'term',
+        term: u64ToString(e.value.term),
+        nodeId: u64ToString(e.value.nodeId),
+        nodeCount: e.value.nodeCount,
+        nodeVoted: e.value.nodeVoted,
+      };
+    case 'functionRegistered':
+      return {
+        kind: 'function_registered',
+        name: e.value.name,
+        version: e.value.version,
+        crc32c: e.value.crc32c,
+      };
+    case 'segmentHeader':
+      return { kind: 'segment_header', segmentId: e.value.segmentId };
+    case 'segmentSealed':
+      return {
+        kind: 'segment_sealed',
+        segmentId: e.value.segmentId,
+        lastTxId: u64ToString(e.value.lastTxId),
+        recordCount: u64ToString(e.value.recordCount),
+      };
+    default:
+      return null;
+  }
 }
 
 // ---- Cluster config / membership ----

@@ -52,6 +52,11 @@ service Control {
   // exposed by the ledger.
   rpc GetNodeLog(GetNodeLogRequest) returns (GetNodeLogResponse); // check more
 
+  // GetNodeWalLog returns raw WAL records from a specific node's local
+  // committed WAL. Mirrors `roda.ledger.v1.Ledger.GetLog` with per-node
+  // targeting so the UI can compare WAL contents across followers.
+  rpc GetNodeWalLog(GetNodeWalLogRequest) returns (GetNodeWalLogResponse);
+
   // ---- Ledger operations ----
 
   // SubmitOperation submits a single financial operation to the cluster.
@@ -365,6 +370,18 @@ message ElectionEvent {
   // 0 = no winner yet (split vote or ongoing election).
   uint64 winner_node_id = 3;
   ElectionReason reason = 4;
+  // Vote cast by the node that answered the underlying GetTerms query
+  // (typically the current leader). 0 if no vote was granted in this term.
+  uint64 voted_for      = 5;
+  // First WAL tx_id this term covered. 0 for vote-only / ongoing terms
+  // where no leader committed a boundary.
+  uint64 start_tx_id    = 6;
+  // True iff the responding node has a durable term-log boundary for
+  // `term` (i.e. someone won this election).
+  bool   has_term_record = 7;
+  // True iff the responding node persisted a vote for `term` (granted
+  // or observed).
+  bool   has_vote_record = 8;
 }
 
 enum ElectionReason {
@@ -406,6 +423,80 @@ message GetNodeLogResponse {
   // The lowest index the node currently retains. Lower indices have been
   // compacted into snapshots and are no longer addressable.
   uint64 oldest_retained_index = 4;
+}
+
+message GetNodeWalLogRequest {
+  uint64 node_id = 1;
+  uint64 from_tx_id = 2; // 0 = include structural records from start.
+  uint64 to_tx_id = 3;   // 0 = unbounded; still capped by limit.
+  uint32 limit = 4;      // default 1000, server hard-cap 10000.
+}
+
+message GetNodeWalLogResponse {
+  repeated WalLogRecordC records = 1;
+  uint64 next_tx_id = 2;
+  uint64 last_commit_tx_id = 3;
+}
+
+// Mirror of `roda.ledger.v1.WalLogRecord` — control.proto duplicates ledger
+// messages by convention rather than importing across packages.
+message WalLogRecordC {
+  oneof entry {
+    WalTxMetadataC         metadata             = 1;
+    WalTxEntryC            tx_entry             = 2;
+    WalTxLinkC             link                 = 3;
+    WalTxTermC             term                 = 4;
+    WalFunctionRegisteredC function_registered  = 5;
+    WalSegmentHeaderC      segment_header       = 6;
+    WalSegmentSealedC      segment_sealed       = 7;
+  }
+}
+
+message WalTxMetadataC {
+  uint64 tx_id = 1;
+  uint32 fail_reason = 2;
+  uint32 sub_item_count = 3;
+  uint32 crc32c = 4;
+  uint64 timestamp = 5;
+  uint64 user_ref = 6;
+  string tag = 7;
+}
+
+message WalTxEntryC {
+  uint64 tx_id = 1;
+  uint64 account_id = 2;
+  uint64 amount = 3;
+  uint32 kind = 4; // 0 = CREDIT, 1 = DEBIT
+  int64 computed_balance = 5;
+}
+
+message WalTxLinkC {
+  uint64 tx_id = 1;
+  uint64 to_tx_id = 2;
+  uint32 kind = 3; // 0 = DUPLICATE, 1 = REVERSAL
+}
+
+message WalTxTermC {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  uint32 node_count = 3;
+  uint32 node_voted = 4;
+}
+
+message WalFunctionRegisteredC {
+  string name = 1;
+  uint32 version = 2;
+  uint32 crc32c = 3;
+}
+
+message WalSegmentHeaderC {
+  uint32 segment_id = 1;
+}
+
+message WalSegmentSealedC {
+  uint32 segment_id = 1;
+  uint64 last_tx_id = 2;
+  uint64 record_count = 3;
 }
 
 message LogEntry {

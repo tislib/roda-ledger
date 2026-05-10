@@ -6,7 +6,7 @@ import type {
   FaultEvent,
   ServerInfo,
 } from '@/types/cluster';
-import type { LogPage } from '@/types/log';
+import type { LogPage, WalLogPage } from '@/types/log';
 import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
 import type { WaitLevel } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
@@ -32,6 +32,10 @@ export interface ClusterClient {
 
   // ---- Logs ----
   getNodeLog(nodeId: string, opts?: { fromIndex?: string; limit?: number }): Promise<LogPage>;
+  getNodeWalLog(
+    nodeId: string,
+    opts?: { fromTxId?: string; toTxId?: string; limit?: number },
+  ): Promise<WalLogPage>;
 
   // ---- Provisioning ----
   getClusterConfig(): Promise<{ config: ClusterConfig; membership: ClusterMembership }>;

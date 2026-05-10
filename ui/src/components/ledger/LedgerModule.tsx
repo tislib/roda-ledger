@@ -28,7 +28,10 @@ export function LedgerModule() {
 
       {isUnhealthy && (
         <div className="mx-6 mt-3 px-3 py-2 rounded border border-health-crashed/40 bg-health-crashed/10 text-xs text-health-crashed">
-          Cluster is unhealthy — submissions will fail until a leader is elected.
+          Cluster is unhealthy — submissions will fail
+          {snapshot?.leaderNodeId === null
+            ? ' until a leader is elected.'
+            : ' until quorum is restored.'}
         </div>
       )}
 

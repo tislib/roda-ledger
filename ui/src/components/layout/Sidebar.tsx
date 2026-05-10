@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { NavLink } from 'react-router-dom';
 import { cn } from '@/lib/cn';
 import { useClusterSnapshot } from '@/hooks/useClusterSnapshot';
@@ -29,6 +30,19 @@ export function Sidebar({ pathname }: Props) {
   const isUnhealthy = snapshot?.clusterHealth === 'Unhealthy';
   const leader = snapshot?.leaderNodeId;
   const term = snapshot?.currentTerm ?? '0';
+  // Cluster commit id = the leader's clusterCommitIndex (or, if there's
+  // no leader, the max across nodes — useful during mid-election).
+  const clusterCommitId = useMemo(() => {
+    if (!snapshot) return '0';
+    const leaderNode = snapshot.nodes.find((n) => n.nodeId === snapshot.leaderNodeId);
+    if (leaderNode) return leaderNode.clusterCommitIndex;
+    let max = 0n;
+    for (const n of snapshot.nodes) {
+      const v = BigInt(n.clusterCommitIndex);
+      if (v > max) max = v;
+    }
+    return max.toString();
+  }, [snapshot]);
 
   return (
     <aside className="w-56 shrink-0 bg-bg-1 border-r border-border-subtle flex flex-col">
@@ -97,19 +111,13 @@ export function Sidebar({ pathname }: Props) {
           <span className="text-text-muted">term</span>
           <TermPill term={term} />
         </div>
-        {/* Always rendered — value is 0 when there are no active partitions —
-            so the sidebar never reflows on partition state changes. */}
         <div className="flex items-center justify-between text-[11px]">
-          <span className="text-text-muted">partitions</span>
+          <span className="text-text-muted">cluster_commit_id</span>
           <span
-            className={cn(
-              'font-mono tabular-nums',
-              (snapshot?.partitions.length ?? 0) > 0
-                ? 'text-health-isolated'
-                : 'text-text-muted',
-            )}
+            className="font-mono tabular-nums text-text-secondary truncate max-w-[100px]"
+            title={clusterCommitId}
           >
-            {snapshot?.partitions.length ?? 0}
+            {clusterCommitId}
           </span>
         </div>
       </div>

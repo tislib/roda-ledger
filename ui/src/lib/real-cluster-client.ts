@@ -17,6 +17,7 @@ import {
   GetClusterSnapshotRequestSchema,
   GetFaultHistoryRequestSchema,
   GetNodeLogRequestSchema,
+  GetNodeWalLogRequestSchema,
   GetRecentElectionsRequestSchema,
   GetServerInfoRequestSchema,
   GetTransactionStatusRequestSchema,
@@ -47,7 +48,7 @@ import type {
   FaultEvent,
   ServerInfo,
 } from '@/types/cluster';
-import type { LogPage } from '@/types/log';
+import type { LogPage, WalLogPage } from '@/types/log';
 import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
 import type { WaitLevel } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
@@ -66,6 +67,7 @@ import {
   electionFromPb,
   faultFromPb,
   logEntryFromPb,
+  walRecordFromPb,
   membershipFromPb,
   operationToPbRequest,
   runSummaryFromPb,
@@ -132,6 +134,27 @@ export class RealClusterClient implements ClusterClient {
       totalCount: u64ToString(resp.totalCount),
       nextFromIndex: u64ToString(resp.nextFromIndex),
       oldestRetainedIndex: u64ToString(resp.oldestRetainedIndex),
+    };
+  }
+
+  async getNodeWalLog(
+    nodeId: string,
+    opts?: { fromTxId?: string; toTxId?: string; limit?: number },
+  ): Promise<WalLogPage> {
+    const resp = await this.client.getNodeWalLog(
+      create(GetNodeWalLogRequestSchema, {
+        nodeId: stringToU64(nodeId),
+        fromTxId: stringToU64(opts?.fromTxId ?? '0'),
+        toTxId: stringToU64(opts?.toTxId ?? '0'),
+        limit: opts?.limit ?? 100,
+      }),
+    );
+    return {
+      records: resp.records
+        .map(walRecordFromPb)
+        .filter((r): r is NonNullable<typeof r> => r !== null),
+      nextTxId: u64ToString(resp.nextTxId),
+      lastCommitTxId: u64ToString(resp.lastCommitTxId),
     };
   }
 
