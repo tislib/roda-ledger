@@ -383,8 +383,7 @@ impl Snapshot {
             let committed = self
                 .samples
                 .iter()
-                .filter(|s| s.at >= window_start && s.at < window_end)
-                .last()
+                .rfind(|s| s.at >= window_start && s.at < window_end)
                 .map(cc)
                 .unwrap_or(prev_committed);
 

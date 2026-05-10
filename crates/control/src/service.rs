@@ -338,24 +338,19 @@ impl Control for ControlService {
         // when the cluster has more than `limit` records).
         let mut all: Vec<proto_ledger::TermInfo> = Vec::new();
         let mut from_term: u64 = 0;
-        loop {
-            match client.node(target).get_terms(from_term, MAX_LIMIT).await {
-                Ok(page) => {
-                    all.extend(page.terms);
-                    if page.next_term == 0 {
-                        break;
-                    }
-                    from_term = page.next_term;
-                    if all.len() >= MAX_LIMIT as usize {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(page) = client.node(target).get_terms(from_term, MAX_LIMIT).await {
+            all.extend(page.terms);
+            if page.next_term == 0 {
+                break;
+            }
+            from_term = page.next_term;
+            if all.len() >= MAX_LIMIT as usize {
+                break;
             }
         }
 
         // Newest first, capped to caller's limit.
-        all.sort_by(|a, b| b.term.cmp(&a.term));
+        all.sort_by_key(|b| std::cmp::Reverse(b.term));
         all.truncate(limit as usize);
 
         let events: Vec<ElectionEvent> = all
@@ -425,7 +420,7 @@ impl Control for ControlService {
         &self,
         _req: Request<GetClusterConfigRequest>,
     ) -> Result<Response<GetClusterConfigResponse>, Status> {
-        let cfg = (*self.handle.config()).clone();
+        let cfg = *self.handle.config();
         let count = self.handle.node_count();
         let addrs = self.handle.node_addrs();
         let nodes: Vec<NodeInfo> = addrs

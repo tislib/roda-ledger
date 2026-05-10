@@ -84,7 +84,7 @@ impl ClusterHandle {
             provisioner.as_ref(),
             &ProvisionConfig {
                 node_count,
-                cluster: config.clone(),
+                cluster: config,
             },
         )
         .await?;
@@ -175,7 +175,7 @@ impl ClusterHandle {
         new_config: Option<ClusterConfig>,
         new_count: Option<u32>,
     ) -> Result<(), HandleError> {
-        let cfg = new_config.unwrap_or_else(|| (*self.config.load_full()).clone());
+        let cfg = new_config.unwrap_or_else(|| *self.config.load_full());
         let count = new_count.unwrap_or_else(|| self.node_count());
         if count == 0 {
             return Err(HandleError::Invalid("node_count must be >= 1".into()));
@@ -184,7 +184,7 @@ impl ClusterHandle {
             self.provisioner.as_ref(),
             &ProvisionConfig {
                 node_count: count,
-                cluster: cfg.clone(),
+                cluster: cfg,
             },
         )
         .await?;

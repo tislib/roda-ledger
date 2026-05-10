@@ -203,7 +203,7 @@ impl ScenarioRunner {
     }
 
     /// Run against a cluster the caller already owns. Skips provision
-    /// + connect — the gRPC server uses this so its single long-lived
+    /// and connect — the gRPC server uses this so its single long-lived
     /// `ClusterHandle` carries the cluster across many runs. The
     /// provisioner is still used for fault-injection steps.
     pub async fn run_against_existing(
@@ -366,12 +366,11 @@ impl ScenarioRunner {
             repeat,
             batch_size,
         } = &s.kind
+            && *batch_size > 0
         {
-            if *batch_size > 0 {
-                return self
-                    .run_submit_batched(client, metrics, ctx, s, base, *repeat, *batch_size)
-                    .await;
-            }
+            return self
+                .run_submit_batched(client, metrics, ctx, s, base, *repeat, *batch_size)
+                .await;
         }
 
         // Per-op path: submit each expanded op individually. Used for
@@ -401,6 +400,7 @@ impl ScenarioRunner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_submit_batched(
         &self,
         client: &ClusterClient,
@@ -677,10 +677,10 @@ impl ScenarioRunner {
             }
             None => {
                 for i in 0..client.node_count() {
-                    if let Ok(pi) = client.node(i).get_pipeline_index().await {
-                        if pi.is_leader {
-                            return Ok(());
-                        }
+                    if let Ok(pi) = client.node(i).get_pipeline_index().await
+                        && pi.is_leader
+                    {
+                        return Ok(());
                     }
                 }
                 Err(RunError::AssertionFailed(
@@ -988,6 +988,113 @@ fn check_capabilities(scenario: &Scenario, caps: Capabilities) -> Result<(), Run
     Ok(())
 }
 
+async fn submit_once(
+    client: &ClusterClient,
+    op: &SubmitOp,
+    wait: WaitLevel,
+) -> Result<u64, RunError> {
+    let user_ref = user_ref_of(op);
+    if let Some(wl) = wait_to_proto(wait) {
+        match op {
+            SubmitOp::Deposit {
+                account, amount, ..
+            } => Ok(client
+                .deposit_and_wait(*account, *amount, user_ref, wl)
+                .await
+                .map_err(client_err)?
+                .tx_id),
+            SubmitOp::Withdraw {
+                account, amount, ..
+            } => Ok(client
+                .withdraw_and_wait(*account, *amount, user_ref, wl)
+                .await
+                .map_err(client_err)?
+                .tx_id),
+            SubmitOp::Transfer {
+                from, to, amount, ..
+            } => Ok(client
+                .transfer_and_wait(*from, *to, *amount, user_ref, wl)
+                .await
+                .map_err(client_err)?
+                .tx_id),
+            SubmitOp::Function { name, params, .. } => Ok(client
+                .submit_function_and_wait(name, params_to_arr(params), user_ref, wl)
+                .await
+                .map_err(client_err)?
+                .tx_id),
+        }
+    } else {
+        match op {
+            SubmitOp::Deposit {
+                account, amount, ..
+            } => client
+                .deposit(*account, *amount, user_ref)
+                .await
+                .map_err(client_err),
+            SubmitOp::Withdraw {
+                account, amount, ..
+            } => client
+                .withdraw(*account, *amount, user_ref)
+                .await
+                .map_err(client_err),
+            SubmitOp::Transfer {
+                from, to, amount, ..
+            } => client
+                .transfer(*from, *to, *amount, user_ref)
+                .await
+                .map_err(client_err),
+            SubmitOp::Function { .. } => Err(RunError::Client(
+                "Function submit with WaitLevel::None is not supported by ClusterClient".into(),
+            )),
+        }
+    }
+}
+
+/// Send a homogeneous batch as a single `submit_batch` RPC. Returns one
+/// transaction id per op, in input order.
+///
+/// Today this only supports all-Deposit batches, because the cluster
+/// client's other batch APIs either don't exist (Withdraw, Function) or
+/// drop the per-op `user_ref` on the wire (`transfer_batch_and_wait`
+/// hardcodes user_ref = 0), which breaks `user_ref → tx_id` bindings.
+/// `BatchKind::Dynamic { batch_size: 0 }` keeps any of those scenarios
+/// working through the per-op fallback path.
+async fn submit_batch_once(
+    client: &ClusterClient,
+    ops: &[SubmitOp],
+    wait: WaitLevel,
+) -> Result<Vec<u64>, RunError> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut deposits: Vec<(u64, u64, u64)> = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            SubmitOp::Deposit {
+                account,
+                amount,
+                user_ref,
+            } => deposits.push((*account, *amount, *user_ref)),
+            _ => {
+                return Err(RunError::Client(
+                    "BatchKind::Dynamic { batch_size > 0 } only supports Deposit ops today; \
+                     use batch_size: 0 for other variants"
+                        .into(),
+                ));
+            }
+        }
+    }
+    if let Some(wl) = wait_to_proto(wait) {
+        let results = client
+            .deposit_batch_and_wait(&deposits, wl)
+            .await
+            .map_err(client_err)?;
+        Ok(results.into_iter().map(|r| r.tx_id).collect())
+    } else {
+        client.deposit_batch(&deposits).await.map_err(client_err)
+    }
+}
+
 // ============================================================
 // Tests — pure functions only (no real cluster, no real backend)
 // ============================================================
@@ -1101,112 +1208,5 @@ mod tests {
             })),
         ]);
         check_capabilities(&s, Capabilities::all()).expect("all caps satisfies");
-    }
-}
-
-async fn submit_once(
-    client: &ClusterClient,
-    op: &SubmitOp,
-    wait: WaitLevel,
-) -> Result<u64, RunError> {
-    let user_ref = user_ref_of(op);
-    if let Some(wl) = wait_to_proto(wait) {
-        match op {
-            SubmitOp::Deposit {
-                account, amount, ..
-            } => Ok(client
-                .deposit_and_wait(*account, *amount, user_ref, wl)
-                .await
-                .map_err(client_err)?
-                .tx_id),
-            SubmitOp::Withdraw {
-                account, amount, ..
-            } => Ok(client
-                .withdraw_and_wait(*account, *amount, user_ref, wl)
-                .await
-                .map_err(client_err)?
-                .tx_id),
-            SubmitOp::Transfer {
-                from, to, amount, ..
-            } => Ok(client
-                .transfer_and_wait(*from, *to, *amount, user_ref, wl)
-                .await
-                .map_err(client_err)?
-                .tx_id),
-            SubmitOp::Function { name, params, .. } => Ok(client
-                .submit_function_and_wait(name, params_to_arr(params), user_ref, wl)
-                .await
-                .map_err(client_err)?
-                .tx_id),
-        }
-    } else {
-        match op {
-            SubmitOp::Deposit {
-                account, amount, ..
-            } => client
-                .deposit(*account, *amount, user_ref)
-                .await
-                .map_err(client_err),
-            SubmitOp::Withdraw {
-                account, amount, ..
-            } => client
-                .withdraw(*account, *amount, user_ref)
-                .await
-                .map_err(client_err),
-            SubmitOp::Transfer {
-                from, to, amount, ..
-            } => client
-                .transfer(*from, *to, *amount, user_ref)
-                .await
-                .map_err(client_err),
-            SubmitOp::Function { .. } => Err(RunError::Client(
-                "Function submit with WaitLevel::None is not supported by ClusterClient".into(),
-            )),
-        }
-    }
-}
-
-/// Send a homogeneous batch as a single `submit_batch` RPC. Returns one
-/// transaction id per op, in input order.
-///
-/// Today this only supports all-Deposit batches, because the cluster
-/// client's other batch APIs either don't exist (Withdraw, Function) or
-/// drop the per-op `user_ref` on the wire (`transfer_batch_and_wait`
-/// hardcodes user_ref = 0), which breaks `user_ref → tx_id` bindings.
-/// `BatchKind::Dynamic { batch_size: 0 }` keeps any of those scenarios
-/// working through the per-op fallback path.
-async fn submit_batch_once(
-    client: &ClusterClient,
-    ops: &[SubmitOp],
-    wait: WaitLevel,
-) -> Result<Vec<u64>, RunError> {
-    if ops.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut deposits: Vec<(u64, u64, u64)> = Vec::with_capacity(ops.len());
-    for op in ops {
-        match op {
-            SubmitOp::Deposit {
-                account,
-                amount,
-                user_ref,
-            } => deposits.push((*account, *amount, *user_ref)),
-            _ => {
-                return Err(RunError::Client(
-                    "BatchKind::Dynamic { batch_size > 0 } only supports Deposit ops today; \
-                     use batch_size: 0 for other variants"
-                        .into(),
-                ));
-            }
-        }
-    }
-    if let Some(wl) = wait_to_proto(wait) {
-        let results = client
-            .deposit_batch_and_wait(&deposits, wl)
-            .await
-            .map_err(client_err)?;
-        Ok(results.into_iter().map(|r| r.tx_id).collect())
-    } else {
-        client.deposit_batch(&deposits).await.map_err(client_err)
     }
 }

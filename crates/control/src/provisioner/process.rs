@@ -134,10 +134,11 @@ impl Provisioner for ProcessProvisioner {
         // Fast path: identical config and a cluster already running.
         {
             let state = self.state.lock();
-            if let Some(prev) = state.last_config.as_ref() {
-                if prev == config && all_running(&state.nodes) {
-                    return Ok(client_urls(&state.nodes));
-                }
+            if let Some(prev) = state.last_config.as_ref()
+                && prev == config
+                && all_running(&state.nodes)
+            {
+                return Ok(client_urls(&state.nodes));
             }
         }
 
