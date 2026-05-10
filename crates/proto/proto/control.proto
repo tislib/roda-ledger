@@ -5,17 +5,20 @@ package roda.control.v1;
 // Control is the operational/management surface for a roda-ledger
 // cluster. The operational UI talks to this service to monitor cluster
 // health, paginate Raft logs, reconfigure membership and cluster-wide
-// ledger settings, inject faults for demos and tests, and run load
-// scenarios.
+// ledger settings, inject faults for demos and tests, run load
+// scenarios, and submit/query ledger operations.
 //
-// Ledger data-plane operations (submit, balances, transaction queries,
-// pipeline indices, function registry) live exclusively on
-// `roda.ledger.v1.Ledger`. The control plane process exposes that
-// service on the same gRPC port as a transparent proxy: it
-// load-balances reads across peers and routes writes through the
-// current leader. Per-node targeting is available via the
-// `node-selector` request metadata header (numeric node_id), which
-// pins the call to the addressed peer regardless of role.
+// The Control service mirrors a subset of `roda.ledger.v1` for client
+// convenience and adds per-node targeting on the read paths
+// (GetBalance, GetTransaction, GetPipelineIndex). Submits and batches
+// have no per-node target — writes go to the leader. Node-to-node
+// replication lives in `roda.node.v1`.
+//
+// All RPCs are unary. Timestamps are int64 milliseconds since the Unix
+// epoch. Node IDs and account IDs are uint64. All RPCs are idempotent
+// where the underlying state allows; the exceptions are SetNodeCount
+// and UpdateClusterConfig, which mutate persistent cluster state and
+// may complete asynchronously.
 service Control {
 
   // GetServerInfo identifies the server and its capabilities. UI clients
@@ -31,6 +34,13 @@ service Control {
   // poll at sub-second cadence.
   rpc GetClusterSnapshot(GetClusterSnapshotRequest) returns (GetClusterSnapshotResponse);
 
+  // WatchClusterSnapshot is the server-streaming variant of
+  // GetClusterSnapshot. The server emits a snapshot at most every
+  // `interval_ms` (clamped to a sane range), driven by a server-side
+  // tick. Client should consume in a loop and stop the stream by
+  // dropping the iterator. Preferred over polling for the Dashboard.
+  rpc WatchClusterSnapshot(WatchClusterSnapshotRequest) returns (stream GetClusterSnapshotResponse);
+
   // GetRecentElections returns recent role transitions and elections,
   // newest first. Drives the Dashboard election timeline.
   rpc GetRecentElections(GetRecentElectionsRequest) returns (GetRecentElectionsResponse);
@@ -40,7 +50,47 @@ service Control {
   // GetNodeLog returns a paginated window over a single node's Raft log.
   // All entries returned are committed; uncommitted entries are not
   // exposed by the ledger.
-  rpc GetNodeLog(GetNodeLogRequest) returns (GetNodeLogResponse);
+  rpc GetNodeLog(GetNodeLogRequest) returns (GetNodeLogResponse); // check more
+
+  // GetNodeWalLog returns raw WAL records from a specific node's local
+  // committed WAL. Mirrors `roda.ledger.v1.Ledger.GetLog` with per-node
+  // targeting so the UI can compare WAL contents across followers.
+  rpc GetNodeWalLog(GetNodeWalLogRequest) returns (GetNodeWalLogResponse);
+
+  // ---- Ledger operations ----
+
+  // SubmitOperation submits a single financial operation to the cluster.
+  // Mirrors `roda.ledger.v1.Ledger.SubmitOperation`. Returns immediately
+  // with a transaction_id once the operation is sequenced. Use
+  // GetTransaction or GetPipelineIndex to poll for finality.
+  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
+
+  // SubmitBatch submits multiple operations in a single round trip.
+  // Mirrors `roda.ledger.v1.Ledger.SubmitBatch`. Operations are sequenced
+  // and executed in the order provided; each operation is independent
+  // and atomic on its own. There is no batch-level atomicity.
+  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
+
+  // GetBalance returns the current balance for a single account, observed
+  // from the addressed node. The per-node target lets the UI inspect
+  // followers (e.g. "did the partitioned follower see this credit?").
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+
+  // GetTransaction retrieves the full details of a transaction as known
+  // to the addressed node. Useful for debugging replication lag — the
+  // same tx_id may resolve on the leader but be missing on a partitioned
+  // follower.
+  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+
+  // GetTransactionStatus reports the current pipeline stage of a single
+  // transaction. Mirrors the per-tx polling the UI's result panel does
+  // while watching an op walk Pending → Computed → Committed → OnSnapshot.
+  rpc GetTransactionStatus(GetTransactionStatusRequest) returns (GetTransactionStatusResponse);
+
+  // GetPipelineIndex returns the staged pipeline progress observed by
+  // a specific node. Drives the per-node pipeline indices on the
+  // Cluster Dashboard.
+  rpc GetPipelineIndex(GetPipelineIndexRequest) returns (GetPipelineIndexResponse);
 
   // ---- Provisioning ----
 
@@ -62,6 +112,17 @@ service Control {
   // Returns immediately; the membership change applies asynchronously
   // through the cluster's normal reconfiguration flow.
   rpc SetNodeCount(SetNodeCountRequest) returns (SetNodeCountResponse);
+
+  // ResetCluster destroys all current cluster state and reinitializes
+  // a fresh cluster with the same node count and current ClusterConfig.
+  //   - All running cluster nodes are stopped.
+  //   - All on-disk data (WALs, snapshots, balances) is wiped.
+  //   - The control plane's ephemeral history (fault log, scenario
+  //     runs, submission records) is cleared.
+  //   - A fresh cluster is provisioned. Returns once the new cluster is
+  //     accepting requests.
+  // Destructive — typically gated by an operator confirmation dialog.
+  rpc ResetCluster(ResetClusterRequest) returns (ResetClusterResponse);
 
   // ---- Fault injection ----
 
@@ -97,7 +158,35 @@ service Control {
   // Injection page's history panel.
   rpc GetFaultHistory(GetFaultHistoryRequest) returns (GetFaultHistoryResponse);
 
-  // ---- Load / Simulations ----
+  // ---- Meta (WASM extensions) ----
+
+  // RegisterFunction installs a compiled WASM module under a snake_case
+  // name. The binary must export `execute(i64 x 8) -> i32`. Mirrors
+  // `roda.ledger.v1.Ledger.RegisterFunction`. Used by the Meta module's
+  // Deploy button.
+  rpc RegisterFunction(RegisterFunctionRequest) returns (RegisterFunctionResponse);
+
+  // UnregisterFunction removes the handler for `name`. Subsequent
+  // Function operations against the name return INVALID_OPERATION.
+  rpc UnregisterFunction(UnregisterFunctionRequest) returns (UnregisterFunctionResponse);
+
+  // ListFunctions returns metadata for every currently-registered function.
+  rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
+
+  // WatchFunctions streams the registered function set whenever the
+  // server thinks it has changed (or at most every `interval_ms` as a
+  // heartbeat). Removes the polling flicker the Meta module sees when
+  // the underlying ListFunctions occasionally returns transient
+  // empties during normal cluster activity.
+  rpc WatchFunctions(WatchFunctionsRequest) returns (stream ListFunctionsResponse);
+
+  // ---- Testing (load + e2e scenarios) ----
+
+  // ListAvailableScenarios returns the server's built-in scenario
+  // catalogue — the same set CI runs. The UI's Testing module reads
+  // this to populate its catalog; users select a scenario by name and
+  // call RunScenario.
+  rpc ListAvailableScenarios(ListAvailableScenariosRequest) returns (ListAvailableScenariosResponse);
 
   // RunScenario submits a scenario for the cluster to execute. Returns
   // a run_id immediately; the scenario runs asynchronously. Poll
@@ -156,6 +245,12 @@ enum Capability {
 // ============================================================
 
 message GetClusterSnapshotRequest {}
+
+message WatchClusterSnapshotRequest {
+  // Server-side emit cadence in ms. 0 = server default (250). Clamped
+  // server-side to [50, 5000].
+  uint32 interval_ms = 1;
+}
 
 message GetClusterSnapshotResponse {
   // Time the snapshot was taken on the server, ms since Unix epoch.
@@ -275,6 +370,18 @@ message ElectionEvent {
   // 0 = no winner yet (split vote or ongoing election).
   uint64 winner_node_id = 3;
   ElectionReason reason = 4;
+  // Vote cast by the node that answered the underlying GetTerms query
+  // (typically the current leader). 0 if no vote was granted in this term.
+  uint64 voted_for      = 5;
+  // First WAL tx_id this term covered. 0 for vote-only / ongoing terms
+  // where no leader committed a boundary.
+  uint64 start_tx_id    = 6;
+  // True iff the responding node has a durable term-log boundary for
+  // `term` (i.e. someone won this election).
+  bool   has_term_record = 7;
+  // True iff the responding node persisted a vote for `term` (granted
+  // or observed).
+  bool   has_vote_record = 8;
 }
 
 enum ElectionReason {
@@ -318,6 +425,80 @@ message GetNodeLogResponse {
   uint64 oldest_retained_index = 4;
 }
 
+message GetNodeWalLogRequest {
+  uint64 node_id = 1;
+  uint64 from_tx_id = 2; // 0 = include structural records from start.
+  uint64 to_tx_id = 3;   // 0 = unbounded; still capped by limit.
+  uint32 limit = 4;      // default 1000, server hard-cap 10000.
+}
+
+message GetNodeWalLogResponse {
+  repeated WalLogRecordC records = 1;
+  uint64 next_tx_id = 2;
+  uint64 last_commit_tx_id = 3;
+}
+
+// Mirror of `roda.ledger.v1.WalLogRecord` — control.proto duplicates ledger
+// messages by convention rather than importing across packages.
+message WalLogRecordC {
+  oneof entry {
+    WalTxMetadataC         metadata             = 1;
+    WalTxEntryC            tx_entry             = 2;
+    WalTxLinkC             link                 = 3;
+    WalTxTermC             term                 = 4;
+    WalFunctionRegisteredC function_registered  = 5;
+    WalSegmentHeaderC      segment_header       = 6;
+    WalSegmentSealedC      segment_sealed       = 7;
+  }
+}
+
+message WalTxMetadataC {
+  uint64 tx_id = 1;
+  uint32 fail_reason = 2;
+  uint32 sub_item_count = 3;
+  uint32 crc32c = 4;
+  uint64 timestamp = 5;
+  uint64 user_ref = 6;
+  string tag = 7;
+}
+
+message WalTxEntryC {
+  uint64 tx_id = 1;
+  uint64 account_id = 2;
+  uint64 amount = 3;
+  uint32 kind = 4; // 0 = CREDIT, 1 = DEBIT
+  int64 computed_balance = 5;
+}
+
+message WalTxLinkC {
+  uint64 tx_id = 1;
+  uint64 to_tx_id = 2;
+  uint32 kind = 3; // 0 = DUPLICATE, 1 = REVERSAL
+}
+
+message WalTxTermC {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  uint32 node_count = 3;
+  uint32 node_voted = 4;
+}
+
+message WalFunctionRegisteredC {
+  string name = 1;
+  uint32 version = 2;
+  uint32 crc32c = 3;
+}
+
+message WalSegmentHeaderC {
+  uint32 segment_id = 1;
+}
+
+message WalSegmentSealedC {
+  uint32 segment_id = 1;
+  uint64 last_tx_id = 2;
+  uint64 record_count = 3;
+}
+
 message LogEntry {
   uint64       index   = 1;
   uint64       term    = 2;
@@ -336,6 +517,195 @@ enum LogEntryKind {
   LOG_ENTRY_KIND_LINK                 = 6;
   LOG_ENTRY_KIND_FUNCTION_REGISTERED  = 7;
   LOG_ENTRY_KIND_FUNCTION_UNREGISTERED = 8;
+}
+
+// ============================================================
+// Ledger operations
+// ============================================================
+//
+// These messages mirror `roda.ledger.v1` for client convenience. The
+// shapes are deliberately wire-compatible field-for-field so the same
+// data-plane semantics apply. Composite operations (proto field 4 in
+// the ledger service) were removed in favour of WASM Function ops and
+// are not surfaced here.
+
+// SubmitOperationRequest wraps one of the supported operation types.
+// Exactly one operation field must be set. Setting zero or more than
+// one is an error.
+message SubmitOperationRequest {
+  oneof operation {
+    Deposit    deposit    = 1;
+    Withdrawal withdrawal = 2;
+    Transfer   transfer   = 3;
+    // 4 reserved (previously Composite; removed in favour of WASM
+    // Function operations).
+    Function   function   = 5;
+  }
+  reserved 4;
+}
+
+message SubmitOperationResponse {
+  // Monotonically increasing, globally ordered transaction ID.
+  uint64 transaction_id = 1;
+  // Current leader term at the moment of the reply.
+  uint64 term           = 2;
+}
+
+message SubmitBatchRequest {
+  // Operations to submit, in order. Each is independent and atomic on
+  // its own — failure of one does not affect others.
+  repeated SubmitOperationRequest operations = 1;
+}
+
+message SubmitBatchResponse {
+  // One result per input operation, same order.
+  repeated SubmitOperationResponse results = 1;
+  // Current leader term at the moment of the reply.
+  uint64 term = 2;
+}
+
+// Deposit credits an account from the system source. The system source
+// (SYSTEM_SOURCE) absorbs the corresponding debit to maintain the
+// zero-sum invariant. Deposits never fail due to insufficient funds.
+message Deposit {
+  uint64 account  = 1;
+  uint64 amount   = 2;
+  uint64 user_ref = 3;
+}
+
+// Withdrawal debits an account to the system sink. The system sink
+// (SYSTEM_SINK) absorbs the corresponding credit to maintain the
+// zero-sum invariant. Fails with INSUFFICIENT_FUNDS if balance < amount.
+message Withdrawal {
+  uint64 account  = 1;
+  uint64 amount   = 2;
+  uint64 user_ref = 3;
+}
+
+// Transfer moves funds between two accounts atomically. No value enters
+// or leaves the system. Fails with INSUFFICIENT_FUNDS if from < amount.
+message Transfer {
+  uint64 from     = 1;
+  uint64 to       = 2;
+  uint64 amount   = 3;
+  uint64 user_ref = 4;
+}
+
+// Function invokes a registered WASM function. The function ABI is
+// fixed-arity: exactly 8 i64 positional parameters. Short lists are
+// zero-padded; entries beyond the first 8 are dropped.
+message Function {
+  string         name     = 1;
+  repeated int64 params   = 2;
+  uint64         user_ref = 3;
+}
+
+// ---- GetBalance ----
+
+message GetBalanceRequest {
+  // Account to query. Returns 0 if never touched.
+  uint64 account_id = 1;
+  // Node to query. The same account observed from different nodes may
+  // disagree if those nodes are at different replication watermarks.
+  uint64 node_id    = 2;
+}
+
+message GetBalanceResponse {
+  // Current balance in minor units, observed by the addressed node.
+  // Reflects only transactions the node has applied through ON_SNAPSHOT.
+  int64  balance             = 1;
+  // All transactions up to and including this ID are reflected in the
+  // returned balance. The actual last snapshot ID may be slightly higher.
+  uint64 last_snapshot_tx_id = 2;
+}
+
+// ---- GetTransaction ----
+
+message GetTransactionRequest {
+  uint64 tx_id   = 1;
+  // Node to query. Lets clients confirm replication state per node
+  // (e.g. is the entry on a partitioned follower yet?).
+  uint64 node_id = 2;
+}
+
+message GetTransactionResponse {
+  uint64                 tx_id   = 1;
+  repeated TxEntryRecord entries = 2;
+  repeated TxLinkRecord  links   = 3;
+}
+
+message TxEntryRecord {
+  uint64    account_id       = 1;
+  uint64    amount           = 2;
+  EntryKind kind             = 3;
+  int64     computed_balance = 4;
+}
+
+enum EntryKind {
+  ENTRY_KIND_CREDIT = 0;
+  ENTRY_KIND_DEBIT  = 1;
+}
+
+message TxLinkRecord {
+  uint64   to_tx_id = 1;
+  LinkKind kind     = 2;
+}
+
+enum LinkKind {
+  LINK_KIND_DUPLICATE = 0;
+  LINK_KIND_REVERSAL  = 1;
+}
+
+// ---- GetTransactionStatus ----
+
+// TransactionStatus mirrors `roda.ledger.v1.TransactionStatus`. Stages are
+// strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
+// ERROR is a terminal state reachable only from PENDING. TX_NOT_FOUND
+// signals the transaction was never sequenced (or has been compacted).
+enum TransactionStatus {
+  TRANSACTION_STATUS_PENDING       = 0;
+  TRANSACTION_STATUS_COMPUTED      = 1;
+  TRANSACTION_STATUS_COMMITTED     = 2;
+  TRANSACTION_STATUS_ON_SNAPSHOT   = 3;
+  TRANSACTION_STATUS_ERROR         = 4;
+  TRANSACTION_STATUS_NOT_FOUND     = 5;
+}
+
+message GetTransactionStatusRequest {
+  uint64 tx_id = 1;
+}
+
+message GetTransactionStatusResponse {
+  TransactionStatus status      = 1;
+  // 0 if status != ERROR. See FailReason codes in roda.ledger.v1.
+  uint32            fail_reason = 2;
+  reserved 3, 4, 5, 6;
+}
+
+// ---- GetPipelineIndex (per-node) ----
+
+message GetPipelineIndexRequest {
+  // Node whose pipeline indices should be reported. Distinct from the
+  // ledger.v1 version, which always reports the responding server's own
+  // indices — here the caller chooses which node's view to read.
+  uint64 node_id = 1;
+}
+
+message GetPipelineIndexResponse {
+  // Highest transaction_id processed by the Transactor on this node.
+  uint64 compute_index        = 1;
+  // Highest transaction_id flushed to WAL on this node.
+  uint64 commit_index          = 2;
+  // Highest transaction_id applied to the balance cache on this node.
+  uint64 snapshot_index       = 3;
+  // Current term as observed by this node.
+  uint64 term                 = 4;
+  // Highest transaction_id known quorum-committed. On followers this is
+  // the most recent watermark advertised by the leader, clamped to the
+  // follower's commit_index.
+  uint64 cluster_commit_index = 5;
+  // True iff this node is currently the cluster leader.
+  bool   is_leader            = 6;
 }
 
 // ============================================================
@@ -376,6 +746,13 @@ message SetNodeCountResponse {
   // asynchronously; clients should poll GetClusterConfig to observe.
   uint32 target_count = 3;
   uint32 current_count = 4;
+}
+
+message ResetClusterRequest {}
+
+message ResetClusterResponse {
+  bool   accepted = 1;
+  string error    = 2;
 }
 
 // ClusterConfig is the cluster-wide ledger and replication configuration
@@ -472,6 +849,55 @@ message FaultEvent {
   string       description = 5;
 }
 
+// ============================================================
+// Meta (WASM extensions)
+// ============================================================
+
+message RegisterFunctionRequest {
+  string name              = 1;
+  // Compiled WASM module bytes; must export execute(i64 x 8) -> i32.
+  bytes  binary            = 2;
+  // If false and `name` already registered, the call returns
+  // accepted=false with `error = "ALREADY_EXISTS"`.
+  bool   override_existing = 3;
+}
+
+message RegisterFunctionResponse {
+  bool   accepted = 1;
+  string error    = 2;
+  // Monotonic per-name version stamped on the WAL record.
+  uint32 version  = 3;
+}
+
+message UnregisterFunctionRequest {
+  string name = 1;
+}
+
+message UnregisterFunctionResponse {
+  bool   accepted = 1;
+  string error    = 2;
+  // Version stamped on the unregister record.
+  uint32 version  = 3;
+}
+
+message ListFunctionsRequest {}
+
+message WatchFunctionsRequest {
+  // Heartbeat cadence in ms. 0 = server default (1000). Clamped
+  // server-side to [200, 10000].
+  uint32 interval_ms = 1;
+}
+
+message ListFunctionsResponse {
+  repeated FunctionInfo functions = 1;
+}
+
+message FunctionInfo {
+  string name    = 1;
+  uint32 version = 2;
+  uint32 crc32c  = 3;
+}
+
 enum FaultKind {
   FAULT_KIND_UNSPECIFIED = 0;
   FAULT_KIND_STOP        = 1;
@@ -483,8 +909,35 @@ enum FaultKind {
 }
 
 // ============================================================
-// Load / Simulations
+// Testing (load + e2e scenarios)
 // ============================================================
+
+// ScenarioCategory groups built-in scenarios for UI navigation.
+// E2E: assertion-style tests (verify cluster behaviour).
+// LOAD: throughput / soak runs.
+enum ScenarioCategory {
+  SCENARIO_CATEGORY_UNSPECIFIED = 0;
+  SCENARIO_CATEGORY_E2E         = 1;
+  SCENARIO_CATEGORY_LOAD        = 2;
+}
+
+// AvailableScenario is one entry in the server's built-in catalogue.
+// Users run it by name via RunScenario.
+message AvailableScenario {
+  string           name        = 1;
+  string           description = 2;
+  ScenarioCategory category    = 3;
+  // Number of steps in the scenario, for the catalog list.
+  uint32           step_count  = 4;
+}
+
+message ListAvailableScenariosRequest {}
+
+message ListAvailableScenariosResponse {
+  // Stable order: e2e first, then load (matches the catalogue's own
+  // declared order in `testing::scenarios::list`).
+  repeated AvailableScenario scenarios = 1;
+}
 
 message RunScenarioRequest {
   Scenario scenario = 1;

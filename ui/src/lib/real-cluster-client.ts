@@ -19,22 +19,31 @@ import { createGrpcWebTransport } from '@connectrpc/connect-web';
 import { Capability, Control } from '@/gen/control_pb';
 import {
   CancelScenarioRequestSchema,
+  GetBalanceRequestSchema,
   GetClusterConfigRequestSchema,
   GetClusterSnapshotRequestSchema,
   GetFaultHistoryRequestSchema,
   GetNodeLogRequestSchema,
+  GetNodeWalLogRequestSchema,
   GetRecentElectionsRequestSchema,
   GetServerInfoRequestSchema,
   HealPartitionRequestSchema,
   KillNodeRequestSchema,
+  ListAvailableScenariosRequestSchema,
+  ListFunctionsRequestSchema,
   ListScenarioRunsRequestSchema,
   PartitionPairRequestSchema,
+  RegisterFunctionRequestSchema,
+  ResetClusterRequestSchema,
   RestartNodeRequestSchema,
   RunScenarioRequestSchema,
   SetNodeCountRequestSchema,
   StartNodeRequestSchema,
   StopNodeRequestSchema,
+  UnregisterFunctionRequestSchema,
   UpdateClusterConfigRequestSchema,
+  WatchClusterSnapshotRequestSchema,
+  WatchFunctionsRequestSchema,
 } from '@/gen/control_pb';
 import { Ledger, GetStatusRequestSchema } from '@/gen/ledger_pb';
 import type { ClusterClient } from './cluster-client';
@@ -46,18 +55,26 @@ import type {
   FaultEvent,
   ServerInfo,
 } from '@/types/cluster';
-import type { LogPage } from '@/types/log';
+import type { LogPage, WalLogPage } from '@/types/log';
 import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
 import type { WaitLevel } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
-import type { Scenario, ScenarioRunStatus, ScenarioRunSummary } from '@/types/scenario';
+import type {
+  AvailableScenario,
+  Scenario,
+  ScenarioRunStatus,
+  ScenarioRunSummary,
+} from '@/types/scenario';
 import { isTerminal } from '@/types/transaction';
+import { base64ToBytes } from './wasm-binaries';
 import {
+  availableScenarioFromPb,
   clusterConfigFromPb,
   clusterConfigToPb,
   electionFromPb,
   faultFromPb,
   logEntryFromPb,
+  walRecordFromPb,
   membershipFromPb,
   operationToPbRequest,
   runSummaryFromPb,
@@ -129,6 +146,27 @@ export class RealClusterClient implements ClusterClient {
     };
   }
 
+  async getNodeWalLog(
+    nodeId: string,
+    opts?: { fromTxId?: string; toTxId?: string; limit?: number },
+  ): Promise<WalLogPage> {
+    const resp = await this.client.getNodeWalLog(
+      create(GetNodeWalLogRequestSchema, {
+        nodeId: stringToU64(nodeId),
+        fromTxId: stringToU64(opts?.fromTxId ?? '0'),
+        toTxId: stringToU64(opts?.toTxId ?? '0'),
+        limit: opts?.limit ?? 100,
+      }),
+    );
+    return {
+      records: resp.records
+        .map(walRecordFromPb)
+        .filter((r): r is NonNullable<typeof r> => r !== null),
+      nextTxId: u64ToString(resp.nextTxId),
+      lastCommitTxId: u64ToString(resp.lastCommitTxId),
+    };
+  }
+
   // ---- Provisioning ----
 
   async getClusterConfig(): Promise<{ config: ClusterConfig; membership: ClusterMembership }> {
@@ -166,6 +204,11 @@ export class RealClusterClient implements ClusterClient {
       targetCount: resp.targetCount,
       currentCount: resp.currentCount,
     };
+  }
+
+  async resetCluster(): Promise<{ accepted: boolean; error: string }> {
+    const resp = await this.client.resetCluster(create(ResetClusterRequestSchema, {}));
+    return { accepted: resp.accepted, error: resp.error };
   }
 
   // ---- Fault injection ----
@@ -270,28 +313,84 @@ export class RealClusterClient implements ClusterClient {
   }
 
   // ---- Meta / WASM ----
-  // The control plane mock does not yet implement function registration RPCs;
-  // these throw until the real backend grows them. The connection-keyed
-  // provider uses these errors to mark certain UI affordances as "not
-  // available on this backend."
 
   async listFunctions(): Promise<WasmFunction[]> {
-    return [];
+    const resp = await this.client.listFunctions(create(ListFunctionsRequestSchema, {}));
+    // The control plane returns name + version + crc only. Example
+    // sources live client-side in `wasm-examples.ts` and the Meta
+    // module merges them with the deployed list at render time.
+    return resp.functions.map((f) => ({
+      name: f.name,
+      deployedAt: 0,
+      sourceLanguage: 'rust' as const,
+      source: '',
+      description: `version ${f.version} · crc ${f.crc32c.toString(16)}`,
+      paramHints: [],
+      defaultParams: ['0', '0', '0', '0', '0', '0', '0', '0'] as const,
+    }));
   }
 
+  /**
+   * `source` is interpreted as a base64-encoded WASM binary. The Meta
+   * module's example "Deploy" buttons send a precompiled noop module
+   * (see `wasm-binaries.ts`) since the example source strings are
+   * illustrative Rust pseudocode — the browser can't compile them.
+   */
   async registerFunction(
-    _name: string,
-    _source: string,
-    _overrideExisting: boolean,
+    name: string,
+    source: string,
+    overrideExisting: boolean,
   ): Promise<SubmitResult> {
-    throw new Error('registerFunction is not yet implemented on the real control plane');
+    const binary = base64ToBytes(source);
+    const resp = await this.client.registerFunction(
+      create(RegisterFunctionRequestSchema, {
+        name,
+        binary,
+        overrideExisting,
+      }),
+    );
+    if (!resp.accepted) {
+      throw new Error(resp.error || 'register failed');
+    }
+    return { txId: '0', failReason: 0 };
   }
 
-  async unregisterFunction(_name: string): Promise<SubmitResult> {
-    throw new Error('unregisterFunction is not yet implemented on the real control plane');
+  async unregisterFunction(name: string): Promise<SubmitResult> {
+    const resp = await this.client.unregisterFunction(
+      create(UnregisterFunctionRequestSchema, { name }),
+    );
+    if (!resp.accepted) {
+      throw new Error(resp.error || 'unregister failed');
+    }
+    return { txId: '0', failReason: 0 };
+  }
+
+  // ---- Ledger reads ----
+
+  async getBalance(
+    accountId: string,
+    nodeId: string,
+  ): Promise<{ balance: string; lastSnapshotTxId: string }> {
+    const resp = await this.client.getBalance(
+      create(GetBalanceRequestSchema, {
+        accountId: stringToU64(accountId),
+        nodeId: stringToU64(nodeId),
+      }),
+    );
+    return {
+      balance: resp.balance.toString(),
+      lastSnapshotTxId: u64ToString(resp.lastSnapshotTxId),
+    };
   }
 
   // ---- Scenarios ----
+
+  async listAvailableScenarios(): Promise<AvailableScenario[]> {
+    const resp = await this.client.listAvailableScenarios(
+      create(ListAvailableScenariosRequestSchema, {}),
+    );
+    return resp.scenarios.map(availableScenarioFromPb);
+  }
 
   async runScenario(scenario: Scenario): Promise<{ runId: string; startedAt: number }> {
     const resp = await this.control.runScenario(
@@ -317,6 +416,34 @@ export class RealClusterClient implements ClusterClient {
       create(ListScenarioRunsRequestSchema, { limit }),
     );
     return resp.runs.map(runSummaryFromPb);
+  }
+
+  // ---- Server streams ----
+
+  async *watchClusterSnapshot(intervalMs: number): AsyncIterable<ClusterSnapshot> {
+    const stream = this.client.watchClusterSnapshot(
+      create(WatchClusterSnapshotRequestSchema, { intervalMs }),
+    );
+    for await (const msg of stream) {
+      yield snapshotFromPb(msg);
+    }
+  }
+
+  async *watchFunctions(intervalMs: number): AsyncIterable<WasmFunction[]> {
+    const stream = this.client.watchFunctions(
+      create(WatchFunctionsRequestSchema, { intervalMs }),
+    );
+    for await (const resp of stream) {
+      yield resp.functions.map((f) => ({
+        name: f.name,
+        deployedAt: 0,
+        sourceLanguage: 'rust' as const,
+        source: '',
+        description: `version ${f.version} · crc ${f.crc32c.toString(16)}`,
+        paramHints: [],
+        defaultParams: ['0', '0', '0', '0', '0', '0', '0', '0'] as const,
+      }));
+    }
   }
 
   /** Best-effort cleanup; Connect-Web transports are GC'd automatically. */

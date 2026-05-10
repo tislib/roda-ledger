@@ -691,20 +691,24 @@ impl<P: Persistence> RaftNode<P> {
                     // index. If this fires, a Raft invariant has
                     // already been violated upstream — surface it
                     // loudly in debug builds. Release-build clamp
-                    // below is belt-and-suspenders. The local-commit
-                    // guard catches the same invariant from the
-                    // follower's side.
+                    // below is belt-and-suspenders.
+                    //
+                    // Note: there is no symmetric `local_commit_index`
+                    // assertion. Under ADR-0016 §9 the follower's
+                    // `last_commit_id` (and therefore raft's
+                    // `local_commit_index`) tracks WAL-fsync'd state
+                    // that may be ahead of cluster_commit while a
+                    // divergent tail is still pending reseed. The
+                    // driver responds to `truncate_after` by tearing
+                    // down the Ledger and restarting it via
+                    // `start_with_recovery_until`, which is what
+                    // physically rolls `last_commit_id` back to the
+                    // truncation point.
                     debug_assert!(
                         after >= self.cluster_commit_index,
                         "truncation below cluster_commit_index: after={} cluster={}",
                         after,
                         self.cluster_commit_index
-                    );
-                    debug_assert!(
-                        after >= self.local_commit_index,
-                        "truncation below local_commit_index: after={} local_commit={}",
-                        after,
-                        self.local_commit_index
                     );
                     self.persistence.truncate_term_after(after);
                     self.local_write_index = after;

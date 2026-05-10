@@ -67,7 +67,11 @@ export function ClusterDashboard() {
             {isUnhealthy ? 'unhealthy' : 'healthy'}
           </span>
           {isUnhealthy && (
-            <span className="text-text-secondary">— no leader; cluster cannot accept writes</span>
+            <span className="text-text-secondary">
+              {snapshot.leaderNodeId === null
+                ? '— no leader; cluster cannot accept writes'
+                : '— quorum lost; cluster cannot accept writes'}
+            </span>
           )}
         </div>
         <div className="font-mono text-[11px] text-text-secondary">

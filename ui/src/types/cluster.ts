@@ -45,6 +45,14 @@ export interface ElectionEvent {
   /** null if no winner yet (split vote / ongoing). */
   winnerNodeId: string | null;
   reason: ElectionReason;
+  /** Vote cast by the responding node in this term; null if no vote granted. */
+  votedFor: string | null;
+  /** First WAL tx_id this term covered; null if no leader committed yet. */
+  startTxId: string | null;
+  /** True iff a leader committed a term boundary. */
+  hasTermRecord: boolean;
+  /** True iff the responding node persisted a vote for this term. */
+  hasVoteRecord: boolean;
 }
 
 export type FaultKind = 'stop' | 'start' | 'restart' | 'partition' | 'heal' | 'kill';

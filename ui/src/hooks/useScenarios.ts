@@ -3,6 +3,15 @@ import { useClusterClient } from '@/lib/cluster-client.runtime';
 import { qk } from '@/lib/query-keys';
 import type { Scenario } from '@/types/scenario';
 
+export function useAvailableScenarios() {
+  const client = useClusterClient();
+  return useQuery({
+    queryKey: ['scenarios', 'available'],
+    queryFn: () => client.listAvailableScenarios(),
+    staleTime: 60_000,
+  });
+}
+
 export function useScenarioStatus(runId: string | null) {
   const client = useClusterClient();
   return useQuery({

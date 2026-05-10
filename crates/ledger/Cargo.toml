@@ -29,6 +29,8 @@ bytemuck = { version = "1.21.0", features = ["derive"] }
 crc32c = "0.6"
 wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"] }
 wat = "1"
+clap = { version = "4.5.60", features = ["derive"] }
+roda-latency-tracker.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

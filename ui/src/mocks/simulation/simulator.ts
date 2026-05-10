@@ -152,6 +152,10 @@ export class Simulator {
       term: '1',
       winnerNodeId: leaderId,
       reason: 'bootstrap',
+      votedFor: leaderId,
+      startTxId: null,
+      hasTermRecord: true,
+      hasVoteRecord: true,
     });
     this.nextHeartbeatAt = now + HEARTBEAT_INTERVAL_MS;
   }
@@ -275,6 +279,10 @@ export class Simulator {
       term: node.termAsString(),
       winnerNodeId: node.nodeId,
       reason: 'leader-crash',
+      votedFor: node.nodeId,
+      startTxId: null,
+      hasTermRecord: true,
+      hasVoteRecord: true,
     };
     this.elections.unshift(event);
     if (this.elections.length > 64) this.elections.length = 64;
@@ -1064,7 +1072,7 @@ export class Simulator {
         };
       }
       case 'FunctionInvocation': {
-        const name = lookup('name', 'escrow');
+        const name = lookup('name', 'transfer_with_fee');
         const params8 = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => lookup(`p${i}`, '0')) as [
           string, string, string, string, string, string, string, string,
         ];

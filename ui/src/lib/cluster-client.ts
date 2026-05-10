@@ -6,11 +6,16 @@ import type {
   FaultEvent,
   ServerInfo,
 } from '@/types/cluster';
-import type { LogPage } from '@/types/log';
+import type { LogPage, WalLogPage } from '@/types/log';
 import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
 import type { WaitLevel } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
-import type { Scenario, ScenarioRunStatus, ScenarioRunSummary } from '@/types/scenario';
+import type {
+  AvailableScenario,
+  Scenario,
+  ScenarioRunStatus,
+  ScenarioRunSummary,
+} from '@/types/scenario';
 
 /**
  * The control-plane surface the UI talks to. V1 has only a mock implementation
@@ -27,6 +32,10 @@ export interface ClusterClient {
 
   // ---- Logs ----
   getNodeLog(nodeId: string, opts?: { fromIndex?: string; limit?: number }): Promise<LogPage>;
+  getNodeWalLog(
+    nodeId: string,
+    opts?: { fromTxId?: string; toTxId?: string; limit?: number },
+  ): Promise<WalLogPage>;
 
   // ---- Provisioning ----
   getClusterConfig(): Promise<{ config: ClusterConfig; membership: ClusterMembership }>;
@@ -37,6 +46,12 @@ export interface ClusterClient {
     targetCount: number;
     currentCount: number;
   }>;
+  /**
+   * Destroy the current cluster (kill nodes, wipe data) and reinitialize
+   * with the same config + node count. Returns once the new cluster is
+   * accepting requests. Destructive — UI should gate behind a confirm.
+   */
+  resetCluster(): Promise<{ accepted: boolean; error: string }>;
 
   // ---- Fault injection ----
   stopNode(nodeId: string): Promise<{ accepted: boolean; error: string }>;
@@ -62,9 +77,22 @@ export interface ClusterClient {
   ): Promise<SubmitResult>;
   unregisterFunction(name: string): Promise<SubmitResult>;
 
-  // ---- Scenarios / load ----
+  // ---- Testing (scenarios) ----
+  /** Server's built-in scenario catalogue (e2e + load), categorised. */
+  listAvailableScenarios(): Promise<AvailableScenario[]>;
   runScenario(scenario: Scenario): Promise<{ runId: string; startedAt: number }>;
   getScenarioStatus(runId: string): Promise<ScenarioRunStatus>;
   cancelScenario(runId: string): Promise<{ accepted: boolean; error: string }>;
   listScenarioRuns(limit?: number): Promise<ScenarioRunSummary[]>;
+
+  // ---- Ledger reads ----
+  getBalance(
+    accountId: string,
+    nodeId: string,
+  ): Promise<{ balance: string; lastSnapshotTxId: string }>;
+
+  // ---- Optional server streams (real-client only). When `undefined`,
+  // consumers should fall back to polling. ----
+  watchClusterSnapshot?(intervalMs: number): AsyncIterable<ClusterSnapshot>;
+  watchFunctions?(intervalMs: number): AsyncIterable<WasmFunction[]>;
 }

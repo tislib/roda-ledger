@@ -302,7 +302,32 @@ impl Term {
     pub fn last_record(&self) -> Option<TermRecord> {
         self.ring.read().expect("term: ring rwlock poisoned").last()
     }
+
+    /// Up to `limit` records on disk whose `term >= from_term`, ascending.
+    /// `limit` is hard-capped at [`LIST_RECORDS_MAX`] regardless of the
+    /// caller's value. Locks the writer briefly while scanning; election
+    /// cadence makes this negligible. Used by the client-facing
+    /// `GetTerms` RPC.
+    pub fn list_records(&self, from_term: u64, limit: usize) -> io::Result<Vec<TermRecord>> {
+        let cap = limit.min(LIST_RECORDS_MAX);
+        let mut writer = self.writer.lock().expect("term: writer mutex poisoned");
+        let mut out = Vec::with_capacity(cap.min(64));
+        writer.scan(|rec| {
+            if out.len() >= cap {
+                return;
+            }
+            if rec.term >= from_term {
+                out.push(rec);
+            }
+        })?;
+        Ok(out)
+    }
 }
+
+/// Hard cap on `Term::list_records` / `Vote::list_records`. Independent of
+/// the handler-side `GetTerms` proto cap so the storage surface is safe
+/// for any caller (including tooling).
+pub const LIST_RECORDS_MAX: usize = 10_000;
 
 // ── Vote log ──────────────────────────────────────────────────────────────
 
@@ -402,6 +427,26 @@ impl Vote {
             writer.path().display(),
         );
         Ok(true)
+    }
+
+    /// Up to `limit` records on disk whose `term >= from_term`, ascending.
+    /// `limit` is hard-capped at [`LIST_RECORDS_MAX`] regardless of the
+    /// caller's value. Locks the writer briefly while scanning; election
+    /// cadence makes this negligible. Used by the client-facing
+    /// `GetTerms` RPC.
+    pub fn list_records(&self, from_term: u64, limit: usize) -> io::Result<Vec<VoteRecord>> {
+        let cap = limit.min(LIST_RECORDS_MAX);
+        let mut writer = self.writer.lock().expect("vote: writer mutex poisoned");
+        let mut out = Vec::with_capacity(cap.min(64));
+        writer.scan(|rec| {
+            if out.len() >= cap {
+                return;
+            }
+            if rec.term >= from_term {
+                out.push(rec);
+            }
+        })?;
+        Ok(out)
     }
 
     /// Observe a strictly-higher term advance; clears `voted_for`.

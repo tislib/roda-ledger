@@ -1,6 +1,9 @@
 use ::proto::ledger as proto;
 use ledger::transaction::{Operation, TransactionStatus};
-use storage::entities::FailReason;
+use storage::entities::{
+    EntryKind, FailReason, FunctionRegistered, SegmentHeader, SegmentSealed, TxEntry, TxLink,
+    TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,
+};
 
 pub fn deposit_to_op(d: proto::Deposit) -> Operation {
     Operation::Deposit {
@@ -78,4 +81,87 @@ pub fn status_to_proto(status: TransactionStatus) -> proto::TransactionStatus {
 
 pub fn fail_reason_to_u32(reason: FailReason) -> u32 {
     reason.as_u8() as u32
+}
+
+pub fn wal_entry_to_proto(e: WalEntry) -> proto::WalLogRecord {
+    use proto::wal_log_record::Entry as E;
+    let entry = match e {
+        WalEntry::Metadata(m) => E::Metadata(metadata_to_proto(m)),
+        WalEntry::Entry(x) => E::TxEntry(entry_to_proto(x)),
+        WalEntry::Link(l) => E::Link(link_to_proto(l)),
+        WalEntry::Term(t) => E::Term(term_to_proto(t)),
+        WalEntry::FunctionRegistered(f) => E::FunctionRegistered(function_registered_to_proto(f)),
+        WalEntry::SegmentHeader(h) => E::SegmentHeader(segment_header_to_proto(h)),
+        WalEntry::SegmentSealed(s) => E::SegmentSealed(segment_sealed_to_proto(s)),
+    };
+    proto::WalLogRecord { entry: Some(entry) }
+}
+
+fn metadata_to_proto(m: TxMetadata) -> proto::WalTxMetadata {
+    proto::WalTxMetadata {
+        tx_id: m.tx_id,
+        fail_reason: m.fail_reason.as_u8() as u32,
+        sub_item_count: m.sub_item_count as u32,
+        crc32c: m.crc32c,
+        timestamp: m.timestamp,
+        user_ref: m.user_ref,
+        tag: encode_tag(&m.tag),
+    }
+}
+
+fn entry_to_proto(x: TxEntry) -> proto::WalTxEntry {
+    let kind = match x.kind {
+        EntryKind::Credit => proto::EntryKind::Credit,
+        EntryKind::Debit => proto::EntryKind::Debit,
+    };
+    proto::WalTxEntry {
+        tx_id: x.tx_id,
+        account_id: x.account_id,
+        amount: x.amount,
+        kind: kind as i32,
+        computed_balance: x.computed_balance,
+    }
+}
+
+fn link_to_proto(l: TxLink) -> proto::WalTxLink {
+    let kind = match l.kind() {
+        TxLinkKind::Duplicate => proto::LinkKind::Duplicate,
+        TxLinkKind::Reversal => proto::LinkKind::Reversal,
+    };
+    proto::WalTxLink {
+        tx_id: l.tx_id,
+        to_tx_id: l.to_tx_id,
+        kind: kind as i32,
+    }
+}
+
+fn term_to_proto(t: TxTerm) -> proto::WalTxTerm {
+    proto::WalTxTerm {
+        term: t.term,
+        node_id: t.node_id,
+        node_count: t.node_count as u32,
+        node_voted: t.node_voted as u32,
+    }
+}
+
+fn function_registered_to_proto(f: FunctionRegistered) -> proto::WalFunctionRegistered {
+    proto::WalFunctionRegistered {
+        name: f.name_str().to_string(),
+        version: f.version as u32,
+        crc32c: f.crc32c,
+    }
+}
+
+fn segment_header_to_proto(h: SegmentHeader) -> proto::WalSegmentHeader {
+    proto::WalSegmentHeader {
+        segment_id: h.segment_id,
+    }
+}
+
+fn segment_sealed_to_proto(s: SegmentSealed) -> proto::WalSegmentSealed {
+    proto::WalSegmentSealed {
+        segment_id: s.segment_id,
+        last_tx_id: s.last_tx_id,
+        record_count: s.record_count,
+    }
 }

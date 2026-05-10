@@ -102,6 +102,19 @@ service Ledger {
 
   // ListFunctions returns metadata for every currently-loaded function.
   rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
+
+  // GetLog reads raw WAL records over [from_tx_id, to_tx_id] from this node's
+  // local committed WAL. Hard-capped at 10,000 records; paginate via next_tx_id.
+  rpc GetLog(GetLogRequest) returns (GetLogResponse);
+
+  // GetTerms returns Raft term boundaries and this node's per-term vote
+  // decisions. Useful for visualising election history. Querying every
+  // node and joining by term reconstructs who voted for whom.
+  //
+  // Reads two local logs: term.log (boundaries committed by an elected
+  // leader) and vote.log (this node's vote decisions). A term may appear
+  // in only one of the two logs — see has_term_record / has_vote_record.
+  rpc GetTerms(GetTermsRequest) returns (GetTermsResponse);
 }
 
 // ---- Operation messages ----
@@ -469,4 +482,100 @@ message FunctionInfo {
   string name = 1;
   uint32 version = 2;
   uint32 crc32c = 3;
+}
+
+// ---- WAL log query ----
+
+message GetLogRequest {
+  uint64 from_tx_id = 1; // 0 = include structural records from start.
+  uint64 to_tx_id = 2;   // 0 = unbounded; still capped by limit.
+  uint32 limit = 3;      // default 1000, server hard-cap 10000.
+}
+
+message GetLogResponse {
+  repeated WalLogRecord records = 1;
+  uint64 next_tx_id = 2;        // 0 = no more records in [from..to] on this node.
+  uint64 last_commit_tx_id = 3; // node's last_commit_id at read time.
+}
+
+// WalLogRecord mirrors the in-memory WalEntry enum (storage::entities::WalEntry).
+message WalLogRecord {
+  oneof entry {
+    WalTxMetadata         metadata             = 1;
+    WalTxEntry            tx_entry             = 2;
+    WalTxLink             link                 = 3;
+    WalTxTerm             term                 = 4;
+    WalFunctionRegistered function_registered  = 5;
+    WalSegmentHeader      segment_header       = 6;
+    WalSegmentSealed      segment_sealed       = 7;
+  }
+}
+
+message WalTxMetadata {
+  uint64 tx_id = 1;
+  uint32 fail_reason = 2;
+  uint32 sub_item_count = 3;
+  uint32 crc32c = 4;
+  uint64 timestamp = 5;
+  uint64 user_ref = 6;
+  // Trailing-null-trimmed UTF-8 when valid, else 16-char lowercase hex.
+  string tag = 7;
+}
+
+message WalTxEntry {
+  uint64 tx_id = 1;
+  uint64 account_id = 2;
+  uint64 amount = 3;
+  EntryKind kind = 4;
+  int64 computed_balance = 5;
+}
+
+message WalTxLink {
+  uint64 tx_id = 1;
+  uint64 to_tx_id = 2;
+  LinkKind kind = 3;
+}
+
+message WalTxTerm {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  uint32 node_count = 3;
+  uint32 node_voted = 4;
+}
+
+message WalFunctionRegistered {
+  string name = 1;
+  uint32 version = 2;
+  uint32 crc32c = 3; // 0 = unregister record
+}
+
+message WalSegmentHeader {
+  uint32 segment_id = 1;
+}
+
+message WalSegmentSealed {
+  uint32 segment_id = 1;
+  uint64 last_tx_id = 2;
+  uint64 record_count = 3;
+}
+
+// ---- Terms / election history query ----
+
+message GetTermsRequest {
+  uint64 from_term = 1; // 0 = include from earliest term.
+  uint32 limit     = 2; // default 1000, server hard-cap 10000.
+}
+
+message GetTermsResponse {
+  repeated TermInfo terms = 1;       // ascending by term.
+  uint64   current_term  = 2;        // mirror.current_term() at read time.
+  uint64   next_term     = 3;        // 0 = no more; else first term not returned.
+}
+
+message TermInfo {
+  uint64 term             = 1;
+  uint64 start_tx_id      = 2; // 0 if no boundary committed (vote-only term).
+  uint64 voted_for        = 3; // this node's vote in this term; 0 = none granted.
+  bool   has_term_record  = 4; // true if term.log has a boundary for this term.
+  bool   has_vote_record  = 5; // true if vote.log has an entry for this term.
 }

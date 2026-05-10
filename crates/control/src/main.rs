@@ -1,79 +1,42 @@
-//! `control` binary — starts the operational control plane and an
-//! in-process Ledger gRPC proxy that forwards calls to the provisioned
-//! cluster peers.
+//! `control` binary — starts the real control plane backed by a live
+//! `roda-server` cluster spawned via `ProcessProvisioner`.
 //!
-//! Defaults: listens on `0.0.0.0:50051`. Peers are provided via
-//! repeated `--peer` flags (each `node_id=URL`) or via the `RODA_PEERS`
-//! environment variable (comma-separated `node_id=URL` pairs). When no
-//! peers are provisioned the server still runs with a mock cluster
-//! membership but the Ledger proxy is disabled.
-//!
-//! SIGINT/SIGTERM triggers cooperative shutdown — the background task
-//! drains, the HTTP server stops accepting new connections, the process
-//! exits 0.
+//! Defaults: listens on `0.0.0.0:50051`, auto-provisions a 3-node
+//! cluster on boot. SIGINT/SIGTERM triggers cooperative shutdown — the
+//! HTTP server stops accepting new connections, the cluster handle is
+//! dropped, and `ProcessProvisioner`'s Drop kills child processes and
+//! cleans up temp dirs before the process exits.
 
-use std::env;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use control::{LedgerProxy, server, state::InMemoryState};
-use parking_lot::RwLock;
+use control::{
+    ClusterHandle, EventStore, server,
+};
+use proto::control::ClusterConfig;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "control", about = "roda-ledger control plane")]
+#[command(name = "control", about = "roda-ledger real control plane")]
 struct Cli {
-    /// Listen address.
-    #[arg(long, default_value = "0.0.0.0:50051")]
+    /// gRPC listen address (browser clients hit this via tonic-web).
+    #[arg(long, env = "RODA_CONTROL_ADDR", default_value = "0.0.0.0:50051")]
     addr: SocketAddr,
 
-    /// Initial node count for the in-memory mock cluster. Used only
-    /// when no `--peer` flags / `RODA_PEERS` are provided — the
-    /// monitoring surface seeds N synthetic nodes so the UI has
-    /// something to render in offline demos.
-    #[arg(long, default_value_t = 5)]
-    seed_nodes: u32,
+    /// How many roda-server children to spawn on boot. The cluster
+    /// can be reshaped at runtime via `SetNodeCount` (which tears
+    /// down + reprovisions).
+    #[arg(long, env = "INITIAL_NODE_COUNT", default_value_t = 3)]
+    initial_node_count: u32,
 
-    /// Provisioned cluster peer. Repeat once per peer. Format
-    /// `node_id=URL`, for example `--peer 1=http://127.0.0.1:50051`.
-    #[arg(long = "peer", value_parser = parse_peer_arg)]
-    peers: Vec<(u64, String)>,
-}
-
-fn parse_peer_arg(raw: &str) -> Result<(u64, String), String> {
-    let (id_str, url) = raw
-        .split_once('=')
-        .ok_or_else(|| format!("expected node_id=URL, got '{raw}'"))?;
-    let id: u64 = id_str
-        .trim()
-        .parse()
-        .map_err(|_| format!("'{id_str}' is not a u64 node_id"))?;
-    let url = url.trim().to_string();
-    if url.is_empty() {
-        return Err(format!("peer URL must not be empty (got '{raw}')"));
-    }
-    Ok((id, url))
-}
-
-fn peers_from_env() -> Vec<(u64, String)> {
-    match env::var("RODA_PEERS") {
-        Ok(s) => s
-            .split(',')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .filter_map(|p| match parse_peer_arg(p) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    warn!("RODA_PEERS skipping '{p}': {e}");
-                    None
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    /// Path to the `roda-server` binary. Defaults to a sibling of
+    /// this binary; override here or via `RODA_SERVER_BIN`.
+    #[arg(long, env = "RODA_SERVER_BIN")]
+    server_bin: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -85,58 +48,97 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut cli = Cli::parse();
-    if cli.peers.is_empty() {
-        cli.peers = peers_from_env();
-    }
-    info!(
-        "control plane starting (addr={}, seed_nodes={}, peers={})",
-        cli.addr,
-        cli.seed_nodes,
-        cli.peers.len()
-    );
+    let cli = Cli::parse();
 
-    let (state, proxy) = if cli.peers.is_empty() {
-        warn!(
-            "no peers provisioned — Ledger proxy disabled. Pass --peer node_id=URL or set RODA_PEERS to enable."
-        );
-        let state = Arc::new(RwLock::new(InMemoryState::new(cli.seed_nodes)));
-        (state, None)
-    } else {
-        for (id, url) in &cli.peers {
-            info!("ledger proxy peer: node_id={id} url={url}");
+    let server_bin = match resolve_server_bin(cli.server_bin.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("{e}");
+            return Err(anyhow::anyhow!(e));
         }
-        let state = Arc::new(RwLock::new(InMemoryState::from_peers(&cli.peers)));
-        let proxy = LedgerProxy::new(cli.peers.clone())
-            .map_err(|e| anyhow::anyhow!("failed to build Ledger proxy ClusterClient: {e}"))?;
-        (state, Some(proxy))
     };
 
+    info!(
+        addr = %cli.addr,
+        nodes = cli.initial_node_count,
+        server_bin = %server_bin.display(),
+        "control real plane starting"
+    );
+
+    let handle =
+        ClusterHandle::bootstrap(server_bin, default_cluster_config(), cli.initial_node_count)
+            .await?;
+    let events = Arc::new(EventStore::new());
     let shutdown = CancellationToken::new();
 
-    // Spawn the periodic background task.
-    let bg = control::background::spawn(state.clone(), shutdown.clone());
-
-    // Wire SIGINT / SIGTERM to the cancellation token.
+    // Wire SIGINT to the cancellation token.
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                info!("received SIGINT; initiating shutdown");
-                signal_shutdown.cancel();
-            }
-            Err(e) => {
-                tracing::warn!("failed to install SIGINT handler: {e}");
-            }
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("failed to install SIGINT handler: {e}");
+            return;
         }
+        info!("received SIGINT; initiating shutdown");
+        signal_shutdown.cancel();
     });
 
-    server::serve(cli.addr, state.clone(), proxy, shutdown.clone()).await?;
+    let serve_result = server::serve(cli.addr, handle.clone(), events.clone(), shutdown.clone()).await;
     shutdown.cancel();
 
-    // Cooperatively await the background task — RAII rule.
-    let _ = bg.await;
+    // Drop the handle here so the provisioner tears the cluster down
+    // before the runtime finishes (cooperative — RAII).
+    drop(handle);
 
-    info!("control plane stopped cleanly");
-    Ok(())
+    match serve_result {
+        Ok(()) => {
+            info!("control plane stopped cleanly");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Sane defaults so a blank cluster has something coherent to start
+/// from. Mirrors the cluster's TOML rendering defaults at
+/// `provisioner/process.rs::render_config_toml`.
+fn default_cluster_config() -> ClusterConfig {
+    ClusterConfig {
+        max_accounts: 1_000_000,
+        queue_size: 16_384,
+        transaction_count_per_segment: 1_000_000,
+        snapshot_frequency: 2,
+        replication_poll_ms: 5,
+        append_entries_max_bytes: 4 * 1024 * 1024,
+    }
+}
+
+/// Resolve the path to the `roda-server` binary. CLI arg > env var >
+/// sibling of this binary. Mirrors `bin/scenario.rs`'s logic so the
+/// two binaries can sit next to each other in `target/release/`.
+fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(p) = explicit {
+        if !p.exists() {
+            return Err(format!("server-bin {} does not exist", p.display()));
+        }
+        return Ok(p.to_path_buf());
+    }
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "current_exe has no parent directory".to_string())?;
+    let candidate = dir.join(if cfg!(windows) {
+        "roda-server.exe"
+    } else {
+        "roda-server"
+    });
+    if !candidate.exists() {
+        return Err(format!(
+            "roda-server binary not found at {}.\n\
+             Build it with: cargo build -p cluster --bin roda-server\n\
+             Or set --server-bin / RODA_SERVER_BIN to override.",
+            candidate.display()
+        ));
+    }
+    Ok(candidate)
 }

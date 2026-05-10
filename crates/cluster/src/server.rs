@@ -13,7 +13,7 @@
 
 use crate::LedgerSlot;
 use crate::cluster_mirror::ClusterMirror;
-use crate::durable::Term;
+use crate::durable::{Term, Vote};
 use crate::ledger_handler::LedgerHandler;
 use crate::node_handler::NodeHandler;
 use ::proto::ledger::ledger_server::LedgerServer;
@@ -37,6 +37,9 @@ pub struct Server {
     /// Shared durable term log — used for term-at-tx stamping. Read
     /// path is independent of the raft mutex.
     term: Arc<Term>,
+    /// Shared durable vote log — surfaces this node's per-term vote
+    /// decisions through `GetTerms`.
+    vote: Arc<Vote>,
     /// Cooperative shutdown trigger. When the owning `*Handles`
     /// drops, it calls `notify_waiters()` and `serve_with_shutdown`
     /// resolves.
@@ -49,6 +52,7 @@ impl Server {
         addr: SocketAddr,
         mirror: Arc<ClusterMirror>,
         term: Arc<Term>,
+        vote: Arc<Vote>,
         shutdown: Arc<Notify>,
     ) -> Self {
         Self {
@@ -56,12 +60,14 @@ impl Server {
             addr,
             mirror,
             term,
+            vote,
             shutdown,
         }
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let handler = LedgerHandler::new(self.ledger_slot, self.mirror.clone(), self.term);
+        let handler =
+            LedgerHandler::new(self.ledger_slot, self.mirror.clone(), self.term, self.vote);
 
         debug!("Ledger gRPC server listening on {}", self.addr);
 

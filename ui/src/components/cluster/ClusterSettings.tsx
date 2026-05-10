@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useClusterConfig, useSetNodeCount, useUpdateClusterConfig } from '@/hooks/useProvisioning';
 import type { ClusterConfig } from '@/types/cluster';
 import { EmptyState } from '@/components/shared/EmptyState';
+import { ResetClusterButton } from '@/components/shared/ResetClusterButton';
 import { formatNodeId } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import { toast } from '@/lib/toast';
@@ -52,11 +53,14 @@ export function ClusterSettings() {
 
   return (
     <div className="flex-1 flex flex-col overflow-auto">
-      <header className="px-6 py-3 border-b border-border-subtle">
-        <h1 className="text-base font-semibold tracking-tight">Cluster Settings</h1>
-        <div className="text-[11px] text-text-muted mt-0.5">
-          Provisioning: cluster size and shared ledger configuration. Per-node deploy-time settings are not editable here.
+      <header className="px-6 py-3 border-b border-border-subtle flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-base font-semibold tracking-tight">Cluster Settings</h1>
+          <div className="text-[11px] text-text-muted mt-0.5">
+            Provisioning: cluster size and shared ledger configuration. Per-node deploy-time settings are not editable here.
+          </div>
         </div>
+        <ResetClusterButton />
       </header>
 
       <div className="p-6 grid grid-cols-1 xl:grid-cols-2 gap-6 max-w-6xl">

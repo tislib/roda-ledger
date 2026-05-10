@@ -140,6 +140,7 @@ impl ClusterNode {
             client_addr,
             mirror,
             self.durable.term.clone(),
+            self.durable.vote.clone(),
             client_shutdown.clone(),
         );
         let client_thread = spawn_grpc_thread("ledger-grpc", async move {
@@ -226,6 +227,7 @@ impl ClusterNode {
             client_addr,
             mirror.clone(),
             self.durable.term.clone(),
+            self.durable.vote.clone(),
             client_shutdown.clone(),
         );
         let client_thread = spawn_grpc_thread("ledger-grpc", async move {
