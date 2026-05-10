@@ -9,4 +9,9 @@ export interface WasmFunction {
   paramHints: string[];
   /** Suggested default invocation parameters. */
   defaultParams: readonly [string, string, string, string, string, string, string, string];
+  /** Mock-only: pre-compiled WASM bytes (base64) the Meta deploy
+   *  button uses for examples that ship a real binary. Examples
+   *  without this field deploy NOOP_WASM_BASE64 instead. Never
+   *  populated for entries returned from the cluster. */
+  wasmBase64?: string;
 }

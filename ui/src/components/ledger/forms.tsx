@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useSubmitOperation } from '@/hooks/useSubmitOperation';
 import { useWasmFunctions } from '@/hooks/useWasmFunctions';
-import { allocateUserRef } from '@/lib/ids';
 
 interface FormProps {
   onTxSubmitted: (txId: string) => void;
@@ -31,7 +30,11 @@ export function DepositForm({ onTxSubmitted }: FormProps) {
       kind: 'Deposit',
       account,
       amount,
-      userRef: allocateUserRef(),
+      // No client-side dedup correlation for ad-hoc UI submissions —
+      // the previous counter-based user_ref reset to 1 on every page
+      // reload and collided with prior submissions, triggering the
+      // ledger's duplicate-detection path.
+      userRef: '0',
     });
     onTxSubmitted(result.txId);
   };
@@ -58,7 +61,11 @@ export function WithdrawalForm({ onTxSubmitted }: FormProps) {
       kind: 'Withdrawal',
       account,
       amount,
-      userRef: allocateUserRef(),
+      // No client-side dedup correlation for ad-hoc UI submissions —
+      // the previous counter-based user_ref reset to 1 on every page
+      // reload and collided with prior submissions, triggering the
+      // ledger's duplicate-detection path.
+      userRef: '0',
     });
     onTxSubmitted(result.txId);
   };
@@ -87,7 +94,11 @@ export function TransferForm({ onTxSubmitted }: FormProps) {
       from,
       to,
       amount,
-      userRef: allocateUserRef(),
+      // No client-side dedup correlation for ad-hoc UI submissions —
+      // the previous counter-based user_ref reset to 1 on every page
+      // reload and collided with prior submissions, triggering the
+      // ledger's duplicate-detection path.
+      userRef: '0',
     });
     onTxSubmitted(result.txId);
   };
@@ -126,7 +137,11 @@ export function FunctionInvokeForm({ onTxSubmitted }: FormProps) {
       kind: 'Function',
       name,
       params: params as unknown as readonly [string, string, string, string, string, string, string, string],
-      userRef: allocateUserRef(),
+      // No client-side dedup correlation for ad-hoc UI submissions —
+      // the previous counter-based user_ref reset to 1 on every page
+      // reload and collided with prior submissions, triggering the
+      // ledger's duplicate-detection path.
+      userRef: '0',
     });
     onTxSubmitted(result.txId);
   };

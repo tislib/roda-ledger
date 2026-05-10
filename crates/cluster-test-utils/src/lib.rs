@@ -770,6 +770,7 @@ impl ClusterTestingControl {
             bare.ledger_slot.clone(),
             bare.mirror.clone(),
             bare.term.clone(),
+            bare.vote.clone(),
         ))
     }
 
@@ -1093,6 +1094,7 @@ impl ClusterTestingControl {
                         commit: 0,
                         snapshot: 0,
                         cluster_commit: 0,
+                        term: 0,
                         is_leader: false,
                     }),
                 });

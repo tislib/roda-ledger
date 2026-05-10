@@ -64,6 +64,59 @@ pub struct TxMetadata {
     pub tag: [u8; 8],        // 8 @ 32
 } // total: 40 bytes
 
+impl TxMetadata {
+    /// Render `tag` as a human-readable string: trailing-null-trimmed UTF-8
+    /// when valid, otherwise 16-char lowercase hex.
+    pub fn tag_string(&self) -> String {
+        encode_tag(&self.tag)
+    }
+
+    /// Parse `s` into an 8-byte tag: 16 hex digits decode as bytes; anything
+    /// else is treated as UTF-8 truncated/null-padded to 8.
+    pub fn parse_tag(s: &str) -> [u8; 8] {
+        decode_tag(s)
+    }
+}
+
+/// Free-function form of [`TxMetadata::tag_string`] for callers holding a
+/// raw `[u8; 8]` (e.g. WAL inspection tools).
+pub fn encode_tag(tag: &[u8; 8]) -> String {
+    let trimmed = match tag.iter().rposition(|&b| b != 0) {
+        Some(last) => &tag[..=last],
+        None => &tag[..0],
+    };
+    match std::str::from_utf8(trimmed) {
+        Ok(s) => s.to_string(),
+        Err(_) => format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            tag[0], tag[1], tag[2], tag[3], tag[4], tag[5], tag[6], tag[7]
+        ),
+    }
+}
+
+/// Free-function form of [`TxMetadata::parse_tag`].
+pub fn decode_tag(s: &str) -> [u8; 8] {
+    let mut tag = [0u8; 8];
+    let is_hex16 = s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex16 {
+        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+            if i >= 8 {
+                break;
+            }
+            if let Ok(cs) = std::str::from_utf8(chunk)
+                && let Ok(b) = u8::from_str_radix(cs, 16)
+            {
+                tag[i] = b;
+            }
+        }
+    } else {
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(8);
+        tag[..len].copy_from_slice(&bytes[..len]);
+    }
+    tag
+}
+
 /// First record in every WAL segment. 40 bytes.
 /// entry_type is the first byte so the WAL format is [entry][entry][entry]…
 /// with no separate type-byte prefix. Fields ordered to avoid implicit padding

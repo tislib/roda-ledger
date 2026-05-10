@@ -3,6 +3,7 @@ import type { WasmFunction } from '@/types/wasm';
 import { useWasmFunctions } from '@/hooks/useWasmFunctions';
 import { useRegisterFunction, useUnregisterFunction } from '@/hooks/useInvokeFunction';
 import { useExampleFunctions } from '@/lib/wasm-examples';
+import { NOOP_WASM_BASE64, bytesToBase64 } from '@/lib/wasm-binaries';
 import { cn } from '@/lib/cn';
 import { FunctionEditor } from './FunctionEditor';
 import { EmptyState } from '@/components/shared/EmptyState';
@@ -39,11 +40,27 @@ export function MetaModule() {
   const deployedNames = new Set((deployed ?? []).map((d) => d.name));
 
   const onDeploy = (fn: WasmFunction) => {
-    registerMutation.mutate({
-      name: fn.name,
-      source: fn.source,
-      overrideExisting: false,
-    });
+    // Examples that ship a precompiled binary (`wasmBase64`) deploy
+    // the real WASM — the displayed Rust source above is a faithful
+    // pseudocode of what the binary does. Re-deploying overrides the
+    // existing version so iterating on the canonical example is a
+    // single click. Examples without bytes fall back to the noop stub
+    // since the browser can't compile Rust; they register under their
+    // name and return 0 regardless of params.
+    const wasm = fn.wasmBase64 ?? NOOP_WASM_BASE64;
+    const isStub = !fn.wasmBase64;
+    registerMutation.mutate(
+      {
+        name: fn.name,
+        source: wasm,
+        overrideExisting: !isStub,
+      },
+      {
+        onSuccess: () =>
+          toast.success(`Deployed ${fn.name}`, isStub ? 'Stub WASM (returns 0)' : 'Real WASM'),
+        onError: (err) => toast.error('Deploy failed', String(err)),
+      },
+    );
   };
 
   const onUnregister = async (name: string) => {
@@ -62,19 +79,34 @@ export function MetaModule() {
     }
   };
 
+  /** Read the chosen .wasm file, base64-encode, and submit. */
+  const onWasmFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const buf = reader.result as ArrayBuffer;
+      const b64 = bytesToBase64(new Uint8Array(buf));
+      setCustomSource(b64);
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
   const onSubmitCustom = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!customName.trim() || !customSource.trim()) return;
+    if (!customName.trim() || !customSource) return;
     registerMutation.mutate(
       { name: customName.trim(), source: customSource, overrideExisting: customOverride },
       {
         onSuccess: () => {
+          toast.success(`Registered ${customName.trim()}`);
           setCustomOpen(false);
           setCustomName('');
           setCustomSource('');
           setCustomOverride(false);
           setSelectedName(customName.trim());
         },
+        onError: (err) => toast.error('Register failed', String(err)),
       },
     );
   };
@@ -105,13 +137,22 @@ export function MetaModule() {
             placeholder="snake_case name (max 32 bytes)"
             className="w-full bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono"
           />
-          <textarea
-            value={customSource}
-            onChange={(e) => setCustomSource(e.target.value)}
-            placeholder="// Rust source (or paste WAT) — read-only after deploy"
-            rows={8}
-            className="w-full bg-bg-2 border border-border rounded px-2 py-1 text-xs font-mono"
-          />
+          <div className="flex flex-col gap-1">
+            <label className="text-[10px] font-mono text-text-muted">
+              .wasm binary (must export `execute(i64 × 8) → i32`)
+            </label>
+            <input
+              type="file"
+              accept=".wasm,application/wasm"
+              onChange={onWasmFile}
+              className="text-xs text-text-secondary file:btn file:mr-2"
+            />
+            {customSource && (
+              <span className="text-[10px] text-text-muted">
+                {Math.round((customSource.length * 3) / 4)} bytes loaded
+              </span>
+            )}
+          </div>
           <label className="flex items-center gap-2 text-[11px] text-text-secondary">
             <input
               type="checkbox"
@@ -121,7 +162,11 @@ export function MetaModule() {
             override if name already registered
           </label>
           <div className="flex gap-2">
-            <button type="submit" className="btn btn-accent" disabled={registerMutation.isPending}>
+            <button
+              type="submit"
+              className="btn btn-accent"
+              disabled={registerMutation.isPending || !customName.trim() || !customSource}
+            >
               {registerMutation.isPending ? 'Registering…' : 'Register'}
             </button>
             <button type="button" className="btn" onClick={() => setCustomOpen(false)}>

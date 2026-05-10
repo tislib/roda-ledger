@@ -36,3 +36,16 @@ export function useSetNodeCount() {
     },
   });
 }
+
+export function useResetCluster() {
+  const client = useClusterClient();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => client.resetCluster(),
+    onSuccess: () => {
+      // Everything is now stale — the new cluster has no fault history,
+      // no scenario runs, no in-flight transactions.
+      qc.clear();
+    },
+  });
+}

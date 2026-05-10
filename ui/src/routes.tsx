@@ -6,7 +6,7 @@ import { ClusterSettings } from './components/cluster/ClusterSettings';
 import { ClusterFaults } from './components/cluster/ClusterFaults';
 import { LedgerModule } from './components/ledger/LedgerModule';
 import { MetaModule } from './components/meta/MetaModule';
-import { LoadModule } from './components/load/LoadModule';
+import { TestingModule } from './components/testing/TestingModule';
 
 export const router = createBrowserRouter([
   {
@@ -26,7 +26,7 @@ export const router = createBrowserRouter([
       // Other modules
       { path: 'ledger', element: <LedgerModule /> },
       { path: 'meta', element: <MetaModule /> },
-      { path: 'load', element: <LoadModule /> },
+      { path: 'testing', element: <TestingModule /> },
     ],
   },
 ]);

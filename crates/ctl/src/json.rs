@@ -1,5 +1,6 @@
 use storage::entities::TxLinkKind;
 use storage::entities::*;
+use storage::entities::{decode_tag, encode_tag};
 use storage::wal_serializer::serialize_wal_records;
 use storage::{WAL_MAGIC, WAL_VERSION};
 
@@ -19,7 +20,7 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "crc32c": format!("{:#010x}", m.crc32c),
             "user_ref": m.user_ref,
             "timestamp": m.timestamp,
-            "tag": hex_encode_tag(&m.tag),
+            "tag": encode_tag(&m.tag),
         }),
         WalEntry::Entry(e) => serde_json::json!({
             "type": "TxEntry",
@@ -91,7 +92,7 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
             let tag = value
                 .get("tag")
                 .and_then(|v| v.as_str())
-                .map(hex_decode_tag)
+                .map(decode_tag)
                 .unwrap_or([0u8; 8]);
             Ok(WalEntry::Metadata(TxMetadata {
                 entry_type: WalEntryKind::TxMetadata as u8,
@@ -186,47 +187,6 @@ pub fn compute_tx_crc(meta: &TxMetadata, sub_items: &[WalEntry]) -> u32 {
 
 pub fn verify_tx_crc(meta: &TxMetadata, sub_items: &[WalEntry]) -> bool {
     compute_tx_crc(meta, sub_items) == meta.crc32c
-}
-
-fn hex_encode_tag(tag: &[u8; 8]) -> String {
-    // Trim trailing null bytes and interpret as UTF-8; fall back to hex if invalid.
-    let trimmed = match tag.iter().rposition(|&b| b != 0) {
-        Some(last) => &tag[..=last],
-        None => &tag[..0],
-    };
-    match std::str::from_utf8(trimmed) {
-        Ok(s) => s.to_string(),
-        Err(_) => format!(
-            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            tag[0], tag[1], tag[2], tag[3], tag[4], tag[5], tag[6], tag[7]
-        ),
-    }
-}
-
-fn hex_decode_tag(s: &str) -> [u8; 8] {
-    let mut tag = [0u8; 8];
-    // If it looks like a 16-char hex string (no non-hex chars other than those
-    // in a plain UTF-8 tag), try hex first only when the string is exactly 16
-    // hex digits; otherwise treat as a plain UTF-8 string padded with nulls.
-    let is_hex16 = s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit());
-    if is_hex16 {
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            if i >= 8 {
-                break;
-            }
-            if let Ok(cs) = std::str::from_utf8(chunk)
-                && let Ok(b) = u8::from_str_radix(cs, 16)
-            {
-                tag[i] = b;
-            }
-        }
-    } else {
-        // Plain UTF-8 string — copy bytes, pad the rest with nulls.
-        let bytes = s.as_bytes();
-        let len = bytes.len().min(8);
-        tag[..len].copy_from_slice(&bytes[..len]);
-    }
-    tag
 }
 
 fn parse_hex_u32(s: &str) -> Option<u32> {

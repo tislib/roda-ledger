@@ -35,6 +35,8 @@ use crate::durable::DurablePersistence;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
 use ::proto::node::node_client::NodeClient;
+use ledger::ledger::Ledger;
+use log::info;
 use raft::{
     AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftNode,
     RejectReason as RaftRejectReason, TxId,
@@ -285,6 +287,14 @@ impl ReplicationLoop {
         } else {
             LogEntryRange::new(req.from_tx_id, req.to_tx_id - req.from_tx_id + 1, req.term)
         };
+        // Capture pre-validate raft state so the Reject branch below can
+        // detect a silent cluster_commit_index clamp inside
+        // validate_append_entries_request — that's the canary for
+        // "leader asked to truncate below committed", which would mean
+        // our reseed-watermark is unsafe.
+        let pre_cluster_commit = self.node.borrow().cluster_commit_index();
+        let pre_local_commit = self.node.borrow().commit_index();
+        let pre_local_write = self.node.borrow().write_index();
         let decision = self.node.borrow_mut().validate_append_entries_request(
             now,
             req.leader_id,
@@ -306,10 +316,38 @@ impl ReplicationLoop {
                     self_id, reason, truncate_after
                 );
                 if let Some(after) = truncate_after {
-                    debug!(
-                        "replication_loop/f[{}]: AE Reject truncate WAL TODO (after={})",
-                        self_id, after
-                    );
+                    let lcid = self.ledger.ledger().last_commit_id();
+                    let lcomp = self.ledger.ledger().last_compute_id();
+                    let unsafe_truncate = after < pre_cluster_commit;
+                    if unsafe_truncate {
+                        error!(
+                            "replication_loop/f[{}]: AE Reject UNSAFE TRUNCATE — after={} < pre_cluster_commit={} (silent clamp): pre(local_commit={} local_write={}) ledger(commit_id={} compute_id={}) — Raft Leader Completeness violated upstream",
+                            self_id,
+                            after,
+                            pre_cluster_commit,
+                            pre_local_commit,
+                            pre_local_write,
+                            lcid,
+                            lcomp
+                        );
+                    } else {
+                        info!(
+                            "replication_loop/f[{}]: AE Reject reseed: after={} pre(cluster_commit={} local_commit={} local_write={}) ledger(commit_id={} compute_id={})",
+                            self_id,
+                            after,
+                            pre_cluster_commit,
+                            pre_local_commit,
+                            pre_local_write,
+                            lcid,
+                            lcomp
+                        );
+                    }
+                    if let Err(e) = self.reseed_ledger(after) {
+                        error!(
+                            "replication_loop/f[{}]: reseed_ledger({}) failed: {}",
+                            self_id, after, e
+                        );
+                    }
                 }
                 let resp = build_ae_response(&self.node.borrow(), false, Some(reason));
                 debug!(
@@ -385,6 +423,86 @@ impl ReplicationLoop {
             }
         }
     }
+
+    /// Tear down the live `Ledger` and rebuild it via
+    /// `start_with_recovery_until(watermark)` (ADR-0016 §9). Invoked
+    /// from the AE-Reject path when raft asks to truncate below an
+    /// already-applied tx_id: WAL is rewound on disk, in-memory
+    /// pipeline state is rebuilt from the truncated WAL, and the new
+    /// ledger is atomically swapped into the slot.
+    ///
+    /// OLD must be fully dropped (its pipeline OS threads joined)
+    /// BEFORE NEW is started — otherwise both ledgers would write to
+    /// the same data dir and races on `wal.bin` corrupt the truncation.
+    /// We achieve that by swapping in a not-yet-started sentinel,
+    /// `Arc::try_unwrap`-ing OLD (with a bounded retry loop for any
+    /// in-flight gRPC clones), dropping it, and only then starting
+    /// NEW and replacing the sentinel.
+    fn reseed_ledger(&mut self, watermark: TxId) -> std::io::Result<()> {
+        let self_id = self.self_id;
+        info!(
+            "replication_loop/f[{}]: reseed: starting (watermark={})",
+            self_id, watermark
+        );
+
+        // 1) Replace the slot with a not-yet-started sentinel so no
+        //    new caller picks up OLD. Existing short-lived clones
+        //    (in-flight gRPC handlers) will release as they finish.
+        let sentinel = Ledger::new(self.config.ledger.clone());
+        let mut old_arc = self.ledger.replace(Arc::new(sentinel));
+
+        // 2) Spin until OLD's strong count drops to 1, then unwrap and
+        //    drop synchronously. `Ledger::Drop` joins pipeline threads
+        //    and writes `wal.stop`; we have to be sure those threads
+        //    are gone before NEW touches the data dir.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let old = loop {
+            match Arc::try_unwrap(old_arc) {
+                Ok(l) => break l,
+                Err(arc) => {
+                    old_arc = arc;
+                    if Instant::now() > deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "reseed: old Ledger had outstanding refs after 5s on node {}",
+                                self_id
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        drop(old);
+        debug!(
+            "replication_loop/f[{}]: reseed: old ledger dropped",
+            self_id
+        );
+
+        // 3) Build NEW and start it with bounded recovery — this
+        //    physically truncates WAL above `watermark`, replays the
+        //    surviving range to rebuild balances, and starts stages.
+        let mut new = Ledger::new(self.config.ledger.clone());
+        new.start_with_recovery_until(watermark)?;
+
+        // 4) Atomically install NEW. The sentinel had no started
+        //    stages so its Drop is cheap.
+        let sentinel_arc = self.ledger.replace(Arc::new(new));
+        drop(sentinel_arc);
+
+        // 5) Reset cached watermarks so the next `poll_ledger_watermark`
+        //    sees the truncated state and doesn't re-bump raft's
+        //    `local_commit_index` from a stale ledger view.
+        self.last_seen_write = watermark;
+        self.last_seen_commit = watermark;
+
+        debug!(
+            "replication_loop/f[{}]: reseed: complete (watermark={})",
+            self_id, watermark
+        );
+        Ok(())
+    }
 }
 
 struct PeerReplicator {
@@ -418,6 +536,12 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
             r.tailer.reset();
             match r.gate_rx.changed().await {
                 Ok(()) => {
+                    // Re-fetch the tailer from the slot — a divergence
+                    // reseed (ADR-0016 §9) while we were parked may
+                    // have replaced the underlying `Arc<Storage>`,
+                    // leaving the cached one pointing at a torn-down
+                    // ledger.
+                    r.tailer = r.ledger.ledger().wal_tailer();
                     debug!(
                         "replication_loop/l[{}]: peer={} gate flipped, resuming",
                         r.self_id, r.peer_id

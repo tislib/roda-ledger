@@ -3,6 +3,7 @@ import { useClusterSnapshot } from '@/hooks/useClusterSnapshot';
 import { ResultPanel } from '@/components/shared/ResultPanel';
 import { TxList } from './TxList';
 import { DepositForm, FunctionInvokeForm, TransferForm, WithdrawalForm } from './forms';
+import { BalanceLookup } from './BalanceLookup';
 
 export function LedgerModule() {
   const { data: snapshot } = useClusterSnapshot();
@@ -27,7 +28,10 @@ export function LedgerModule() {
 
       {isUnhealthy && (
         <div className="mx-6 mt-3 px-3 py-2 rounded border border-health-crashed/40 bg-health-crashed/10 text-xs text-health-crashed">
-          Cluster is unhealthy — submissions will fail until a leader is elected.
+          Cluster is unhealthy — submissions will fail
+          {snapshot?.leaderNodeId === null
+            ? ' until a leader is elected.'
+            : ' until quorum is restored.'}
         </div>
       )}
 
@@ -37,6 +41,7 @@ export function LedgerModule() {
           <WithdrawalForm onTxSubmitted={recordSubmit} />
           <TransferForm onTxSubmitted={recordSubmit} />
           <FunctionInvokeForm onTxSubmitted={recordSubmit} />
+          <BalanceLookup />
         </div>
 
         <div className="col-span-5 space-y-3">

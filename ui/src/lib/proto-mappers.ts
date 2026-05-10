@@ -7,19 +7,19 @@
  * else operates on `@/types/*`.
  */
 import type {
+  AvailableScenario as PbAvailableScenario,
   ClusterConfig as PbClusterConfig,
   ClusterMembership as PbMembership,
   ElectionEvent as PbElectionEvent,
   FaultEvent as PbFaultEvent,
   GetClusterSnapshotResponse,
-  GetTransactionStatusResponse,
   LogEntry as PbLogEntry,
   NodeStatus as PbNodeStatus,
   ScenarioRunSummary as PbRunSummary,
   GetScenarioStatusResponse as PbScenarioStatus,
   Scenario as PbScenario,
   ScenarioStep as PbScenarioStep,
-  SubmitOperationRequest,
+  WalLogRecordC as PbWalLogRecordC,
 } from '@/gen/control_pb';
 import {
   ClusterHealth as PbClusterHealth,
@@ -28,10 +28,18 @@ import {
   LogEntryKind as PbLogEntryKind,
   NodeHealth as PbNodeHealth,
   NodeRole as PbNodeRole,
+  ScenarioCategory as PbScenarioCategory,
   ScenarioState as PbScenarioState,
-  TransactionStatus as PbTxStatus,
   WorkloadKind as PbWorkloadKind,
 } from '@/gen/control_pb';
+// Ledger data-plane operations are served via the Ledger gRPC proxy on
+// the same control-plane port — request/response shapes come from
+// `ledger_pb`, not `control_pb`.
+import type {
+  GetStatusResponse as PbStatusResponse,
+  SubmitOperationRequest,
+} from '@/gen/ledger_pb';
+import { TransactionStatus as PbTxStatus } from '@/gen/ledger_pb';
 
 import type {
   ClusterHealth,
@@ -44,10 +52,12 @@ import type {
   NodeStatus,
   Role,
 } from '@/types/cluster';
-import type { LogEntry, LogEntryKind } from '@/types/log';
+import type { LogEntry, LogEntryKind, WalLogRecord } from '@/types/log';
 import type { Operation, TransactionStatus } from '@/types/transaction';
 import type {
+  AvailableScenario,
   Scenario,
+  ScenarioCategory,
   ScenarioRunStatus,
   ScenarioRunSummary,
   ScenarioState,
@@ -127,6 +137,21 @@ const LOG_KIND_FROM: Record<PbLogEntryKind, LogEntryKind> = {
   [PbLogEntryKind.FUNCTION_UNREGISTERED]: 'FunctionUnregistered',
 };
 
+const SCENARIO_CATEGORY_FROM: Record<PbScenarioCategory, ScenarioCategory> = {
+  [PbScenarioCategory.UNSPECIFIED]: 'Unspecified',
+  [PbScenarioCategory.E2E]: 'E2E',
+  [PbScenarioCategory.LOAD]: 'Load',
+};
+
+export function availableScenarioFromPb(pb: PbAvailableScenario): AvailableScenario {
+  return {
+    name: pb.name,
+    description: pb.description,
+    category: SCENARIO_CATEGORY_FROM[pb.category] ?? 'Unspecified',
+    stepCount: pb.stepCount,
+  };
+}
+
 const SCENARIO_STATE_FROM: Record<PbScenarioState, ScenarioState> = {
   [PbScenarioState.UNSPECIFIED]: 'Failed',
   [PbScenarioState.QUEUED]: 'Queued',
@@ -186,6 +211,10 @@ export function electionFromPb(pb: PbElectionEvent): ElectionEvent {
     term: u64ToString(pb.term),
     winnerNodeId: pb.winnerNodeId === 0n ? null : u64ToString(pb.winnerNodeId),
     reason: ELECTION_REASON_FROM[pb.reason] ?? 'timeout',
+    votedFor: pb.votedFor === 0n ? null : u64ToString(pb.votedFor),
+    startTxId: pb.startTxId === 0n ? null : u64ToString(pb.startTxId),
+    hasTermRecord: pb.hasTermRecord,
+    hasVoteRecord: pb.hasVoteRecord,
   };
 }
 
@@ -212,6 +241,66 @@ export function logEntryFromPb(pb: PbLogEntry): LogEntry {
     kind: LOG_KIND_FROM[pb.kind] ?? 'TxEntry',
     summary: pb.summary,
   };
+}
+
+export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
+  const e = pb.entry;
+  if (!e) return null;
+  switch (e.case) {
+    case 'metadata':
+      return {
+        kind: 'metadata',
+        txId: u64ToString(e.value.txId),
+        failReason: e.value.failReason,
+        subItemCount: e.value.subItemCount,
+        crc32c: e.value.crc32c,
+        timestamp: u64ToString(e.value.timestamp),
+        userRef: u64ToString(e.value.userRef),
+        tag: e.value.tag,
+      };
+    case 'txEntry':
+      return {
+        kind: 'tx_entry',
+        txId: u64ToString(e.value.txId),
+        accountId: u64ToString(e.value.accountId),
+        amount: u64ToString(e.value.amount),
+        entryKind: e.value.kind === 1 ? 'DEBIT' : 'CREDIT',
+        computedBalance: e.value.computedBalance.toString(),
+      };
+    case 'link':
+      return {
+        kind: 'link',
+        txId: u64ToString(e.value.txId),
+        toTxId: u64ToString(e.value.toTxId),
+        linkKind: e.value.kind === 1 ? 'REVERSAL' : 'DUPLICATE',
+      };
+    case 'term':
+      return {
+        kind: 'term',
+        term: u64ToString(e.value.term),
+        nodeId: u64ToString(e.value.nodeId),
+        nodeCount: e.value.nodeCount,
+        nodeVoted: e.value.nodeVoted,
+      };
+    case 'functionRegistered':
+      return {
+        kind: 'function_registered',
+        name: e.value.name,
+        version: e.value.version,
+        crc32c: e.value.crc32c,
+      };
+    case 'segmentHeader':
+      return { kind: 'segment_header', segmentId: e.value.segmentId };
+    case 'segmentSealed':
+      return {
+        kind: 'segment_sealed',
+        segmentId: e.value.segmentId,
+        lastTxId: u64ToString(e.value.lastTxId),
+        recordCount: u64ToString(e.value.recordCount),
+      };
+    default:
+      return null;
+  }
 }
 
 // ---- Cluster config / membership ----
@@ -257,10 +346,10 @@ const TX_STATE_FROM: Record<PbTxStatus, TransactionStatus['state']> = {
   [PbTxStatus.COMMITTED]: 'Committed',
   [PbTxStatus.ON_SNAPSHOT]: 'OnSnapshot',
   [PbTxStatus.ERROR]: 'Error',
-  [PbTxStatus.NOT_FOUND]: 'NotFound',
+  [PbTxStatus.TX_NOT_FOUND]: 'NotFound',
 };
 
-export function txStatusFromPb(pb: GetTransactionStatusResponse): TransactionStatus {
+export function txStatusFromPb(pb: PbStatusResponse): TransactionStatus {
   const state = TX_STATE_FROM[pb.status];
   // The control-plane API no longer surfaces per-stage timestamps; the UI
   // just records the moment the response was observed and uses 0 for stages
@@ -304,11 +393,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
   switch (op.kind) {
     case 'Deposit':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'deposit',
           value: {
-            $typeName: 'roda.control.v1.Deposit',
+            $typeName: 'roda.ledger.v1.Deposit',
             account: stringToU64(op.account),
             amount: stringToU64(op.amount),
             userRef: stringToU64(op.userRef),
@@ -317,11 +406,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
       };
     case 'Withdrawal':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'withdrawal',
           value: {
-            $typeName: 'roda.control.v1.Withdrawal',
+            $typeName: 'roda.ledger.v1.Withdrawal',
             account: stringToU64(op.account),
             amount: stringToU64(op.amount),
             userRef: stringToU64(op.userRef),
@@ -330,11 +419,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
       };
     case 'Transfer':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'transfer',
           value: {
-            $typeName: 'roda.control.v1.Transfer',
+            $typeName: 'roda.ledger.v1.Transfer',
             from: stringToU64(op.from),
             to: stringToU64(op.to),
             amount: stringToU64(op.amount),
@@ -344,11 +433,11 @@ export function operationToPbRequest(op: Operation): SubmitOperationRequest {
       };
     case 'Function':
       return {
-        $typeName: 'roda.control.v1.SubmitOperationRequest',
+        $typeName: 'roda.ledger.v1.SubmitOperationRequest',
         operation: {
           case: 'function',
           value: {
-            $typeName: 'roda.control.v1.Function',
+            $typeName: 'roda.ledger.v1.Function',
             name: op.name,
             params: op.params.map((p) => BigInt(p)),
             userRef: stringToU64(op.userRef),

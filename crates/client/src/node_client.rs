@@ -98,6 +98,8 @@ pub struct PipelineIndex {
     /// from the leader, clamped to the follower's `last_commit_id`.
     /// `0` in single-node mode.
     pub cluster_commit: u64,
+    /// Current Raft term as observed by this node. `0` in single-node mode.
+    pub term: u64,
     /// True iff the responding node is currently the cluster leader.
     /// Cluster-aware clients use this to discover the leader without
     /// having to attempt a write.
@@ -153,6 +155,22 @@ pub struct FunctionInfo {
     pub crc32c: u32,
 }
 
+/// One page of raw WAL records returned by [`NodeClient::get_log`].
+#[derive(Debug, Clone)]
+pub struct LogPage {
+    pub records: Vec<proto::WalLogRecord>,
+    pub next_tx_id: u64,
+    pub last_commit_tx_id: u64,
+}
+
+/// One page of term/vote records returned by [`NodeClient::get_terms`].
+#[derive(Debug, Clone)]
+pub struct TermsPage {
+    pub terms: Vec<proto::TermInfo>,
+    pub current_term: u64,
+    pub next_term: u64,
+}
+
 // ---------------------------------------------------------------------------
 // LedgerClient
 // ---------------------------------------------------------------------------
@@ -192,6 +210,36 @@ impl NodeClient {
             retry: RetryConfig::default(),
             url: url.to_string(),
         })
+    }
+
+    /// Build a `NodeClient` whose underlying tonic channel connects
+    /// **lazily** on the first RPC. Useful when bringing up a process
+    /// that points at peers which may not yet be reachable — RPCs
+    /// fail until the peer is up rather than blocking construction.
+    pub fn connect_lazy(url: &str) -> std::result::Result<Self, tonic::transport::Error> {
+        use tonic::transport::Endpoint;
+        let endpoint: Endpoint = url.parse()?;
+        let channel = endpoint.connect_lazy();
+        Ok(Self {
+            inner: TonicLedgerClient::new(channel),
+            retry: RetryConfig::default(),
+            url: url.to_string(),
+        })
+    }
+
+    /// URL the client was built with (e.g. `http://127.0.0.1:50051`).
+    /// Useful when comparing nodes for membership-diff logic.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Borrow a clone of the underlying tonic-generated `LedgerClient`.
+    /// Use this when a caller needs to issue raw RPCs (e.g. forwarding
+    /// arbitrary request metadata) that the `NodeClient` facade
+    /// doesn't expose. Cheap — `tonic::transport::Channel` clones
+    /// share the underlying connection pool.
+    pub fn ledger_client(&self) -> TonicLedgerClient<Channel> {
+        self.inner.clone()
     }
 
     /// Build a client wrapping `inner` with a custom retry policy.
@@ -678,6 +726,7 @@ impl NodeClient {
                 commit: resp.commit_index,
                 snapshot: resp.snapshot_index,
                 cluster_commit: resp.cluster_commit_index,
+                term: resp.term,
                 is_leader: resp.is_leader,
             })
         })
@@ -753,6 +802,55 @@ impl NodeClient {
                     })
                     .collect(),
                 next_tx_id: resp.next_tx_id,
+            })
+        })
+        .await
+    }
+
+    /// Read raw WAL records over [from_tx_id, to_tx_id] from this node's
+    /// local committed WAL. Server hard-cap is 10,000; paginate via next_tx_id.
+    pub async fn get_log(&self, from_tx_id: u64, to_tx_id: u64, limit: u32) -> Result<LogPage> {
+        self.with_retry("get_log", || async {
+            let mut client = self.inner.clone();
+            trace!(
+                "get_log: from_tx_id={} to_tx_id={} limit={} at node_url: {:?}",
+                from_tx_id, to_tx_id, limit, self.url
+            );
+            let resp = client
+                .get_log(proto::GetLogRequest {
+                    from_tx_id,
+                    to_tx_id,
+                    limit,
+                })
+                .await?
+                .into_inner();
+            Ok(LogPage {
+                records: resp.records,
+                next_tx_id: resp.next_tx_id,
+                last_commit_tx_id: resp.last_commit_tx_id,
+            })
+        })
+        .await
+    }
+
+    /// Fetch term boundaries and per-term vote decisions from this
+    /// node's `term.log` and `vote.log`. `from_term = 0` starts at the
+    /// earliest term; `limit = 0` lets the server pick a default.
+    pub async fn get_terms(&self, from_term: u64, limit: u32) -> Result<TermsPage> {
+        self.with_retry("get_terms", || async {
+            let mut client = self.inner.clone();
+            trace!(
+                "get_terms: from_term={} limit={} at node_url: {:?}",
+                from_term, limit, self.url
+            );
+            let resp = client
+                .get_terms(proto::GetTermsRequest { from_term, limit })
+                .await?
+                .into_inner();
+            Ok(TermsPage {
+                terms: resp.terms,
+                current_term: resp.current_term,
+                next_term: resp.next_term,
             })
         })
         .await

@@ -1,0 +1,33 @@
+# Bring up the demo control plane: control (gRPC) + ui (nginx).
+#
+#   docker compose -f docker-compose.control.yml up --build
+#
+# Then open http://localhost:8080 in the browser.
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: control.Dockerfile
+    image: roda-control:latest
+    ports:
+      - "50051:50051"
+    environment:
+      RODA_CONTROL_ADDR: "0.0.0.0:50051"
+      INITIAL_NODE_COUNT: "3"
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    image: roda-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      # Browser-reachable URL for control's gRPC. The browser runs on
+      # the host, so it talks to control via the published port — not
+      # via the docker network. Override when reaching the demo over a
+      # network (e.g. CONTROL_PLANE_URL=http://demo.example.com:50051).
+      CONTROL_PLANE_URL: "http://localhost:50051"
+    depends_on:
+      - control

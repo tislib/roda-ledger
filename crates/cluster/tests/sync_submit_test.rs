@@ -3,7 +3,7 @@ mod tests {
     use ::proto::ledger::{
         Deposit, SubmitAndWaitRequest, SubmitBatchAndWaitRequest, Transfer, WaitLevel, Withdrawal,
     };
-    use cluster::{ClusterMirror, Role, Server, Term};
+    use cluster::{ClusterMirror, Role, Server, Term, Vote};
     use ledger::ledger::{Ledger, LedgerConfig};
     use ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
     use std::net::SocketAddr;
@@ -225,6 +225,7 @@ mod tests {
 
         let server_ledger = ledger.clone();
         let term = Arc::new(Term::open_in_dir(&data_dir).unwrap());
+        let vote = Arc::new(Vote::open_in_dir(&data_dir).unwrap());
         let mirror = ClusterMirror::new();
         mirror.set_role_for_standalone(Role::Leader);
         // Bare server has no cluster_commit_index advancement; tests using
@@ -235,6 +236,7 @@ mod tests {
                 addr,
                 mirror,
                 term,
+                vote,
                 std::sync::Arc::new(tokio::sync::Notify::new()),
             );
             server.run().await.unwrap();
