@@ -28,7 +28,10 @@ pub async fn serve(
     proxy: Option<LedgerProxy>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let service = ControlService::new(state.clone());
+    let service = match proxy.as_ref() {
+        Some(p) => ControlService::new(state.clone()).with_proxy(p.clone()),
+        None => ControlService::new(state.clone()),
+    };
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::control::FILE_DESCRIPTOR_SET)

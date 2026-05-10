@@ -20,16 +20,61 @@ use proto::control::{
 };
 use tonic::{Request, Response, Status};
 
+use crate::ledger_proxy::LedgerProxy;
 use crate::state::{InMemoryState, NodeRecord, ProcessHealth, canonical_pair, epoch_ms_now};
 
 #[derive(Clone)]
 pub struct ControlService {
     state: Arc<RwLock<InMemoryState>>,
+    /// Optional Ledger proxy. When present, membership-mutating RPCs
+    /// (currently only [`Self::set_node_count`]) push the updated peer
+    /// list into the proxy so newly-added nodes start receiving traffic
+    /// and removed nodes have their tonic channels dropped.
+    proxy: Option<LedgerProxy>,
 }
 
 impl ControlService {
     pub fn new(state: Arc<RwLock<InMemoryState>>) -> Self {
-        Self { state }
+        Self { state, proxy: None }
+    }
+
+    /// Attach a [`LedgerProxy`] so membership changes flow through to
+    /// it. Without this the proxy keeps the peer list it was built with.
+    pub fn with_proxy(mut self, proxy: LedgerProxy) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// Recompute the proxy peer list from the current `InMemoryState`
+    /// node membership and push it to the proxy. No-op when no proxy
+    /// is attached. Existing peer entries with the same `(node_id, url)`
+    /// keep their long-lived tonic channels via [`LedgerProxy::sync_peers`].
+    fn sync_proxy_peers(&self, state: &InMemoryState) {
+        let Some(proxy) = self.proxy.as_ref() else {
+            return;
+        };
+        let desired: Vec<(u64, String)> = state
+            .nodes
+            .values()
+            .map(|n| (n.node_id, peer_url_from_address(&n.address)))
+            .collect();
+        if let Err(e) = proxy.sync_peers(&desired) {
+            tracing::warn!(
+                "ledger-proxy: failed to sync peers after membership change: {e}"
+            );
+        }
+    }
+}
+
+/// Build a tonic-compatible URL from the node's recorded `address`.
+/// Records produced by `--peer node_id=URL` already carry a scheme;
+/// synthesized records (e.g. from `SetNodeCount`) just hold a
+/// `host:port`, so prepend `http://` for those.
+fn peer_url_from_address(address: &str) -> String {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        address.to_string()
+    } else {
+        format!("http://{address}")
     }
 }
 
@@ -283,6 +328,12 @@ impl Control for ControlService {
             );
         }
         let current = state.nodes.len() as u32;
+        // Push the new membership through to the Ledger proxy so newly
+        // added peers start receiving traffic and removed peers have
+        // their tonic channels dropped. Done while we still hold the
+        // write lock so a concurrent RPC can't observe the in-memory
+        // state and the proxy out of step.
+        self.sync_proxy_peers(&state);
         Ok(Response::new(SetNodeCountResponse {
             accepted: true,
             error: String::new(),
