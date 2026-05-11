@@ -10,8 +10,21 @@ env:
 
 jobs:
   docker:
-    name: Build & Push
+    name: Build & Push (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cluster
+            dockerfile: Dockerfile
+            tag_prefix: ""
+          - variant: ui
+            dockerfile: ui/Dockerfile
+            tag_prefix: "ui-"
+          - variant: control
+            dockerfile: control.Dockerfile
+            tag_prefix: "control-"
     steps:
       - uses: actions/checkout@v4
 
@@ -30,17 +43,18 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ matrix.tag_prefix }}latest,enable={{is_default_branch}}
+            type=sha,prefix=${{ matrix.tag_prefix }}sha-,format=short
+            type=semver,pattern=${{ matrix.tag_prefix }}{{version}}
+            type=semver,pattern=${{ matrix.tag_prefix }}{{major}}.{{minor}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
