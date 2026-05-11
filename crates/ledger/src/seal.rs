@@ -1,6 +1,7 @@
 use crate::config::LedgerConfig;
 use crate::pipeline::SealContext;
 use spdlog::{debug, error, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
@@ -15,6 +16,11 @@ pub struct Seal {
 struct SealRunner {
     storage: Arc<Storage>,
     balances: Vec<i64>,
+    /// Latest `(version, crc32c)` per function name. `crc32c == 0` means
+    /// the name's most recent record is an unregister; the entry stays in
+    /// the map so the function snapshot preserves the audit trail
+    /// (internal.md §11.4).
+    function_map: HashMap<String, (u16, u32)>,
     seal_check_internal: Duration,
 }
 
@@ -24,6 +30,7 @@ impl Seal {
             runner: Some(SealRunner {
                 storage,
                 balances: vec![0; config.max_accounts],
+                function_map: HashMap::new(),
                 seal_check_internal: config.seal_check_internal,
             }),
         }
@@ -88,6 +95,26 @@ impl Seal {
     ) -> std::io::Result<()> {
         if let Some(mut runner) = self.runner.take() {
             runner.balances[account_id] = computed_balance;
+            self.runner = Some(runner);
+            Ok(())
+        } else {
+            Err(std::io::Error::other("Seal already started"))
+        }
+    }
+
+    /// Seed (or update) Seal's in-memory function map during recovery —
+    /// from a function snapshot triple or a forward-replayed
+    /// `FunctionRegistered` record. `crc32c == 0` means the name is in
+    /// an unregistered state; the entry is still recorded so the next
+    /// snapshot reflects the audit trail (internal.md §11.4).
+    pub(crate) fn recover_function_record(
+        &mut self,
+        name: &str,
+        version: u16,
+        crc32c: u32,
+    ) -> std::io::Result<()> {
+        if let Some(mut runner) = self.runner.take() {
+            runner.function_map.insert(name.to_string(), (version, crc32c));
             self.runner = Some(runner);
             Ok(())
         } else {
@@ -185,9 +212,12 @@ impl SealRunner {
             );
         }
 
-        // Load WAL records and update balances from this segment's WAL.
-        segment.visit_wal_records(|entry| {
-            if let WalEntry::Entry(e) = entry {
+        // Load WAL records and update balances + function map from this
+        // segment's WAL. Function registrations are kept in the map even
+        // when unregistered (crc32c == 0) so the next snapshot preserves
+        // the audit trail (internal.md §11.4).
+        segment.visit_wal_records(|entry| match entry {
+            WalEntry::Entry(e) => {
                 let id = e.account_id as usize;
                 if id < self.balances.len() {
                     self.balances[id] = e.computed_balance;
@@ -195,9 +225,14 @@ impl SealRunner {
                     warn!("Seal: account ID {} exceeds balance vector length", id);
                 }
             }
+            WalEntry::FunctionRegistered(f) => {
+                self.function_map
+                    .insert(f.name_str().to_string(), (f.version, f.crc32c));
+            }
+            _ => {}
         })?;
 
-        // Write the balance snapshot at the configured cadence.
+        // Write the balance + function snapshots at the configured cadence.
         let snapshot_frequency = self.storage.config().snapshot_frequency;
         if snapshot_frequency > 0 && segment.id().is_multiple_of(snapshot_frequency) {
             let mut snapshot_records: Vec<(u64, i64)> = self
@@ -218,6 +253,27 @@ impl SealRunner {
             if let Err(e) = segment.save_snapshot(&snapshot_records[..]) {
                 error!(
                     "Seal: failed to save snapshot for segment {}: {}",
+                    segment.id(),
+                    e
+                );
+            }
+
+            // Function snapshot — emitted even when empty (internal.md §20.7).
+            let mut function_records: Vec<(String, u16, u32)> = self
+                .function_map
+                .iter()
+                .map(|(name, (version, crc))| (name.clone(), *version, *crc))
+                .collect();
+            function_records.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+            debug!(
+                "Seal: saving function snapshot for WAL segment {} ({} entries)",
+                segment.id(),
+                function_records.len()
+            );
+            if let Err(e) = segment.save_function_snapshot(&function_records[..]) {
+                error!(
+                    "Seal: failed to save function snapshot for segment {}: {}",
                     segment.id(),
                     e
                 );

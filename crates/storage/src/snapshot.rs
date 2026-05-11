@@ -1,5 +1,7 @@
 use crate::layout::{
-    snapshot_bin_path, snapshot_bin_tmp_path, snapshot_crc_path, snapshot_crc_tmp_path,
+    function_snapshot_bin_path, function_snapshot_bin_tmp_path, function_snapshot_crc_path,
+    function_snapshot_crc_tmp_path, snapshot_bin_path, snapshot_bin_tmp_path, snapshot_crc_path,
+    snapshot_crc_tmp_path,
 };
 use crate::segment::Segment;
 use spdlog::warn;
@@ -12,9 +14,24 @@ pub struct SnapshotData {
     pub balances: Vec<(u64, i64)>,
 }
 
+/// In-memory representation of a function snapshot (internal.md §20.6).
+/// Each entry is `(name, version, crc32c)` — `crc32c == 0` means the name
+/// was unregistered at the snapshot boundary. Entries are sorted by name
+/// for deterministic on-disk layout.
+pub struct FunctionSnapshotData {
+    pub segment_id: u32,
+    pub entries: Vec<(String, u16, u32)>,
+}
+
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_HEADER_SIZE: usize = 36;
+
+const FUNCTION_SNAPSHOT_MAGIC: u32 = 0x46554E43; // "FUNC"
+const FUNCTION_SNAPSHOT_VERSION: u8 = 1;
+const FUNCTION_SNAPSHOT_HEADER_SIZE: usize = 28;
+const FUNCTION_RECORD_NAME_LEN: usize = 32;
+const FUNCTION_RECORD_SIZE: usize = FUNCTION_RECORD_NAME_LEN + 2 + 4; // 38 bytes
 
 impl Segment {
     /// Writes a compressed snapshot for this segment to disk.
@@ -98,6 +115,90 @@ impl Segment {
         let data_dir = Path::new(self.data_dir());
         let bin_path = snapshot_bin_path(data_dir, self.id());
         bin_path.exists()
+    }
+
+    /// Write the function-registry snapshot for this segment (internal.md §20.6).
+    /// Mirrors `save_snapshot`: 28-byte header (magic + version + segment_id +
+    /// entry_count + data_crc32c) + LZ4-compressed body of 38-byte
+    /// `(name[32], version, crc32c)` records, written via temp files +
+    /// atomic rename. Empty entry lists are still emitted (internal.md §20.7).
+    pub fn save_function_snapshot(&self, records: &[(String, u16, u32)]) -> std::io::Result<()> {
+        let segment_id = self.id();
+        let data_dir = Path::new(self.data_dir());
+        let bin_tmp = function_snapshot_bin_tmp_path(data_dir, segment_id);
+        let crc_tmp = function_snapshot_crc_tmp_path(data_dir, segment_id);
+        let bin_final = function_snapshot_bin_path(data_dir, segment_id);
+        let crc_final = function_snapshot_crc_path(data_dir, segment_id);
+
+        let entry_count = records.len() as u32;
+
+        let mut raw_data: Vec<u8> = Vec::with_capacity(records.len() * FUNCTION_RECORD_SIZE);
+        for (name, version, crc) in records {
+            let bytes = name.as_bytes();
+            if bytes.len() > FUNCTION_RECORD_NAME_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "function name `{}` exceeds {} bytes",
+                        name, FUNCTION_RECORD_NAME_LEN
+                    ),
+                ));
+            }
+            let mut name_buf = [0u8; FUNCTION_RECORD_NAME_LEN];
+            name_buf[..bytes.len()].copy_from_slice(bytes);
+            raw_data.extend_from_slice(&name_buf);
+            raw_data.extend_from_slice(&version.to_le_bytes());
+            raw_data.extend_from_slice(&crc.to_le_bytes());
+        }
+
+        let data_crc32c = crc32c::crc32c(&raw_data);
+        let body_data = lz4_flex::compress_prepend_size(&raw_data);
+
+        let mut header = Vec::with_capacity(FUNCTION_SNAPSHOT_HEADER_SIZE);
+        header.extend_from_slice(&FUNCTION_SNAPSHOT_MAGIC.to_le_bytes()); // 4
+        header.push(FUNCTION_SNAPSHOT_VERSION); // 1
+        header.extend_from_slice(&[0u8; 3]); // 3 pad
+        header.extend_from_slice(&segment_id.to_le_bytes()); // 4
+        header.extend_from_slice(&entry_count.to_le_bytes()); // 4
+        header.push(1u8); // 1 compressed=true
+        header.extend_from_slice(&[0u8; 7]); // 7 pad
+        header.extend_from_slice(&data_crc32c.to_le_bytes()); // 4
+        debug_assert_eq!(header.len(), FUNCTION_SNAPSHOT_HEADER_SIZE);
+
+        {
+            let mut file = std::fs::File::create(&bin_tmp)?;
+            file.write_all(&header)?;
+            file.write_all(&body_data)?;
+            file.sync_all()?;
+        }
+
+        let file_data = std::fs::read(&bin_tmp)?;
+        let file_crc = crc32c::crc32c(&file_data);
+        let file_size = file_data.len() as u64;
+
+        {
+            let mut sidecar = Vec::with_capacity(16);
+            sidecar.extend_from_slice(&file_crc.to_le_bytes());
+            sidecar.extend_from_slice(&file_size.to_le_bytes());
+            sidecar.extend_from_slice(&FUNCTION_SNAPSHOT_MAGIC.to_le_bytes());
+            let mut crc_file = std::fs::File::create(&crc_tmp)?;
+            crc_file.write_all(&sidecar)?;
+            crc_file.sync_all()?;
+        }
+
+        std::fs::rename(&bin_tmp, &bin_final)?;
+        std::fs::rename(&crc_tmp, &crc_final)?;
+        Ok(())
+    }
+
+    pub fn load_function_snapshot(&self) -> std::io::Result<Option<FunctionSnapshotData>> {
+        let data_dir = Path::new(self.data_dir());
+        load_function_snapshot_for_segment(data_dir, self.id())
+    }
+
+    pub fn has_function_snapshot(&self) -> bool {
+        let data_dir = Path::new(self.data_dir());
+        function_snapshot_bin_path(data_dir, self.id()).exists()
     }
 }
 
@@ -253,4 +354,215 @@ fn load_snapshot_for_segment(
         last_tx_id,
         balances,
     }))
+}
+
+fn load_function_snapshot_for_segment(
+    data_dir: &Path,
+    segment_id: u32,
+) -> std::io::Result<Option<FunctionSnapshotData>> {
+    let bin_path = function_snapshot_bin_path(data_dir, segment_id);
+    let crc_path = function_snapshot_crc_path(data_dir, segment_id);
+    let bin_name = format!("function_snapshot_{:06}.bin", segment_id);
+    let crc_name = format!("function_snapshot_{:06}.crc", segment_id);
+
+    let bin_data = std::fs::read(&bin_path)?;
+
+    if !crc_path.exists() {
+        warn!(
+            "{}: no .crc sidecar found, skipping file-level verification",
+            bin_name
+        );
+        return Ok(None);
+    }
+    let crc_data = std::fs::read(&crc_path)?;
+    if crc_data.len() != 16 {
+        let msg = format!(
+            "{}: .crc sidecar has wrong size ({})",
+            crc_name,
+            crc_data.len()
+        );
+        warn!("{}", msg);
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    let stored_crc = u32::from_le_bytes(crc_data[0..4].try_into().unwrap());
+    let stored_size = u64::from_le_bytes(crc_data[4..12].try_into().unwrap());
+    let sidecar_magic = u32::from_le_bytes(crc_data[12..16].try_into().unwrap());
+    if sidecar_magic != FUNCTION_SNAPSHOT_MAGIC {
+        let msg = format!("{}: .crc sidecar has wrong magic", crc_name);
+        warn!("{}", msg);
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    if stored_size != bin_data.len() as u64 {
+        let msg = format!(
+            "{}: size mismatch (stored={}, actual={})",
+            crc_name,
+            stored_size,
+            bin_data.len()
+        );
+        warn!("{}", msg);
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    let actual_crc = crc32c::crc32c(&bin_data);
+    if actual_crc != stored_crc {
+        let msg = format!("{}: file CRC mismatch", bin_name);
+        warn!("{}", msg);
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+
+    if bin_data.len() < FUNCTION_SNAPSHOT_HEADER_SIZE {
+        warn!("{}: file too small for header", bin_name);
+        return Ok(None);
+    }
+
+    let mut offset = 0usize;
+    let magic = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    if magic != FUNCTION_SNAPSHOT_MAGIC {
+        warn!("{}: wrong magic {:#010x}", bin_name, magic);
+        return Ok(None);
+    }
+    let version = bin_data[offset];
+    offset += 1;
+    if version != FUNCTION_SNAPSHOT_VERSION {
+        warn!("{}: unknown version {}", bin_name, version);
+        return Ok(None);
+    }
+    offset += 3; // pad
+
+    let file_segment_id = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    if file_segment_id != segment_id {
+        warn!(
+            "{}: segment_id mismatch (header={}, expected={})",
+            bin_name, file_segment_id, segment_id
+        );
+        return Ok(None);
+    }
+
+    let entry_count = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+
+    let compressed = bin_data[offset] != 0;
+    offset += 1;
+    offset += 7; // pad
+
+    let data_crc32c = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+
+    let compressed_data = &bin_data[offset..];
+    let record_data = if compressed {
+        match lz4_flex::decompress_size_prepended(compressed_data) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("{}: LZ4 decompression failed: {}", bin_name, e);
+                return Ok(None);
+            }
+        }
+    } else {
+        compressed_data.to_vec()
+    };
+
+    let actual_data_crc = crc32c::crc32c(&record_data);
+    if actual_data_crc != data_crc32c {
+        warn!("{}: data CRC mismatch", bin_name);
+        return Ok(None);
+    }
+
+    let expected_data_len = entry_count as usize * FUNCTION_RECORD_SIZE;
+    if record_data.len() != expected_data_len {
+        warn!(
+            "{}: data length mismatch (expected={}, got={})",
+            bin_name,
+            expected_data_len,
+            record_data.len()
+        );
+        return Ok(None);
+    }
+
+    let mut entries = Vec::with_capacity(entry_count as usize);
+    let mut rec_offset = 0;
+    for _ in 0..entry_count {
+        let name_bytes = &record_data[rec_offset..rec_offset + FUNCTION_RECORD_NAME_LEN];
+        rec_offset += FUNCTION_RECORD_NAME_LEN;
+        let end = name_bytes.iter().position(|b| *b == 0).unwrap_or(FUNCTION_RECORD_NAME_LEN);
+        let name = match std::str::from_utf8(&name_bytes[..end]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                warn!("{}: non-UTF-8 function name", bin_name);
+                return Ok(None);
+            }
+        };
+        let version =
+            u16::from_le_bytes(record_data[rec_offset..rec_offset + 2].try_into().unwrap());
+        rec_offset += 2;
+        let crc = u32::from_le_bytes(record_data[rec_offset..rec_offset + 4].try_into().unwrap());
+        rec_offset += 4;
+        entries.push((name, version, crc));
+    }
+
+    Ok(Some(FunctionSnapshotData {
+        segment_id,
+        entries,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::StorageConfig;
+    use crate::engine::Storage;
+
+    fn temp_segment() -> (Segment, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StorageConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        };
+        let storage = Storage::new(cfg).expect("storage");
+        let mut seg = storage.active_segment().expect("active segment");
+        seg.close().expect("close segment");
+        (seg, dir)
+    }
+
+    #[test]
+    fn function_snapshot_roundtrip() {
+        let (seg, _td) = temp_segment();
+        let records = vec![
+            ("alpha".to_string(), 1u16, 0xDEADBEEFu32),
+            ("beta".to_string(), 7u16, 0u32), // unregister
+            ("gamma".to_string(), 3u16, 0xCAFEBABEu32),
+        ];
+        seg.save_function_snapshot(&records).expect("save");
+        assert!(seg.has_function_snapshot());
+
+        let loaded = seg
+            .load_function_snapshot()
+            .expect("load")
+            .expect("data present");
+        assert_eq!(loaded.segment_id, seg.id());
+        assert_eq!(loaded.entries, records);
+    }
+
+    #[test]
+    fn empty_function_snapshot_roundtrip() {
+        let (seg, _td) = temp_segment();
+        seg.save_function_snapshot(&[]).expect("save empty");
+        assert!(seg.has_function_snapshot());
+        let loaded = seg
+            .load_function_snapshot()
+            .expect("load")
+            .expect("data present");
+        assert_eq!(loaded.segment_id, seg.id());
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn function_snapshot_rejects_long_name() {
+        let (seg, _td) = temp_segment();
+        let bad_name = "x".repeat(33);
+        let err = seg
+            .save_function_snapshot(&[(bad_name, 1, 1)])
+            .expect_err("should reject long name");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }
