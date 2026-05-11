@@ -50,6 +50,18 @@ Stop the container, restart it — the balance is still there. That is the durab
 
 ---
 
+## Demo
+
+Spin up the multi-node control plane with a web UI:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/tislib/roda-ledger/master/docker-compose.control.yml | docker compose -f - up
+```
+
+Then open [http://localhost:8080](http://localhost:8080) — control launches a 3-node cluster on `localhost:50051` and the UI streams pipeline indexes, balances, and operations in real time.
+
+---
+
 ## How it works
 
 roda-ledger is a four-stage pipeline. Each stage runs on its own thread, communicates through lock-free queues, and advances a monotonic index as it processes transactions:
