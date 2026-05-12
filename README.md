@@ -55,7 +55,7 @@ Stop the container, restart it — the balance is still there. That is the durab
 Spin up the multi-node control plane with a web UI:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/tislib/roda-ledger/master/docker-compose.control.yml | docker compose -f - up
+curl -sSL https://raw.githubusercontent.com/tislib/roda-ledger/master/docker-compose.control.yml | docker compose -f - up --no-build
 ```
 
 Then open [http://localhost:8080](http://localhost:8080) — control launches a 3-node cluster on `localhost:50051` and the UI streams pipeline indexes, balances, and operations in real time.
