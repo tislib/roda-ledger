@@ -11,7 +11,7 @@ on:
       server_type:
         description: "Hetzner server type (e.g. cx22, cpx31, ccx33). If the type isn't available in fsn1, the run will fail and print the list of available types."
         required: false
-        default: "CX33"
+        default: "cx33"
         type: string
 
 env:
