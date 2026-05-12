@@ -65,34 +65,28 @@ export interface SubmitResult {
   failReason: FailReasonCode;
 }
 
-export type TransactionStatus =
-  | { state: 'NotFound' }
-  | { state: 'Pending'; submittedAt: number }
-  | { state: 'Computed'; submittedAt: number; computedAt: number }
-  | {
-      state: 'Committed';
-      submittedAt: number;
-      computedAt: number;
-      committedAt: number;
-    }
-  | {
-      state: 'OnSnapshot';
-      submittedAt: number;
-      computedAt: number;
-      committedAt: number;
-      snapshotAt: number;
-    }
-  | {
-      state: 'Error';
-      submittedAt: number;
-      reason: FailReasonCode;
-      erroredAt: number;
-    };
+/**
+ * Position in the four-stage pipeline. Derived from the leader's
+ * pipeline indices (compute/commit/snapshot/cluster_commit), NOT from
+ * the per-tx GetTransactionStatus RPC. A freshly submitted tx is always
+ * at least Pending since the leader has assigned its id.
+ */
+export type PipelineStage = 'Pending' | 'Computed' | 'Committed' | 'OnSnapshot';
 
-export type TerminalState = 'OnSnapshot' | 'Error' | 'NotFound';
+/**
+ * Combined per-tx view: stage from pipeline indices, failReason from
+ * per-tx polling. Both are independent: an errored tx still advances
+ * through stages, and failReason is sticky once observed.
+ */
+export interface TransactionStatus {
+  txId: string;
+  stage: PipelineStage;
+  /** 0 = no error. Sticky: once non-zero, never cleared. */
+  failReason: FailReasonCode;
+}
 
-export function isTerminal(status: TransactionStatus): boolean {
-  return (
-    status.state === 'OnSnapshot' || status.state === 'Error' || status.state === 'NotFound'
-  );
+const STAGE_ORDER: PipelineStage[] = ['Pending', 'Computed', 'Committed', 'OnSnapshot'];
+
+export function stageReached(stage: PipelineStage, target: PipelineStage): boolean {
+  return STAGE_ORDER.indexOf(stage) >= STAGE_ORDER.indexOf(target);
 }

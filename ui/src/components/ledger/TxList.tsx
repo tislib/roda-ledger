@@ -1,5 +1,5 @@
 import { useTxStatus } from '@/hooks/useTxStatus';
-import type { TransactionStatus } from '@/types/transaction';
+import type { PipelineStage } from '@/types/transaction';
 import { FAIL_REASON_LABEL } from '@/types/transaction';
 import { cn } from '@/lib/cn';
 
@@ -9,13 +9,11 @@ interface Props {
   onSelect: (txId: string) => void;
 }
 
-const STATE_STYLES: Record<TransactionStatus['state'], string> = {
-  NotFound: 'text-text-muted',
+const STAGE_STYLES: Record<PipelineStage, string> = {
   Pending: 'text-accent',
   Computed: 'text-role-follower',
   Committed: 'text-role-leader',
   OnSnapshot: 'text-health-up',
-  Error: 'text-health-crashed',
 };
 
 export function TxList({ txIds, activeTxId, onSelect }: Props) {
@@ -46,12 +44,12 @@ function TxRow({
   active: boolean;
   onSelect: (id: string) => void;
 }) {
-  const { data } = useTxStatus(txId);
-  const status = data ?? { state: 'NotFound' as const };
-  const stateLabel =
-    status.state === 'Error'
-      ? `Error · ${FAIL_REASON_LABEL[status.reason] ?? status.reason}`
-      : status.state;
+  const { data: status } = useTxStatus(txId);
+  const stage: PipelineStage = status?.stage ?? 'Pending';
+  const failReason = status?.failReason ?? 0;
+  const errSuffix =
+    failReason !== 0 ? ` · ${FAIL_REASON_LABEL[failReason] ?? `code ${failReason}`}` : '';
+  const cls = failReason !== 0 ? 'text-health-crashed' : STAGE_STYLES[stage];
   return (
     <li
       onClick={() => onSelect(txId)}
@@ -61,7 +59,10 @@ function TxRow({
       )}
     >
       <span className="font-mono text-text-secondary">tx&nbsp;{txId}</span>
-      <span className={cn('font-mono', STATE_STYLES[status.state])}>{stateLabel}</span>
+      <span className={cn('font-mono', cls)}>
+        {stage}
+        {errSuffix}
+      </span>
     </li>
   );
 }

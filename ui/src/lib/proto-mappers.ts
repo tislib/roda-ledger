@@ -19,7 +19,6 @@ import type {
   GetScenarioStatusResponse as PbScenarioStatus,
   Scenario as PbScenario,
   ScenarioStep as PbScenarioStep,
-  WalLogRecordC as PbWalLogRecordC,
 } from '@/gen/control_pb';
 import {
   ClusterHealth as PbClusterHealth,
@@ -38,8 +37,13 @@ import {
 import type {
   GetStatusResponse as PbStatusResponse,
   SubmitOperationRequest,
+  WalLogRecord as PbWalLogRecord,
 } from '@/gen/ledger_pb';
-import { TransactionStatus as PbTxStatus } from '@/gen/ledger_pb';
+import {
+  EntryKind as PbEntryKind,
+  LinkKind as PbLinkKind,
+  TransactionStatus as PbTxStatus,
+} from '@/gen/ledger_pb';
 
 import type {
   ClusterHealth,
@@ -53,7 +57,8 @@ import type {
   Role,
 } from '@/types/cluster';
 import type { LogEntry, LogEntryKind, WalLogRecord } from '@/types/log';
-import type { Operation, TransactionStatus } from '@/types/transaction';
+import type { FailReasonCode, Operation } from '@/types/transaction';
+import type { WaitStatus, WaitStatusState } from '@/types/wait';
 import type {
   AvailableScenario,
   Scenario,
@@ -130,8 +135,6 @@ const LOG_KIND_FROM: Record<PbLogEntryKind, LogEntryKind> = {
   [PbLogEntryKind.TX_METADATA]: 'TxMetadata',
   [PbLogEntryKind.TX_ENTRY]: 'TxEntry',
   [PbLogEntryKind.TX_TERM]: 'TxTerm',
-  [PbLogEntryKind.SEGMENT_HEADER]: 'SegmentHeader',
-  [PbLogEntryKind.SEGMENT_SEALED]: 'SegmentSealed',
   [PbLogEntryKind.LINK]: 'Link',
   [PbLogEntryKind.FUNCTION_REGISTERED]: 'FunctionRegistered',
   [PbLogEntryKind.FUNCTION_UNREGISTERED]: 'FunctionUnregistered',
@@ -243,7 +246,7 @@ export function logEntryFromPb(pb: PbLogEntry): LogEntry {
   };
 }
 
-export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
+export function walRecordFromPb(pb: PbWalLogRecord): WalLogRecord | null {
   const e = pb.entry;
   if (!e) return null;
   switch (e.case) {
@@ -264,7 +267,7 @@ export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
         txId: u64ToString(e.value.txId),
         accountId: u64ToString(e.value.accountId),
         amount: u64ToString(e.value.amount),
-        entryKind: e.value.kind === 1 ? 'DEBIT' : 'CREDIT',
+        entryKind: e.value.kind === PbEntryKind.DEBIT ? 'DEBIT' : 'CREDIT',
         computedBalance: e.value.computedBalance.toString(),
       };
     case 'link':
@@ -272,7 +275,7 @@ export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
         kind: 'link',
         txId: u64ToString(e.value.txId),
         toTxId: u64ToString(e.value.toTxId),
-        linkKind: e.value.kind === 1 ? 'REVERSAL' : 'DUPLICATE',
+        linkKind: e.value.kind === PbLinkKind.REVERSAL ? 'REVERSAL' : 'DUPLICATE',
       };
     case 'term':
       return {
@@ -288,15 +291,6 @@ export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
         name: e.value.name,
         version: e.value.version,
         crc32c: e.value.crc32c,
-      };
-    case 'segmentHeader':
-      return { kind: 'segment_header', segmentId: e.value.segmentId };
-    case 'segmentSealed':
-      return {
-        kind: 'segment_sealed',
-        segmentId: e.value.segmentId,
-        lastTxId: u64ToString(e.value.lastTxId),
-        recordCount: u64ToString(e.value.recordCount),
       };
     default:
       return null;
@@ -340,7 +334,7 @@ export function membershipFromPb(pb: PbMembership) {
 
 // ---- Tx status ----
 
-const TX_STATE_FROM: Record<PbTxStatus, TransactionStatus['state']> = {
+const WAIT_STATE_FROM: Record<PbTxStatus, WaitStatusState> = {
   [PbTxStatus.PENDING]: 'Pending',
   [PbTxStatus.COMPUTED]: 'Computed',
   [PbTxStatus.COMMITTED]: 'Committed',
@@ -349,42 +343,24 @@ const TX_STATE_FROM: Record<PbTxStatus, TransactionStatus['state']> = {
   [PbTxStatus.TX_NOT_FOUND]: 'NotFound',
 };
 
-export function txStatusFromPb(pb: PbStatusResponse): TransactionStatus {
-  const state = TX_STATE_FROM[pb.status];
-  // The control-plane API no longer surfaces per-stage timestamps; the UI
-  // just records the moment the response was observed and uses 0 for stages
-  // that haven't happened yet (the StagedPipeline shows "—" then).
-  const now = Date.now();
-  switch (state) {
-    case 'NotFound':
-      return { state: 'NotFound' };
-    case 'Pending':
-      return { state: 'Pending', submittedAt: now };
-    case 'Computed':
-      return { state: 'Computed', submittedAt: now, computedAt: now };
-    case 'Committed':
-      return {
-        state: 'Committed',
-        submittedAt: now,
-        computedAt: now,
-        committedAt: now,
-      };
-    case 'OnSnapshot':
-      return {
-        state: 'OnSnapshot',
-        submittedAt: now,
-        computedAt: now,
-        committedAt: now,
-        snapshotAt: now,
-      };
-    case 'Error':
-      return {
-        state: 'Error',
-        submittedAt: now,
-        reason: pb.failReason,
-        erroredAt: now,
-      };
-  }
+export interface PerTxStatus {
+  failReason: FailReasonCode;
+}
+
+/**
+ * Live UI consumes only `fail_reason` from per-tx polling — pipeline stage
+ * is derived from cluster pipeline indices, not from the per-tx response.
+ */
+export function txStatusFromPb(pb: PbStatusResponse): PerTxStatus {
+  return { failReason: pb.failReason as FailReasonCode };
+}
+
+/** Used only by `waitForTransaction` blocking-poll loops. */
+export function waitStatusFromPb(pb: PbStatusResponse): WaitStatus {
+  return {
+    state: WAIT_STATE_FROM[pb.status] ?? 'Pending',
+    failReason: pb.failReason as FailReasonCode,
+  };
 }
 
 // ---- Operation -> SubmitOperationRequest ----

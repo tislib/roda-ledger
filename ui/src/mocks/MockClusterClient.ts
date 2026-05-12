@@ -8,8 +8,8 @@ import type {
   ServerInfo,
 } from '@/types/cluster';
 import type { LogPage, WalLogPage } from '@/types/log';
-import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
-import type { WaitLevel } from '@/types/wait';
+import type { FailReasonCode, Operation, SubmitResult } from '@/types/transaction';
+import type { WaitLevel, WaitStatus, WaitStatusState } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
 import type {
   AvailableScenario,
@@ -17,7 +17,8 @@ import type {
   ScenarioRunStatus,
   ScenarioRunSummary,
 } from '@/types/scenario';
-import { isTerminal } from '@/types/transaction';
+import { isWaitTerminal } from '@/types/wait';
+import type { SimTxStatus } from './simulation/simulator';
 
 import { Simulator } from './simulation/simulator';
 
@@ -115,24 +116,28 @@ export class MockClusterClient implements ClusterClient {
   async submitOperation(op: Operation): Promise<SubmitResult> {
     return delay(this.sim.submit(op));
   }
-  async getTransactionStatus(txId: string): Promise<TransactionStatus> {
-    return delay(this.sim.txStatus(txId));
+  async getTransactionStatus(txId: string): Promise<{ failReason: FailReasonCode }> {
+    return delay({ failReason: simFailReason(this.sim.txStatus(txId)) });
   }
   async waitForTransaction(
     txId: string,
     level: WaitLevel,
     timeoutMs: number,
-  ): Promise<TransactionStatus> {
+  ): Promise<WaitStatus> {
     const start = Date.now();
     return new Promise((resolve) => {
       const tick = () => {
-        const status = this.sim.txStatus(txId);
+        const sim = this.sim.txStatus(txId);
+        const status: WaitStatus = {
+          state: sim.state as WaitStatusState,
+          failReason: simFailReason(sim),
+        };
         const reached =
           (level === 'Computed' && status.state === 'Computed') ||
           (level === 'Committed' &&
             (status.state === 'Committed' || status.state === 'OnSnapshot')) ||
           (level === 'OnSnapshot' && status.state === 'OnSnapshot') ||
-          isTerminal(status);
+          isWaitTerminal(status);
         if (reached || Date.now() - start >= timeoutMs) {
           resolve(status);
           return;
@@ -218,4 +223,8 @@ export class MockClusterClient implements ClusterClient {
   async listScenarioRuns(limit = 32): Promise<ScenarioRunSummary[]> {
     return delay(this.sim.listScenarioRuns(limit));
   }
+}
+
+function simFailReason(s: SimTxStatus): FailReasonCode {
+  return s.state === 'Error' ? (s.reason as FailReasonCode) : 0;
 }
