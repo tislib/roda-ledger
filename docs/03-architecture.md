@@ -174,7 +174,7 @@ A segment moves through three states:
 | `CLOSED` | `wal_NNNNNN.bin` | WAL Writer rotated away. Immutable, awaiting Seal. |
 | `SEALED` | `wal_NNNNNN.bin` + `.crc` + `.seal` | Verified, safe for recovery. May have snapshot. |
 
-**ACTIVE → CLOSED:** transaction count threshold hit → WAL Writer writes `SegmentSealed` entry, `fdatasync`, renames `wal.bin` to `wal_NNNNNN.bin`, opens new `wal.bin`.
+**ACTIVE → CLOSED:** transaction count threshold hit → WAL Writer `fdatasync`s, renames `wal.bin` to `wal_NNNNNN.bin`, opens new `wal.bin`.
 
 **CLOSED → SEALED:** Seal process picks it up on a timer, computes CRC32, writes `.crc` and `.seal` sidecar files.
 

@@ -396,6 +396,7 @@ message GetNodeWalLogResponse {
 
 // Mirror of `roda.ledger.v1.WalLogRecord` — control.proto duplicates ledger
 // messages by convention rather than importing across packages.
+// Field numbers 6 and 7 are retired (formerly WalSegmentHeaderC / WalSegmentSealedC).
 message WalLogRecordC {
   oneof entry {
     WalTxMetadataC         metadata             = 1;
@@ -403,8 +404,6 @@ message WalLogRecordC {
     WalTxLinkC             link                 = 3;
     WalTxTermC             term                 = 4;
     WalFunctionRegisteredC function_registered  = 5;
-    WalSegmentHeaderC      segment_header       = 6;
-    WalSegmentSealedC      segment_sealed       = 7;
   }
 }
 
@@ -445,16 +444,6 @@ message WalFunctionRegisteredC {
   uint32 crc32c = 3;
 }
 
-message WalSegmentHeaderC {
-  uint32 segment_id = 1;
-}
-
-message WalSegmentSealedC {
-  uint32 segment_id = 1;
-  uint64 last_tx_id = 2;
-  uint64 record_count = 3;
-}
-
 message LogEntry {
   uint64       index   = 1;
   uint64       term    = 2;
@@ -463,13 +452,12 @@ message LogEntry {
   string       summary = 4;
 }
 
+// Values 4 and 5 are retired (formerly SEGMENT_HEADER / SEGMENT_SEALED).
 enum LogEntryKind {
   LOG_ENTRY_KIND_UNSPECIFIED          = 0;
   LOG_ENTRY_KIND_TX_METADATA          = 1;
   LOG_ENTRY_KIND_TX_ENTRY             = 2;
   LOG_ENTRY_KIND_TX_TERM              = 3;
-  LOG_ENTRY_KIND_SEGMENT_HEADER       = 4;
-  LOG_ENTRY_KIND_SEGMENT_SEALED       = 5;
   LOG_ENTRY_KIND_LINK                 = 6;
   LOG_ENTRY_KIND_FUNCTION_REGISTERED  = 7;
   LOG_ENTRY_KIND_FUNCTION_UNREGISTERED = 8;

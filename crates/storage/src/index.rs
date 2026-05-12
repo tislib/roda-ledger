@@ -52,11 +52,7 @@ impl Segment {
                 WalEntry::Entry(e) => {
                     account_entries.push((e.account_id, e.tx_id));
                 }
-                WalEntry::Link(_)
-                | WalEntry::SegmentHeader(_)
-                | WalEntry::SegmentSealed(_)
-                | WalEntry::FunctionRegistered(_)
-                | WalEntry::Term(_) => {}
+                WalEntry::Link(_) | WalEntry::FunctionRegistered(_) | WalEntry::Term(_) => {}
             }
             offset += 40;
         }

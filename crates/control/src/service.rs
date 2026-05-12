@@ -899,18 +899,6 @@ fn ledger_record_to_control(r: proto_ledger::WalLogRecord) -> proto::control::Wa
                 crc32c: f.crc32c,
             },
         )),
-        Some(L::SegmentHeader(h)) => Some(c::wal_log_record_c::Entry::SegmentHeader(
-            c::WalSegmentHeaderC {
-                segment_id: h.segment_id,
-            },
-        )),
-        Some(L::SegmentSealed(s)) => Some(c::wal_log_record_c::Entry::SegmentSealed(
-            c::WalSegmentSealedC {
-                segment_id: s.segment_id,
-                last_tx_id: s.last_tx_id,
-                record_count: s.record_count,
-            },
-        )),
         None => None,
     };
     c::WalLogRecordC { entry }

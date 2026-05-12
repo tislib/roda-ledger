@@ -10,7 +10,6 @@ use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{JoinHandle, yield_now};
 use storage::entities::{WalEntry, WalInput};
-use storage::entries::{wal_segment_header_entry, wal_segment_sealed_entry};
 use storage::{Segment, Storage, Syncer};
 
 pub struct Wal {
@@ -80,17 +79,11 @@ impl WalRunner {
         active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
         ctx: &WalContext,
     ) -> Self {
-        let mut active_segment = storage.active_segment().unwrap();
+        let active_segment = storage.active_segment().unwrap();
         let syncer = active_segment.syncer().expect("Failed to get syncer");
         active_segment_sync.store(Arc::new(Some(syncer)));
         let buffer = VecDeque::with_capacity(ctx.input_capacity() * 16);
         let wait_strategy = ctx.wait_strategy();
-
-        if active_segment.current_wal_offset() == 0 {
-            active_segment.write_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
-                active_segment.id(),
-            ))])
-        }
 
         Self {
             storage,
@@ -196,15 +189,6 @@ impl WalRunner {
     }
 
     fn rotate(&mut self, ctx: &WalContext) {
-        let last_written_tx_id = self.last_written_tx_id.load(Acquire);
-
-        self.active_segment
-            .write_entries(&[WalEntry::SegmentSealed(wal_segment_sealed_entry(
-                self.active_segment.id(),
-                last_written_tx_id,
-                self.active_segment.record_count(),
-            ))]);
-
         self.commit_sync(ctx);
 
         self.active_segment
@@ -213,10 +197,6 @@ impl WalRunner {
 
         self.storage.next_segment();
         self.active_segment = self.storage.active_segment().unwrap();
-        self.active_segment
-            .write_entries(&[WalEntry::SegmentHeader(wal_segment_header_entry(
-                self.active_segment.id(),
-            ))]);
         let syncer = self.active_segment.syncer().expect("Failed to get syncer");
         self.active_segment_sync.store(Arc::new(Some(syncer)));
         self.segment_start_tx_id = 0; // will be set on next tx arrival
@@ -235,7 +215,6 @@ impl WalRunner {
             | WalEntry::FunctionRegistered(_) => {
                 self.pending_records = self.pending_records.saturating_sub(1);
             }
-            WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {}
         }
         self.pending_records == 0
     }

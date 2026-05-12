@@ -6,10 +6,9 @@ use std::time::Duration;
 use storage::StorageConfig;
 
 /// Verify that WAL segment rotation works end-to-end:
-/// - SegmentHeader is written as the first record of wal.bin
 /// - When the size threshold is reached, wal.bin is sealed and renamed to wal_000001.bin
 /// - A .crc sidecar and an empty .seal marker are created alongside the sealed segment
-/// - A fresh wal.bin is created with a new SegmentHeader
+/// - A fresh wal.bin is created on the next rotation
 /// - Replay after rotation restores the correct balance from all segments
 #[test]
 fn test_wal_segment_rotation() {

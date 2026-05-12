@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use storage::SegmentStaus;
 use storage::entities::*;
-use storage::{SegmentStaus, WAL_MAGIC, WAL_VERSION};
 
 use super::json::{compute_tx_crc, verify_tx_crc};
 use super::{CtlError, SegmentReport, SnapshotReport, VerifyReport, make_storage};
@@ -106,7 +106,6 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
     let mut last_meta_tx: Option<u64> = None;
     let mut pending_meta: Option<TxMetadata> = None;
     let mut pending_sub_items: Vec<WalEntry> = Vec::new();
-    let mut header_checked = false;
     // Per-account last known computed_balance for continuity checks.
     let mut account_balances: std::collections::HashMap<u64, i64> =
         std::collections::HashMap::new();
@@ -114,26 +113,6 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
     let visit_result = segment.visit_wal_records(|entry| {
         record_count += 1;
         match entry {
-            WalEntry::SegmentHeader(h) => {
-                if !header_checked {
-                    header_checked = true;
-                    if h.magic != WAL_MAGIC {
-                        errors.push(format!("SegmentHeader: wrong magic {:#010x}", h.magic));
-                        ok = false;
-                    }
-                    if h.version != WAL_VERSION {
-                        errors.push(format!("SegmentHeader: unknown version {}", h.version));
-                        ok = false;
-                    }
-                    if h.segment_id != segment_id {
-                        errors.push(format!(
-                            "SegmentHeader: segment_id {} != filename {}",
-                            h.segment_id, segment_id
-                        ));
-                        ok = false;
-                    }
-                }
-            }
             WalEntry::Metadata(m) => {
                 flush_pending(&mut pending_meta, &pending_sub_items, &mut errors, &mut ok);
                 pending_sub_items.clear();
@@ -201,28 +180,10 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                     pending_sub_items.push(WalEntry::Term(*t));
                 }
             }
-            WalEntry::SegmentSealed(s) => {
-                flush_pending(&mut pending_meta, &pending_sub_items, &mut errors, &mut ok);
-                pending_sub_items.clear();
-
-                if s.segment_id != segment_id {
-                    errors.push(format!(
-                        "SegmentSealed: segment_id {} != filename {}",
-                        s.segment_id, segment_id
-                    ));
-                    ok = false;
-                }
-                if s.record_count != record_count {
-                    errors.push(format!(
-                        "SegmentSealed: record_count {} != actual {}",
-                        s.record_count, record_count
-                    ));
-                    ok = false;
-                }
-                last_tx_id = s.last_tx_id;
-            }
         }
     });
+
+    flush_pending(&mut pending_meta, &pending_sub_items, &mut errors, &mut ok);
 
     if let Err(e) = visit_result {
         errors.push(format!("Record parse error: {}", e));
@@ -300,10 +261,8 @@ fn verify_active_wal(storage: &storage::Storage) -> SegmentReport {
 
     let visit_result = segment.visit_wal_records(|entry| {
         record_count += 1;
-        match entry {
-            WalEntry::SegmentHeader(_) => {}
-            WalEntry::Metadata(m) => last_tx_id = m.tx_id,
-            _ => {}
+        if let WalEntry::Metadata(m) = entry {
+            last_tx_id = m.tx_id;
         }
     });
 
