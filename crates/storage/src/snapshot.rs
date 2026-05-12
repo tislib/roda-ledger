@@ -484,7 +484,10 @@ fn load_function_snapshot_for_segment(
     for _ in 0..entry_count {
         let name_bytes = &record_data[rec_offset..rec_offset + FUNCTION_RECORD_NAME_LEN];
         rec_offset += FUNCTION_RECORD_NAME_LEN;
-        let end = name_bytes.iter().position(|b| *b == 0).unwrap_or(FUNCTION_RECORD_NAME_LEN);
+        let end = name_bytes
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(FUNCTION_RECORD_NAME_LEN);
         let name = match std::str::from_utf8(&name_bytes[..end]) {
             Ok(s) => s.to_string(),
             Err(_) => {

@@ -114,7 +114,9 @@ impl Seal {
         crc32c: u32,
     ) -> std::io::Result<()> {
         if let Some(mut runner) = self.runner.take() {
-            runner.function_map.insert(name.to_string(), (version, crc32c));
+            runner
+                .function_map
+                .insert(name.to_string(), (version, crc32c));
             self.runner = Some(runner);
             Ok(())
         } else {

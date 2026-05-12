@@ -70,7 +70,9 @@ async fn update_cluster_config_rejected_for_zero_max_accounts() {
     let mut bad = common::default_cluster_config();
     bad.max_accounts = 0;
     let resp = svc
-        .update_cluster_config(Request::new(UpdateClusterConfigRequest { config: Some(bad) }))
+        .update_cluster_config(Request::new(UpdateClusterConfigRequest {
+            config: Some(bad),
+        }))
         .await
         .expect("update_cluster_config returns Ok with accepted=false")
         .into_inner();

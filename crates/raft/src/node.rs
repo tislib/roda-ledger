@@ -340,19 +340,25 @@ impl<P: Persistence> RaftNode<P> {
     /// argument down to the write argument (same posture as the
     /// AE-reply guard).
     pub fn advance_write_index(&mut self, local_write_index: TxId) {
-        debug_assert!(
-            self.local_commit_index <= local_write_index,
-            "advance: commit_index={} > write_index={}",
-            self.local_commit_index,
-            local_write_index
-        );
-
+        // Monotonic: skip stale inputs. Only assert on real updates —
+        // an in-order call below current write_index is a no-op even if
+        // the caller's snapshot of (compute, commit) is briefly skewed.
         if local_write_index > self.local_write_index {
+            debug_assert!(
+                self.local_commit_index <= local_write_index,
+                "advance: commit_index={} > write_index={}",
+                self.local_commit_index,
+                local_write_index
+            );
             self.local_write_index = local_write_index;
         }
     }
     pub fn advance_commit_index(&mut self, local_commit_index: TxId) {
-        let new_commit = local_commit_index;
+        // Per ADR-0017: clamp commit down to write so the
+        // local_commit_index <= local_write_index invariant always
+        // holds, even when the caller's ledger snapshot races ahead
+        // of the matching write watermark.
+        let new_commit = local_commit_index.min(self.local_write_index);
 
         if new_commit > self.local_commit_index {
             self.local_commit_index = new_commit;

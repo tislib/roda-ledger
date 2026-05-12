@@ -904,11 +904,16 @@ fn recovery_without_older_function_binaries_still_works() {
     }
 
     let v1_path = guard.0.join("functions").join("foo_v1.wasm");
-    assert!(v1_path.exists(), "v1 binary should exist after registration");
+    assert!(
+        v1_path.exists(),
+        "v1 binary should exist after registration"
+    );
     std::fs::remove_file(&v1_path).unwrap();
 
     let mut ledger = Ledger::new(persistent_config(&guard.0));
-    ledger.start().expect("recovery must succeed without v1 binary");
+    ledger
+        .start()
+        .expect("recovery must succeed without v1 binary");
     let list = ledger.list_functions();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].name, "foo");

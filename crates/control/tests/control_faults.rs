@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control::ClusterHandle;
 use control::EventStore;
 use control::service::ControlService;
-use control::ClusterHandle;
 use proto::control::control_server::Control;
 use proto::control::{
     FaultEvent, FaultKind, GetFaultHistoryRequest, HealPartitionRequest, KillNodeRequest,
@@ -258,7 +258,10 @@ async fn get_fault_history_orders_newest_first() {
         .filter(|n| n.role == proto::control::NodeRole::Follower as i32)
         .map(|n| n.node_id)
         .collect();
-    assert!(followers.len() >= 2, "expected >=2 followers in a 3-node cluster");
+    assert!(
+        followers.len() >= 2,
+        "expected >=2 followers in a 3-node cluster"
+    );
 
     svc.stop_node(Request::new(StopNodeRequest {
         node_id: followers[0],

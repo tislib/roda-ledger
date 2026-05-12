@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control::service::ControlService;
-use control::{EventStore, LedgerProxy, NODE_SELECTOR_METADATA_KEY};
-use proto::control::control_server::Control;
+use control::{EventStore, NODE_SELECTOR_METADATA_KEY};
 use proto::control::WatchFunctionsRequest;
+use proto::control::control_server::Control;
 use proto::ledger as pb;
 use proto::ledger::ledger_server::Ledger;
 use proto::ledger::submit_operation_request::Operation;
@@ -78,7 +78,10 @@ async fn get_transaction_status_reaches_terminal_state() {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("tx {} never reached terminal state; last status={}", tx, status.status);
+            panic!(
+                "tx {} never reached terminal state; last status={}",
+                tx, status.status
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

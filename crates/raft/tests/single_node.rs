@@ -131,19 +131,22 @@ fn advance_is_monotonic() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "advance: commit_index=5 > write_index=3")]
-fn advance_write_panics_below_commit_in_debug() {
+fn advance_write_below_commit_is_noop() {
     let mut node = fresh(1, vec![1]);
     let t0 = Instant::now();
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
-    // Drive write/commit to 5, then attempt to regress write below
-    // commit — `advance_write_index` must panic on the invariant
-    // `local_commit_index <= local_write_index`.
+    // Drive write/commit to 5, then call advance_write_index with a
+    // stale value below current commit. The function is monotonic and
+    // skips inputs at or below current write — the invariant
+    // `local_commit_index <= local_write_index` holds without panicking
+    // on stale callers (e.g. handle_append_entries replaying a lower-
+    // range AE after a higher-range one already bumped commit).
     node.advance_write_index(5);
     node.advance_commit_index(5);
     node.advance_write_index(3);
+    assert_eq!(node.write_index(), 5);
+    assert_eq!(node.commit_index(), 5);
 }
 
 /// `advance` only updates `cluster_commit_index` on a leader. On a

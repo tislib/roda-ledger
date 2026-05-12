@@ -3,7 +3,7 @@
 
 use ::proto::ledger::WaitLevel;
 use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::entities::SYSTEM_ACCOUNT_ID;
 
 const ACCOUNT_A: u64 = 11;
@@ -106,6 +106,47 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
 
     for tx_id in &acked {
         ctl.require_transaction_committed(*tx_id).await;
+    }
+}
+
+/// Cluster commit must advance on every node after a 1k-tx burst that
+/// crosses many segment rotations. Repros the leader-stall where
+/// `replicate_once` leaks `in_flight` on `tail()==0` and follower
+/// `cluster_commit_index` never moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cluster_commit_advances_under_burst() {
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        transaction_count_per_segment: 100,
+        ..ClusterTestingConfig::cluster(3)
+    })
+    .await
+    .expect("start");
+    let _ = ctl.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+
+    for ur in 1..=1000u64 {
+        ctl.deposit(ACCOUNT_A, AMOUNT, ur).await.expect("deposit");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for i in 0..ctl.len() {
+        loop {
+            let pi = ctl.pipeline_index_on(i).await.expect("pipeline_index");
+            if pi.cluster_commit >= 1000 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "node {i} cluster_commit stuck at {} (expected >= 1000); compute={} commit={} snapshot={}",
+                    pi.cluster_commit, pi.compute, pi.commit, pi.snapshot
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let target = (1000 * AMOUNT) as i64;
+    for i in 0..ctl.len() {
+        ctl.require_balance_on(i, ACCOUNT_A, target).await;
     }
 }
 
