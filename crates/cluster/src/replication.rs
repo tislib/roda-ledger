@@ -36,7 +36,7 @@ use crate::ledger_slot::LedgerSlot;
 use ::proto::node as proto;
 use ::proto::node::node_client::NodeClient;
 use ledger::ledger::Ledger;
-use log::info;
+use log::{info, warn};
 use raft::{
     AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, RaftNode,
     RejectReason as RaftRejectReason, TxId,
@@ -310,10 +310,12 @@ impl ReplicationLoop {
             AppendEntriesDecision::Reject {
                 reason,
                 truncate_after,
+                conflict_term,
+                conflict_index,
             } => {
-                debug!(
-                    "replication_loop/f[{}]: AE Reject reason={:?} truncate_after={:?}",
-                    self_id, reason, truncate_after
+                warn!(
+                    "replication_loop/f[{}]: AE Reject reason={:?} truncate_after={:?} conflict_term={} conflict_index={}",
+                    self_id, reason, truncate_after, conflict_term, conflict_index
                 );
                 if let Some(after) = truncate_after {
                     let lcid = self.ledger.ledger().last_commit_id();
@@ -331,7 +333,7 @@ impl ReplicationLoop {
                             lcomp
                         );
                     } else {
-                        info!(
+                        warn!(
                             "replication_loop/f[{}]: AE Reject reseed: after={} pre(cluster_commit={} local_commit={} local_write={}) ledger(commit_id={} compute_id={})",
                             self_id,
                             after,
@@ -349,8 +351,14 @@ impl ReplicationLoop {
                         );
                     }
                 }
-                let resp = build_ae_response(&self.node.borrow(), false, Some(reason));
-                debug!(
+                let resp = build_ae_response(
+                    &self.node.borrow(),
+                    false,
+                    Some(reason),
+                    conflict_term,
+                    conflict_index,
+                );
+                warn!(
                     "replication_loop/f[{}]: AE Reject reply term={} last_write_id={} last_commit_id={}",
                     self_id, resp.term, resp.last_write_id, resp.last_commit_id
                 );
@@ -361,7 +369,7 @@ impl ReplicationLoop {
                 // self.node.borrow_mut().advance_commit_index(commit_index);
                 // self.mirror.snapshot_from(&self.node.borrow());
 
-                let resp = build_ae_response(&self.node.borrow(), true, None);
+                let resp = build_ae_response(&self.node.borrow(), true, None, 0, 0);
                 let _ = reply.send(resp);
             }
             AppendEntriesDecision::Accept {
@@ -384,6 +392,8 @@ impl ReplicationLoop {
                         &self.node.borrow(),
                         false,
                         Some(RaftRejectReason::LogMismatch),
+                        0,
+                        0,
                     );
                     let _ = reply.send(resp);
                     return;
@@ -414,7 +424,7 @@ impl ReplicationLoop {
                 );
                 self.mirror.snapshot_from(&self.node.borrow());
 
-                let resp = build_ae_response(&self.node.borrow(), true, None);
+                let resp = build_ae_response(&self.node.borrow(), true, None, 0, 0);
                 debug!(
                     "replication_loop/f[{}]: AE Accept(entries) reply term={} last_write_id={} last_commit_id={}",
                     self_id, resp.term, resp.last_write_id, resp.last_commit_id
@@ -686,6 +696,7 @@ async fn replicate_once(r: &mut PeerReplicator) {
         if written == 0 {
             Some(TailAttempt::Empty)
         } else {
+            info!("wrote {} out of {} max bytes", written, r.append_max_bytes);
             buffer.truncate(written);
             Some(TailAttempt::Bytes(buffer))
         }
@@ -750,10 +761,19 @@ async fn replicate_once(r: &mut PeerReplicator) {
             reason,
             last_write_id,
             last_commit_id,
+            conflict_term,
+            conflict_index,
         } => {
-            debug!(
-                "replication_loop/l[{}]: peer={} ← AE Reject term={} reason={:?} last_write_id={} last_commit_id={}",
-                r.self_id, r.peer_id, term, reason, last_write_id, last_commit_id
+            warn!(
+                "replication_loop/l[{}]: peer={} ← AE Reject term={} reason={:?} last_write_id={} last_commit_id={} conflict_term={} conflict_index={}",
+                r.self_id,
+                r.peer_id,
+                term,
+                reason,
+                last_write_id,
+                last_commit_id,
+                conflict_term,
+                conflict_index
             );
         }
         AppendResult::Timeout => {
@@ -836,6 +856,8 @@ async fn send_append_entries_rpc(
             reason: proto_reject_to_raft(resp.reject_reason),
             last_write_id: resp.last_write_id,
             last_commit_id: resp.last_commit_id,
+            conflict_term: resp.conflict_term,
+            conflict_index: resp.conflict_index,
         }
     }
 }
@@ -853,11 +875,15 @@ fn proto_reject_to_raft(code: u32) -> RaftRejectReason {
     }
 }
 
-/// Build the proto response from raft's getters.
+/// Build the proto response from raft's getters. `conflict_term` /
+/// `conflict_index` are the Raft §5.3 fast-backoff hint and are only
+/// non-zero on `LogMismatch` rejects.
 fn build_ae_response(
     node: &RaftNode<DurablePersistence>,
     success: bool,
     reject_reason: Option<RaftRejectReason>,
+    conflict_term: u64,
+    conflict_index: u64,
 ) -> proto::AppendEntriesResponse {
     let reject_code = match reject_reason {
         None => proto::RejectReason::RejectNone as u32,
@@ -873,6 +899,8 @@ fn build_ae_response(
         last_commit_id: node.commit_index(),
         last_write_id: node.write_index(),
         reject_reason: reject_code,
+        conflict_term,
+        conflict_index,
     }
 }
 

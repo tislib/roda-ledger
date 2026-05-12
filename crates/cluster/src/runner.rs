@@ -5,7 +5,7 @@ use crate::node::ClusterNode;
 use spdlog::info;
 use std::path::Path;
 
-pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = Config::from_file(config_path).map_err(|e| {
         format!(
             "failed to load config from {}: {}",
@@ -22,9 +22,17 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + S
     );
 
     let cluster = ClusterNode::new(cfg)?;
-    let handles = cluster.run().await?;
+    let handles = cluster.run()?;
 
-    shutdown_signal().await;
+    // Signal-handling needs a tokio runtime; the cluster itself runs
+    // entirely on its own dedicated OS threads with private runtimes,
+    // so this one is scoped narrowly to `block_on(shutdown_signal())`.
+    let signal_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .thread_name("cluster-signal")
+        .build()?;
+    signal_rt.block_on(shutdown_signal());
+
     info!("received shutdown signal, draining cluster");
     drop(handles);
     Ok(())

@@ -215,7 +215,7 @@ impl Default for ClusterTestingConfig {
             append_entries_max_bytes: 256 * 1024,
             transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,
-            ledger_log_level: Level::Debug,
+            ledger_log_level: Level::Info,
             autostart: true,
             data_dir_root: None,
             retry_config: RetryConfig::default(),
@@ -621,7 +621,7 @@ impl ClusterTestingControl {
         Ok(node.ledger())
     }
 
-    /// Call `node.run().await` on a slot already built via
+    /// Call `node.run()` on a slot already built via
     /// [`build_node`] (or [`start_node`]). Errors if the slot was
     /// never built. Cluster/Standalone modes only.
     pub async fn run_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
@@ -638,7 +638,6 @@ impl ClusterTestingControl {
             .ok_or(ClusterTestingError::NotStarted { idx: i })?;
         let handles = node
             .run()
-            .await
             .map_err(|e| ClusterTestingError::Run(format!("{e}")))?;
         slot.handles = Some(handles);
         *self.cached_leader_idx.lock().await = None;

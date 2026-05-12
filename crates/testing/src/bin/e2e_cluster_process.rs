@@ -7,12 +7,11 @@
 use std::env;
 use std::path::PathBuf;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path: PathBuf = env::args()
         .nth(1)
         .unwrap_or_else(|| panic!("usage: e2e-cluster-process <config.toml>"))
         .into();
 
-    cluster::run(&config_path).await
+    cluster::run(&config_path)
 }

@@ -75,17 +75,27 @@ pub enum AppendResult {
     },
     /// Peer rejected. `reason` drives the recovery strategy:
     ///
-    /// - [`RejectReason::LogMismatch`] — leader walks `next_index`
-    ///   back one (clamped at 1) and the cluster's next iteration
-    ///   builds a fresh request with the lower `prev_log_*`.
+    /// - [`RejectReason::LogMismatch`] — leader uses
+    ///   `(conflict_term, conflict_index)` for the Raft §5.3
+    ///   fast-backoff (skip a whole conflicting term in one RPC).
+    ///   When both are 0 (legacy peer / no hint), the leader falls
+    ///   back to decrementing `next_index` by 1.
     /// - [`RejectReason::TermBehind`] — peer's term is strictly
     ///   higher; leader observes the term and transitions to
-    ///   follower.
+    ///   follower. Hint fields ignored.
+    ///
+    /// `conflict_term`: follower's term at `prev_log_tx_id`, or 0 if
+    /// the follower's log is shorter than `prev_log_tx_id`.
+    /// `conflict_index`: when `conflict_term != 0`, the first index
+    /// in the follower's log carrying `conflict_term`; when
+    /// `conflict_term == 0`, one past the follower's last log index.
     Reject {
         term: Term,
         reason: RejectReason,
         last_write_id: TxId,
         last_commit_id: TxId,
+        conflict_term: Term,
+        conflict_index: TxId,
     },
     /// RPC fired but no reply within the cluster's deadline. The
     /// state machine clears `in_flight` and leaves `next_index` /

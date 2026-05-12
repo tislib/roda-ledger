@@ -108,7 +108,7 @@ impl ClusterNode {
     }
 
     /// Dispatch to the standalone or clustered bring-up.
-    pub async fn run(&self) -> Result<Handles, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn run(&self) -> Result<Handles, Box<dyn std::error::Error + Send + Sync>> {
         if self.config.is_clustered() {
             Ok(Handles::Cluster(self.run_clustered()?))
         } else {

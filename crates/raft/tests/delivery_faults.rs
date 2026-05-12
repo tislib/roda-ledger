@@ -185,6 +185,8 @@ fn late_reply_after_rpc_timeout_does_not_crash() {
             reason: RejectReason::RpcTimeout,
             last_write_id: 0,
             last_commit_id: 0,
+            conflict_term: 0,
+            conflict_index: 0,
         },
     );
     assert!(node.role().is_leader());

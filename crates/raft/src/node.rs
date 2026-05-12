@@ -117,9 +117,20 @@ pub enum AppendEntriesDecision {
     /// the driver must drop entry-log records with `tx_id > t`.
     /// Raft's term-log mirror is already truncated synchronously
     /// inside validate.
+    ///
+    /// `conflict_term` / `conflict_index` carry the Raft §5.3
+    /// fast-backoff hint (paper section "If desired, the protocol
+    /// can be optimized..."). They are populated only when `reason
+    /// == LogMismatch`; both are 0 on `TermBehind`. See
+    /// [`crate::replication::AppendResult::Reject`] for the field
+    /// semantics. The driver must forward these to the leader on
+    /// the wire so the leader can skip past an entire diverged
+    /// term in one RPC instead of probing one index at a time.
     Reject {
         reason: RejectReason,
         truncate_after: Option<TxId>,
+        conflict_term: Term,
+        conflict_index: TxId,
     },
     /// Reply true. `append: None` is a heartbeat — no I/O, reply
     /// immediately. `append: Some(range)` means the driver must
@@ -564,6 +575,8 @@ impl<P: Persistence> RaftNode<P> {
                     last_commit_id,
                     last_write_id,
                     None,
+                    0,
+                    0,
                 );
             }
             AppendResult::Reject {
@@ -571,6 +584,8 @@ impl<P: Persistence> RaftNode<P> {
                 reason,
                 last_write_id,
                 last_commit_id,
+                conflict_term,
+                conflict_index,
             } => {
                 self.on_append_entries_reply(
                     now,
@@ -580,6 +595,8 @@ impl<P: Persistence> RaftNode<P> {
                     last_commit_id,
                     last_write_id,
                     Some(reason),
+                    conflict_term,
+                    conflict_index,
                 );
             }
             AppendResult::Timeout => {
@@ -599,6 +616,8 @@ impl<P: Persistence> RaftNode<P> {
                     0,
                     0,
                     Some(RejectReason::RpcTimeout),
+                    0,
+                    0,
                 );
             }
         }
@@ -663,6 +682,8 @@ impl<P: Persistence> RaftNode<P> {
             return AppendEntriesDecision::Reject {
                 reason: RejectReason::TermBehind,
                 truncate_after: None,
+                conflict_term: 0,
+                conflict_index: 0,
             };
         }
 
@@ -679,13 +700,27 @@ impl<P: Persistence> RaftNode<P> {
         // reference — entries up to that watermark exist on disk and
         // can be checked against the leader's prev_log_term.
         if prev_log_tx_id != 0 {
-            let our_term_at_prev = self
-                .persistence
-                .term_at_tx(prev_log_tx_id)
-                .map(|r| r.term)
-                .unwrap_or(0);
+            let our_term_record_at_prev = self.persistence.term_at_tx(prev_log_tx_id);
+            let our_term_at_prev = our_term_record_at_prev.map(|r| r.term).unwrap_or(0);
             let log_covers_prev = prev_log_tx_id <= self.local_write_index;
             if !log_covers_prev || our_term_at_prev != prev_log_term {
+                // Compute the §5.3 fast-backoff hint BEFORE we
+                // mutate the term log (the truncation below would
+                // otherwise erase the record we need to read).
+                let (conflict_term, conflict_index) = if log_covers_prev {
+                    match our_term_record_at_prev {
+                        Some(r) => (r.term, r.start_tx_id),
+                        // Defensive: log_covers_prev but no term
+                        // record covers prev_log_tx_id. Treat as
+                        // "shorter log" by sending a non-skipping
+                        // hint at prev_log_tx_id.
+                        None => (0, prev_log_tx_id),
+                    }
+                } else {
+                    // Follower's log is shorter than prev_log_tx_id.
+                    // Tell the leader to resume at one past our end.
+                    (0, self.local_write_index + 1)
+                };
                 if log_covers_prev {
                     let after = prev_log_tx_id.saturating_sub(1);
                     // Leader Completeness §5.4: a leader cannot ask a
@@ -723,11 +758,15 @@ impl<P: Persistence> RaftNode<P> {
                     return AppendEntriesDecision::Reject {
                         reason: RejectReason::LogMismatch,
                         truncate_after: Some(after),
+                        conflict_term,
+                        conflict_index,
                     };
                 }
                 return AppendEntriesDecision::Reject {
                     reason: RejectReason::LogMismatch,
                     truncate_after: None,
+                    conflict_term,
+                    conflict_index,
                 };
             }
         }
@@ -779,6 +818,8 @@ impl<P: Persistence> RaftNode<P> {
         last_commit_id: TxId,
         last_write_id: TxId,
         reject_reason: Option<RejectReason>,
+        conflict_term: Term,
+        conflict_index: TxId,
     ) {
         let current_term = self.current_term();
         if term > current_term {
@@ -815,6 +856,33 @@ impl<P: Persistence> RaftNode<P> {
         // quorum slot defensively to the peer's reported durable end.
         // `Err(None)` — non-mismatch reject (term behind, rpc
         // timeout); leave the quorum alone.
+        //
+        // For the `LogMismatch` branch we compute the new
+        // `next_index` BEFORE re-borrowing `&mut self.state`, since
+        // the fast-backoff helper needs `&self.persistence` and
+        // `self.local_write_index`. A `conflict_index == 0` hint is
+        // the "no hint" sentinel — leave `fast_next = None` so the
+        // reply handler falls back to the §5.3 1-entry decrement.
+        let fast_next = if !success
+            && matches!(reject_reason, Some(RejectReason::LogMismatch) | None)
+            && conflict_index != 0
+        {
+            let current_next = match &self.state {
+                NodeState::Leader(l) => l.peers.get(&from).map(|p| p.next_index),
+                _ => None,
+            };
+            current_next.map(|cn| {
+                Self::fast_backoff_next_index(
+                    &self.persistence,
+                    cn,
+                    self.local_write_index,
+                    conflict_term,
+                    conflict_index,
+                )
+            })
+        } else {
+            None
+        };
         let outcome: Result<TxId, Option<TxId>> = match &mut self.state {
             NodeState::Leader(l) => {
                 let progress = match l.peers.get_mut(&from) {
@@ -833,12 +901,17 @@ impl<P: Persistence> RaftNode<P> {
                         Some(RejectReason::TermBehind) | Some(RejectReason::RpcTimeout) => {
                             Err(None)
                         }
-                        // LogMismatch (explicit) and the unannotated
-                        // case both mean §5.3: walk `next_index` back
-                        // one entry. Clamp at 1 — tx_id 0 is the "no
-                        // entry" sentinel.
+                        // §5.3 LogMismatch (or unannotated reject).
+                        // Apply the fast-backoff next_index computed
+                        // above; falls back to next_index - 1 when
+                        // the peer sent no hint (both fields zero).
                         Some(RejectReason::LogMismatch) | None => {
-                            progress.next_index = progress.next_index.saturating_sub(1).max(1);
+                            if let Some(nx) = fast_next {
+                                progress.next_index = nx;
+                            } else {
+                                progress.next_index =
+                                    progress.next_index.saturating_sub(1).max(1);
+                            }
                             Err(Some(last_commit_id))
                         }
                     }
@@ -872,6 +945,91 @@ impl<P: Persistence> RaftNode<P> {
             }
             Err(None) => {}
         }
+    }
+
+    /// Raft §5.3 fast-backoff: given a follower's
+    /// `(conflict_term, conflict_index)` hint, compute the new
+    /// `next_index` that skips an entire diverged term in one RPC.
+    ///
+    /// Three cases (paper §5.3, "If desired, the protocol can be
+    /// optimized..."):
+    ///
+    /// - **No hint** (`conflict_index == 0`): legacy peer or
+    ///   `RpcTimeout` synthetic reject. Caller falls back to the
+    ///   1-entry decrement.
+    /// - **`conflict_term == 0`**: follower's log is shorter than
+    ///   `prev_log_tx_id`; resume at `conflict_index` (one past the
+    ///   follower's end).
+    /// - **`conflict_term != 0`**: follower's term at
+    ///   `prev_log_tx_id` is `conflict_term`. If the leader's log
+    ///   contains entries with that term, restart probing one past
+    ///   the leader's last such entry; otherwise jump to
+    ///   `conflict_index` (the first index of `conflict_term` in
+    ///   the follower's log).
+    ///
+    /// The result is monotonically non-increasing — a stale or
+    /// malicious hint can never push `next_index` forward.
+    fn fast_backoff_next_index(
+        persistence: &P,
+        current_next_index: TxId,
+        local_write_index: TxId,
+        conflict_term: Term,
+        conflict_index: TxId,
+    ) -> TxId {
+        if conflict_index == 0 {
+            // Caller is responsible for the no-hint fallback; we
+            // return `current_next_index` so the .min(current)
+            // clamp at the end is a no-op and the caller can
+            // detect "no hint" via `Option::None`. In practice,
+            // the caller does not invoke us when conflict_index ==
+            // 0 — see `on_append_entries_reply`.
+            return current_next_index;
+        }
+        let target = if conflict_term == 0 {
+            conflict_index
+        } else {
+            match Self::last_index_of_term(persistence, conflict_term, local_write_index) {
+                Some(last) => last.saturating_add(1),
+                None => conflict_index,
+            }
+        };
+        target.max(1).min(current_next_index)
+    }
+
+    /// Largest `tx_id` in `1..=upper_bound` whose term is
+    /// `target_term`, or `None` if no such entry exists. Binary
+    /// search on the monotone term-at-tx mapping (terms are
+    /// non-decreasing in `tx_id`).
+    fn last_index_of_term(
+        persistence: &P,
+        target_term: Term,
+        upper_bound: TxId,
+    ) -> Option<TxId> {
+        if upper_bound == 0 || target_term == 0 {
+            return None;
+        }
+        let mut lo: TxId = 1;
+        let mut hi: TxId = upper_bound;
+        let mut best: Option<TxId> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            match persistence.term_at_tx(mid).map(|r| r.term) {
+                Some(t) if t == target_term => {
+                    best = Some(mid);
+                    lo = mid + 1;
+                }
+                Some(t) if t < target_term => {
+                    lo = mid + 1;
+                }
+                _ => {
+                    if mid == 0 {
+                        break;
+                    }
+                    hi = mid - 1;
+                }
+            }
+        }
+        best
     }
 }
 
@@ -1163,7 +1321,9 @@ mod tests {
             decision,
             AppendEntriesDecision::Reject {
                 reason: RejectReason::TermBehind,
-                truncate_after: None
+                truncate_after: None,
+                conflict_term: 0,
+                conflict_index: 0,
             }
         );
     }
@@ -1216,6 +1376,9 @@ mod tests {
             AppendEntriesDecision::Reject {
                 reason: RejectReason::LogMismatch,
                 truncate_after: Some(4),
+                // commit_term(1, 0) ⇒ TermRecord{term:1, start_tx_id:0}.
+                conflict_term: 1,
+                conflict_index: 0,
             }
         );
     }
@@ -1523,9 +1686,12 @@ mod tests {
                 reason: RejectReason::LogMismatch,
                 last_write_id: 0,
                 last_commit_id: 0,
+                // No hint ⇒ legacy 1-entry decrement.
+                conflict_term: 0,
+                conflict_index: 0,
             },
         );
-        // §5.3: walk back next_index by 1 (clamped at 1).
+        // §5.3 legacy fallback: walk back next_index by 1 (clamped at 1).
         assert_eq!(node.replication().peer(2).unwrap().next_index(), 3);
     }
 
@@ -1546,6 +1712,8 @@ mod tests {
                 reason: RejectReason::TermBehind,
                 last_write_id: 0,
                 last_commit_id: 0,
+                conflict_term: 0,
+                conflict_index: 0,
             },
         );
         assert_eq!(node.role(), Role::Follower);
@@ -1583,6 +1751,234 @@ mod tests {
         assert!(
             req2.is_some(),
             "timeout must clear in_flight so a fresh request can fire after next_heartbeat"
+        );
+    }
+
+    // ─── §5.3 fast-backoff (ConflictIndex / ConflictTerm) ────────────────
+
+    /// Helper: build a `TestPersistence` whose term log carries the
+    /// given list of `(term, start_tx_id)` records.
+    fn persistence_with_terms(records: &[(Term, TxId)]) -> TestPersistence {
+        let mut p = TestPersistence::default();
+        for &(term, start_tx_id) in records {
+            p.term_log.push(crate::TermRecord { term, start_tx_id });
+        }
+        p
+    }
+
+    #[test]
+    fn last_index_of_term_finds_largest_tx_in_target_term() {
+        // Terms: t1 [1..=3], t2 [4..=7], t3 [8..=12].
+        let p = persistence_with_terms(&[(1, 1), (2, 4), (3, 8)]);
+        let last = RaftNode::<TestPersistence>::last_index_of_term(&p, 2, 12);
+        assert_eq!(last, Some(7));
+        let last_first = RaftNode::<TestPersistence>::last_index_of_term(&p, 1, 12);
+        assert_eq!(last_first, Some(3));
+        let last_third = RaftNode::<TestPersistence>::last_index_of_term(&p, 3, 12);
+        assert_eq!(last_third, Some(12));
+    }
+
+    #[test]
+    fn last_index_of_term_returns_none_when_term_absent() {
+        let p = persistence_with_terms(&[(1, 1), (3, 5)]);
+        assert!(RaftNode::<TestPersistence>::last_index_of_term(&p, 2, 8).is_none());
+        assert!(RaftNode::<TestPersistence>::last_index_of_term(&p, 0, 8).is_none());
+        assert!(RaftNode::<TestPersistence>::last_index_of_term(&p, 5, 0).is_none());
+    }
+
+    #[test]
+    fn fast_backoff_jumps_past_leader_last_index_of_conflict_term() {
+        // Leader log: t1 [1..=5], t5 [6..=20].
+        // Follower says conflict_term=5, conflict_index=6. Leader has
+        // term 5 ending at 20 ⇒ next_index = 21.
+        let p = persistence_with_terms(&[(1, 1), (5, 6)]);
+        let next = RaftNode::<TestPersistence>::fast_backoff_next_index(
+            &p, 100, // current_next_index
+            20,  // local_write_index
+            5, 6,
+        );
+        assert_eq!(next, 21);
+    }
+
+    #[test]
+    fn fast_backoff_jumps_to_conflict_index_when_term_absent_on_leader() {
+        // Leader log: t1 [1..=10]. Follower says conflict_term=7
+        // (which leader has never seen), conflict_index=4 — meaning
+        // follower's term 7 starts at index 4. Leader should resume
+        // at conflict_index = 4.
+        let p = persistence_with_terms(&[(1, 1)]);
+        let next = RaftNode::<TestPersistence>::fast_backoff_next_index(&p, 100, 10, 7, 4);
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn fast_backoff_uses_conflict_index_when_conflict_term_zero() {
+        // Follower's log is shorter than prev_log_tx_id. Hint:
+        // conflict_term=0, conflict_index = follower's local_write + 1.
+        let p = persistence_with_terms(&[(1, 1), (2, 5)]);
+        let next = RaftNode::<TestPersistence>::fast_backoff_next_index(&p, 50, 10, 0, 7);
+        assert_eq!(next, 7);
+    }
+
+    #[test]
+    fn fast_backoff_never_advances_next_index() {
+        // A stale hint that would push next_index forward must be
+        // clamped to current_next_index — only retreat is legal.
+        let p = persistence_with_terms(&[(1, 1)]);
+        let next = RaftNode::<TestPersistence>::fast_backoff_next_index(
+            &p, 5, // current_next_index
+            10, 0, 99,
+        );
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn fast_backoff_floors_at_one() {
+        let p = persistence_with_terms(&[(1, 1)]);
+        // conflict_index=0 with conflict_term>0: leader has term 1
+        // ending at write_index=3 ⇒ next_index = 4. But current is
+        // 2, so clamp to 2.
+        let next = RaftNode::<TestPersistence>::fast_backoff_next_index(&p, 2, 3, 1, 1);
+        assert_eq!(next, 2);
+    }
+
+    /// End-to-end convergence: a follower with hundreds of entries
+    /// of a stale term resolves in one fast-backoff round-trip, not
+    /// O(N) one-entry decrements.
+    #[test]
+    fn replication_append_result_fast_backoff_skips_entire_diverged_term() {
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
+        node.advance_write_index(500);
+        node.advance_commit_index(0);
+        // Model a peer with `next_index` deep into a divergent tail.
+        if let NodeState::Leader(l) = &mut node.state {
+            l.peers.get_mut(&2).unwrap().next_index = 500;
+        }
+        let _ = node
+            .replication()
+            .peer(2)
+            .unwrap()
+            .get_append_range(leader_now);
+
+        // Follower hint: its log has term=99 at every index from
+        // 50 onward — and the leader has never seen term 99.
+        let leader_term = node.current_term();
+        node.replication().peer(2).unwrap().append_result(
+            leader_now,
+            AppendResult::Reject {
+                term: leader_term,
+                reason: RejectReason::LogMismatch,
+                last_write_id: 49,
+                last_commit_id: 0,
+                conflict_term: 99,
+                conflict_index: 50,
+            },
+        );
+        // One RPC has collapsed the entire 450-entry diverged tail
+        // down to the conflict_index. With the legacy 1-entry
+        // decrement we would have walked 499 → 498 → ... → 50,
+        // taking 450 RPCs.
+        assert_eq!(node.replication().peer(2).unwrap().next_index(), 50);
+    }
+
+    /// Convergence in the other direction: leader has a term the
+    /// follower thought was different. Jumps to one past leader's
+    /// last entry of that term — in one round.
+    #[test]
+    fn replication_append_result_fast_backoff_uses_leader_term_when_present() {
+        let (mut node, leader_now) = fresh_leader_3node(1, vec![1, 2, 3]);
+        // fresh_leader_3node leaves term_log = [{1, 1}]. Append a
+        // boundary at 100 so leader's log spans t1 [1..=99] then a
+        // new term (call it 2) [100..=500]. The election's current
+        // term remains 1 — that's fine, the reply handler is term-
+        // independent on the LogMismatch branch.
+        node.persistence
+            .term_log
+            .push(crate::TermRecord { term: 2, start_tx_id: 100 });
+        node.advance_write_index(500);
+        node.advance_commit_index(0);
+        if let NodeState::Leader(l) = &mut node.state {
+            l.peers.get_mut(&2).unwrap().next_index = 500;
+        }
+
+        let _ = node
+            .replication()
+            .peer(2)
+            .unwrap()
+            .get_append_range(leader_now);
+
+        // Follower claims term 1 at prev_log_tx_id; first index of
+        // term 1 in follower's log is 1. Leader's last index of
+        // term 1 is 99 ⇒ next_index = 100.
+        let leader_term = node.current_term();
+        node.replication().peer(2).unwrap().append_result(
+            leader_now,
+            AppendResult::Reject {
+                term: leader_term,
+                reason: RejectReason::LogMismatch,
+                last_write_id: 250,
+                last_commit_id: 0,
+                conflict_term: 1,
+                conflict_index: 1,
+            },
+        );
+        assert_eq!(node.replication().peer(2).unwrap().next_index(), 100);
+    }
+
+    /// Follower-side: the AE Reject decision must carry a non-zero
+    /// hint so leaders that speak the new protocol can skip ahead.
+    #[test]
+    fn validate_emits_conflict_hint_on_log_mismatch_with_short_follower() {
+        let mut node = fresh(1, vec![1, 2, 3]);
+        // Follower has nothing — local_write_index = 0.
+        let decision = node.validate_append_entries_request(
+            Instant::now(),
+            2,
+            5,
+            10, // prev_log_tx_id
+            5,  // prev_log_term
+            LogEntryRange::empty(),
+            0,
+        );
+        // `!log_covers_prev` branch: hint is (0, local_write + 1).
+        assert_eq!(
+            decision,
+            AppendEntriesDecision::Reject {
+                reason: RejectReason::LogMismatch,
+                truncate_after: None,
+                conflict_term: 0,
+                conflict_index: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_emits_conflict_hint_on_log_mismatch_with_divergent_term() {
+        let mut node = fresh(1, vec![1, 2, 3]);
+        // Plant: term 4 starts at 1, term 7 starts at 11.
+        node.persistence.term_log.push(crate::TermRecord { term: 4, start_tx_id: 1 });
+        node.persistence.term_log.push(crate::TermRecord { term: 7, start_tx_id: 11 });
+        node.local_write_index = 20;
+        // Leader says prev_log_tx_id=15, prev_log_term=9 (mismatch:
+        // follower has term 7 at index 15).
+        let decision = node.validate_append_entries_request(
+            Instant::now(),
+            2,
+            9,
+            15,
+            9,
+            LogEntryRange::empty(),
+            0,
+        );
+        // Hint: (conflict_term=7, conflict_index=11).
+        assert_eq!(
+            decision,
+            AppendEntriesDecision::Reject {
+                reason: RejectReason::LogMismatch,
+                truncate_after: Some(14),
+                conflict_term: 7,
+                conflict_index: 11,
+            }
         );
     }
 }

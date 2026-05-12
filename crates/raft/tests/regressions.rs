@@ -123,6 +123,11 @@ fn log_mismatch_decrements_next_index() {
                     reason: RejectReason::LogMismatch,
                     last_write_id: 0,
                     last_commit_id: 0,
+                    // Legacy-style (no hint) reject keeps the
+                    // §5.3 1-entry walk-back behavior the
+                    // regression asserts.
+                    conflict_term: 0,
+                    conflict_index: 0,
                 },
             );
         }
@@ -187,6 +192,12 @@ fn term_log_truncates_with_entry_log() {
         AppendEntriesDecision::Reject {
             reason: RejectReason::LogMismatch,
             truncate_after: Some(4),
+            // The fixture's term log has only one record (term=1
+            // at start_tx_id=0 via the implicit term-init that
+            // accompanies the AE accept above), so the hint
+            // points back to the first conflicting term boundary.
+            conflict_term: 1,
+            conflict_index: 1,
         }
     );
 

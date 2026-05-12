@@ -239,6 +239,8 @@ fn higher_term_in_append_reply_demotes_leader() {
             reason: RejectReason::TermBehind,
             last_write_id: 0,
             last_commit_id: 0,
+            conflict_term: 0,
+            conflict_index: 0,
         },
     );
     assert!(!leader_node.role().is_leader());
@@ -388,6 +390,8 @@ fn append_entries_from_old_leader_is_rejected() {
         AppendEntriesDecision::Reject {
             reason: RejectReason::TermBehind,
             truncate_after: None,
+            conflict_term: 0,
+            conflict_index: 0,
         }
     );
     // The cluster stamps the reply's `term` from `current_term()`.

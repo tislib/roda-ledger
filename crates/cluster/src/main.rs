@@ -10,8 +10,7 @@
 use std::env;
 use std::path::PathBuf;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path: PathBuf = env::args()
         .nth(1)
         .or_else(|| env::var("RODA_CONFIG").ok())
@@ -19,5 +18,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|| "config.toml".to_string())
         .into();
 
-    cluster::run(&config_path).await
+    cluster::run(&config_path)
 }

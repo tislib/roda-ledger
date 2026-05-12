@@ -175,7 +175,7 @@ async fn main() {
         };
         cfg.validate().expect("follower cfg validate");
         let cluster = ClusterNode::new(cfg).expect("follower ledger");
-        let handles = cluster.run().await.expect("follower run");
+        let handles = cluster.run().expect("follower run");
         follower_ledgers.push(cluster.ledger());
         follower_handles.push(handles);
         follower_clusters.push(cluster);
@@ -205,7 +205,7 @@ async fn main() {
     leader_cfg.validate().expect("leader cfg validate");
 
     let leader = ClusterNode::new(leader_cfg).expect("leader ledger");
-    let leader_handles = leader.run().await.expect("leader run");
+    let leader_handles = leader.run().expect("leader run");
     let leader_ledger = leader.ledger();
 
     // Source-of-truth for replication progress. The leader owns a

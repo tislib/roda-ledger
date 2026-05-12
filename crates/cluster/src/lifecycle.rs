@@ -86,17 +86,24 @@ where
 }
 
 /// Join the dedicated gRPC server threads owned by a `*Handles` Drop.
-/// Wrapped in `block_in_place` when the surrounding tokio runtime has
-/// multiple workers so the parked worker can be replaced while the
-/// join proceeds — important because in-flight gRPC handlers may be
-/// awaiting oneshots driven by the raft loop on that same runtime.
 ///
-/// On a `current_thread` runtime there is no other worker to swap in,
-/// so we fall back to a plain `join()` and log a warning. The dedicated
-/// gRPC runtime exits independently of the host runtime, so the join
-/// itself does not deadlock — but a parked AppendEntries reply on a
-/// stalled host runtime could keep the gRPC drain pinned. Tests that
-/// drive the cluster lifecycle should use `flavor = "multi_thread"`.
+/// Three host-runtime cases, each handled differently:
+/// - **Multi-worker runtime**: wrap in `block_in_place` so the parked
+///   worker can be replaced while the join proceeds — important
+///   because in-flight gRPC handlers may be awaiting oneshots driven
+///   by the raft loop on that same runtime.
+/// - **Single-worker runtime** (`current_thread`, or `multi_thread`
+///   with `worker_threads = 1`): plain `join()`, plus a warning. The
+///   join itself does not deadlock — the dedicated gRPC runtime exits
+///   independently — but a parked AppendEntries reply on a stalled
+///   host runtime could keep the gRPC drain pinned. Tests that drive
+///   the cluster lifecycle should use `flavor = "multi_thread"` with
+///   `worker_threads >= 2`.
+/// - **No host runtime** (production `roda-server` main path post-
+///   refactor): plain `join()`, no warning. The cluster's own
+///   dedicated thread runtimes drive their work to completion
+///   independently of the caller, so there's nothing to swap in even
+///   if we wanted to.
 pub(crate) fn join_grpc_threads(
     label: &'static str,
     threads: impl IntoIterator<Item = Option<thread::JoinHandle<()>>>,
@@ -106,10 +113,6 @@ pub(crate) fn join_grpc_threads(
         return;
     }
 
-    let multi_thread = tokio::runtime::Handle::try_current()
-        .map(|h| h.metrics().num_workers() > 1)
-        .unwrap_or(false);
-
     let join_all = move || {
         for t in owned {
             if let Err(e) = t.join() {
@@ -118,15 +121,18 @@ pub(crate) fn join_grpc_threads(
         }
     };
 
-    if multi_thread {
-        tokio::task::block_in_place(join_all);
-    } else {
-        spdlog::warn!(
-            "{}: Drop without a multi_thread runtime — gRPC thread join may stall \
-             if a parked AppendEntries reply needs the host runtime to advance \
-             (test should use #[tokio::test(flavor = \"multi_thread\")])",
-            label
-        );
-        join_all();
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.metrics().num_workers() > 1 => tokio::task::block_in_place(join_all),
+        Ok(_) => {
+            spdlog::warn!(
+                "{}: Drop on a single-worker runtime — gRPC thread join may stall \
+                 if a parked AppendEntries reply needs the host runtime to advance \
+                 (test should use #[tokio::test(flavor = \"multi_thread\")] with \
+                 worker_threads >= 2)",
+                label
+            );
+            join_all();
+        }
+        Err(_) => join_all(),
     }
 }

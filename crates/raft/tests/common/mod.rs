@@ -697,19 +697,26 @@ impl Sim {
             None => return,
         };
 
-        let (success, reject_reason): (bool, Option<RejectReason>) = match decision {
+        let (success, reject_reason, conflict_term, conflict_index): (
+            bool,
+            Option<RejectReason>,
+            u64,
+            u64,
+        ) = match decision {
             AppendEntriesDecision::Reject {
                 reason,
                 truncate_after,
+                conflict_term,
+                conflict_index,
             } => {
                 if let Some(t) = truncate_after
                     && let Some(b) = self.nodes.get_mut(&target)
                 {
                     b.entries.truncate(t as usize);
                 }
-                (false, Some(reason))
+                (false, Some(reason), conflict_term, conflict_index)
             }
-            AppendEntriesDecision::Accept { append: None } => (true, None),
+            AppendEntriesDecision::Accept { append: None } => (true, None, 0, 0),
             AppendEntriesDecision::Accept {
                 append: Some(range),
             } => {
@@ -737,7 +744,7 @@ impl Sim {
                         node.advance_commit_index(last_tx);
                     }
                 }
-                (true, None)
+                (true, None, 0, 0)
             }
         };
 
@@ -771,6 +778,8 @@ impl Sim {
                 reason: reject_reason.unwrap_or(RejectReason::LogMismatch),
                 last_write_id,
                 last_commit_id,
+                conflict_term,
+                conflict_index,
             }
         };
         let when = now + self.network_delay;

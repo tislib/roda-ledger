@@ -74,6 +74,20 @@ message AppendEntriesResponse {
   // replication window (next_index — i.e. "what to ship next").
   // Invariant: last_write_id >= last_commit_id.
   uint64 last_write_id   = 5;
+
+  // Raft §5.3 fast-backoff hint. Populated only on
+  // REJECT_PREV_MISMATCH; zero on all other replies. See
+  // `RaftNode::on_append_entries_reply` for the leader's three-case
+  // application logic. Both zero ⇒ no hint (legacy fallback:
+  // decrement next_index by 1).
+  //
+  // `conflict_term`: follower's term at `prev_tx_id` (0 if the
+  // follower's log is shorter than `prev_tx_id`).
+  // `conflict_index`: when conflict_term != 0, the first index in
+  // the follower's log carrying conflict_term; when conflict_term ==
+  // 0, one past the follower's last log index (i.e. local_write + 1).
+  uint64 conflict_term   = 6;
+  uint64 conflict_index  = 7;
 }
 
 enum RejectReason {
