@@ -146,10 +146,10 @@ impl Storage {
     ///   older segments may also be fully past or may straddle.
     /// - **Straddles `watermark`** (`first_tx ≤ watermark < last_tx`):
     ///   byte-truncate the file at the first `Metadata > watermark`
-    ///   offset and discard the snapshot pair (it captured state past
-    ///   the watermark and is no longer trustworthy). Walk
-    ///   terminates — older segments are entirely below by
-    ///   construction.
+    ///   offset and discard the balance + function snapshot pair (they
+    ///   captured state past the watermark and are no longer
+    ///   trustworthy). Walk terminates — older segments are entirely
+    ///   below by construction.
     ///
     /// **Sealed segments are immutable.** ADR-0016 §10's seal-watermark
     /// gate (`Ledger::set_seal_watermark`) guarantees a sealed segment

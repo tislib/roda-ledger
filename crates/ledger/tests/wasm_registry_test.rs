@@ -638,9 +638,11 @@ fn handler_loads_after_restart() {
         // the next open.
     }
 
-    // The Transactor now owns WasmRuntime, so registration state lives
-    // ONLY in the WAL — there are no `function_snapshot_*.bin` files.
-    let snap_count = std::fs::read_dir(&guard.0)
+    // Seal emits `function_snapshot_NNNNNN.bin` at every snapshot
+    // boundary (internal.md §11.5 / §20.6), paired 1:1 with each
+    // balance snapshot. With `snapshot_frequency = 1` every sealed
+    // segment writes one of each.
+    let bin_count = std::fs::read_dir(&guard.0)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -650,9 +652,23 @@ fn handler_loads_after_restart() {
                 .unwrap_or(false)
         })
         .count();
+    let crc_count = std::fs::read_dir(&guard.0)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("function_snapshot_") && n.ends_with(".crc"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        bin_count > 0,
+        "expected at least one function_snapshot_*.bin to be emitted"
+    );
     assert_eq!(
-        snap_count, 0,
-        "function_snapshot_*.bin should no longer be emitted (transactor owns WasmRuntime)"
+        bin_count, crc_count,
+        "every function_snapshot_*.bin must have a paired .crc sidecar"
     );
 
     // Phase 2: reopen the same data_dir. Recovery should reload the
@@ -802,4 +818,183 @@ fn unregister_persists_across_restart() {
         .map(|i| i.name)
         .collect();
     assert_eq!(names, vec!["b".to_string()]);
+}
+
+#[test]
+fn function_snapshot_emitted_even_when_empty() {
+    // No `register_function` call — registry is empty for the entire
+    // run. Seal should still emit `function_snapshot_NNNNNN.bin` at
+    // every snapshot boundary (internal.md §20.7) so recovery can
+    // always pair a balance snapshot with a function snapshot.
+    let guard = make_dir();
+    {
+        let mut ledger = Ledger::new(persistent_config(&guard.0));
+        ledger.start().expect("first start");
+        for i in 0..12 {
+            ledger.submit_and_wait(
+                Operation::Deposit {
+                    account: 1,
+                    amount: 1,
+                    user_ref: i + 1,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger.wait_for_seal();
+    }
+
+    let mut found: Vec<String> = std::fs::read_dir(&guard.0)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .filter(|n| n.starts_with("function_snapshot_") && n.ends_with(".bin"))
+        .collect();
+    found.sort();
+    assert!(
+        !found.is_empty(),
+        "Seal must emit a function snapshot even when no functions are registered"
+    );
+
+    // Reopen and confirm the registry is still empty after recovery —
+    // the snapshot load must not invent phantom registrations.
+    let mut ledger = Ledger::new(persistent_config(&guard.0));
+    ledger.start().expect("second start");
+    assert!(ledger.list_functions().is_empty());
+}
+
+#[test]
+fn recovery_without_older_function_binaries_still_works() {
+    // Differentiator between snapshot-based recovery and the legacy
+    // WAL pre-pass: register `foo` v1, run traffic, override to v2,
+    // run more traffic so a snapshot lands past the v2 record. Then
+    // delete the v1 binary on disk and restart. The pre-pass would
+    // try to reload v1 (the disk-read fails → recovery aborts). The
+    // snapshot path only references v2 — v1's binary is never needed.
+    let guard = make_dir();
+    {
+        let mut ledger = Ledger::new(persistent_config(&guard.0));
+        ledger.start().expect("first start");
+        ledger
+            .register_function("foo", &compile(NOOP_WAT), false)
+            .unwrap();
+        for i in 0..6 {
+            ledger.submit_and_wait(
+                Operation::Deposit {
+                    account: 1,
+                    amount: 1,
+                    user_ref: i + 1,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger
+            .register_function("foo", &compile(REJECT_WAT), true)
+            .unwrap();
+        for i in 0..12 {
+            ledger.submit_and_wait(
+                Operation::Deposit {
+                    account: 2,
+                    amount: 1,
+                    user_ref: 100 + i,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger.wait_for_seal();
+    }
+
+    let v1_path = guard.0.join("functions").join("foo_v1.wasm");
+    assert!(v1_path.exists(), "v1 binary should exist after registration");
+    std::fs::remove_file(&v1_path).unwrap();
+
+    let mut ledger = Ledger::new(persistent_config(&guard.0));
+    ledger.start().expect("recovery must succeed without v1 binary");
+    let list = ledger.list_functions();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "foo");
+    assert_eq!(list[0].version, 2);
+}
+
+#[test]
+fn function_snapshot_load_skips_segments_below_snapshot_id() {
+    // Phase 1: register two functions over multiple segments so the
+    // FunctionRegistered records live in early sealed segments, then
+    // run enough traffic to push a snapshot boundary past them.
+    let guard = make_dir();
+    {
+        let mut ledger = Ledger::new(persistent_config(&guard.0));
+        ledger.start().expect("first start");
+        ledger
+            .register_function("alpha", &compile(NOOP_WAT), false)
+            .unwrap();
+        for i in 0..6 {
+            ledger.submit_and_wait(
+                Operation::Deposit {
+                    account: 1,
+                    amount: 1,
+                    user_ref: i + 1,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger
+            .register_function("beta", &compile(NOOP_WAT), false)
+            .unwrap();
+        for i in 0..12 {
+            ledger.submit_and_wait(
+                Operation::Deposit {
+                    account: 2,
+                    amount: 1,
+                    user_ref: 100 + i,
+                },
+                WaitLevel::OnSnapshot,
+            );
+        }
+        ledger.wait_for_seal();
+    }
+
+    // Pick the highest function snapshot — recovery should load this
+    // one, and its content must include both registrations sorted by
+    // name. Decoding through the storage crate's public load API
+    // mirrors what Recover does.
+    let highest_id = std::fs::read_dir(&guard.0)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name
+                .strip_prefix("function_snapshot_")?
+                .strip_suffix(".bin")?;
+            stem.parse::<u32>().ok()
+        })
+        .max()
+        .expect("at least one function snapshot");
+
+    let storage = std::sync::Arc::new(
+        storage::Storage::new(StorageConfig {
+            data_dir: guard.0.to_string_lossy().into_owned(),
+            temporary: false,
+            ..StorageConfig::default()
+        })
+        .unwrap(),
+    );
+    let seg = storage.segment(highest_id).unwrap();
+    let data = seg
+        .load_function_snapshot()
+        .unwrap()
+        .expect("snapshot present");
+    let names: Vec<String> = data.entries.iter().map(|(n, _, _)| n.clone()).collect();
+    assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    drop(storage);
+
+    // Phase 2: reopen — both functions should be loaded via the snapshot.
+    let mut ledger = Ledger::new(persistent_config(&guard.0));
+    ledger.start().expect("second start");
+    let mut names: Vec<String> = ledger
+        .list_functions()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
 }

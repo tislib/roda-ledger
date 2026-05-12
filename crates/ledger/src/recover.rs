@@ -6,7 +6,7 @@ use spdlog::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use storage::SegmentStaus::SEALED;
-use storage::entities::{FailReason, TxMetadata, WalEntry, WalEntryKind};
+use storage::entities::{FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind};
 use storage::{Segment, Storage};
 
 const ENTRY_SIZE: usize = 40;
@@ -353,78 +353,6 @@ impl<'r> Recover<'r> {
         let mut last_tx_id = 0;
         let mut recover_balances = HashMap::new();
 
-        // Pre-pass: replay every `FunctionRegistered` record in every
-        // sealed segment up to AND INCLUDING the snapshot segment.
-        // The balance snapshot captures balances only — function
-        // registrations live ONLY in the WAL, so we have to walk the
-        // whole sealed history. Segments AFTER the snapshot are
-        // covered by the main per-segment pass below; including the
-        // snapshot segment here is necessary because the main loop
-        // treats it as snapshot-only and skips its WAL records.
-        // Segment loads here are reused (cached) by the main pass.
-        // Watermark filtering is by preceding TxMetadata.tx_id (same
-        // discipline as the main loop).
-        {
-            let transactor = &*self.transactor;
-            for segment in self.segments.iter_mut() {
-                if segment.id() > latest_snapshot_segment_id {
-                    // Segments strictly after the snapshot are visited
-                    // by the main pass for both balances and functions.
-                    continue;
-                }
-                segment.load().map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to load segment {} for function pre-pass: {}",
-                            segment.id(),
-                            e
-                        ),
-                    )
-                })?;
-                let mut skipping_tx = false;
-                let mut function_apply_err: Option<std::io::Error> = None;
-                segment
-                    .visit_wal_records(|record| match record {
-                        WalEntry::Metadata(m) => {
-                            skipping_tx = m.tx_id > watermark;
-                        }
-                        WalEntry::FunctionRegistered(f) => {
-                            if skipping_tx {
-                                return;
-                            }
-                            if function_apply_err.is_none()
-                                && let Err(e) = transactor.recover_function_registered(f)
-                            {
-                                function_apply_err = Some(std::io::Error::new(
-                                    e.kind(),
-                                    format!(
-                                        "recover: replay FunctionRegistered({} v{}) failed: {}",
-                                        f.name_str(),
-                                        f.version,
-                                        e
-                                    ),
-                                ));
-                            }
-                        }
-                        _ => {}
-                    })
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "failed to visit wal records (function pre-pass) for segment {}: {}",
-                                segment.id(),
-                                e
-                            ),
-                        )
-                    })?;
-                if let Some(e) = function_apply_err {
-                    return Err(e);
-                }
-            }
-        }
-
         // restore the latest snapshot
         for segment in self.segments.iter_mut() {
             // ignore segments before snapshot
@@ -464,6 +392,47 @@ impl<'r> Recover<'r> {
                 }
 
                 last_tx_id = data.last_tx_id;
+
+                // Pair: load the function snapshot for the same segment
+                // and seed both Seal's function map and the WASM runtime
+                // before any FunctionRegistered records are replayed
+                // forward (internal.md §12.3 / §12.4).
+                if let Some(fdata) = segment.load_function_snapshot().map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to load function snapshot for segment {}: {}",
+                            segment.id(),
+                            e
+                        ),
+                    )
+                })? {
+                    for (name, version, crc) in fdata.entries {
+                        self.seal
+                            .recover_function_record(&name, version, crc)
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "failed to seed seal function map for {} v{}: {}",
+                                        name, version, e
+                                    ),
+                                )
+                            })?;
+                        let record = FunctionRegistered::new(&name, version, crc);
+                        self.transactor
+                            .recover_function_registered(&record)
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "recover: function snapshot apply for {} v{} failed: {}",
+                                        name, version, e
+                                    ),
+                                )
+                            })?;
+                    }
+                }
 
                 continue;
             }
@@ -508,6 +477,7 @@ impl<'r> Recover<'r> {
             let mut skipping_tx = false;
             let snapshot = &mut self.snapshot;
             let transactor = &*self.transactor;
+            let seal = &mut *self.seal;
             let mut function_apply_err: Option<std::io::Error> = None;
             segment
                 .visit_wal_records(|record| match record {
@@ -550,6 +520,21 @@ impl<'r> Recover<'r> {
                                     e
                                 ),
                             ));
+                            return;
+                        }
+                        if function_apply_err.is_none()
+                            && let Err(e) =
+                                seal.recover_function_record(f.name_str(), f.version, f.crc32c)
+                        {
+                            function_apply_err = Some(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "recover: seal map update for {} v{} failed: {}",
+                                    f.name_str(),
+                                    f.version,
+                                    e
+                                ),
+                            ));
                         }
                     }
                     _ => {}
@@ -578,6 +563,7 @@ impl<'r> Recover<'r> {
         let mut skipping_tx = false;
         let snapshot = &mut self.snapshot;
         let transactor = &mut self.transactor;
+        let seal = &mut *self.seal;
         let mut function_apply_err: Option<std::io::Error> = None;
         active_segment
             .visit_wal_records(|record| match record {
@@ -624,6 +610,21 @@ impl<'r> Recover<'r> {
                             e.kind(),
                             format!(
                                 "recover: replay FunctionRegistered({} v{}) failed: {}",
+                                f.name_str(),
+                                f.version,
+                                e
+                            ),
+                        ));
+                        return;
+                    }
+                    if function_apply_err.is_none()
+                        && let Err(e) =
+                            seal.recover_function_record(f.name_str(), f.version, f.crc32c)
+                    {
+                        function_apply_err = Some(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "recover: seal map update for {} v{} failed: {}",
                                 f.name_str(),
                                 f.version,
                                 e

@@ -9,8 +9,9 @@
 //! `data_dir`, `segment_id`). That stays inside the `storage` module.
 
 use crate::layout::{
-    active_wal_path, segment_account_index_path, segment_crc_path, segment_seal_path,
-    segment_tx_index_path, segment_wal_path, snapshot_bin_path, snapshot_crc_path,
+    active_wal_path, function_snapshot_bin_path, function_snapshot_crc_path,
+    segment_account_index_path, segment_crc_path, segment_seal_path, segment_tx_index_path,
+    segment_wal_path, snapshot_bin_path, snapshot_crc_path,
 };
 use crate::wal_reader::read_wal_data;
 use crate::{Segment, SegmentStaus};
@@ -63,10 +64,9 @@ impl Segment {
     /// Removes every on-disk artifact for this segment id:
     /// `wal_{id}.bin`, `wal_{id}.crc`, `wal_{id}.seal`,
     /// `wal_index_{id}.bin`, `account_index_{id}.bin`,
-    /// `snapshot_{id}.bin`, `snapshot_{id}.crc`. Also clears any
-    /// legacy `function_snapshot_{id}.{bin,crc}` paired to this segment
-    /// (no longer emitted, but cleaned up defensively in case an older
-    /// version's data directory is being truncated).
+    /// `snapshot_{id}.bin`, `snapshot_{id}.crc`,
+    /// `function_snapshot_{id}.bin`, `function_snapshot_{id}.crc`
+    /// (internal.md §23.5).
     ///
     /// Used by [`storage::Storage::truncate_wal_above`] when an
     /// entire segment falls past the recovery watermark (ADR-0016 §9).
@@ -81,8 +81,8 @@ impl Segment {
             segment_account_index_path(dir, segment_id),
             snapshot_bin_path(dir, segment_id),
             snapshot_crc_path(dir, segment_id),
-            dir.join(format!("function_snapshot_{:06}.bin", segment_id)),
-            dir.join(format!("function_snapshot_{:06}.crc", segment_id)),
+            function_snapshot_bin_path(dir, segment_id),
+            function_snapshot_crc_path(dir, segment_id),
         ];
         for path in &candidates {
             if path.exists() {
@@ -94,19 +94,19 @@ impl Segment {
         Ok(())
     }
 
-    /// Removes only the snapshot pair (`snapshot_{id}.bin` +
-    /// `snapshot_{id}.crc`, plus any legacy
-    /// `function_snapshot_{id}.*`) for this segment id. Used after
-    /// truncating a *straddling* segment — its existing balance
-    /// snapshot captured state past the watermark and is no longer
-    /// trustworthy. Missing files are tolerated.
+    /// Removes the balance and function snapshot pairs
+    /// (`snapshot_{id}.{bin,crc}` and `function_snapshot_{id}.{bin,crc}`)
+    /// for this segment id. Used after truncating a *straddling*
+    /// segment — its existing snapshots captured state past the
+    /// watermark and are no longer trustworthy. Missing files are
+    /// tolerated.
     pub fn delete_snapshot_files_for_segment(data_dir: &str, segment_id: u32) -> Result<(), Error> {
         let dir = Path::new(data_dir);
         let candidates = [
             snapshot_bin_path(dir, segment_id),
             snapshot_crc_path(dir, segment_id),
-            dir.join(format!("function_snapshot_{:06}.bin", segment_id)),
-            dir.join(format!("function_snapshot_{:06}.crc", segment_id)),
+            function_snapshot_bin_path(dir, segment_id),
+            function_snapshot_crc_path(dir, segment_id),
         ];
         for path in &candidates {
             if path.exists() {
