@@ -265,7 +265,7 @@ function RaftLogPanel({ nodeId }: { nodeId: string | null }) {
 function errorHint(error: unknown): string {
   const msg = error instanceof Error ? error.message : String(error ?? '');
   if (msg.toLowerCase().includes('unimplemented')) {
-    return 'Control plane was built without GetNodeWalLog. Rebuild and restart it.';
+    return 'Cluster nodes were built without `Ledger.GetLog`. Rebuild and restart them.';
   }
   return msg || 'Request failed.';
 }

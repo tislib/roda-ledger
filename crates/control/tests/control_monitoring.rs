@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use proto::control::control_server::Control;
 use proto::control::{
-    Capability, ClusterHealth, GetClusterSnapshotRequest, GetNodeWalLogRequest,
-    GetRecentElectionsRequest, GetServerInfoRequest, NodeRole, WatchClusterSnapshotRequest,
+    Capability, ClusterHealth, GetClusterSnapshotRequest, GetRecentElectionsRequest,
+    GetServerInfoRequest, NodeRole, WatchClusterSnapshotRequest,
 };
 use tokio_stream::StreamExt;
-use tonic::{Code, Request};
+use tonic::Request;
 
 mod common;
 
@@ -145,38 +145,4 @@ async fn get_recent_elections_returns_term() {
         "expected at least one election event"
     );
     assert!(resp.events[0].term >= 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn get_node_wal_log_for_valid_node() {
-    let (svc, _events, _h) = common::build_control(3).await;
-    common::wait_for_leader(&svc, Duration::from_secs(10)).await;
-
-    let resp = svc
-        .get_node_wal_log(Request::new(GetNodeWalLogRequest {
-            node_id: 1,
-            from_tx_id: 0,
-            to_tx_id: 0,
-            limit: 10,
-        }))
-        .await
-        .expect("get_node_wal_log");
-    let _ = resp.into_inner();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn get_node_wal_log_unknown_node_returns_not_found() {
-    let (svc, _events, _h) = common::build_control(3).await;
-    common::wait_for_leader(&svc, Duration::from_secs(10)).await;
-
-    let err = svc
-        .get_node_wal_log(Request::new(GetNodeWalLogRequest {
-            node_id: 999,
-            from_tx_id: 0,
-            to_tx_id: 0,
-            limit: 10,
-        }))
-        .await
-        .expect_err("expected Status::not_found for unknown node_id");
-    assert_eq!(err.code(), Code::NotFound, "{:?}", err);
 }

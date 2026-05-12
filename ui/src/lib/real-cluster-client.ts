@@ -23,7 +23,6 @@ import {
   GetClusterSnapshotRequestSchema,
   GetFaultHistoryRequestSchema,
   GetNodeLogRequestSchema,
-  GetNodeWalLogRequestSchema,
   GetRecentElectionsRequestSchema,
   GetServerInfoRequestSchema,
   HealPartitionRequestSchema,
@@ -44,6 +43,7 @@ import {
 import {
   Ledger,
   GetBalanceRequestSchema,
+  GetLogRequestSchema,
   GetStatusRequestSchema,
   ListFunctionsRequestSchema,
   RegisterFunctionRequestSchema,
@@ -154,13 +154,16 @@ export class RealClusterClient implements ClusterClient {
     nodeId: string,
     opts?: { fromTxId?: string; toTxId?: string; limit?: number },
   ): Promise<WalLogPage> {
-    const resp = await this.control.getNodeWalLog(
-      create(GetNodeWalLogRequestSchema, {
-        nodeId: stringToU64(nodeId),
+    // `ledger.proto`'s GetLog has no per-node target — the proxy honors
+    // the `node-selector` request metadata header to pin the call to a
+    // specific peer instead.
+    const resp = await this.ledger.getLog(
+      create(GetLogRequestSchema, {
         fromTxId: stringToU64(opts?.fromTxId ?? '0'),
         toTxId: stringToU64(opts?.toTxId ?? '0'),
         limit: opts?.limit ?? 100,
       }),
+      { headers: { 'node-selector': nodeId } },
     );
     return {
       records: resp.records
