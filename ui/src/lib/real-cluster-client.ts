@@ -287,7 +287,7 @@ export class RealClusterClient implements ClusterClient {
     return { txId: u64ToString(resp.transactionId), failReason: 0 };
   }
 
-  async getTransactionStatus(txId: string): Promise<TransactionStatus> {
+  async getTransactionStatus(txId: string): Promise<{ failReason: FailReasonCode }> {
     const resp = await this.ledger.getTransactionStatus(
       create(GetStatusRequestSchema, { transactionId: stringToU64(txId) }),
     );
@@ -298,17 +298,20 @@ export class RealClusterClient implements ClusterClient {
     txId: string,
     level: WaitLevel,
     timeoutMs: number,
-  ): Promise<TransactionStatus> {
+  ): Promise<WaitStatus> {
     const start = Date.now();
     return new Promise((resolve) => {
       const tick = async () => {
-        const status = await this.getTransactionStatus(txId);
+        const resp = await this.ledger.getTransactionStatus(
+          create(GetStatusRequestSchema, { transactionId: stringToU64(txId) }),
+        );
+        const status = waitStatusFromPb(resp);
         const reached =
           (level === 'Computed' && status.state === 'Computed') ||
           (level === 'Committed' &&
             (status.state === 'Committed' || status.state === 'OnSnapshot')) ||
           (level === 'OnSnapshot' && status.state === 'OnSnapshot') ||
-          isTerminal(status);
+          isWaitTerminal(status);
         if (reached || Date.now() - start >= timeoutMs) {
           resolve(status);
           return;
