@@ -231,11 +231,8 @@ impl ReplicationLoop {
     /// the mirror. Logs both pre- and post-advance index triples.
     fn poll_ledger_watermark(&mut self) {
         let self_id = self.self_id;
-        // Read commit first so compute_id >= commit_id holds in the
-        // snapshot we feed into raft. Reversing the order races with
-        // the ledger pipeline advancing both atomics independently.
-        let commit_index = self.ledger.ledger().last_commit_id();
         let write_index = self.ledger.ledger().last_compute_id();
+        let commit_index = self.ledger.ledger().last_commit_id();
         if write_index == self.last_seen_write && commit_index == self.last_seen_commit {
             return;
         }
@@ -566,9 +563,9 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
         }
         replicate_once(&mut r).await;
 
-        // Commit first → compute, same ordering rule as poll_ledger_watermark.
-        let commit_index = r.ledger.ledger().last_commit_id();
+        // self advance
         let write_index = r.ledger.ledger().last_compute_id();
+        let commit_index = r.ledger.ledger().last_commit_id();
         r.node.borrow_mut().advance_write_index(write_index);
         r.node.borrow_mut().advance_commit_index(commit_index);
         r.mirror.snapshot_from(&r.node.borrow());
@@ -604,6 +601,64 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
     );
 }
 
+/// Outcome of the leader-side "build the next AE" step. Pure function;
+/// no side effects on `RaftNode` or `WalTailer` here — the orchestrator
+/// in `replicate_once` decides whether to send the request or reset the
+/// tailer based on this.
+#[derive(Debug)]
+pub(crate) enum AeAction {
+    /// Issue this proto request to the peer.
+    Send(proto::AppendEntriesRequest),
+    /// Tail returned 0 bytes for a non-empty entries range; the cursor
+    /// has been exhausted past undelivered bytes. The orchestrator
+    /// resets the tailer and skips the tick.
+    ResetTailerSkip,
+}
+
+/// Whether the tail call produced bytes or came up empty for a
+/// non-empty entries range.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TailAttempt {
+    Bytes(Vec<u8>),
+    Empty,
+}
+
+/// Pure decision: given the raft-issued AE request and the tailer's
+/// outcome for any non-empty entries range, produce the action the
+/// orchestrator should take. Heartbeats (empty entries range) bypass
+/// the tailer entirely.
+pub(crate) fn build_ae_action(
+    self_id: NodeId,
+    req: &raft::AppendEntriesRequest,
+    tail: Option<TailAttempt>,
+) -> AeAction {
+    let common = |to_tx_id: TxId, wal_bytes: Vec<u8>| proto::AppendEntriesRequest {
+        leader_id: self_id,
+        term: req.term,
+        prev_tx_id: req.prev_log_tx_id,
+        prev_term: req.prev_log_term,
+        from_tx_id: req.entries.start_tx_id,
+        to_tx_id,
+        wal_bytes,
+        leader_commit_tx_id: req.leader_commit,
+    };
+    if req.entries.is_empty() {
+        debug_assert!(tail.is_none(), "heartbeat AE must not consult the tailer");
+        let to_tx_id = req.entries.start_tx_id.saturating_sub(1);
+        return AeAction::Send(common(to_tx_id, Vec::new()));
+    }
+    match tail.expect("entries AE must include a tail attempt") {
+        TailAttempt::Empty => AeAction::ResetTailerSkip,
+        TailAttempt::Bytes(wal_bytes) => {
+            let to_tx_id = req
+                .entries
+                .last_tx_id()
+                .expect("non-empty range has a last_tx_id");
+            AeAction::Send(common(to_tx_id, wal_bytes))
+        }
+    }
+}
+
 async fn replicate_once(r: &mut PeerReplicator) {
     let now = Instant::now();
     let request = {
@@ -622,67 +677,52 @@ async fn replicate_once(r: &mut PeerReplicator) {
         return;
     };
 
-    let to_tx_id;
-    let wal_bytes: Vec<u8>;
-    if req.entries.is_empty() {
-        to_tx_id = req.entries.start_tx_id.saturating_sub(1);
-        wal_bytes = Vec::new();
+    let tail_attempt = if req.entries.is_empty() {
+        None
     } else {
         let from_tx_id = req.entries.start_tx_id;
-        let last_tx_id = req
-            .entries
-            .last_tx_id()
-            .expect("non-empty range has a last_tx_id");
         let mut buffer = vec![0u8; r.append_max_bytes];
         let written = r.tailer.tail(from_tx_id, &mut buffer) as usize;
         if written == 0 {
-            // Tailer couldn't load the requested range — release in_flight
-            // (Timeout clears it without changing match/next), reset the
-            // cursor so the next tick re-seeks from from_tx_id (the cursor
-            // is one-shot; once advanced it won't re-emit bytes that were
-            // tailed but never delivered), then degrade to a heartbeat so
-            // leader_commit still propagates to this peer in the meantime.
-            debug!(
-                "replication_loop/l[{}]: peer={} tailer empty for from_tx={}; releasing in_flight and sending heartbeat",
-                r.self_id, r.peer_id, from_tx_id
-            );
-            let mut node = r.node.borrow_mut();
-            if let Some(mut p) = node.replication().peer(r.peer_id) {
-                p.append_result(now, AppendResult::Timeout);
-            }
-            drop(node);
-            r.tailer.reset();
-            to_tx_id = req.entries.start_tx_id.saturating_sub(1);
-            wal_bytes = Vec::new();
+            Some(TailAttempt::Empty)
         } else {
             buffer.truncate(written);
-            wal_bytes = buffer;
-            to_tx_id = last_tx_id;
+            Some(TailAttempt::Bytes(buffer))
+        }
+    };
+
+    let proto_req = match build_ae_action(r.self_id, &req, tail_attempt) {
+        AeAction::Send(p) => {
             debug!(
-                "replication_loop/l[{}]: peer={} → AE entries term={} prev_tx={} prev_term={} from_tx={} to_tx={} count={} leader_commit={} wal_bytes={}",
+                "replication_loop/l[{}]: peer={} → AE term={} prev_tx={} prev_term={} from_tx={} to_tx={} count={} leader_commit={} wal_bytes={}",
                 r.self_id,
                 r.peer_id,
-                req.term,
-                req.prev_log_tx_id,
-                req.prev_log_term,
-                from_tx_id,
-                last_tx_id,
+                p.term,
+                p.prev_tx_id,
+                p.prev_term,
+                p.from_tx_id,
+                p.to_tx_id,
                 req.entries.count,
-                req.leader_commit,
-                written
+                p.leader_commit_tx_id,
+                p.wal_bytes.len()
             );
+            p
         }
-    }
-
-    let proto_req = proto::AppendEntriesRequest {
-        leader_id: r.self_id,
-        term: req.term,
-        prev_tx_id: req.prev_log_tx_id,
-        prev_term: req.prev_log_term,
-        from_tx_id: req.entries.start_tx_id,
-        to_tx_id,
-        wal_bytes,
-        leader_commit_tx_id: req.leader_commit,
+        AeAction::ResetTailerSkip => {
+            // Cursor exhausted: reset so the next tick re-seeks from
+            // from_tx_id. Don't clear in_flight here — the existing
+            // 500ms rpc_timeout sweep handles that. Clearing it would
+            // re-arm get_append_range immediately and, on a freshly
+            // elected leader with stale term_at_tx for early tx_ids,
+            // cause a heartbeat with mismatched prev_log_term that
+            // triggers a spurious follower reseed loop.
+            debug!(
+                "replication_loop/l[{}]: peer={} tailer empty for from_tx={}; resetting tailer",
+                r.self_id, r.peer_id, req.entries.start_tx_id
+            );
+            r.tailer.reset();
+            return;
+        }
     };
 
     let result = send_append_entries_rpc(
@@ -724,10 +764,6 @@ async fn replicate_once(r: &mut PeerReplicator) {
         }
     }
 
-    // Timeout leaves match/next unchanged but the tailer has already
-    // advanced past undelivered bytes — reset it so the next tick
-    // re-reads from the peer's current next_index.
-    let timed_out = matches!(result, AppendResult::Timeout);
     let mut node = r.node.borrow_mut();
     if let Some(mut p) = node.replication().peer(r.peer_id) {
         p.append_result(now, result);
@@ -745,10 +781,6 @@ async fn replicate_once(r: &mut PeerReplicator) {
         );
     }
     r.mirror.snapshot_from(&node);
-    drop(node);
-    if timed_out {
-        r.tailer.reset();
-    }
 }
 
 async fn send_append_entries_rpc(
@@ -841,5 +873,108 @@ fn build_ae_response(
         last_commit_id: node.commit_index(),
         last_write_id: node.write_index(),
         reject_reason: reject_code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure decision logic that `replicate_once`
+    //! sits on top of. The orchestration itself (gRPC dispatch,
+    //! `RaftNode::replication()` borrow dance) is exercised by the
+    //! integration tests in `crates/cluster/tests/`; here we lock in
+    //! the behaviors that have been subtle in practice:
+    //!
+    //! - Heartbeats (`req.entries.is_empty()`) skip the tailer
+    //!   entirely and ship with empty `wal_bytes`.
+    //! - Entries AEs with non-zero tail bytes ship those bytes
+    //!   verbatim with the matching `to_tx_id`.
+    //! - Entries AEs whose tail returned 0 produce a
+    //!   `ResetTailerSkip` so the orchestrator re-seeks the cursor
+    //!   on the next tick instead of shipping a phantom heartbeat
+    //!   with stale `prev_log_term` (which would loop a freshly-
+    //!   elected leader into spurious follower reseeds — see the
+    //!   `no_leader_blocks_writes` safety test).
+    //!
+    //! `LogEntryRange::empty()` has `start_tx_id = 0`; the
+    //! heartbeat's `from_tx_id`/`to_tx_id` shape is `(0, 0)` — the
+    //! follower treats `to_tx_id < from_tx_id` as empty too.
+    use super::*;
+    use raft::{AppendEntriesRequest, LogEntryRange};
+
+    fn mk_req(start_tx: TxId, count: u64, term: u64) -> AppendEntriesRequest {
+        AppendEntriesRequest {
+            to: 2,
+            term: 5,
+            prev_log_tx_id: start_tx.saturating_sub(1),
+            prev_log_term: 3,
+            entries: if count == 0 {
+                LogEntryRange::empty()
+            } else {
+                LogEntryRange::new(start_tx, count, term)
+            },
+            leader_commit: 7,
+        }
+    }
+
+    #[test]
+    fn heartbeat_request_skips_tailer_and_ships_empty_bytes() {
+        let req = mk_req(0, 0, 0);
+        let action = build_ae_action(1, &req, None);
+        let p = match action {
+            AeAction::Send(p) => p,
+            AeAction::ResetTailerSkip => panic!("heartbeat should send"),
+        };
+        assert_eq!(p.leader_id, 1);
+        assert_eq!(p.term, 5);
+        assert_eq!(p.wal_bytes, Vec::<u8>::new());
+        assert_eq!(p.from_tx_id, 0);
+        // Heartbeat's to_tx_id = start_tx_id.saturating_sub(1) so the
+        // follower's `to_tx_id < from_tx_id` check yields an empty range.
+        assert_eq!(p.to_tx_id, 0);
+        assert_eq!(p.leader_commit_tx_id, 7);
+    }
+
+    #[test]
+    fn entries_request_with_bytes_ships_them_and_sets_to_tx_id() {
+        let req = mk_req(10, 3, 4);
+        let bytes = vec![0xAA; 120];
+        let action = build_ae_action(1, &req, Some(TailAttempt::Bytes(bytes.clone())));
+        let p = match action {
+            AeAction::Send(p) => p,
+            AeAction::ResetTailerSkip => panic!("entries with bytes should send"),
+        };
+        assert_eq!(p.from_tx_id, 10);
+        assert_eq!(p.to_tx_id, 12);
+        assert_eq!(p.wal_bytes, bytes);
+        assert_eq!(p.term, 5);
+        assert_eq!(p.prev_tx_id, 9);
+        assert_eq!(p.prev_term, 3);
+    }
+
+    #[test]
+    fn entries_request_with_empty_tail_yields_reset_skip() {
+        // The critical bug-locus: a tail==0 must NOT degrade to a
+        // heartbeat-shaped AE. Sending a heartbeat carries the
+        // leader's stale `prev_log_term` from its persistence, which
+        // can mismatch a freshly-observed term on the follower and
+        // trigger a follower reseed loop after re-election. The
+        // orchestrator instead resets the tailer and lets the next
+        // tick re-seek + reload the bytes.
+        let req = mk_req(10, 3, 4);
+        let action = build_ae_action(1, &req, Some(TailAttempt::Empty));
+        assert!(
+            matches!(action, AeAction::ResetTailerSkip),
+            "tail==0 must produce ResetTailerSkip, not Send (got {action:?})"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "heartbeat AE must not consult the tailer")]
+    fn heartbeat_with_tail_input_panics_in_debug() {
+        // Guard: the caller of `build_ae_action` must not even call
+        // the tailer for heartbeats. Passing a tail attempt is a
+        // programming error and `replicate_once` is shaped to avoid it.
+        let req = mk_req(0, 0, 0);
+        let _ = build_ae_action(1, &req, Some(TailAttempt::Empty));
     }
 }
