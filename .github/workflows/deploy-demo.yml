@@ -9,21 +9,10 @@ on:
         default: "roda-ledger-demo"
         type: string
       server_type:
-        description: "Hetzner server type. Shared AMD (cpx*) and dedicated AMD (ccx*) — all x86, matching our linux/amd64 images."
+        description: "Hetzner server type (e.g. cx22, cpx31, ccx33). If the type isn't available in fsn1, the run will fail and print the list of available types."
         required: false
-        default: "cpx31"
-        type: choice
-        options:
-          - cpx11
-          - cpx21
-          - cpx31
-          - cpx41
-          - cpx51
-          - ccx13
-          - ccx23
-          - ccx33
-          - ccx43
-          - ccx53
+        default: "CX33"
+        type: string
 
 env:
   IMAGE: tislib/roda-ledger
