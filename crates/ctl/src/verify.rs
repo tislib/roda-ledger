@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use storage::entities::*;
 use storage::SegmentStaus;
+use storage::entities::*;
 
 use super::json::{compute_tx_crc, verify_tx_crc};
 use super::{CtlError, SegmentReport, SnapshotReport, VerifyReport, make_storage};

@@ -76,7 +76,10 @@ async fn get_log_from_zero_includes_metadata() {
         .records
         .iter()
         .any(|r| matches!(r.entry, Some(LogEntry::Metadata(_))));
-    assert!(has_metadata, "from_tx_id=0 should include TxMetadata records");
+    assert!(
+        has_metadata,
+        "from_tx_id=0 should include TxMetadata records"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

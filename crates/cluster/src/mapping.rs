@@ -149,4 +149,3 @@ fn function_registered_to_proto(f: FunctionRegistered) -> proto::WalFunctionRegi
         crc32c: f.crc32c,
     }
 }
-
