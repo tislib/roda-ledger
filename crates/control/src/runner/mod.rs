@@ -809,7 +809,9 @@ fn user_ref_of(op: &SubmitOp) -> u64 {
     }
 }
 
+// `user_ref == 0` is the dedup opt-out sentinel; preserve it through offset.
 fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
+    let shift = |user_ref: u64| if user_ref == 0 { 0 } else { user_ref + offset };
     match op {
         SubmitOp::Deposit {
             account,
@@ -818,7 +820,7 @@ fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
         } => SubmitOp::Deposit {
             account,
             amount,
-            user_ref: user_ref + offset,
+            user_ref: shift(user_ref),
         },
         SubmitOp::Withdraw {
             account,
@@ -827,7 +829,7 @@ fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
         } => SubmitOp::Withdraw {
             account,
             amount,
-            user_ref: user_ref + offset,
+            user_ref: shift(user_ref),
         },
         SubmitOp::Transfer {
             from,
@@ -838,7 +840,7 @@ fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
             from,
             to,
             amount,
-            user_ref: user_ref + offset,
+            user_ref: shift(user_ref),
         },
         SubmitOp::Function {
             name,
@@ -847,7 +849,7 @@ fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
         } => SubmitOp::Function {
             name,
             params,
-            user_ref: user_ref + offset,
+            user_ref: shift(user_ref),
         },
     }
 }
@@ -1208,5 +1210,72 @@ mod tests {
             })),
         ]);
         check_capabilities(&s, Capabilities::all()).expect("all caps satisfies");
+    }
+
+    #[test]
+    fn with_user_ref_offset_preserves_zero_for_all_variants() {
+        let offset = 1_000;
+        let variants = [
+            SubmitOp::Deposit {
+                account: 1,
+                amount: 1,
+                user_ref: 0,
+            },
+            SubmitOp::Withdraw {
+                account: 1,
+                amount: 1,
+                user_ref: 0,
+            },
+            SubmitOp::Transfer {
+                from: 1,
+                to: 2,
+                amount: 1,
+                user_ref: 0,
+            },
+            SubmitOp::Function {
+                name: "noop".into(),
+                params: vec![],
+                user_ref: 0,
+            },
+        ];
+        for op in variants {
+            let shifted = with_user_ref_offset(op.clone(), offset);
+            assert_eq!(
+                user_ref_of(&shifted),
+                0,
+                "user_ref == 0 must be preserved through offset for {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_user_ref_offset_adds_offset_for_nonzero() {
+        let shifted = with_user_ref_offset(
+            SubmitOp::Deposit {
+                account: 1,
+                amount: 1,
+                user_ref: 1,
+            },
+            100,
+        );
+        assert_eq!(user_ref_of(&shifted), 101);
+    }
+
+    #[test]
+    fn expand_batch_preserves_zero_user_ref() {
+        let kind = BatchKind::Dynamic {
+            base: vec![SubmitOp::Deposit {
+                account: 1,
+                amount: 1,
+                user_ref: 0,
+            }],
+            repeat: 3,
+            batch_size: 2,
+        };
+        let ops = expand_batch(&kind);
+        assert_eq!(ops.len(), 6);
+        for op in &ops {
+            assert_eq!(user_ref_of(op), 0);
+        }
     }
 }
