@@ -420,4 +420,134 @@ mod tests {
         assert!(record_matches(&func, 5, 10));
         assert!(!record_matches(&func, 11, 10));
     }
+
+    use crate::config::StorageConfig;
+    use crate::entities::{
+        EntryKind, FailReason, TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry,
+    };
+    use crate::wal_serializer::serialize_wal_records;
+    use std::io::Write;
+
+    fn meta(tx_id: u64) -> WalEntry {
+        WalEntry::Metadata(TxMetadata {
+            entry_type: WalEntryKind::TxMetadata as u8,
+            fail_reason: FailReason::NONE,
+            sub_item_count: 3,
+            crc32c: 0,
+            tx_id,
+            timestamp: 0,
+            user_ref: 0,
+            tag: [0; 8],
+        })
+    }
+    fn entry(tx_id: u64) -> WalEntry {
+        WalEntry::Entry(TxEntry {
+            entry_type: WalEntryKind::TxEntry as u8,
+            kind: EntryKind::Credit,
+            _pad0: [0; 6],
+            tx_id,
+            account_id: 1,
+            amount: 1,
+            computed_balance: 1,
+        })
+    }
+    fn link(tx_id: u64) -> WalEntry {
+        WalEntry::Link(TxLink {
+            entry_type: WalEntryKind::Link as u8,
+            link_kind: TxLinkKind::Duplicate as u8,
+            _pad: [0; 6],
+            tx_id,
+            to_tx_id: 0,
+            _pad2: [0; 16],
+        })
+    }
+    fn term() -> WalEntry {
+        WalEntry::Term(TxTerm {
+            entry_type: WalEntryKind::TxTerm as u8,
+            _pad0: [0; 7],
+            term: 1,
+            node_id: 1,
+            node_count: 1,
+            node_voted: 1,
+            _pad1: [0; 12],
+        })
+    }
+
+    fn write_segment(path: &std::path::Path, entries: &[WalEntry]) {
+        let mut f = std::fs::File::create(path).unwrap();
+        for e in entries {
+            f.write_all(serialize_wal_records(e)).unwrap();
+        }
+        f.sync_all().unwrap();
+    }
+
+    fn open_storage(dir: &tempfile::TempDir) -> Arc<crate::engine::Storage> {
+        let cfg = StorageConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        };
+        Arc::new(crate::engine::Storage::new(cfg).unwrap())
+    }
+
+    #[test]
+    fn tail_bridges_sealed_segment_to_active() {
+        // segment 1 (sealed): tx=1 records ending with a structural TxTerm.
+        // active (wal.bin): tx=2 records. The carried last_meta_tx_id=1
+        // from segment 1 must not leak any tx=1 sub-items into the result
+        // when the caller asks for from_tx_id=2.
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(
+            &segment_wal_path(dir.path(), 1),
+            &[meta(1), entry(1), link(1), term()],
+        );
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[meta(2), entry(2), link(2)],
+        );
+
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer();
+        let mut buf = vec![0u8; 64 * WAL_RECORD_SIZE];
+
+        // from_tx_id=2 should yield exactly the three tx=2 records.
+        let n = tailer.tail(2, &mut buf) as usize;
+        assert_eq!(n, 3 * WAL_RECORD_SIZE, "expected 3 records for tx=2");
+        let decoded = decode_records(&buf[..n]);
+        assert_eq!(decoded.len(), 3);
+        for e in &decoded {
+            assert_eq!(e.tx_id(), 2);
+        }
+    }
+
+    #[test]
+    fn tail_returns_records_spanning_segments() {
+        // segment 1 (sealed): tx=1 ... tx=2 records.
+        // active (wal.bin): tx=3 records.
+        // from_tx_id=2 must cross the boundary and emit tx=2 (sealed) + tx=3 (active).
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(
+            &segment_wal_path(dir.path(), 1),
+            &[meta(1), entry(1), meta(2), entry(2), term()],
+        );
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[meta(3), entry(3), link(3)],
+        );
+
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer();
+        let mut buf = vec![0u8; 64 * WAL_RECORD_SIZE];
+
+        let n = tailer.tail(2, &mut buf) as usize;
+        let decoded = decode_records(&buf[..n]);
+        // Expected: TxMetadata(2), TxEntry(2), TxTerm (inherits 2),
+        // TxMetadata(3), TxEntry(3), TxLink(3) = 6 records.
+        assert_eq!(decoded.len(), 6, "got {:?}", decoded);
+        // First three are tx=2 (or inherit 2 via TxTerm).
+        assert!(matches!(decoded[0], WalEntry::Metadata(m) if m.tx_id == 2));
+        assert!(matches!(decoded[1], WalEntry::Entry(e) if e.tx_id == 2));
+        assert!(matches!(decoded[2], WalEntry::Term(_)));
+        // Then tx=3.
+        assert!(matches!(decoded[3], WalEntry::Metadata(m) if m.tx_id == 3));
+    }
 }

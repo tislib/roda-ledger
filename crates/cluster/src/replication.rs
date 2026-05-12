@@ -231,8 +231,11 @@ impl ReplicationLoop {
     /// the mirror. Logs both pre- and post-advance index triples.
     fn poll_ledger_watermark(&mut self) {
         let self_id = self.self_id;
-        let write_index = self.ledger.ledger().last_compute_id();
+        // Read commit first so compute_id >= commit_id holds in the
+        // snapshot we feed into raft. Reversing the order races with
+        // the ledger pipeline advancing both atomics independently.
         let commit_index = self.ledger.ledger().last_commit_id();
+        let write_index = self.ledger.ledger().last_compute_id();
         if write_index == self.last_seen_write && commit_index == self.last_seen_commit {
             return;
         }
@@ -563,9 +566,9 @@ async fn peer_replication_loop(mut r: PeerReplicator) {
         }
         replicate_once(&mut r).await;
 
-        // self advance
-        let write_index = r.ledger.ledger().last_compute_id();
+        // Commit first → compute, same ordering rule as poll_ledger_watermark.
         let commit_index = r.ledger.ledger().last_commit_id();
+        let write_index = r.ledger.ledger().last_compute_id();
         r.node.borrow_mut().advance_write_index(write_index);
         r.node.borrow_mut().advance_commit_index(commit_index);
         r.mirror.snapshot_from(&r.node.borrow());
@@ -633,28 +636,42 @@ async fn replicate_once(r: &mut PeerReplicator) {
         let mut buffer = vec![0u8; r.append_max_bytes];
         let written = r.tailer.tail(from_tx_id, &mut buffer) as usize;
         if written == 0 {
+            // Tailer couldn't load the requested range — release in_flight
+            // (Timeout clears it without changing match/next), reset the
+            // cursor so the next tick re-seeks from from_tx_id (the cursor
+            // is one-shot; once advanced it won't re-emit bytes that were
+            // tailed but never delivered), then degrade to a heartbeat so
+            // leader_commit still propagates to this peer in the meantime.
             debug!(
-                "replication_loop/l[{}]: peer={} tailer empty for from_tx={} (skip; retry next tick)",
+                "replication_loop/l[{}]: peer={} tailer empty for from_tx={}; releasing in_flight and sending heartbeat",
                 r.self_id, r.peer_id, from_tx_id
             );
-            return;
+            let mut node = r.node.borrow_mut();
+            if let Some(mut p) = node.replication().peer(r.peer_id) {
+                p.append_result(now, AppendResult::Timeout);
+            }
+            drop(node);
+            r.tailer.reset();
+            to_tx_id = req.entries.start_tx_id.saturating_sub(1);
+            wal_bytes = Vec::new();
+        } else {
+            buffer.truncate(written);
+            wal_bytes = buffer;
+            to_tx_id = last_tx_id;
+            debug!(
+                "replication_loop/l[{}]: peer={} → AE entries term={} prev_tx={} prev_term={} from_tx={} to_tx={} count={} leader_commit={} wal_bytes={}",
+                r.self_id,
+                r.peer_id,
+                req.term,
+                req.prev_log_tx_id,
+                req.prev_log_term,
+                from_tx_id,
+                last_tx_id,
+                req.entries.count,
+                req.leader_commit,
+                written
+            );
         }
-        buffer.truncate(written);
-        wal_bytes = buffer;
-        to_tx_id = last_tx_id;
-        debug!(
-            "replication_loop/l[{}]: peer={} → AE entries term={} prev_tx={} prev_term={} from_tx={} to_tx={} count={} leader_commit={} wal_bytes={}",
-            r.self_id,
-            r.peer_id,
-            req.term,
-            req.prev_log_tx_id,
-            req.prev_log_term,
-            from_tx_id,
-            last_tx_id,
-            req.entries.count,
-            req.leader_commit,
-            written
-        );
     }
 
     let proto_req = proto::AppendEntriesRequest {
@@ -707,6 +724,10 @@ async fn replicate_once(r: &mut PeerReplicator) {
         }
     }
 
+    // Timeout leaves match/next unchanged but the tailer has already
+    // advanced past undelivered bytes — reset it so the next tick
+    // re-reads from the peer's current next_index.
+    let timed_out = matches!(result, AppendResult::Timeout);
     let mut node = r.node.borrow_mut();
     if let Some(mut p) = node.replication().peer(r.peer_id) {
         p.append_result(now, result);
@@ -724,6 +745,10 @@ async fn replicate_once(r: &mut PeerReplicator) {
         );
     }
     r.mirror.snapshot_from(&node);
+    drop(node);
+    if timed_out {
+        r.tailer.reset();
+    }
 }
 
 async fn send_append_entries_rpc(
