@@ -1,15 +1,17 @@
 # Bring up the demo control plane: control (gRPC) + ui (nginx).
 #
-#   docker compose -f docker-compose.control.yml up          # pulls published images
-#   docker compose -f docker-compose.control.yml up --build  # rebuilds from local source
+#   docker compose -f docker-compose.control.yml up
 #
 # Then open http://localhost:8080 in the browser.
+#
+# Images are pulled from Docker Hub. To run against local source instead,
+# build the images first with the published tags:
+#
+#   docker build -t tislib/roda-ledger:control-latest -f control.Dockerfile .
+#   docker build -t tislib/roda-ledger:ui-latest      -f ui/Dockerfile      .
 
 services:
   control:
-    build:
-      context: .
-      dockerfile: control.Dockerfile
     image: tislib/roda-ledger:control-latest
     ports:
       - "50051:50051"
@@ -18,9 +20,6 @@ services:
       INITIAL_NODE_COUNT: "3"
 
   ui:
-    build:
-      context: .
-      dockerfile: ui/Dockerfile
     image: tislib/roda-ledger:ui-latest
     ports:
       - "8080:8080"
