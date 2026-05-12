@@ -135,8 +135,6 @@ const LOG_KIND_FROM: Record<PbLogEntryKind, LogEntryKind> = {
   [PbLogEntryKind.TX_METADATA]: 'TxMetadata',
   [PbLogEntryKind.TX_ENTRY]: 'TxEntry',
   [PbLogEntryKind.TX_TERM]: 'TxTerm',
-  [PbLogEntryKind.SEGMENT_HEADER]: 'SegmentHeader',
-  [PbLogEntryKind.SEGMENT_SEALED]: 'SegmentSealed',
   [PbLogEntryKind.LINK]: 'Link',
   [PbLogEntryKind.FUNCTION_REGISTERED]: 'FunctionRegistered',
   [PbLogEntryKind.FUNCTION_UNREGISTERED]: 'FunctionUnregistered',
@@ -293,15 +291,6 @@ export function walRecordFromPb(pb: PbWalLogRecord): WalLogRecord | null {
         name: e.value.name,
         version: e.value.version,
         crc32c: e.value.crc32c,
-      };
-    case 'segmentHeader':
-      return { kind: 'segment_header', segmentId: e.value.segmentId };
-    case 'segmentSealed':
-      return {
-        kind: 'segment_sealed',
-        segmentId: e.value.segmentId,
-        lastTxId: u64ToString(e.value.lastTxId),
-        recordCount: u64ToString(e.value.recordCount),
       };
     default:
       return null;
