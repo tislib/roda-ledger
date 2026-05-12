@@ -7,8 +7,8 @@ import type {
   ServerInfo,
 } from '@/types/cluster';
 import type { LogPage, WalLogPage } from '@/types/log';
-import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
-import type { WaitLevel } from '@/types/wait';
+import type { FailReasonCode, Operation, SubmitResult } from '@/types/transaction';
+import type { WaitLevel, WaitStatus } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
 import type {
   AvailableScenario,
@@ -65,8 +65,9 @@ export interface ClusterClient {
 
   // ---- Ledger ops ----
   submitOperation(op: Operation): Promise<SubmitResult>;
-  getTransactionStatus(txId: string): Promise<TransactionStatus>;
-  waitForTransaction(txId: string, level: WaitLevel, timeoutMs: number): Promise<TransactionStatus>;
+  /** Returns just `fail_reason`; pipeline stage is derived from cluster indices. */
+  getTransactionStatus(txId: string): Promise<{ failReason: FailReasonCode }>;
+  waitForTransaction(txId: string, level: WaitLevel, timeoutMs: number): Promise<WaitStatus>;
 
   // ---- Meta / WASM ----
   listFunctions(): Promise<WasmFunction[]>;

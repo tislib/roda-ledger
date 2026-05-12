@@ -11,7 +11,29 @@ import type {
   ServerInfo,
 } from '@/types/cluster';
 import type { LogEntry, LogPage } from '@/types/log';
-import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
+import type { FailReasonCode, Operation, SubmitResult } from '@/types/transaction';
+
+/**
+ * Local-only state machine for the in-memory simulator. The reactive UI
+ * consumes a different shape ({@link @/types/transaction.TransactionStatus}
+ * which is `{txId, stage, failReason}`); we convert at the MockClusterClient
+ * boundary. Keeping per-stage timestamps here lets the simulator gate stage
+ * transitions on elapsed wall-clock time without round-tripping through the
+ * UI type.
+ */
+export type SimTxStatus =
+  | { state: 'NotFound' }
+  | { state: 'Pending'; submittedAt: number }
+  | { state: 'Computed'; submittedAt: number; computedAt: number }
+  | { state: 'Committed'; submittedAt: number; computedAt: number; committedAt: number }
+  | {
+      state: 'OnSnapshot';
+      submittedAt: number;
+      computedAt: number;
+      committedAt: number;
+      snapshotAt: number;
+    }
+  | { state: 'Error'; submittedAt: number; reason: FailReasonCode; erroredAt: number };
 import type { WasmFunction } from '@/types/wasm';
 import type {
   Scenario,
@@ -46,7 +68,7 @@ export const SNAPSHOT_APPLY_MAX_MS = 400;
 interface TxRecord {
   txId: string;
   op: Operation;
-  status: TransactionStatus;
+  status: SimTxStatus;
   computedTickAt: number | null;
   committedTickAt: number | null;
   snapshotEligibleAt: number | null;
@@ -533,7 +555,7 @@ export class Simulator {
     const leader = this.currentLeader();
     if (!leader) {
       const txId = allocateTxId();
-      const status: TransactionStatus = {
+      const status: SimTxStatus = {
         state: 'Error',
         submittedAt: Date.now(),
         reason: 5,
@@ -554,7 +576,7 @@ export class Simulator {
     const txId = allocateTxId();
     const submittedAt = Date.now();
     appendToLeaderLog(leader, txId, op);
-    const status: TransactionStatus = { state: 'Pending', submittedAt };
+    const status: SimTxStatus = { state: 'Pending', submittedAt };
     this.transactions.set(txId, {
       txId,
       op,
@@ -567,7 +589,7 @@ export class Simulator {
     return { txId, failReason: 0 };
   }
 
-  txStatus(txId: string): TransactionStatus {
+  txStatus(txId: string): SimTxStatus {
     const tx = this.transactions.get(txId);
     if (!tx) return { state: 'NotFound' };
     return tx.status;

@@ -59,8 +59,8 @@ import type {
   ServerInfo,
 } from '@/types/cluster';
 import type { LogPage, WalLogPage } from '@/types/log';
-import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
-import type { WaitLevel } from '@/types/wait';
+import type { FailReasonCode, Operation, SubmitResult } from '@/types/transaction';
+import type { WaitLevel, WaitStatus } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
 import type {
   AvailableScenario,
@@ -68,7 +68,7 @@ import type {
   ScenarioRunStatus,
   ScenarioRunSummary,
 } from '@/types/scenario';
-import { isTerminal } from '@/types/transaction';
+import { isWaitTerminal } from '@/types/wait';
 import { base64ToBytes } from './wasm-binaries';
 import {
   availableScenarioFromPb,
@@ -87,6 +87,7 @@ import {
   stringToU64,
   txStatusFromPb,
   u64ToString,
+  waitStatusFromPb,
 } from './proto-mappers';
 
 export class RealClusterClient implements ClusterClient {
@@ -286,7 +287,7 @@ export class RealClusterClient implements ClusterClient {
     return { txId: u64ToString(resp.transactionId), failReason: 0 };
   }
 
-  async getTransactionStatus(txId: string): Promise<TransactionStatus> {
+  async getTransactionStatus(txId: string): Promise<{ failReason: FailReasonCode }> {
     const resp = await this.ledger.getTransactionStatus(
       create(GetStatusRequestSchema, { transactionId: stringToU64(txId) }),
     );
@@ -297,17 +298,20 @@ export class RealClusterClient implements ClusterClient {
     txId: string,
     level: WaitLevel,
     timeoutMs: number,
-  ): Promise<TransactionStatus> {
+  ): Promise<WaitStatus> {
     const start = Date.now();
     return new Promise((resolve) => {
       const tick = async () => {
-        const status = await this.getTransactionStatus(txId);
+        const resp = await this.ledger.getTransactionStatus(
+          create(GetStatusRequestSchema, { transactionId: stringToU64(txId) }),
+        );
+        const status = waitStatusFromPb(resp);
         const reached =
           (level === 'Computed' && status.state === 'Computed') ||
           (level === 'Committed' &&
             (status.state === 'Committed' || status.state === 'OnSnapshot')) ||
           (level === 'OnSnapshot' && status.state === 'OnSnapshot') ||
-          isTerminal(status);
+          isWaitTerminal(status);
         if (reached || Date.now() - start >= timeoutMs) {
           resolve(status);
           return;
