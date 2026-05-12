@@ -25,7 +25,7 @@ use proto::control::{
     ClusterMembership, ElectionEvent, FaultEvent, FaultKind, FunctionEntry, FunctionListUpdate,
     GetClusterConfigRequest, GetClusterConfigResponse, GetClusterSnapshotRequest,
     GetClusterSnapshotResponse, GetFaultHistoryRequest, GetFaultHistoryResponse, GetNodeLogRequest,
-    GetNodeLogResponse, GetNodeWalLogRequest, GetNodeWalLogResponse, GetRecentElectionsRequest,
+    GetNodeLogResponse, GetRecentElectionsRequest,
     GetRecentElectionsResponse, GetScenarioStatusRequest, GetScenarioStatusResponse,
     GetServerInfoRequest, GetServerInfoResponse, HealPartitionRequest, HealPartitionResponse,
     KillNodeRequest, KillNodeResponse, ListAvailableScenariosRequest,
@@ -379,40 +379,6 @@ impl Control for ControlService {
             total_count: 0,
             next_from_index: 0,
             oldest_retained_index: 0,
-        }))
-    }
-
-    async fn get_node_wal_log(
-        &self,
-        req: Request<GetNodeWalLogRequest>,
-    ) -> Result<Response<GetNodeWalLogResponse>, Status> {
-        let r = req.into_inner();
-        let idx = self
-            .handle
-            .idx_for_node_id(r.node_id)
-            .ok_or_else(|| Status::not_found(format!("unknown node_id={}", r.node_id)))?;
-        let addrs = self.handle.node_addrs();
-        let url = addrs
-            .get(idx)
-            .ok_or_else(|| Status::internal("node index out of range"))?
-            .clone();
-        let url = if url.starts_with("http://") || url.starts_with("https://") {
-            url
-        } else {
-            format!("http://{}", url)
-        };
-        let client = client::NodeClient::connect_url(&url)
-            .await
-            .map_err(|e| Status::unavailable(format!("connect {}: {}", url, e)))?;
-        let page = client.get_log(r.from_tx_id, r.to_tx_id, r.limit).await?;
-        Ok(Response::new(GetNodeWalLogResponse {
-            records: page
-                .records
-                .into_iter()
-                .map(ledger_record_to_control)
-                .collect(),
-            next_tx_id: page.next_tx_id,
-            last_commit_tx_id: page.last_commit_tx_id,
         }))
     }
 
@@ -859,49 +825,6 @@ fn validate_cluster_config(cfg: &proto::control::ClusterConfig) -> Option<String
         return Some("append_entries_max_bytes must be > 0".into());
     }
     None
-}
-
-fn ledger_record_to_control(r: proto_ledger::WalLogRecord) -> proto::control::WalLogRecordC {
-    use proto::control as c;
-    use proto_ledger::wal_log_record::Entry as L;
-    let entry = match r.entry {
-        Some(L::Metadata(m)) => Some(c::wal_log_record_c::Entry::Metadata(c::WalTxMetadataC {
-            tx_id: m.tx_id,
-            fail_reason: m.fail_reason,
-            sub_item_count: m.sub_item_count,
-            crc32c: m.crc32c,
-            timestamp: m.timestamp,
-            user_ref: m.user_ref,
-            tag: m.tag,
-        })),
-        Some(L::TxEntry(e)) => Some(c::wal_log_record_c::Entry::TxEntry(c::WalTxEntryC {
-            tx_id: e.tx_id,
-            account_id: e.account_id,
-            amount: e.amount,
-            kind: e.kind as u32,
-            computed_balance: e.computed_balance,
-        })),
-        Some(L::Link(l)) => Some(c::wal_log_record_c::Entry::Link(c::WalTxLinkC {
-            tx_id: l.tx_id,
-            to_tx_id: l.to_tx_id,
-            kind: l.kind as u32,
-        })),
-        Some(L::Term(t)) => Some(c::wal_log_record_c::Entry::Term(c::WalTxTermC {
-            term: t.term,
-            node_id: t.node_id,
-            node_count: t.node_count,
-            node_voted: t.node_voted,
-        })),
-        Some(L::FunctionRegistered(f)) => Some(c::wal_log_record_c::Entry::FunctionRegistered(
-            c::WalFunctionRegisteredC {
-                name: f.name,
-                version: f.version,
-                crc32c: f.crc32c,
-            },
-        )),
-        None => None,
-    };
-    c::WalLogRecordC { entry }
 }
 
 /// Look up a scenario by name from the seed catalogues. Mirrors the

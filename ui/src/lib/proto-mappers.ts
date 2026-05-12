@@ -19,7 +19,6 @@ import type {
   GetScenarioStatusResponse as PbScenarioStatus,
   Scenario as PbScenario,
   ScenarioStep as PbScenarioStep,
-  WalLogRecordC as PbWalLogRecordC,
 } from '@/gen/control_pb';
 import {
   ClusterHealth as PbClusterHealth,
@@ -38,8 +37,13 @@ import {
 import type {
   GetStatusResponse as PbStatusResponse,
   SubmitOperationRequest,
+  WalLogRecord as PbWalLogRecord,
 } from '@/gen/ledger_pb';
-import { TransactionStatus as PbTxStatus } from '@/gen/ledger_pb';
+import {
+  EntryKind as PbEntryKind,
+  LinkKind as PbLinkKind,
+  TransactionStatus as PbTxStatus,
+} from '@/gen/ledger_pb';
 
 import type {
   ClusterHealth,
@@ -243,7 +247,7 @@ export function logEntryFromPb(pb: PbLogEntry): LogEntry {
   };
 }
 
-export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
+export function walRecordFromPb(pb: PbWalLogRecord): WalLogRecord | null {
   const e = pb.entry;
   if (!e) return null;
   switch (e.case) {
@@ -264,7 +268,7 @@ export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
         txId: u64ToString(e.value.txId),
         accountId: u64ToString(e.value.accountId),
         amount: u64ToString(e.value.amount),
-        entryKind: e.value.kind === 1 ? 'DEBIT' : 'CREDIT',
+        entryKind: e.value.kind === PbEntryKind.DEBIT ? 'DEBIT' : 'CREDIT',
         computedBalance: e.value.computedBalance.toString(),
       };
     case 'link':
@@ -272,7 +276,7 @@ export function walRecordFromPb(pb: PbWalLogRecordC): WalLogRecord | null {
         kind: 'link',
         txId: u64ToString(e.value.txId),
         toTxId: u64ToString(e.value.toTxId),
-        linkKind: e.value.kind === 1 ? 'REVERSAL' : 'DUPLICATE',
+        linkKind: e.value.kind === PbLinkKind.REVERSAL ? 'REVERSAL' : 'DUPLICATE',
       };
     case 'term':
       return {

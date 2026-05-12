@@ -181,6 +181,31 @@ async fn node_selector_metadata_pins_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_log_pinned_per_node_succeeds() {
+    let (proxy, h) = common::build_ledger_proxy(3).await;
+    let svc = ControlService::new(h.clone(), Arc::new(EventStore::new()));
+    common::wait_for_leader(&svc, Duration::from_secs(10)).await;
+
+    // Per-node WAL inspection is the use-case the deleted GetNodeWalLog
+    // RPC served; the Ledger proxy serves it via Ledger.GetLog with a
+    // node-selector header. All three nodes — leader and followers —
+    // must serve get_log from their local WAL.
+    for node_id in 1u64..=3 {
+        proxy
+            .get_log(req_with_node_selector(
+                pb::GetLogRequest {
+                    from_tx_id: 0,
+                    to_tx_id: 0,
+                    limit: 10,
+                },
+                node_id,
+            ))
+            .await
+            .expect("get_log via node-selector");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_selector_unknown_id_returns_invalid_argument() {
     let (proxy, _h) = common::build_ledger_proxy(3).await;
     let err = proxy
