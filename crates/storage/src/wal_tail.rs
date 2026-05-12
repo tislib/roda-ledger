@@ -500,10 +500,7 @@ mod tests {
             &segment_wal_path(dir.path(), 1),
             &[meta(1), entry(1), link(1), term()],
         );
-        write_segment(
-            &active_wal_path(dir.path()),
-            &[meta(2), entry(2), link(2)],
-        );
+        write_segment(&active_wal_path(dir.path()), &[meta(2), entry(2), link(2)]);
 
         let storage = open_storage(&dir);
         let mut tailer = storage.wal_tailer();
@@ -529,10 +526,7 @@ mod tests {
             &segment_wal_path(dir.path(), 1),
             &[meta(1), entry(1), meta(2), entry(2), term()],
         );
-        write_segment(
-            &active_wal_path(dir.path()),
-            &[meta(3), entry(3), link(3)],
-        );
+        write_segment(&active_wal_path(dir.path()), &[meta(3), entry(3), link(3)]);
 
         let storage = open_storage(&dir);
         let mut tailer = storage.wal_tailer();
