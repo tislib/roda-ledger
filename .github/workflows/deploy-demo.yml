@@ -103,9 +103,8 @@ jobs:
                 --image "$HETZNER_IMAGE" \
                 --location "$HETZNER_LOCATION" \
                 --ssh-key "$SERVER_NAME" \
-                --output json 2>&1); then
-            echo "::error::hcloud server create failed:"
-            echo "$SERVER_RESPONSE"
+                --output json); then
+            echo "::error::hcloud server create failed (see error above)"
             echo "::group::Server types available in $HETZNER_LOCATION"
             hcloud server-type list -o columns=name,cores,cpu_type,memory,disk || true
             echo "::endgroup::"
