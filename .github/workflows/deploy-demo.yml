@@ -9,15 +9,11 @@ on:
         default: "roda-ledger-demo"
         type: string
       server_type:
-        description: "Hetzner server type"
+        description: "Hetzner server type. Shared AMD (cpx*) and dedicated AMD (ccx*) — all x86, matching our linux/amd64 images."
         required: false
-        default: "cx32"
+        default: "cpx31"
         type: choice
         options:
-          - cx22
-          - cx32
-          - cx42
-          - cx52
           - cpx11
           - cpx21
           - cpx31
@@ -112,13 +108,20 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
-          SERVER_RESPONSE=$(hcloud server create \
-            --name "$SERVER_NAME" \
-            --type "$SERVER_TYPE" \
-            --image "$HETZNER_IMAGE" \
-            --location "$HETZNER_LOCATION" \
-            --ssh-key "$SERVER_NAME" \
-            --output json)
+          if ! SERVER_RESPONSE=$(hcloud server create \
+                --name "$SERVER_NAME" \
+                --type "$SERVER_TYPE" \
+                --image "$HETZNER_IMAGE" \
+                --location "$HETZNER_LOCATION" \
+                --ssh-key "$SERVER_NAME" \
+                --output json 2>&1); then
+            echo "::error::hcloud server create failed:"
+            echo "$SERVER_RESPONSE"
+            echo "::group::Server types available in $HETZNER_LOCATION"
+            hcloud server-type list -o columns=name,cores,cpu_type,memory,disk || true
+            echo "::endgroup::"
+            exit 1
+          fi
           SERVER_IP=$(echo "$SERVER_RESPONSE" | jq -r '.server.public_net.ipv4.ip')
           echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
           echo "Server created at $SERVER_IP"
