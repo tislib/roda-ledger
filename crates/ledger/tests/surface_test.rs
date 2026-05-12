@@ -149,30 +149,14 @@ fn tailer_passive_empty_ledger_from_nonzero_returns_zero() {
 }
 
 #[test]
-fn tailer_from_zero_includes_segment_header() {
-    let ledger = started_ledger();
-    let mut tailer = ledger.wal_tailer();
-    wait_until("segment header visible", || {
-        let mut buf = vec![0u8; 256];
-        tailer.tail(0, &mut buf) >= WAL_RECORD_SIZE as u32
-    });
-
-    tailer.reset();
-    let mut buf = vec![0u8; 256];
-    let n = tailer.tail(0, &mut buf) as usize;
-    assert!(n >= WAL_RECORD_SIZE);
-    assert_eq!(buf[0], WalEntryKind::SegmentHeader as u8);
-}
-
-#[test]
-fn tailer_from_tx_id_skips_structural_records() {
+fn tailer_from_tx_id_returns_only_transactional_records() {
     let ledger = started_ledger();
     let tx = deposit_client(&ledger, 1, 100);
 
     let mut tailer = ledger.wal_tailer();
     let mut buf = vec![0u8; 4096];
     let n = tailer.tail(tx, &mut buf) as usize;
-    // Deposit → 1 metadata + 2 entries (debit + credit); structural skipped.
+    // Deposit → 1 metadata + 2 entries (debit + credit).
     assert_eq!(n, WAL_RECORD_SIZE * 3);
     assert_eq!(buf[0], WalEntryKind::TxMetadata as u8);
     assert_eq!(buf[WAL_RECORD_SIZE], WalEntryKind::TxEntry as u8);

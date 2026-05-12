@@ -1,12 +1,12 @@
 use bytemuck::{Pod, Zeroable};
 
+// Discriminants 2 and 3 are retired (formerly SegmentHeader / SegmentSealed);
+// segment boundaries now come from filenames and the .seal / .crc sidecars.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalEntryKind {
     TxMetadata = 0,
     TxEntry = 1,
-    SegmentHeader = 2,
-    SegmentSealed = 3,
     Link = 4,
     FunctionRegistered = 5,
     TxTerm = 6,
@@ -117,37 +117,6 @@ pub fn decode_tag(s: &str) -> [u8; 8] {
     tag
 }
 
-/// First record in every WAL segment. 40 bytes.
-/// entry_type is the first byte so the WAL format is [entry][entry][entry]…
-/// with no separate type-byte prefix. Fields ordered to avoid implicit padding
-/// (bytemuck::Pod requires zero implicit padding bytes).
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
-pub struct SegmentHeader {
-    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::SegmentHeader
-    pub version: u8,     // 1 @ 1  — WAL_VERSION
-    pub _pad0: [u8; 2],  // 2 @ 2
-    pub magic: u32,      // 4 @ 4  — WAL_MAGIC
-    pub segment_id: u32, // 4 @ 8  — monotonic, matches filename suffix
-    pub _pad1: [u8; 4],  // 4 @ 12 — align first_tx_id to 16
-    pub _pad2: [u8; 24], // 16 @ 24 — total: 40 bytes
-}
-
-/// Last record before a segment is sealed. 40 bytes.
-/// entry_type at offset 0 makes the record self-describing; _pad0 absorbs the
-/// u8→u32 alignment gap so bytemuck::Pod compiles without implicit padding.
-/// file_crc32c is always the last field (offset 36) for easy streaming verification.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
-pub struct SegmentSealed {
-    pub entry_type: u8,    // 1 @ 0  — WalEntryKind::SegmentSealed
-    pub _pad0: [u8; 3],    // 3 @ 1  — align segment_id to 4
-    pub segment_id: u32,   // 4 @ 4  — matches SegmentHeader.segment_id
-    pub last_tx_id: u64,   // 8 @ 8  — last committed tx
-    pub record_count: u64, // 8 @ 16 — total records (including header + sealed)
-    pub _pad1: [u8; 16],   // 12 @ 24 — pad to align file_crc32c to last 4 bytes
-} // 40 bytes total
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxEntry {
@@ -242,7 +211,7 @@ impl FunctionRegistered {
 /// Raft term/quorum snapshot recorded inline in the WAL stream. Written by
 /// the cluster layer at every term transition so a recovering node can read
 /// the WAL alone and learn which term was active at each point. Structural
-/// (carries no `tx_id`) like `SegmentHeader` and `FunctionRegistered`.
+/// (carries no `tx_id`) like `FunctionRegistered`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxTerm {
@@ -259,8 +228,6 @@ pub struct TxTerm {
 pub enum WalEntry {
     Metadata(TxMetadata),
     Entry(TxEntry),
-    SegmentHeader(SegmentHeader),
-    SegmentSealed(SegmentSealed),
     Link(TxLink),
     FunctionRegistered(FunctionRegistered),
     Term(TxTerm),
@@ -271,8 +238,6 @@ impl WalEntry {
         match self {
             WalEntry::Metadata(_) => WalEntryKind::TxMetadata,
             WalEntry::Entry(_) => WalEntryKind::TxEntry,
-            WalEntry::SegmentHeader(_) => WalEntryKind::SegmentHeader,
-            WalEntry::SegmentSealed(_) => WalEntryKind::SegmentSealed,
             WalEntry::Link(_) => WalEntryKind::Link,
             WalEntry::FunctionRegistered(_) => WalEntryKind::FunctionRegistered,
             WalEntry::Term(_) => WalEntryKind::TxTerm,
@@ -284,14 +249,8 @@ impl WalEntry {
             WalEntry::Metadata(m) => m.tx_id,
             WalEntry::Entry(e) => e.tx_id,
             WalEntry::Link(e) => e.tx_id,
-            WalEntry::SegmentHeader(_) => 0,
-            WalEntry::SegmentSealed(_) => 0,
-            // FunctionRegistered carries no tx_id; it is not a financial
-            // transaction and the Pipeline's commit/snapshot indexes never
-            // advance from it.
+            // FunctionRegistered and TxTerm are structural records with no tx_id.
             WalEntry::FunctionRegistered(_) => 0,
-            // TxTerm is a structural cluster-state record; its position in
-            // the WAL stream defines when the term applies.
             WalEntry::Term(_) => 0,
         }
     }
@@ -340,8 +299,6 @@ unsafe impl Zeroable for TxLinkKind {}
 // Hard compile-time guarantees: every WAL entry must be exactly 40 bytes.
 const _: () = assert!(std::mem::size_of::<TxMetadata>() == 40);
 const _: () = assert!(std::mem::size_of::<TxEntry>() == 40);
-const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 40);
-const _: () = assert!(std::mem::size_of::<SegmentSealed>() == 40);
 const _: () = assert!(std::mem::size_of::<TxLink>() == 40);
 const _: () = assert!(std::mem::size_of::<FunctionRegistered>() == 40);
 const _: () = assert!(std::mem::size_of::<TxTerm>() == 40);

@@ -1,8 +1,8 @@
 use ::proto::ledger as proto;
 use ledger::transaction::{Operation, TransactionStatus};
 use storage::entities::{
-    EntryKind, FailReason, FunctionRegistered, SegmentHeader, SegmentSealed, TxEntry, TxLink,
-    TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,
+    EntryKind, FailReason, FunctionRegistered, TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm,
+    WalEntry, encode_tag,
 };
 
 pub fn deposit_to_op(d: proto::Deposit) -> Operation {
@@ -91,8 +91,6 @@ pub fn wal_entry_to_proto(e: WalEntry) -> proto::WalLogRecord {
         WalEntry::Link(l) => E::Link(link_to_proto(l)),
         WalEntry::Term(t) => E::Term(term_to_proto(t)),
         WalEntry::FunctionRegistered(f) => E::FunctionRegistered(function_registered_to_proto(f)),
-        WalEntry::SegmentHeader(h) => E::SegmentHeader(segment_header_to_proto(h)),
-        WalEntry::SegmentSealed(s) => E::SegmentSealed(segment_sealed_to_proto(s)),
     };
     proto::WalLogRecord { entry: Some(entry) }
 }
@@ -152,16 +150,3 @@ fn function_registered_to_proto(f: FunctionRegistered) -> proto::WalFunctionRegi
     }
 }
 
-fn segment_header_to_proto(h: SegmentHeader) -> proto::WalSegmentHeader {
-    proto::WalSegmentHeader {
-        segment_id: h.segment_id,
-    }
-}
-
-fn segment_sealed_to_proto(s: SegmentSealed) -> proto::WalSegmentSealed {
-    proto::WalSegmentSealed {
-        segment_id: s.segment_id,
-        last_tx_id: s.last_tx_id,
-        record_count: s.record_count,
-    }
-}

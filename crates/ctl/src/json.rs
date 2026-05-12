@@ -2,16 +2,9 @@ use storage::entities::TxLinkKind;
 use storage::entities::*;
 use storage::entities::{decode_tag, encode_tag};
 use storage::wal_serializer::serialize_wal_records;
-use storage::{WAL_MAGIC, WAL_VERSION};
 
 pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
     match entry {
-        WalEntry::SegmentHeader(h) => serde_json::json!({
-            "type": "SegmentHeader",
-            "segment_id": h.segment_id,
-            "version": h.version,
-            "magic": format!("{:#010x}", h.magic),
-        }),
         WalEntry::Metadata(m) => serde_json::json!({
             "type": "TxMetadata",
             "tx_id": m.tx_id,
@@ -29,12 +22,6 @@ pub fn wal_entry_to_json(entry: &WalEntry) -> serde_json::Value {
             "amount": e.amount,
             "kind": if e.kind == EntryKind::Credit { "Credit" } else { "Debit" },
             "computed_balance": e.computed_balance,
-        }),
-        WalEntry::SegmentSealed(s) => serde_json::json!({
-            "type": "SegmentSealed",
-            "segment_id": s.segment_id,
-            "last_tx_id": s.last_tx_id,
-            "record_count": s.record_count,
         }),
         WalEntry::Link(l) => serde_json::json!({
             "type": "TxLink",
@@ -60,27 +47,6 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
     let entry_type = value["type"].as_str().ok_or("missing 'type' field")?;
 
     match entry_type {
-        "SegmentHeader" => {
-            let segment_id = value["segment_id"].as_u64().ok_or("missing segment_id")? as u32;
-            let version = value
-                .get("version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(WAL_VERSION as u64) as u8;
-            let magic = value
-                .get("magic")
-                .and_then(|v| v.as_str())
-                .and_then(parse_hex_u32)
-                .unwrap_or(WAL_MAGIC);
-            Ok(WalEntry::SegmentHeader(SegmentHeader {
-                entry_type: WalEntryKind::SegmentHeader as u8,
-                version,
-                _pad0: [0; 2],
-                magic,
-                segment_id,
-                _pad1: [0; 4],
-                _pad2: [0; 24],
-            }))
-        }
         "TxMetadata" => {
             let tx_id = value["tx_id"].as_u64().ok_or("missing tx_id")?;
             let sub_item_count = value["sub_item_count"]
@@ -125,21 +91,6 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 account_id,
                 amount,
                 computed_balance,
-            }))
-        }
-        "SegmentSealed" => {
-            let segment_id = value["segment_id"].as_u64().ok_or("missing segment_id")? as u32;
-            let last_tx_id = value["last_tx_id"].as_u64().ok_or("missing last_tx_id")?;
-            let record_count = value["record_count"]
-                .as_u64()
-                .ok_or("missing record_count")?;
-            Ok(WalEntry::SegmentSealed(SegmentSealed {
-                entry_type: WalEntryKind::SegmentSealed as u8,
-                _pad0: [0; 3],
-                segment_id,
-                last_tx_id,
-                record_count,
-                _pad1: [0; 16],
             }))
         }
         "TxLink" => {

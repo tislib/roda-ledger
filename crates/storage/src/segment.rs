@@ -366,12 +366,10 @@ impl Segment {
     /// Lowest `tx_id` present in this segment's WAL records, or `0`
     /// if the segment contains no transactional records.
     ///
-    /// Walks **forwards** record-by-record and returns the first
-    /// non-zero `tx_id` encountered. Typically O(1) — the very first
-    /// record after `SegmentHeader` is a transaction's `Metadata`.
+    /// Walks forwards and returns the first non-zero `tx_id`. Typically
+    /// O(1) — the very first record is a transaction's `Metadata`.
     /// Used by `Storage::truncate_wal_above` to distinguish "segment
-    /// fully past watermark" from "segment straddles watermark"
-    /// (ADR-0016 §9).
+    /// fully past watermark" from "segment straddles watermark".
     pub fn first_tx_id_in_wal_data(&self) -> Result<u64, Error> {
         assert!(
             self.loaded,
@@ -396,17 +394,12 @@ impl Segment {
     }
 
     /// Highest `tx_id` present in this segment's WAL records, or `0`
-    /// if the segment contains no transactional records (an empty
-    /// active, or a segment with only `SegmentHeader` /
-    /// `SegmentSealed` / `FunctionRegistered`).
+    /// if the segment contains no transactional records.
     ///
-    /// Walks **backwards** record-by-record (each record is 40 bytes)
-    /// and returns the first non-zero `tx_id` encountered. O(1) in
-    /// the typical case where the segment ends with an `Entry` /
-    /// `Link` of the most recent transaction. Used by the seal stage's
-    /// cluster gate (ADR-0016 §10) to decide whether a CLOSED segment
-    /// is yet eligible for sealing without paying the cost of a full
-    /// forward scan.
+    /// Walks backwards and returns the first non-zero `tx_id`. O(1)
+    /// when the segment ends with an `Entry` / `Link` of the most
+    /// recent transaction. Used by the seal stage's cluster gate to
+    /// decide whether a CLOSED segment is yet eligible for sealing.
     pub fn last_tx_id_in_wal_data(&self) -> Result<u64, Error> {
         assert!(
             self.loaded,
@@ -488,10 +481,9 @@ impl Segment {
     /// well above the watermark when the diverged tail spans the
     /// whole segment).
     ///
-    /// Non-transactional records (`SegmentHeader`, `SegmentSealed`,
-    /// `FunctionRegistered`) all carry `tx_id = 0` per
-    /// `WalEntry::tx_id`, so they never trigger truncation on their
-    /// own — they are kept alongside the transactions that bound them.
+    /// Non-transactional records (`FunctionRegistered`, `Term`) carry
+    /// `tx_id = 0` per `WalEntry::tx_id`, so they never trigger
+    /// truncation on their own.
     pub fn locate_tx_watermark(&self, watermark: u64) -> Result<Option<usize>, Error> {
         assert!(
             self.loaded,

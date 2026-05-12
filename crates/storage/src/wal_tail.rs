@@ -160,8 +160,7 @@ impl WalTailer {
             cursor.position += n_aligned as u64;
 
             // In-place filter: keep records whose tx_id (own or inherited
-            // from the preceding meta) is >= from_tx_id. Structural
-            // segment delimiters are kept only on full replay (from_tx_id==0).
+            // from the preceding meta) is >= from_tx_id.
             let from_tx_id = cursor.from_tx_id;
             let records = n_aligned / WAL_RECORD_SIZE;
             let mut w = 0usize;
@@ -196,10 +195,7 @@ impl WalTailer {
     fn seek(&mut self, from_tx_id: u64) -> std::io::Result<()> {
         // DIAG-flake-replication: capture pre-seek state so we can see
         // both the path being opened and the storage's view of the
-        // current segment id. Especially relevant when from_tx_id=1
-        // and the active wal.bin has only a SegmentHeader (H2 in the
-        // diagnose plan) — the resulting cursor sits parked on an
-        // empty active segment and never recovers.
+        // current segment id.
         let data_dir_for_diag = self.storage.config().data_dir.clone();
         let active_path_for_diag = active_wal_path(Path::new(&data_dir_for_diag));
         let last_segment_id_for_diag = self.storage.last_segment_id();
@@ -353,7 +349,7 @@ impl WalTailer {
 }
 
 /// First transactional record's `tx_id` in `file`, or `None` if there are
-/// no tx records yet (e.g. a fresh segment with only a `SegmentHeader`).
+/// no tx records yet (an empty active segment).
 fn first_tx_id_in_file(file: &File) -> Option<u64> {
     let mut buf = [0u8; WAL_RECORD_SIZE];
     let mut off = 0u64;
@@ -392,28 +388,13 @@ fn record_matches(record: &[u8], from_tx_id: u64, last_meta_tx_id: u64) -> bool 
         return tx_id >= from_tx_id;
     }
 
-    // Sub-items (TxTerm, FunctionRegistered) inherit tx_id from the
-    // preceding TxMetadata. Segment delimiters keep the original
-    // "only on full replay" rule.
-    let inherits_tx_id =
-        kind == WalEntryKind::TxTerm as u8 || kind == WalEntryKind::FunctionRegistered as u8;
-    if inherits_tx_id {
-        return last_meta_tx_id >= from_tx_id;
-    }
-    from_tx_id == 0
+    // TxTerm and FunctionRegistered inherit tx_id from the preceding TxMetadata.
+    last_meta_tx_id >= from_tx_id
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn record_matches_filters_structural_unless_from_zero() {
-        let mut header = [0u8; WAL_RECORD_SIZE];
-        header[0] = WalEntryKind::SegmentHeader as u8;
-        assert!(record_matches(&header, 0, 0));
-        assert!(!record_matches(&header, 1, 0));
-    }
 
     #[test]
     fn record_matches_filters_by_tx_id() {

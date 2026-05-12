@@ -63,7 +63,7 @@ async fn get_log_filters_by_to_tx_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_log_from_zero_includes_structural_records() {
+async fn get_log_from_zero_includes_metadata() {
     let (_ctl, client) = setup().await;
 
     client
@@ -72,14 +72,11 @@ async fn get_log_from_zero_includes_structural_records() {
         .unwrap();
 
     let page = client.get_log(0, 0, 100).await.unwrap();
-    let has_segment_header = page
+    let has_metadata = page
         .records
         .iter()
-        .any(|r| matches!(r.entry, Some(LogEntry::SegmentHeader(_))));
-    assert!(
-        has_segment_header,
-        "from_tx_id=0 should include WalSegmentHeader"
-    );
+        .any(|r| matches!(r.entry, Some(LogEntry::Metadata(_))));
+    assert!(has_metadata, "from_tx_id=0 should include TxMetadata records");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

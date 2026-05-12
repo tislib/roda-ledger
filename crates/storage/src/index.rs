@@ -53,8 +53,6 @@ impl Segment {
                     account_entries.push((e.account_id, e.tx_id));
                 }
                 WalEntry::Link(_)
-                | WalEntry::SegmentHeader(_)
-                | WalEntry::SegmentSealed(_)
                 | WalEntry::FunctionRegistered(_)
                 | WalEntry::Term(_) => {}
             }

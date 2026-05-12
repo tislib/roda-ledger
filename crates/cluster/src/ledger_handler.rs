@@ -570,14 +570,9 @@ impl Ledger for LedgerHandler {
                     break 'outer;
                 }
 
-                // Metadata / structural records mark whole-tx boundaries.
-                match e {
-                    storage::entities::WalEntry::Metadata(_)
-                    | storage::entities::WalEntry::SegmentHeader(_)
-                    | storage::entities::WalEntry::SegmentSealed(_) => {
-                        last_whole_tx_end = emitted.len();
-                    }
-                    _ => {}
+                // TxMetadata marks the start of a whole transaction.
+                if matches!(e, storage::entities::WalEntry::Metadata(_)) {
+                    last_whole_tx_end = emitted.len();
                 }
 
                 emitted.push(e);
