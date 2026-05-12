@@ -87,6 +87,7 @@ import {
   stringToU64,
   txStatusFromPb,
   u64ToString,
+  waitStatusFromPb,
 } from './proto-mappers';
 
 export class RealClusterClient implements ClusterClient {
