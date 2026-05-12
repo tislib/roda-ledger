@@ -27,7 +27,11 @@ async fn get_server_info_reports_version_and_capabilities() {
         .into_inner();
 
     assert_eq!(resp.api_version, 1);
-    assert!(resp.version.starts_with("control-real-"), "{}", resp.version);
+    assert!(
+        resp.version.starts_with("control-real-"),
+        "{}",
+        resp.version
+    );
     assert!(
         resp.capabilities.contains(&(Capability::Kill as i32)),
         "expected KILL capability, got {:?}",
@@ -70,7 +74,9 @@ async fn watch_cluster_snapshot_streams_frames() {
     common::wait_for_leader(&svc, Duration::from_secs(10)).await;
 
     let stream = svc
-        .watch_cluster_snapshot(Request::new(WatchClusterSnapshotRequest { interval_ms: 100 }))
+        .watch_cluster_snapshot(Request::new(WatchClusterSnapshotRequest {
+            interval_ms: 100,
+        }))
         .await
         .expect("watch_cluster_snapshot")
         .into_inner();
@@ -101,7 +107,9 @@ async fn watch_cluster_snapshot_clamps_interval() {
 
     // interval_ms=10 is below the 50 ms floor; the server clamps it.
     let stream = svc
-        .watch_cluster_snapshot(Request::new(WatchClusterSnapshotRequest { interval_ms: 10 }))
+        .watch_cluster_snapshot(Request::new(WatchClusterSnapshotRequest {
+            interval_ms: 10,
+        }))
         .await
         .expect("watch_cluster_snapshot")
         .into_inner();
@@ -132,7 +140,10 @@ async fn get_recent_elections_returns_term() {
         .expect("get_recent_elections")
         .into_inner();
 
-    assert!(!resp.events.is_empty(), "expected at least one election event");
+    assert!(
+        !resp.events.is_empty(),
+        "expected at least one election event"
+    );
     assert!(resp.events[0].term >= 1);
 }
 

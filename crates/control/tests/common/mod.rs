@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use control::{ClusterHandle, EventStore, LedgerProxy};
 use control::service::ControlService;
+use control::{ClusterHandle, EventStore, LedgerProxy};
 use proto::control::control_server::Control;
 use proto::control::{ClusterConfig, GetClusterSnapshotRequest, GetClusterSnapshotResponse};
 use tonic::Request;

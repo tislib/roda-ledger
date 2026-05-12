@@ -77,7 +77,10 @@ async fn run_scenario_single_deposit_committed_completes() {
             status.error
         );
         if std::time::Instant::now() >= deadline {
-            panic!("scenario {} never reached Completed; last state={}", run_id, status.state);
+            panic!(
+                "scenario {} never reached Completed; last state={}",
+                run_id, status.state
+            );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
