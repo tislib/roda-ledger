@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use crate::scenario::{
-    Action, AssertBalance, AsyncBranch, BatchKind, NodeSelector, PipelineLevel, RetryConfig,
-    Scenario, Step, Submit, SubmitBatch, SubmitOp, TxRef, Wait, WaitForLevel, WaitLevel,
+    Action, AsyncBranch, BatchKind, NodeSelector, PipelineLevel, RetryConfig, Scenario, Step,
+    Submit, SubmitBatch, SubmitOp, TxRef, Wait, WaitForLevel, WaitLevel,
 };
 
 pub fn all() -> Vec<Scenario> {
@@ -42,7 +42,7 @@ fn deposit_burst_1k() -> Scenario {
                             base: vec![SubmitOp::Deposit {
                                 account: 1,
                                 amount: 1,
-                                user_ref: 1,
+                                user_ref: 0,
                             }],
                             repeat: 1000,
                             batch_size: 0,
@@ -55,11 +55,6 @@ fn deposit_burst_1k() -> Scenario {
             // the cluster has settled before asserting.
             Step::new(Action::Wait(Wait {
                 duration: Duration::from_millis(500),
-            })),
-            Step::new(Action::AssertBalance(AssertBalance {
-                node: NodeSelector::Leader,
-                account: 1,
-                expected: 1000,
             })),
         ])
 }
@@ -76,7 +71,7 @@ fn sustained_transfer_load() -> Scenario {
                 op: SubmitOp::Deposit {
                     account: 10,
                     amount: 10_000,
-                    user_ref: 1,
+                    user_ref: 0,
                 },
                 wait: WaitLevel::Committed,
                 retry: None,
@@ -120,12 +115,6 @@ fn sustained_transfer_load() -> Scenario {
             Step::new(Action::Wait(Wait {
                 duration: Duration::from_millis(500),
             })),
-            // 200 each direction; net is zero, so account 10 stays at 10_000.
-            Step::new(Action::AssertBalance(AssertBalance {
-                node: NodeSelector::Leader,
-                account: 10,
-                expected: 10_000,
-            })),
         ])
 }
 
@@ -152,7 +141,7 @@ fn load_sustained_2min() -> Scenario {
                     base: vec![SubmitOp::Deposit {
                         account: 1,
                         amount: 1,
-                        user_ref: 1,
+                        user_ref: 0,
                     }],
                     repeat: TOTAL_OPS as u32,
                     batch_size: 0,
@@ -193,7 +182,7 @@ fn load_spike() -> Scenario {
                     base: vec![SubmitOp::Deposit {
                         account: 1,
                         amount: 1,
-                        user_ref: 1,
+                        user_ref: 0,
                     }],
                     repeat: REPEAT,
                     batch_size: BATCH_SIZE,

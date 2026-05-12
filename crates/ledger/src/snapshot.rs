@@ -186,8 +186,6 @@ impl SnapshotRunner {
                                 );
                                 self.pending_records = self.pending_records.saturating_sub(1);
                             }
-                            WalEntry::SegmentSealed(_) => {}
-                            WalEntry::SegmentHeader(_) => {}
                             WalEntry::FunctionRegistered(_) => {
                                 // The Transactor owns WasmRuntime
                                 // mutations — registration and

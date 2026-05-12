@@ -80,35 +80,6 @@ pub fn run(input: &Path, out: Option<&Path>, no_validate: bool) -> Result<(), Ct
 }
 
 fn validate_structure(entries: &[WalEntry]) -> Result<(), CtlError> {
-    if !matches!(entries[0], WalEntry::SegmentHeader(_)) {
-        return Err(CtlError::new("first record must be SegmentHeader"));
-    }
-    if !matches!(entries.last(), Some(WalEntry::SegmentSealed(_))) {
-        return Err(CtlError::new("last record must be SegmentSealed"));
-    }
-
-    let header_id = match &entries[0] {
-        WalEntry::SegmentHeader(h) => h.segment_id,
-        _ => unreachable!(),
-    };
-    let (sealed_id, sealed_count) = match entries.last().unwrap() {
-        WalEntry::SegmentSealed(s) => (s.segment_id, s.record_count),
-        _ => unreachable!(),
-    };
-    if header_id != sealed_id {
-        return Err(CtlError::new(format!(
-            "segment_id mismatch: SegmentHeader={}, SegmentSealed={}",
-            header_id, sealed_id
-        )));
-    }
-    if sealed_count != entries.len() as u64 {
-        return Err(CtlError::new(format!(
-            "record_count mismatch: SegmentSealed says {}, actual {}",
-            sealed_count,
-            entries.len()
-        )));
-    }
-
     let mut last_tx_id: Option<u64> = None;
     for entry in entries {
         if let WalEntry::Metadata(m) = entry {

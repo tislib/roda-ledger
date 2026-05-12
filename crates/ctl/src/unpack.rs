@@ -79,24 +79,6 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
                     let _ = writeln!(writer, "{}", wal_entry_to_json(entry));
                 }
             }
-            WalEntry::SegmentHeader(_) | WalEntry::SegmentSealed(_) => {
-                if let Some((prev, idx)) = pending_meta.take() {
-                    if let Err(e) = flush_tx(
-                        &prev,
-                        &pending_sub_items,
-                        &pending_json,
-                        idx,
-                        ignore_crc,
-                        &mut writer,
-                    ) {
-                        result = Err(e);
-                        return;
-                    }
-                    pending_sub_items.clear();
-                    pending_json.clear();
-                }
-                let _ = writeln!(writer, "{}", wal_entry_to_json(entry));
-            }
         }
         record_index += 1;
     })?;

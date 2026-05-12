@@ -499,6 +499,7 @@ message GetLogResponse {
 }
 
 // WalLogRecord mirrors the in-memory WalEntry enum (storage::entities::WalEntry).
+// Field numbers 6 and 7 are retired (formerly WalSegmentHeader / WalSegmentSealed).
 message WalLogRecord {
   oneof entry {
     WalTxMetadata         metadata             = 1;
@@ -506,8 +507,6 @@ message WalLogRecord {
     WalTxLink             link                 = 3;
     WalTxTerm             term                 = 4;
     WalFunctionRegistered function_registered  = 5;
-    WalSegmentHeader      segment_header       = 6;
-    WalSegmentSealed      segment_sealed       = 7;
   }
 }
 
@@ -547,16 +546,6 @@ message WalFunctionRegistered {
   string name = 1;
   uint32 version = 2;
   uint32 crc32c = 3; // 0 = unregister record
-}
-
-message WalSegmentHeader {
-  uint32 segment_id = 1;
-}
-
-message WalSegmentSealed {
-  uint32 segment_id = 1;
-  uint64 last_tx_id = 2;
-  uint64 record_count = 3;
 }
 
 // ---- Terms / election history query ----

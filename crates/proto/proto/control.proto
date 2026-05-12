@@ -384,13 +384,12 @@ message LogEntry {
   string       summary = 4;
 }
 
+// Values 4 and 5 are retired (formerly SEGMENT_HEADER / SEGMENT_SEALED).
 enum LogEntryKind {
   LOG_ENTRY_KIND_UNSPECIFIED          = 0;
   LOG_ENTRY_KIND_TX_METADATA          = 1;
   LOG_ENTRY_KIND_TX_ENTRY             = 2;
   LOG_ENTRY_KIND_TX_TERM              = 3;
-  LOG_ENTRY_KIND_SEGMENT_HEADER       = 4;
-  LOG_ENTRY_KIND_SEGMENT_SEALED       = 5;
   LOG_ENTRY_KIND_LINK                 = 6;
   LOG_ENTRY_KIND_FUNCTION_REGISTERED  = 7;
   LOG_ENTRY_KIND_FUNCTION_UNREGISTERED = 8;

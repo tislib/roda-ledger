@@ -114,14 +114,6 @@ impl<'r> Recover<'r> {
             let kind = data[offset];
 
             match kind {
-                // ── Structural records (SegmentHeader / SegmentSealed) ──
-                k if k == WalEntryKind::SegmentHeader as u8
-                    || k == WalEntryKind::SegmentSealed as u8 =>
-                {
-                    offset += ENTRY_SIZE;
-                    last_good = offset;
-                }
-
                 // ── Transaction: TxMetadata + sub-items ─────────────────
                 k if k == WalEntryKind::TxMetadata as u8 => {
                     let meta: TxMetadata =

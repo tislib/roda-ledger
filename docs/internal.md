@@ -79,14 +79,14 @@ makes the WAL stream `[record][record][record]…` self-describing without a
 separate length-prefix or framing layer. Records are laid out for zero-copy
 serialization: the bytes on the wire are the bytes in memory.
 
-### §1.7 The six WAL record kinds
+### §1.7 The five WAL record kinds
 
-`WalEntryKind` enumerates the only six record types that may appear in the
-log: `TxMetadata = 0`, `TxEntry = 1`, `SegmentHeader = 2`, `SegmentSealed = 3`,
-`Link = 4`, `FunctionRegistered = 5`. New record types must extend this enum;
-the discriminant is the first byte of the record (§1.6). `SegmentHeader` and
-`SegmentSealed` are emitted by the WAL stage at segment boundaries (§7.6); their
-on-disk byte layout is in Stage 2.
+`WalEntryKind` enumerates the only five record types that may appear in the
+log: `TxMetadata = 0`, `TxEntry = 1`, `Link = 4`, `FunctionRegistered = 5`,
+`TxTerm = 6`. Discriminants `2` and `3` are retired (formerly `SegmentHeader`
+and `SegmentSealed`). New record types must extend this enum; the discriminant
+is the first byte of the record (§1.6). Segment boundaries are determined from
+file names and the `.seal` / `.crc` sidecars, not from in-band records.
 
 ### §1.8 TxMetadata
 
@@ -747,13 +747,14 @@ a partial transaction must never leak across a segment boundary.
 The Writer rotates segments on a transaction-count threshold: when the
 number of transactions in the active segment reaches
 `transaction_count_per_segment`. This is the same boundary that drives
-dedup window flips (§5.2) and hot-index sizing (§9.6). Rotation appends
-a `SegmentSealed` record, performs a *synchronous* `fdatasync` (the
-Writer cannot defer this one to the Committer because the next step
-closes the file), closes the segment, opens the next one, writes a
-fresh `SegmentHeader` record, and hands the new sync handle to the
-Committer. Rotation is a transient cost: the pipeline pauses only for
-the synchronous sync and the open of the next file. [ADR-0013]
+dedup window flips (§5.2) and hot-index sizing (§9.6). Rotation performs
+a *synchronous* `fdatasync` (the Writer cannot defer this one to the
+Committer because the next step closes the file), closes the segment,
+opens the next one, and hands the new sync handle to the Committer. No
+in-band markers are written — segment boundaries are determined by file
+rename and the `.seal` marker created later by the seal thread. Rotation
+is a transient cost: the pipeline pauses only for the synchronous sync
+and the open of the next file. [ADR-0013]
 
 ### §7.7 Committer loop
 
@@ -840,7 +841,6 @@ For each WAL entry the Snapshotter dispatches by record kind:
   `computed_balance` to the read-side balance cache.
 - `TxLink` — record the link against the current `tx_id` in the hot
   index.
-- `SegmentHeader` / `SegmentSealed` — ignored.
 - `FunctionRegistered` — handled per §8.7.
 
 Once every record of a transaction has been applied, the Snapshotter
@@ -1059,14 +1059,13 @@ read volumes without contention.
 
 Sealing is the act of making a *closed* segment safe to recover from.
 The WAL Writer (§7.6) closes a segment when the transaction-count
-threshold is reached; the closed file on disk has a `SegmentSealed`
-record at its tail but no integrity-check sidecars and no built indexes.
-Sealing turns this into a fully recoverable artifact: it computes a
-file-level CRC, writes sidecar files, builds the on-disk transaction
-and account indexes for cold-tier queries (§10.4), and — at the
-configured frequency — emits a balance snapshot and a function snapshot.
-The exact file format of all of these is in Stage 2; the *mechanism* is
-described here.
+threshold is reached; the closed file on disk has no integrity-check
+sidecars and no built indexes. Sealing turns this into a fully
+recoverable artifact: it computes a file-level CRC, writes sidecar
+files, builds the on-disk transaction and account indexes for cold-tier
+queries (§10.4), and — at the configured frequency — emits a balance
+snapshot and a function snapshot. The exact file format of all of
+these is in Stage 2; the *mechanism* is described here.
 
 ### §11.2 Independent thread, polling loop
 
@@ -1479,25 +1478,24 @@ for a given segment.
 ### §17.3 Three lifecycle states
 
 A segment is in exactly one of three states: **Active** — it is
-`wal.bin`, the writer is appending records to it, no `SegmentSealed`
-record has been written; **Closed** — it has been renamed to
-`wal_NNNNNN.bin` and a `SegmentSealed` record has been written and
-fsynced, but the seal marker and CRC sidecar are not yet present;
-**Sealed** — the per-segment seal procedure (§11.3) has computed the
-file CRC, written the `.crc` sidecar, and written the empty `.seal`
-marker. Cold-tier index lookups (§22) require the Sealed state;
-recovery (§12.2) re-seals any Closed-but-not-Sealed segment it finds.
+`wal.bin`, the writer is appending records to it; **Closed** — it has
+been renamed to `wal_NNNNNN.bin` and `fdatasync`ed, but the seal marker
+and CRC sidecar are not yet present; **Sealed** — the per-segment seal
+procedure (§11.3) has computed the file CRC, written the `.crc`
+sidecar, and written the empty `.seal` marker. Cold-tier index lookups
+(§22) require the Sealed state; recovery (§12.2) re-seals any
+Closed-but-not-Sealed segment it finds.
 
 ### §17.4 Rotation is rename-then-open
 
-When the WAL Writer crosses the rotation threshold (§7.6), it appends
-the `SegmentSealed` record to `wal.bin`, performs a synchronous
-`fdatasync`, then renames `wal.bin` to `wal_NNNNNN.bin` and opens a
-fresh `wal.bin` for the next segment. The rename is atomic on every
-supported filesystem. A reader that opened `wal.bin` before the rename
-retains its handle to the now-renamed inode; a reader that opens after
-the rename gets the new file. This is the foundation of the inode-based
-rotation detection used by replication (§23.3).
+When the WAL Writer crosses the rotation threshold (§7.6), it performs
+a synchronous `fdatasync` on `wal.bin`, then renames `wal.bin` to
+`wal_NNNNNN.bin` and opens a fresh `wal.bin` for the next segment. The
+rename is atomic on every supported filesystem. A reader that opened
+`wal.bin` before the rename retains its handle to the now-renamed
+inode; a reader that opens after the rename gets the new file. This is
+the foundation of the inode-based rotation detection used by
+replication (§23.3).
 
 ### §17.5 The `wal.stop` clean-shutdown marker
 
@@ -1585,39 +1583,16 @@ duplicated on every entry so a reader that joins on a tx boundary
 (account-history walks, §10.3) does not need to look back at the
 owning `TxMetadata`.
 
-### §18.5 `SegmentHeader` (`entry_type = 2`)
+### §18.5 Retired record kinds (`entry_type = 2` and `3`)
 
-| Bytes | Field |
-|---|---|
-| `[0]` | `entry_type = 2` (u8) |
-| `[1]` | `version` (u8) — `WAL_VERSION = 1` |
-| `[2..4]` | `_pad0` (2 bytes) |
-| `[4..8]` | `magic` (u32) — `WAL_MAGIC = 0x524F4441` (`"RODA"` in ASCII) |
-| `[8..12]` | `segment_id` (u32) — must equal the suffix in the file name |
-| `[12..40]` | `_pad1`, `_pad2` (28 bytes) |
-
-`SegmentHeader` is the first record of every segment file. The `magic`
-field is the cheapest sanity check on any read: a wrong magic means
-the file is not a roda WAL. The `version` byte exists for forward
-evolution; a reader that does not know how to interpret a version
-refuses the file rather than risk silent miscompute.
-
-### §18.6 `SegmentSealed` (`entry_type = 3`)
-
-| Bytes | Field |
-|---|---|
-| `[0]` | `entry_type = 3` (u8) |
-| `[1..4]` | `_pad0` (3 bytes) |
-| `[4..8]` | `segment_id` (u32) |
-| `[8..16]` | `last_tx_id` (u64) — last committed `tx_id` in this segment |
-| `[16..24]` | `record_count` (u64) — total records including this one and the header |
-| `[24..40]` | `_pad1` (16 bytes) |
-
-`SegmentSealed` is written only by rotation (§7.6) and is followed by
-a synchronous `fdatasync`. Its presence at the tail is the definitive
-signal that a segment file is complete; cold-boot recovery uses
-`record_count` and `last_tx_id` as cross-checks against the bytes it
-walked.
+Discriminants `2` and `3` previously encoded `SegmentHeader` and
+`SegmentSealed` records that bracketed every segment file. They have
+been removed: a WAL stream now consists solely of transaction-rooted
+records. Segment identification comes from the file name (e.g.
+`wal_000042.bin`); integrity comes from the `.crc` sidecar (which
+carries magic, size, and CRC32C — see §17.4); and clean closure is
+signalled by the presence of the `.seal` marker file. A parser that
+encounters discriminant `2` or `3` treats it as corruption.
 
 ### §18.7 `TxLink` (`entry_type = 4`)
 
@@ -1677,12 +1652,12 @@ prefix; the `magic` field disambiguates a `.crc` against any unrelated
 
 Alongside the `.crc` sidecar, Seal writes an empty `wal_NNNNNN.seal`
 file. Presence of the marker is what distinguishes a Sealed segment
-from a Closed-but-not-yet-sealed one: a crash between `SegmentSealed`
-writing and the seal procedure leaves a Closed segment that recovery
-(§12.2) re-seals on the next startup. The marker file carries no
-content; only its existence matters. An empty marker file is cheaper
-than a flag inside the sidecar because its presence can be detected by
-a stat call alone.
+from a Closed-but-not-yet-sealed one: a crash between the WAL rename
+and the seal procedure leaves a Closed segment that recovery (§12.2)
+re-seals on the next startup. The marker file carries no content; only
+its existence matters. An empty marker file is cheaper than a flag
+inside the sidecar because its presence can be detected by a stat call
+alone.
 
 ### §19.3 The `wal.stop` clean-shutdown marker
 
@@ -1696,11 +1671,11 @@ tail-trimming (§23.4) versus full-trust load.
 
 A Sealed segment that is missing its `.crc` sidecar is loaded with a
 warning, not a failure. The rationale: the sidecar is a redundant
-check; the segment's own per-record CRCs (§18.3) and `SegmentSealed`
-cross-check (§18.6) are still authoritative. Missing sidecars are most
-commonly produced by a crash after the segment was renamed but before
-Seal ran, or by external tools that copied a segment without copying
-its sidecar. Neither case warrants a refusal to start. [ADR-0006]
+check; the segment's own per-record CRCs (§18.3) are still
+authoritative. Missing sidecars are most commonly produced by a crash
+after the segment was renamed but before Seal ran, or by external tools
+that copied a segment without copying its sidecar. Neither case
+warrants a refusal to start. [ADR-0006]
 
 ---
 
@@ -2036,25 +2011,22 @@ answered by piping its output to `jq`.
 binary segment to `--out` (or stdout). It re-encodes each record
 using the zero-copy serialization (§18.2) and recomputes the CRC32C
 of every `TxMetadata` from its dependent entries and links. By
-default it validates structural invariants: the first record is
-`SegmentHeader`, the last is `SegmentSealed`, segment ids match, and
-the `record_count` in `SegmentSealed` equals the actual record count.
-`--no_validate` disables the structural checks for cases where a
-deliberately partial or malformed segment is needed (typically for
-testing recovery).
+default it validates that `tx_id` values are monotonically increasing.
+`--no_validate` disables the check for cases where a deliberately
+partial or malformed segment is needed (typically for testing
+recovery).
 
 ### §25.4 `verify`
 
 `roda_ctl verify DIR [--segment ID | --range FROM..TO]` runs an
 integrity audit over a data directory or a subset of its segments.
 Per segment it checks: the file-level CRC against the `.crc` sidecar;
-the magic byte and version of the `SegmentHeader`; the per-transaction
-CRC; the cumulative `computed_balance` chain (no unexplained jumps);
-declared `entry_count` and `link_count` match the actual record
-counts. Across segments it checks that sealed segments form a
-contiguous `tx_id` chain with no gaps and no overlaps. The output is
-a structured report; a non-zero exit code signals at least one
-failure.
+the per-transaction CRC; the cumulative `computed_balance` chain (no
+unexplained jumps); declared `entry_count` and `link_count` match the
+actual record counts. Across segments it checks that sealed segments
+form a contiguous `tx_id` chain with no gaps and no overlaps. The
+output is a structured report; a non-zero exit code signals at least
+one failure.
 
 ### §25.5 `seal`
 

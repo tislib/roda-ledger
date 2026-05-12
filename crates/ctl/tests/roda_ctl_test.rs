@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use storage::WAL_MAGIC;
 use storage::entities::*;
-use storage::{WAL_MAGIC, WAL_VERSION};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -34,21 +34,8 @@ fn compute_tx_crc(meta: &TxMetadata, entries: &[TxEntry]) -> u32 {
 fn create_test_segment(dir: &Path, segment_id: u32, tx_start: u64, num_txs: u32) -> PathBuf {
     let mut data = Vec::new();
 
-    let header = SegmentHeader {
-        entry_type: WalEntryKind::SegmentHeader as u8,
-        version: WAL_VERSION,
-        _pad0: [0; 2],
-        magic: WAL_MAGIC,
-        segment_id,
-        _pad1: [0; 4],
-        _pad2: [0; 24],
-    };
-    data.extend_from_slice(bytemuck::bytes_of(&header));
-
-    let mut last_tx_id = tx_start;
     for i in 0..num_txs {
         let tx_id = tx_start + i as u64;
-        last_tx_id = tx_id;
 
         // Real convention (transactor.rs): Debit → balance += amount, Credit → balance -= amount.
         // account_id=1 is the receiving side (Debit, balance grows positive).
@@ -88,17 +75,6 @@ fn create_test_segment(dir: &Path, segment_id: u32, tx_start: u64, num_txs: u32)
         data.extend_from_slice(bytemuck::bytes_of(&e2));
     }
 
-    let record_count = 1 + (num_txs as u64) * 3 + 1;
-    let sealed = SegmentSealed {
-        entry_type: WalEntryKind::SegmentSealed as u8,
-        _pad0: [0; 3],
-        segment_id,
-        last_tx_id,
-        record_count,
-        _pad1: [0; 16],
-    };
-    data.extend_from_slice(bytemuck::bytes_of(&sealed));
-
     let path = dir.join(format!("wal_{:06}.bin", segment_id));
     fs::write(&path, &data).unwrap();
     path
@@ -134,7 +110,7 @@ fn unpack_produces_valid_ndjson() {
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 11); // 1 header + 3*(1+2) + 1 sealed
+    assert_eq!(lines.len(), 9); // 3 × (1 metadata + 2 entries)
 
     for (i, l) in lines.iter().enumerate() {
         let _: serde_json::Value =
@@ -142,12 +118,8 @@ fn unpack_produces_valid_ndjson() {
     }
 
     let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(first["type"], "SegmentHeader");
-    assert_eq!(first["segment_id"], 1);
-
-    let last: serde_json::Value = serde_json::from_str(lines[10]).unwrap();
-    assert_eq!(last["type"], "SegmentSealed");
-    assert_eq!(last["record_count"], 11);
+    assert_eq!(first["type"], "TxMetadata");
+    assert_eq!(first["tx_id"], 1);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -157,7 +129,7 @@ fn unpack_detects_crc_mismatch() {
     let dir = unique_dir("unpack_crc");
     let wal = create_test_segment(&dir, 1, 1, 2);
     let mut data = fs::read(&wal).unwrap();
-    data[104] ^= 0xFF; // corrupt TxEntry
+    data[64] ^= 0xFF; // corrupt TxEntry
     fs::write(&wal, &data).unwrap();
 
     let out = roda_ctl()
@@ -175,7 +147,7 @@ fn unpack_ignore_crc_continues() {
     let dir = unique_dir("unpack_ignore");
     let wal = create_test_segment(&dir, 1, 1, 2);
     let mut data = fs::read(&wal).unwrap();
-    data[104] ^= 0xFF;
+    data[64] ^= 0xFF;
     fs::write(&wal, &data).unwrap();
 
     let out = roda_ctl()
@@ -205,7 +177,7 @@ fn unpack_to_file() {
         .unwrap();
     assert!(out.status.success());
     assert!(outf.exists());
-    assert_eq!(fs::read_to_string(&outf).unwrap().trim().lines().count(), 8);
+    assert_eq!(fs::read_to_string(&outf).unwrap().trim().lines().count(), 6);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -312,11 +284,12 @@ fn pack_recomputes_crc() {
 }
 
 #[test]
-fn pack_validates_structure() {
+fn pack_validates_tx_id_monotonicity() {
     let dir = unique_dir("pack_validate");
     let json = dir.join("bad.json");
-    fs::write(&json, r#"{"type":"TxMetadata","tx_id":1,"sub_item_count":0,"fail_reason":0,"crc32c":"0x00","user_ref":0,"timestamp":0,"tag":"0000000000000000"}
-{"type":"SegmentSealed","segment_id":1,"last_tx_id":1,"record_count":2}
+    // tx_id goes 2 → 1, which is non-monotonic
+    fs::write(&json, r#"{"type":"TxMetadata","tx_id":2,"sub_item_count":0,"fail_reason":0,"crc32c":"0x00","user_ref":0,"timestamp":0,"tag":"0000000000000000"}
+{"type":"TxMetadata","tx_id":1,"sub_item_count":0,"fail_reason":0,"crc32c":"0x00","user_ref":0,"timestamp":0,"tag":"0000000000000000"}
 "#).unwrap();
 
     let out = roda_ctl()
@@ -329,7 +302,7 @@ fn pack_validates_structure() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("first record must be SegmentHeader"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("tx_id not monotonically increasing"));
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -424,7 +397,7 @@ fn verify_detects_record_crc_corruption() {
     let dir = unique_dir("verify_rcrc");
     let wal = create_test_segment(&dir, 1, 1, 3);
     let mut data = fs::read(&wal).unwrap();
-    data[104] ^= 0xFF;
+    data[64] ^= 0xFF;
     fs::write(&wal, &data).unwrap();
     seal_segment_files(&dir, 1); // file CRC matches corrupted data
 
