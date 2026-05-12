@@ -59,8 +59,8 @@ import type {
   ServerInfo,
 } from '@/types/cluster';
 import type { LogPage, WalLogPage } from '@/types/log';
-import type { Operation, SubmitResult, TransactionStatus } from '@/types/transaction';
-import type { WaitLevel } from '@/types/wait';
+import type { FailReasonCode, Operation, SubmitResult } from '@/types/transaction';
+import type { WaitLevel, WaitStatus } from '@/types/wait';
 import type { WasmFunction } from '@/types/wasm';
 import type {
   AvailableScenario,
@@ -68,7 +68,7 @@ import type {
   ScenarioRunStatus,
   ScenarioRunSummary,
 } from '@/types/scenario';
-import { isTerminal } from '@/types/transaction';
+import { isWaitTerminal } from '@/types/wait';
 import { base64ToBytes } from './wasm-binaries';
 import {
   availableScenarioFromPb,
