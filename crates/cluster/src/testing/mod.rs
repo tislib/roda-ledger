@@ -1477,8 +1477,20 @@ impl Drop for ClusterTestingControl {
 // ── Free helpers ──────────────────────────────────────────────────────────
 
 fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").port()
+    use std::collections::HashSet;
+    use std::sync::LazyLock;
+    static ALLOCATED: LazyLock<std::sync::Mutex<HashSet<u16>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    let mut allocated = ALLOCATED.lock().expect("port set");
+    let mut held: Vec<TcpListener> = Vec::new();
+    loop {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let port = l.local_addr().expect("local_addr").port();
+        if allocated.insert(port) {
+            return port;
+        }
+        held.push(l);
+    }
 }
 
 fn make_root_tmp_dir(label: &str) -> PathBuf {
