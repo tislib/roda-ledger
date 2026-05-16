@@ -87,13 +87,13 @@ impl Consensus {
             HandshakeDecision::Reject { truncate_after, .. } => *truncate_after,
             _ => None,
         };
-        if let Some(after) = truncate_after {
-            if let Err(e) = self.ledger.reseed(after) {
-                error!(
-                    "replication_follower[{}]: reseed(after={}) failed: {}",
-                    nid, after, e
-                );
-            }
+        if let Some(after) = truncate_after
+            && let Err(e) = self.ledger.reseed(after)
+        {
+            error!(
+                "replication_follower[{}]: reseed(after={}) failed: {}",
+                nid, after, e
+            );
         }
 
         let (last_term, last_term_first_tx_id) = self
