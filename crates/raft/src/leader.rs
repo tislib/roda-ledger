@@ -7,11 +7,10 @@
 //! `next_index` (Raft §5.3 `next_index -= 1` on `LogMismatch`) and on
 //! every `Tick` to decide which peers need a fresh AppendEntries.
 //!
-//! The reply's two watermarks (`last_write_id`, `last_commit_id`) drive
-//! `next_index` and `match_index` independently — see ADR-0017 §"AE
-//! reply: write vs commit watermark". The leader's own write-extent
-//! watermark lives on `RaftNode.local_write_index` (advanced via the
-//! `advance(write, commit)` driver method); `leader_send_to` reads it
+//! The reply's `last_commit_id` drives both `next_index` and
+//! `match_index`. The leader's own commit watermark lives on
+//! `RaftNode.local_commit_index` (advanced via the
+//! `advance_commit_index` driver method); `leader_send_to` reads it
 //! directly to bound replication.
 
 use std::collections::BTreeMap;
@@ -36,10 +35,9 @@ pub struct InFlightAppend {
 pub struct PeerProgress {
     /// Next tx_id to ship to this peer. On `LogMismatch` reject we
     /// decrement (clamped at 1) until we find the agreement point.
-    /// On success we advance to the reply's `last_write_id + 1` (the
-    /// peer's accepted/written end — "what the peer already has, so
-    /// don't re-ship it"). See ADR-0017 §"AE reply: write vs commit
-    /// watermark" for why this is the write-id, not the commit-id.
+    /// On success we advance to the reply's `last_commit_id + 1`
+    /// (the peer's durable end — "what the peer already has, so
+    /// don't re-ship it").
     pub next_index: TxId,
     /// Highest tx_id known durably replicated on this peer. Advanced
     /// from each reply's `last_commit_id` (the peer's durable end).
@@ -79,11 +77,11 @@ pub struct LeaderState {
 
 impl LeaderState {
     /// Construct from the leader's view at bring-up. `last_local_tx`
-    /// is the leader's own write extent; new peers start at
+    /// is the leader's own commit watermark; new peers start at
     /// `next_index = last_local_tx + 1` so the leader can immediately
     /// ship already-on-disk entries from the first
     /// `Action::SendAppendEntries`. The replication-window upper
-    /// bound is the node-level `local_write_index`, read directly in
+    /// bound is the node-level `local_commit_index`, read directly in
     /// `leader_send_to` (no longer mirrored on `LeaderState`).
     pub fn new(
         peer_ids: &[NodeId],

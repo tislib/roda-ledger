@@ -95,6 +95,11 @@ pub trait Persistence {
     /// truncation Raft §5.3 demands when a follower's log diverges.
     fn truncate_term_after(&mut self, tx_id: TxId);
 
+    /// All term-log records in ascending `start_tx_id` order. Used by
+    /// the cluster driver to ship the leader's full term log on a
+    /// handshake (until `InstallSnapshot` covers cross-term catch-up).
+    fn iter_term_records(&self) -> Vec<TermRecord>;
+
     // ── vote log ────────────────────────────────────────────────────────
 
     /// Term currently recorded in the vote log. May lead the term

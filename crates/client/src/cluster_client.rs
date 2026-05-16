@@ -24,6 +24,8 @@ use ledger::tools::backoff::Backoff;
 use spdlog::warn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 use tonic::Code;
 
 /// Metadata key used by the server to hint at the current leader's
@@ -360,6 +362,44 @@ impl ClusterClient {
             c.get_balance(account_id).await
         })
         .await
+    }
+
+    /// Read balance from one node, polling that node until its
+    /// `last_snapshot_tx_id >= last_tx_id`. Rotates on transport error.
+    pub async fn get_balance_at(&self, account_id: u64, last_tx_id: u64) -> Result<Balance> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let n = self.nodes.len();
+        let mut idx = self.pick_read_node();
+        loop {
+            let node = self.nodes[idx].clone();
+            match node.get_balance(account_id).await {
+                Ok(bal) if bal.last_snapshot_tx_id >= last_tx_id => return Ok(bal),
+                Ok(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(tonic::Status::deadline_exceeded(format!(
+                            "get_balance_at: node[{}] snapshot did not reach tx_id={} within 15s",
+                            idx, last_tx_id
+                        )));
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    let next = (idx + 1) % n;
+                    warn!(
+                        "cluster::get_balance_at: error '{}' (code={:?}) on node[{}] — rotating to node[{}]",
+                        e.message(),
+                        e.code(),
+                        idx,
+                        next
+                    );
+                    idx = next;
+                    sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
     }
 
     pub async fn get_balances(&self, account_ids: &[u64]) -> Result<Vec<i64>> {

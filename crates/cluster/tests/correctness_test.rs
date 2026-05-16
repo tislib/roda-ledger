@@ -2,7 +2,8 @@
 //! WAL replication, durable acknowledged writes.
 
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
+use spdlog::warn;
 use std::time::{Duration, Instant};
 use storage::entities::SYSTEM_ACCOUNT_ID;
 
@@ -22,13 +23,17 @@ async fn balances_converge_across_nodes_after_churn() {
     let mut user_ref: u64 = 1;
     for round in 0..3 {
         for _ in 0..10 {
-            ctl.deposit_and_wait(ACCOUNT_A, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+            let r1 = ctl
+                .deposit_and_wait(ACCOUNT_A, AMOUNT, user_ref, WaitLevel::ClusterCommit)
                 .await
                 .unwrap();
+            warn!("r1:{}", r1.tx_id);
             user_ref += 1;
-            ctl.deposit_and_wait(ACCOUNT_B, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+            let r2 = ctl
+                .deposit_and_wait(ACCOUNT_B, AMOUNT, user_ref, WaitLevel::ClusterCommit)
                 .await
                 .unwrap();
+            warn!("r2:{}", r2.tx_id);
             user_ref += 1;
         }
         // Kill current leader and let a new one rise (except on last round).
@@ -110,18 +115,12 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
 }
 
 /// Cluster commit must advance on every node after 10k individual
-/// fire-and-forget deposits. Repros the leader-stall where
-/// `replicate_once` returned early on `tail()==0` without resetting
-/// the cursor.
-///
-/// Ignored: at 10k sequential gRPCs the leader gets starved of
-/// heartbeat scheduling and the cluster re-elects mid-burst, which
-/// drags in §5.3 walk-back recovery (O(extras)) and other robustness
-/// issues that need a separate rearchitecture to address. The pure
-/// tail==0 regression is locked in by the `replication::tests` unit
-/// tests in the cluster crate.
-#[ignore = "tracks 10k-burst leader churn / §5.3 walk-back — see replication::tests for the locked-in tail==0 behavior"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// fire-and-forget deposits. Under burst load the leader can be
+/// starved of heartbeats and the cluster re-elects mid-burst, which
+/// historically dragged in O(extras) §5.3 walk-back recovery; with
+/// the ConflictIndex/ConflictTerm fast-backoff in place (Raft paper
+/// §5.3, end of section) catch-up is now O(distinct terms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_commit_advances_under_burst() {
     const N: u64 = 10_000;
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
@@ -156,9 +155,9 @@ async fn cluster_commit_advances_under_burst() {
     }
 }
 
-/// Followers' WAL is byte-exact with the leader's after catch-up.
-/// Verified by comparing each follower's `wal_tailer().tail()` output
-/// to the leader's for the same byte range.
+/// Followers serve the same committed WAL records as the leader via
+/// `GetLog`. Records are canonically-encoded proto3, so record-equality
+/// across replicas is the gRPC-visible analogue of byte-equality.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wal_is_byte_exact_across_replicas() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig {
@@ -171,46 +170,54 @@ async fn wal_is_byte_exact_across_replicas() {
 
     // The harness's `deposit_and_wait` already retries through
     // `with_leader_retry` if the cached leader briefly stepped down.
+    let mut last_tx_id = 0u64;
     for ur in 1..=20u64 {
-        ctl.deposit_and_wait(ACCOUNT_A, AMOUNT, ur, WaitLevel::ClusterCommit)
+        let r = ctl
+            .deposit_and_wait(ACCOUNT_A, AMOUNT, ur, WaitLevel::ClusterCommit)
             .await
             .expect("deposit");
+        last_tx_id = r.tx_id;
     }
 
     let leader_idx = ctl.leader_index().await.unwrap();
-    let leader_ledger = ctl.ledger(leader_idx).unwrap();
 
-    // Wait for every follower to catch up at the WAL level.
+    // Wait for every follower to commit up to the leader's last tx_id
+    // (NewTerm consumes a tx_id, so this is > 20).
     for i in 0..ctl.len() {
         if i == leader_idx {
             continue;
         }
-        ctl.require_pipeline_commit_at_least(i, 20).await;
+        ctl.require_pipeline_commit_at_least(i, last_tx_id).await;
     }
 
-    // Compare WAL bytes for tx range [1, 20] across every node.
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut leader_tailer = leader_ledger.wal_tailer();
-    let n_leader = leader_tailer.tail(1, &mut buf) as usize;
-    let leader_bytes = buf[..n_leader].to_vec();
+    let leader_log = ctl
+        .raw_client_for_slot(leader_idx)
+        .expect("leader client")
+        .get_log(1, u64::MAX, 0)
+        .await
+        .expect("leader get_log");
 
     for i in 0..ctl.len() {
         if i == leader_idx {
             continue;
         }
-        let follower_ledger = ctl.ledger(i).unwrap();
-        let mut t = follower_ledger.wal_tailer();
-        let mut fbuf = vec![0u8; 64 * 1024];
-        let n = t.tail(1, &mut fbuf) as usize;
+        let follower_log = ctl
+            .raw_client_for_slot(i)
+            .expect("follower client")
+            .get_log(1, u64::MAX, 0)
+            .await
+            .expect("follower get_log");
         assert_eq!(
-            n, n_leader,
-            "follower {} streamed {} bytes; leader streamed {}",
-            i, n, n_leader
+            follower_log.records.len(),
+            leader_log.records.len(),
+            "follower {} returned {} records; leader returned {}",
+            i,
+            follower_log.records.len(),
+            leader_log.records.len()
         );
         assert_eq!(
-            fbuf[..n],
-            leader_bytes[..n],
-            "WAL bytes diverge between leader and follower {}",
+            follower_log.records, leader_log.records,
+            "WAL records diverge between leader and follower {}",
             i
         );
     }

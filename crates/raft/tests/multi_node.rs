@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use common::Sim;
 use common::mem_persistence::MemPersistence;
 use raft::{
-    AppendEntriesDecision, AppendResult, LogEntryRange, NodeId, Persistence, RaftConfig, RaftNode,
-    RejectReason, RequestVoteRequest, Role,
+    AppendResult, HandshakeDecision, NodeId, Persistence, RaftConfig, RaftNode, RejectReason,
+    RequestVote, Role,
 };
 
 fn pick_leader(sim: &Sim) -> Option<NodeId> {
@@ -158,7 +158,7 @@ fn higher_term_request_vote_during_candidacy_forces_step_down() {
 
     let _ = node.election().handle_request_vote(
         now,
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 99,
             last_tx_id: 0,
@@ -237,7 +237,6 @@ fn higher_term_in_append_reply_demotes_leader() {
         AppendResult::Reject {
             term: 99,
             reason: RejectReason::TermBehind,
-            last_write_id: 0,
             last_commit_id: 0,
         },
     );
@@ -285,94 +284,58 @@ fn empty_follower_rejects_then_accepts_after_walk_back() {
     sim.assert_log_matching();
 }
 
-/// AppendEntries with `prev_log_tx_id=0` (start of log) is accepted
+/// Handshake with `prev_log_tx_id=0` (start of log) is accepted
 /// without a §5.3 check — that's the convention for the empty-log
-/// boundary. The success reply is parked until the driver
-/// acknowledges durability via `advance` + `Tick`.
+/// boundary.
 #[test]
 fn prev_log_tx_id_zero_skips_term_match_check() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let decision = node.validate_append_entries_request(
+    let records = [raft::TermRecord {
+        term: 5,
+        start_tx_id: 1,
+    }];
+    let decision = node.validate_handshake(
         Instant::now(),
         2,
         5,
+        &records,
         0,
-        // prev_log_term=99 would fail the term check, but tx 0
-        // is the "start of log" sentinel — no check runs.
-        99,
-        LogEntryRange::new(1, 1, 5),
-        0,
+        99, // prev_log_term=99 ignored because prev_log_tx_id=0
     );
-    assert_eq!(
-        decision,
-        AppendEntriesDecision::Accept {
-            append: Some(LogEntryRange::new(1, 1, 5))
-        }
-    );
-    // Cluster acks durability via `advance`. Watermarks now reflect
-    // the new state — what the driver stamps onto the success reply.
-    node.advance_write_index(1);
-    node.advance_commit_index(1);
-    assert_eq!(node.write_index(), 1);
+    assert_eq!(decision, HandshakeDecision::Accept);
+    // Driver applies durable entry and advances watermark.
+    node.advance_local_index(1);
     assert_eq!(node.commit_index(), 1);
 }
 
-/// Follower clamps `leader_commit` to its local log length: a leader
-/// telling it `leader_commit=10` while it only has up to tx 3
-/// advances `cluster_commit_index` to 3, not 10. The advance is
-/// emitted only after the driver durably appends the entries —
-/// `cluster_commit` cannot ride ahead of durability.
+/// Follower clamps the leader's claimed cluster commit to its own
+/// local commit watermark: a leader telling it `leader_commit=10`
+/// while it only has up to tx 3 advances `cluster_commit_index` to
+/// 3, not 10.
 #[test]
 fn leader_commit_clamp_to_local_log() {
     let mut node = fresh_node(1, vec![1, 2]);
-    let decision = node.validate_append_entries_request(
-        Instant::now(),
-        2,
-        1,
-        0,
-        0,
-        LogEntryRange::new(1, 3, 1),
-        10, // intentionally beyond the batch
-    );
-    assert_eq!(
-        decision,
-        AppendEntriesDecision::Accept {
-            append: Some(LogEntryRange::new(1, 3, 1))
-        }
-    );
-    // Cluster commit cannot advance before the entries are durable;
-    // `leader_commit` is parked in `pending_leader_commit`.
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Cluster acks durability. `advance` drains
-    // `pending_leader_commit`, clamped at the new
-    // `local_commit_index = 3`.
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    let records = [raft::TermRecord {
+        term: 1,
+        start_tx_id: 1,
+    }];
+    let decision = node.validate_handshake(Instant::now(), 2, 1, &records, 0, 0);
+    assert_eq!(decision, HandshakeDecision::Accept);
+    // Driver durably applies 3 entries, then advances cluster index
+    // from the leader's claim of 10 — clamped to local=3.
+    node.advance_local_index(3);
+    node.advance_cluster_index(10);
     assert_eq!(node.cluster_commit_index(), 3);
 }
 
-/// Empty AppendEntries (heartbeat) keeps the follower's election
-/// timer reset and replies success — no AppendLog actions.
-#[test]
-fn empty_append_entries_is_a_heartbeat() {
-    let mut node = fresh_node(1, vec![1, 2]);
-    let decision =
-        node.validate_append_entries_request(Instant::now(), 2, 1, 0, 0, LogEntryRange::empty(), 0);
-    // Heartbeat: Accept with no entries to append; cluster builds
-    // the success reply from `current_term()` / watermark getters.
-    assert_eq!(decision, AppendEntriesDecision::Accept { append: None });
-}
-
-/// AppendEntries from an old leader (lower term) is rejected with
-/// the receiver's higher term in the reply.
+/// Handshake from an old leader (lower term) is rejected with
+/// `TermBehind`.
 #[test]
 fn append_entries_from_old_leader_is_rejected() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
-    // Force the node up to term 5 via observing a higher term.
     let _ = node.election().handle_request_vote(
         Instant::now(),
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 5,
             last_tx_id: 0,
@@ -380,17 +343,14 @@ fn append_entries_from_old_leader_is_rejected() {
         },
     );
     assert_eq!(node.current_term(), 5);
-    // Now an old leader at term 3 sends AE — must be refused.
-    let decision =
-        node.validate_append_entries_request(Instant::now(), 3, 3, 0, 0, LogEntryRange::empty(), 0);
+    let decision = node.validate_handshake(Instant::now(), 3, 3, &[], 0, 0);
     assert_eq!(
         decision,
-        AppendEntriesDecision::Reject {
+        HandshakeDecision::Reject {
             reason: RejectReason::TermBehind,
             truncate_after: None,
         }
     );
-    // The cluster stamps the reply's `term` from `current_term()`.
     assert_eq!(node.current_term(), 5);
 }
 
@@ -432,19 +392,18 @@ fn became_leader_matches_immediate_query() {
 }
 
 /// `cluster_commit_index()` reflects the in-place advance from
-/// `advance(write, commit)` — there is no dedicated action.
+/// `advance_commit_index` — there is no dedicated action.
 #[test]
 fn cluster_commit_query_reflects_advance() {
     let mut node = fresh_node(1, vec![1]);
     let t0 = Instant::now();
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
-    // Single-node leader: `advance(7, 7)` lifts cluster_commit
-    // immediately. The driver polls `cluster_commit_index()` to
-    // observe the change (no dedicated action; ADR-0017 §"Driver
-    // call pattern").
-    node.advance_write_index(7);
-    node.advance_commit_index(7);
+    // Single-node leader: `advance_commit_index(7)` lifts
+    // cluster_commit immediately. The driver polls
+    // `cluster_commit_index()` to observe the change (no dedicated
+    // action; ADR-0017 §"Driver call pattern").
+    node.advance_local_index(7);
     assert!(node.cluster_commit_index() >= 7);
 }
 
@@ -470,12 +429,11 @@ fn vote_denied_when_candidate_last_term_below_ours() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    node.advance_local_index(3);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 6,
             last_tx_id: 10, // higher than ours
@@ -503,12 +461,11 @@ fn vote_denied_when_same_last_term_but_lower_last_tx_id() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance_write_index(10);
-    node.advance_commit_index(10);
+    node.advance_local_index(10);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 6,
             last_tx_id: 7, // strictly less than ours
@@ -536,12 +493,11 @@ fn vote_granted_when_candidate_last_term_above_ours() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance_write_index(10);
-    node.advance_commit_index(10);
+    node.advance_local_index(10);
 
     let reply = node.election().handle_request_vote(
         Instant::now(),
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 6,
             last_tx_id: 2,
@@ -569,7 +525,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
     // First RV from candidate 2 at term 3 — granted.
     let first = node.election().handle_request_vote(
         now,
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 3,
             last_tx_id: 0,
@@ -582,7 +538,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
     // be granted again (idempotent on duplicate inbound RPCs).
     let second = node.election().handle_request_vote(
         now,
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: 3,
             last_tx_id: 0,
@@ -598,7 +554,7 @@ fn duplicate_request_vote_from_same_candidate_grants_again() {
     // A different candidate at the same term — refused.
     let third = node.election().handle_request_vote(
         now,
-        RequestVoteRequest {
+        RequestVote {
             from: 3,
             term: 3,
             last_tx_id: 0,
@@ -631,27 +587,21 @@ fn heartbeat_propagates_leader_commit_advance() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    node.advance_local_index(3);
     assert_eq!(node.cluster_commit_index(), 0);
 
-    // Heartbeat at term 1 with leader_commit=2.
-    let decision =
-        node.validate_append_entries_request(Instant::now(), 2, 1, 3, 1, LogEntryRange::empty(), 2);
-    // Heartbeat: Accept with no entries.
-    assert_eq!(decision, AppendEntriesDecision::Accept { append: None });
-    // The advance is observable via the getter (no dedicated
-    // action — ADR-0017 §"Driver call pattern").
+    // Handshake at term 1; driver then advances cluster commit to 2.
+    let decision = node.validate_handshake(Instant::now(), 2, 1, &[], 3, 1);
+    assert_eq!(decision, HandshakeDecision::Accept);
+    node.advance_cluster_index(2);
     assert_eq!(node.cluster_commit_index(), 2);
 }
 
-// ── Index-split refactor regressions ──────────────────────────────────────
+// ── Single-watermark refactor regressions ─────────────────────────────────
 
 /// On a follower, the heartbeat path clamps `leader_commit` to
-/// `local_commit_index` (not `local_write_index`) — the cluster
-/// commit watermark on a follower is bounded by what the local
-/// ledger has applied. Pre-refactor the single conflated field
-/// served both roles; this test pins the new semantics.
+/// `local_commit_index` — the cluster commit watermark on a follower
+/// is bounded by what the local ledger has applied.
 #[test]
 fn heartbeat_leader_commit_clamps_to_local_commit() {
     let persistence = MemPersistence::with_state(
@@ -663,35 +613,25 @@ fn heartbeat_leader_commit_clamps_to_local_commit() {
         0,
     );
     let mut node = RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42);
-    // Five entries durably written, only three committed locally.
-    node.advance_write_index(5);
-    node.advance_commit_index(3);
+    // Three entries committed locally.
+    node.advance_local_index(3);
 
-    // Heartbeat with leader_commit=10 (intentionally above our
-    // commit). Cluster commit advances only to local_commit_index=3.
-    let _ = node.validate_append_entries_request(
-        Instant::now(),
-        2,
-        1,
-        5,
-        1,
-        LogEntryRange::empty(),
-        10,
-    );
+    // Handshake; driver claims leader_commit=10 (intentionally above
+    // our local commit). advance_cluster_index clamps to local=3.
+    let _ = node.validate_handshake(Instant::now(), 2, 1, &[], 3, 1);
+    node.advance_cluster_index(10);
     assert_eq!(
         node.cluster_commit_index(),
         3,
-        "cluster_commit must clamp to local_commit_index, not write_index"
+        "cluster_commit must clamp to local_commit_index"
     );
 }
 
-/// A Candidate's `local_write_index` survives the role transition
-/// to Follower (when an AE at a higher term arrives). Pre-refactor,
-/// `LeaderState.last_written` would have been dropped if the node
-/// had been leader; the node-scoped field is preserved on every
-/// transition.
+/// A Candidate's `local_commit_index` survives the role transition
+/// to Follower (when an AE at a higher term arrives). The
+/// node-scoped field is preserved on every transition.
 #[test]
-fn local_write_index_survives_election_loss() {
+fn local_commit_index_survives_election_loss() {
     let persistence = MemPersistence::with_state(
         vec![raft::TermRecord {
             term: 1,
@@ -702,31 +642,21 @@ fn local_write_index_survives_election_loss() {
     );
     let mut node = RaftNode::new(1, vec![1, 2, 3], persistence, RaftConfig::default(), 42);
     let t0 = Instant::now();
-    // Hydrate the write extent before any election runs.
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    // Hydrate the commit watermark before any election runs.
+    node.advance_local_index(3);
     // First Tick lazy-arms; second Tick expires → Candidate.
     common::drive_tick(&mut node, t0);
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert_eq!(node.role(), Role::Candidate);
     let term_now = node.current_term();
-    assert_eq!(node.write_index(), 3);
+    assert_eq!(node.commit_index(), 3);
 
-    // Receive AE at a strictly higher term (a different node won
-    // the election). prev_log_tx_id = 0 sentinels the start-of-log
-    // check so we don't tangle with the §5.3 path here.
-    let _ = node.validate_append_entries_request(
-        t0 + Duration::from_secs(60),
-        2,
-        term_now + 1,
-        0,
-        0,
-        LogEntryRange::empty(),
-        0,
-    );
+    // Handshake at a strictly higher term (a different node won
+    // the election). prev_log_tx_id = 0 short-circuits the §5.3 check.
+    let _ = node.validate_handshake(t0 + Duration::from_secs(60), 2, term_now + 1, &[], 0, 0);
     assert!(matches!(node.role(), Role::Follower));
     // Survives the Candidate → Follower transition.
-    assert_eq!(node.write_index(), 3);
+    assert_eq!(node.commit_index(), 3);
 }
 
 // ── Concurrent-vote API regressions (Election primitive) ─────────────────
@@ -872,8 +802,7 @@ fn tick_returns_wakeup_with_future_deadline_after_lazy_arm() {
 // `match_index = [leader_local_commit, peer2_match, peer3_match]`.
 // Majority = 2, so the candidate is `sorted_desc[1]` — the
 // second-highest slot value. The leader's self-slot is fed by
-// `advance(write, commit)` and tracks `local_commit_index` (NOT
-// `local_write_index`); peer slots are fed by
+// `advance_commit_index`; peer slots are fed by
 // `AppendResult::Success { last_commit_id }`.
 
 /// Drive a 3-node node into the leader role by running an election
@@ -903,125 +832,9 @@ fn cluster_index_advance_on_replication() {
     let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
     let term = node.current_term();
 
-    // Leader writes 200 entries; nothing committed locally yet.
-    node.advance_write_index(200);
-    node.advance_commit_index(0);
-    assert_eq!(node.write_index(), 200);
-    assert_eq!(node.commit_index(), 0);
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Leader pulls AE for replica1 (arms in_flight; the actual entries
-    // shipped don't matter — the reply is fabricated below).
-    let _ = node
-        .replication()
-        .peer(2)
-        .unwrap()
-        .get_append_range(leader_now);
-
-    // Replica1 acks fully — its commit reached 200. With the leader's
-    // self-slot still at 0, slots = [0, 200, 0]; second-highest = 0 →
-    // no cluster_commit advance.
-    node.replication().peer(2).unwrap().append_result(
-        leader_now,
-        AppendResult::Success {
-            term,
-            last_write_id: 200,
-            last_commit_id: 200,
-        },
-    );
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Leader's local commit catches up. Self-slot → 200; slots =
-    // [200, 200, 0]; second-highest = 200 → advance. Replica2 never
-    // replied (slot 2 stays 0).
-    node.advance_write_index(200);
-    node.advance_commit_index(200);
-    assert_eq!(node.cluster_commit_index(), 200);
-}
-
-#[test]
-fn cluster_index_advance_on_replication_lagged() {
-    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
-    let term = node.current_term();
-
-    // Leader writes 200; local commit still 0.
-    node.advance_write_index(200);
-    node.advance_commit_index(0);
-
-    // Leader pulls AE for replica1.
-    let _ = node
-        .replication()
-        .peer(2)
-        .unwrap()
-        .get_append_range(leader_now);
-
-    // Replica1 acks the WRITE but its commit is still 0 (lagged).
-    // `match_index` is driven by `last_commit_id`, not `last_write_id`,
-    // so slot 1 stays 0.
-    node.replication().peer(2).unwrap().append_result(
-        leader_now,
-        AppendResult::Success {
-            term,
-            last_write_id: 200,
-            last_commit_id: 0,
-        },
-    );
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Leader's local commit catches up. Self-slot → 200, but slots =
-    // [200, 0, 0]; second-highest = 0 → no advance. Replica2 never
-    // replied.
-    node.advance_write_index(200);
-    node.advance_commit_index(200);
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Leader sends a heartbeat to replica1. The previous
-    // `get_append_range` pushed `next_heartbeat` out by
-    // `cfg.heartbeat_interval` (50ms default) — wait past it.
-    let after_hb = leader_now + Duration::from_millis(100);
-    let req = node
-        .replication()
-        .peer(2)
-        .unwrap()
-        .get_append_range(after_hb)
-        .expect("heartbeat must be due past next_heartbeat");
-    // Peer's `next_index` was advanced to `last_write_id + 1 = 201` by
-    // the previous reply, and leader's `local_write` is 200, so the AE
-    // is a pure heartbeat.
-    assert!(
-        req.entries.is_empty(),
-        "expected heartbeat AE, got entries={:?}",
-        req.entries
-    );
-
-    // Replica1's commit caught up to 150. Slot 1 → 150; slots =
-    // [200, 150, 0]; second-highest = 150 → advance. Replica2 still
-    // never replied.
-    node.replication().peer(2).unwrap().append_result(
-        after_hb,
-        AppendResult::Success {
-            term,
-            last_write_id: 200,
-            last_commit_id: 150,
-        },
-    );
-    assert_eq!(node.cluster_commit_index(), 150);
-}
-
-/// Same shape as `cluster_index_advance_on_replication`, but the
-/// leader advances its `local_commit_index` UP FRONT (before the
-/// replica reply) instead of after. The self-slot lift is no longer
-/// the trigger — the trigger is the peer ack alone.
-#[test]
-fn cluster_index_advance_on_replication_leader_commits_first() {
-    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
-    let term = node.current_term();
-
-    // Leader writes AND commits 200 entries up front. Self-slot →
-    // 200; slots = [200, 0, 0]; second-highest = 0 → no advance.
-    node.advance_write_index(200);
-    node.advance_commit_index(200);
-    assert_eq!(node.write_index(), 200);
+    // Leader commits 200 entries. Self-slot → 200; slots =
+    // [200, 0, 0]; second-highest = 0 → no advance yet.
+    node.advance_local_index(200);
     assert_eq!(node.commit_index(), 200);
     assert_eq!(node.cluster_commit_index(), 0);
 
@@ -1038,108 +851,43 @@ fn cluster_index_advance_on_replication_leader_commits_first() {
         leader_now,
         AppendResult::Success {
             term,
-            last_write_id: 200,
             last_commit_id: 200,
         },
     );
     assert_eq!(node.cluster_commit_index(), 200);
 }
 
-/// Same shape as `cluster_index_advance_on_replication_lagged`, but
-/// the leader's `local_commit_index` is at 200 from the start. The
-/// lagged replica still gates the cluster commit until its own
-/// `last_commit_id` reaches a quorum-cover value.
-#[test]
-fn cluster_index_advance_on_replication_lagged_leader_commits_first() {
-    let (mut node, leader_now) = make_3node_leader(1, vec![1, 2, 3]);
-    let term = node.current_term();
-
-    // Leader writes AND commits 200 entries up front. Self-slot →
-    // 200; slots = [200, 0, 0]; second-highest = 0 → no advance.
-    node.advance_write_index(200);
-    node.advance_commit_index(200);
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Leader pulls AE for replica1.
-    let _ = node
-        .replication()
-        .peer(2)
-        .unwrap()
-        .get_append_range(leader_now);
-
-    // Replica1 acks the WRITE but its commit is still 0 (lagged).
-    // Slot 1 stays 0 (per-slot guard); slots = [200, 0, 0];
-    // second-highest = 0 → no advance. Replica2 never replied.
-    node.replication().peer(2).unwrap().append_result(
-        leader_now,
-        AppendResult::Success {
-            term,
-            last_write_id: 200,
-            last_commit_id: 0,
-        },
-    );
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Heartbeat to replica1 (peer's `next_index = 201 > local_write
-    // 200`). Wait past `next_heartbeat`.
-    let after_hb = leader_now + Duration::from_millis(100);
-    let req = node
-        .replication()
-        .peer(2)
-        .unwrap()
-        .get_append_range(after_hb)
-        .expect("heartbeat must be due past next_heartbeat");
-    assert!(
-        req.entries.is_empty(),
-        "expected heartbeat AE, got entries={:?}",
-        req.entries
-    );
-
-    // Replica1's commit caught up to 150. Slot 1 → 150; slots =
-    // [200, 150, 0]; second-highest = 150 → advance. Replica2 still
-    // never replied.
-    node.replication().peer(2).unwrap().append_result(
-        after_hb,
-        AppendResult::Success {
-            term,
-            last_write_id: 200,
-            last_commit_id: 150,
-        },
-    );
-    assert_eq!(node.cluster_commit_index(), 150);
-}
-
 /// **BUG**: when a node promoted to leader inherits prior-term entries
-/// (`local_write = 200`, `current_term_first_tx = 201`) and `cluster_commit`
-/// is below the prior-term boundary, the §5.4.2 / Figure-8 gate at
-/// `node.rs:849` blocks every quorum-acked advance whose value is
+/// (`local_commit = 200`, `current_term_first_tx = 201`) and
+/// `cluster_commit` is below the prior-term boundary, the §5.4.2 /
+/// Figure-8 gate blocks every quorum-acked advance whose value is
 /// `< current_term_first_tx`. The cluster gets stuck —
 /// `quorum.cluster_commit_index` advances internally to 200, but
 /// `node.cluster_commit_index` stays at 0. Standard Raft breaks the
-/// deadlock by writing a no-op on election win to commit a current-term
-/// entry; this codebase doesn't, so the cluster cannot make progress
-/// without external client traffic that lands a current-term entry.
-///
-/// This test exercises the user-reported state
-/// `(current_term_first_tx=201, new_cluster=200, cluster_commit_index=0)`
-/// — quorum advances but node doesn't reflect it.
+/// deadlock by writing a no-op on election win to commit a
+/// current-term entry; this codebase doesn't, so the cluster cannot
+/// make progress without external client traffic that lands a
+/// current-term entry.
 #[test]
 fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
     let mut node = fresh_node(1, vec![1, 2, 3]);
     let t0 = Instant::now();
 
-    // Become follower; receive 200 prior-term entries with leader_commit=0
-    // (the prior leader never reached quorum). Driver fsyncs WAL but
-    // applies nothing to the ledger (since leader_commit was 0).
-    let _ = node.validate_append_entries_request(t0, 2, 1, 0, 0, LogEntryRange::new(1, 200, 1), 0);
-    node.advance_write_index(200);
-    node.advance_commit_index(0);
-    assert_eq!(node.write_index(), 200);
-    assert_eq!(node.commit_index(), 0);
+    // Become follower; receive 200 prior-term entries with
+    // leader_commit=0 (the prior leader never reached quorum). Driver
+    // applies the entries to the ledger; cluster_commit stays at 0
+    // because leader_commit was 0.
+    let records = [raft::TermRecord {
+        term: 1,
+        start_tx_id: 1,
+    }];
+    let _ = node.validate_handshake(t0, 2, 1, &records, 0, 0);
+    node.advance_local_index(200);
+    assert_eq!(node.commit_index(), 200);
     assert_eq!(node.cluster_commit_index(), 0);
 
     // Election timer fires; node 1 wins election at term 2 with peer 2's vote.
-    // `become_leader_after_win` sets `current_term_first_tx = local_write + 1 = 201`.
+    // `become_leader_after_win` sets `current_term_first_tx = local_commit + 1 = 201`.
     let t1 = t0 + Duration::from_secs(60);
     common::drive_tick(&mut node, t1);
     let cand_term = node.current_term();
@@ -1148,20 +896,16 @@ fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
     let leader_term = node.current_term();
     assert_eq!(node.cluster_commit_index(), 0);
 
-    // Both peers ack with `last_commit_id = 200` — they happen to have
-    // committed up to the prior-term boundary via some earlier history.
-    // After both acks: quorum match_index = [0 (slot 0 = leader's local_commit),
-    // 200, 200]. Sorted desc = [200, 200, 0]. Candidate = sorted_desc[1] = 200.
-    // `quorum.advance` returns Some(200) — quorum's internal
-    // cluster_commit advances to 200. The §5.4.2 gate fires (200 < 201)
-    // and the body of the if-let chain is skipped. node.cluster_commit_index
-    // stays at 0.
+    // Both peers ack with `last_commit_id = 200` — they happen to
+    // have committed up to the prior-term boundary via some earlier
+    // history. After both acks: quorum match_index = [200, 200, 200].
+    // Candidate = 200. The §5.4.2 gate fires (200 < 201) so
+    // `node.cluster_commit_index` stays at 0.
     let _ = node.replication().peer(2).unwrap().get_append_range(t1);
     node.replication().peer(2).unwrap().append_result(
         t1,
         AppendResult::Success {
             term: leader_term,
-            last_write_id: 200,
             last_commit_id: 200,
         },
     );
@@ -1170,16 +914,15 @@ fn cluster_commit_stuck_at_prior_term_boundary_after_promotion() {
         t1,
         AppendResult::Success {
             term: leader_term,
-            last_write_id: 200,
             last_commit_id: 200,
         },
     );
 
     // §5.4.2 itself is correct (it prevents the Figure-8 safety
-    // violation). Raft's
-    // standard fix is to write a no-op on election win to commit a
-    // current-term entry, which then lifts cluster_commit past
-    // current_term_first_tx and unblocks the gate.
+    // violation). Raft's standard fix is to write a no-op on
+    // election win to commit a current-term entry, which then lifts
+    // cluster_commit past current_term_first_tx and unblocks the
+    // gate.
     assert_eq!(
         node.cluster_commit_index(),
         0,

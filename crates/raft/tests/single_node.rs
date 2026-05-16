@@ -57,10 +57,8 @@ fn single_node_leader_commits_own_writes_immediately() {
 
     // `advance` is silent; observe the cluster_commit advance via
     // the getter (ADR-0017 §"Driver call pattern").
-    node.advance_write_index(5);
-    node.advance_commit_index(5);
+    node.advance_local_index(5);
     assert_eq!(node.commit_index(), 5);
-    assert_eq!(node.write_index(), 5);
     assert_eq!(node.cluster_commit_index(), 5);
 }
 
@@ -102,10 +100,10 @@ fn two_node_cluster_without_peer_replies_keeps_bumping_term() {
     assert!(!node.role().is_leader());
 }
 
-// ── advance() behavior tests (split-watermark refactor) ────────────────
+// ── advance() behavior tests ───────────────────────────────────────────
 
-/// `advance_*` is monotonic — a regressed argument is silently
-/// ignored. Mirrors `Quorum`'s monotonicity invariant for
+/// `advance_commit_index` is monotonic — a regressed argument is
+/// silently ignored. Mirrors `Quorum`'s monotonicity invariant for
 /// `cluster_commit_index`.
 #[test]
 fn advance_is_monotonic() {
@@ -115,50 +113,21 @@ fn advance_is_monotonic() {
     common::drive_tick(&mut node, t0 + Duration::from_secs(60));
     assert!(node.role().is_leader());
 
-    // Write monotonicity: regressed write argument is ignored. Tested
-    // before any commit advance so the new `advance_write_index`
-    // debug_assert (`local_commit_index <= local_write_index`) holds.
-    node.advance_write_index(5);
-    assert_eq!(node.write_index(), 5);
-    node.advance_write_index(2);
-    assert_eq!(node.write_index(), 5, "write must not regress");
-
     // Commit monotonicity: regressed commit argument is ignored.
-    node.advance_commit_index(3);
+    node.advance_local_index(3);
     assert_eq!(node.commit_index(), 3);
-    node.advance_commit_index(1);
+    node.advance_local_index(1);
     assert_eq!(node.commit_index(), 3, "commit must not regress");
-}
-
-#[test]
-fn advance_write_below_commit_is_noop() {
-    let mut node = fresh(1, vec![1]);
-    let t0 = Instant::now();
-    common::drive_tick(&mut node, t0);
-    common::drive_tick(&mut node, t0 + Duration::from_secs(60));
-    // Drive write/commit to 5, then call advance_write_index with a
-    // stale value below current commit. The function is monotonic and
-    // skips inputs at or below current write — the invariant
-    // `local_commit_index <= local_write_index` holds without panicking
-    // on stale callers (e.g. handle_append_entries replaying a lower-
-    // range AE after a higher-range one already bumped commit).
-    node.advance_write_index(5);
-    node.advance_commit_index(5);
-    node.advance_write_index(3);
-    assert_eq!(node.write_index(), 5);
-    assert_eq!(node.commit_index(), 5);
 }
 
 /// `advance` only updates `cluster_commit_index` on a leader. On a
 /// non-leader (Initializing / Follower / Candidate) the watermark
-/// stays put — only the local fields move.
+/// stays put — only the local field moves.
 #[test]
 fn advance_updates_cluster_commit_on_leader_only() {
     // Initializing follower: cluster_commit must NOT advance.
     let mut follower = fresh(1, vec![1, 2, 3]);
-    follower.advance_write_index(5);
-    follower.advance_commit_index(5);
-    assert_eq!(follower.write_index(), 5);
+    follower.advance_local_index(5);
     assert_eq!(follower.commit_index(), 5);
     assert_eq!(
         follower.cluster_commit_index(),
@@ -173,8 +142,7 @@ fn advance_updates_cluster_commit_on_leader_only() {
     common::drive_tick(&mut leader, t0);
     common::drive_tick(&mut leader, t0 + Duration::from_secs(60));
     assert!(leader.role().is_leader());
-    leader.advance_write_index(5);
-    leader.advance_commit_index(5);
+    leader.advance_local_index(5);
     assert_eq!(leader.cluster_commit_index(), 5);
 }
 
@@ -192,7 +160,6 @@ fn advance_returns_unit() {
 
     // The method is `() -> ()` — no actions returned. We assert on
     // the post-condition observable via getters.
-    node.advance_write_index(5);
-    node.advance_commit_index(5);
+    node.advance_local_index(5);
     assert_eq!(node.cluster_commit_index(), 5);
 }

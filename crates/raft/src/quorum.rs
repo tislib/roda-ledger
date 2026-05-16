@@ -9,8 +9,8 @@
 //! `advance` is called.
 //!
 //! Slot 0 is conventionally the leader's own progress, fed by
-//! `RaftNode::advance(write, commit)` (the `commit` argument lifts
-//! the self-slot). Slots `1..=N` are the peers in the same order as
+//! `RaftNode::advance_commit_index` (which lifts the self-slot).
+//! Slots `1..=N` are the peers in the same order as
 //! `RaftNode::new`'s `peers: Vec<NodeId>`.
 //!
 //! `match_index[node]` is monotonically non-decreasing — once a peer

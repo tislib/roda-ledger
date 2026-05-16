@@ -183,7 +183,6 @@ fn late_reply_after_rpc_timeout_does_not_crash() {
         AppendResult::Reject {
             term: term_now,
             reason: RejectReason::RpcTimeout,
-            last_write_id: 0,
             last_commit_id: 0,
         },
     );

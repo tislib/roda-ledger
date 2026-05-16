@@ -32,6 +32,9 @@ pub const RING_CAP: usize = 10_000;
 /// Durable + in-memory term state. Clone via `Arc<Term>` to share across
 /// the raft driver and the client-facing handlers.
 pub struct Term {
+    /// Node id this instance belongs to — included in every log prefix
+    /// so multi-node test output can be attributed.
+    node_id: u64,
     /// Current durable term. `Release`-stored after every successful
     /// append so readers observing a value see the corresponding record
     /// on disk and in the ring.
@@ -123,7 +126,7 @@ impl TermRing {
 impl Term {
     /// Open `{data_dir}/term.log` and hydrate the hot ring from its tail.
     /// On first boot the file is empty; `current` stays at 0.
-    pub fn open_in_dir(data_dir: &str) -> io::Result<Self> {
+    pub fn open_in_dir(data_dir: &str, node_id: u64) -> io::Result<Self> {
         let mut file = TermStorage::open(data_dir)?;
         let mut ring = TermRing::new();
         let mut current = 0u64;
@@ -132,12 +135,14 @@ impl Term {
             ring.push(rec);
         })?;
         debug!(
-            "term: opened {} (current={}, records_loaded={})",
+            "term[{}]: opened {} (current={}, records_loaded={})",
+            node_id,
             file.path().display(),
             current,
             ring.len
         );
         Ok(Self {
+            node_id,
             current: AtomicU64::new(current),
             ring: RwLock::new(ring),
             writer: Mutex::new(file),
@@ -169,38 +174,6 @@ impl Term {
         writer.cold_lookup(tx_id)
     }
 
-    /// Test/tooling convenience: open a fresh term at `current + 1`,
-    /// covering `start_tx_id`. Returns the new term. Production code
-    /// goes through `commit_term` with an explicit expected term —
-    /// `new_term` only exists so synthetic test seeders don't have to
-    /// thread the increment manually.
-    pub fn new_term(&self, start_tx_id: u64) -> io::Result<u64> {
-        let mut writer = self.writer.lock().expect("term: writer mutex poisoned");
-        let next = self
-            .current
-            .load(Ordering::Acquire)
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("term: u64 overflow"))?;
-        let rec = TermRecord {
-            term: next,
-            start_tx_id,
-        };
-        writer.append(rec)?;
-        writer.sync()?;
-        {
-            let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
-            ring.push(rec);
-        }
-        self.current.store(next, Ordering::Release);
-        debug!(
-            "term: opened term {} at start_tx_id={} ({})",
-            next,
-            start_tx_id,
-            writer.path().display()
-        );
-        Ok(next)
-    }
-
     /// Candidate-on-Won path: durably commit a term boundary at a
     /// **specific** expected term. Per ADR-0017 §"Required Invariants" #7
     /// the term log permits non-contiguous forward jumps — this method
@@ -214,6 +187,10 @@ impl Term {
         let mut writer = self.writer.lock().expect("term: writer mutex poisoned");
         let current = self.current.load(Ordering::Acquire);
         if current >= expected {
+            debug!(
+                "term[{}]: commit_term({}) ignored (current={} already >= expected)",
+                self.node_id, expected, current
+            );
             return Ok(false);
         }
         let rec = TermRecord {
@@ -228,7 +205,8 @@ impl Term {
         }
         self.current.store(expected, Ordering::Release);
         debug!(
-            "term: committed term {} at start_tx_id={} ({})",
+            "term[{}]: committed term {} at start_tx_id={} ({})",
+            self.node_id,
             expected,
             start_tx_id,
             writer.path().display()
@@ -245,6 +223,10 @@ impl Term {
             return Ok(());
         }
         if term < current {
+            warn!(
+                "term[{}]: observe rejected: term regression incoming={} current={}",
+                self.node_id, term, current
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("term regression: incoming={} current={}", term, current),
@@ -266,7 +248,8 @@ impl Term {
         }
         self.current.store(term, Ordering::Release);
         debug!(
-            "term: observed term {} at start_tx_id={} ({})",
+            "term[{}]: observed term {} at start_tx_id={} ({})",
+            self.node_id,
             term,
             start_tx_id,
             writer.path().display()
@@ -289,7 +272,8 @@ impl Term {
         })?;
         self.current.store(current, Ordering::Release);
         debug!(
-            "term: truncated after tx_id={} (current={}, records_loaded={}, {})",
+            "term[{}]: truncated after tx_id={} (current={}, records_loaded={}, {})",
+            self.node_id,
             tx_id,
             current,
             ring.len,
@@ -334,6 +318,8 @@ pub const LIST_RECORDS_MAX: usize = 10_000;
 /// Durable + in-memory vote state. Clone via `Arc<Vote>` to share across
 /// the raft driver and any read-side consumer.
 pub struct Vote {
+    /// Node id this instance belongs to — included in every log prefix.
+    node_id: u64,
     /// Current durable term as observed by the vote layer. May lag
     /// `Term::get_current_term()` momentarily; both converge through
     /// `observe_term`. `Release`-stored after every successful append.
@@ -350,7 +336,7 @@ pub struct Vote {
 impl Vote {
     /// Open `{data_dir}/vote.log` and hydrate `(current_term, voted_for)`
     /// from the last record.
-    pub fn open_in_dir(data_dir: &str) -> io::Result<Self> {
+    pub fn open_in_dir(data_dir: &str, node_id: u64) -> io::Result<Self> {
         let mut file = VoteStorage::open(data_dir)?;
         let last = file.last_record()?;
         let (term, voted_for) = match last {
@@ -358,12 +344,14 @@ impl Vote {
             None => (0, 0),
         };
         debug!(
-            "vote: opened {} (current_term={}, voted_for={})",
+            "vote[{}]: opened {} (current_term={}, voted_for={})",
+            node_id,
             file.path().display(),
             term,
             voted_for,
         );
         Ok(Self {
+            node_id,
             current_term: AtomicU64::new(term),
             voted_for: AtomicU64::new(voted_for),
             writer: Mutex::new(file),
@@ -399,6 +387,10 @@ impl Vote {
         let current = self.current_term.load(Ordering::Acquire);
 
         if term < current {
+            debug!(
+                "vote[{}]: denied term={} candidate={} (term behind current={})",
+                self.node_id, term, candidate_id, current
+            );
             return Ok(false);
         }
 
@@ -408,6 +400,10 @@ impl Vote {
                 return Ok(true);
             }
             if already != 0 {
+                debug!(
+                    "vote[{}]: denied term={} candidate={} (already voted_for={})",
+                    self.node_id, term, candidate_id, already
+                );
                 return Ok(false);
             }
         }
@@ -421,7 +417,8 @@ impl Vote {
         self.voted_for.store(candidate_id, Ordering::Release);
         self.current_term.store(term, Ordering::Release);
         debug!(
-            "vote: granted term={} candidate_id={} ({})",
+            "vote[{}]: granted term={} candidate_id={} ({})",
+            self.node_id,
             term,
             candidate_id,
             writer.path().display(),
@@ -478,7 +475,8 @@ impl Vote {
         self.voted_for.store(0, Ordering::Release);
         self.current_term.store(term, Ordering::Release);
         debug!(
-            "vote: observed higher term={} (cleared voted_for) ({})",
+            "vote[{}]: observed higher term={} (cleared voted_for) ({})",
+            self.node_id,
             term,
             writer.path().display(),
         );
@@ -493,15 +491,20 @@ impl Vote {
 /// `LedgerHandler` can read `Term::get_term_at_tx` outside the raft
 /// mutex.
 pub struct DurablePersistence {
+    pub node_id: u64,
     pub term: Arc<Term>,
     pub vote: Arc<Vote>,
 }
 
 impl DurablePersistence {
-    pub fn open(data_dir: &str) -> io::Result<Self> {
-        let term = Arc::new(Term::open_in_dir(data_dir)?);
-        let vote = Arc::new(Vote::open_in_dir(data_dir)?);
-        Ok(Self { term, vote })
+    pub fn open(data_dir: &str, node_id: u64) -> io::Result<Self> {
+        let term = Arc::new(Term::open_in_dir(data_dir, node_id)?);
+        let vote = Arc::new(Vote::open_in_dir(data_dir, node_id)?);
+        Ok(Self {
+            node_id,
+            term,
+            vote,
+        })
     }
 }
 
@@ -533,8 +536,8 @@ impl Persistence for DurablePersistence {
             Ok(rec) => rec.map(into_raft_record),
             Err(e) => {
                 warn!(
-                    "durable: term_at_tx({}) storage error: {} (returning None)",
-                    tx_id, e
+                    "durable[{}]: term_at_tx({}) storage error: {} (returning None)",
+                    self.node_id, tx_id, e
                 );
                 None
             }
@@ -559,6 +562,19 @@ impl Persistence for DurablePersistence {
         self.term
             .truncate_after(tx_id)
             .unwrap_or_else(|e| panic!("durable: truncate_term_after({tx_id}) failed: {e}"));
+    }
+
+    fn iter_term_records(&self) -> Vec<RaftTermRecord> {
+        match self.term.list_records(0, LIST_RECORDS_MAX) {
+            Ok(records) => records.into_iter().map(into_raft_record).collect(),
+            Err(e) => {
+                warn!(
+                    "durable[{}]: iter_term_records storage error: {} (returning empty)",
+                    self.node_id, e
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn vote_term(&self) -> u64 {
@@ -590,14 +606,14 @@ mod tests {
     fn open_term() -> (TempDir, Term) {
         let td = TempDir::new().unwrap();
         let dir = td.path().to_string_lossy().into_owned();
-        let term = Term::open_in_dir(&dir).unwrap();
+        let term = Term::open_in_dir(&dir, 1).unwrap();
         (td, term)
     }
 
     fn open_vote() -> (TempDir, Vote) {
         let td = TempDir::new().unwrap();
         let dir = td.path().to_string_lossy().into_owned();
-        let vote = Vote::open_in_dir(&dir).unwrap();
+        let vote = Vote::open_in_dir(&dir, 1).unwrap();
         (td, vote)
     }
 
@@ -684,7 +700,7 @@ mod tests {
     fn durable_persistence_round_trips_through_trait() {
         let td = TempDir::new().unwrap();
         let dir = td.path().to_string_lossy().into_owned();
-        let mut p = DurablePersistence::open(&dir).unwrap();
+        let mut p = DurablePersistence::open(&dir, 1).unwrap();
         assert_eq!(p.current_term(), 0);
         assert_eq!(p.last_term_record(), None);
         assert!(p.commit_term(3, 0));

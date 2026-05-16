@@ -1,0 +1,47 @@
+name: Repeat Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat_count:
+        description: "How many times to run the test suite (stops on first failure)"
+        required: false
+        default: "10"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  repeat-tests:
+    name: Repeat Tests (${{ inputs.repeat_count }}x)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          save-if: false
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run tests ${{ inputs.repeat_count }} times
+        env:
+          REPEAT_COUNT: ${{ inputs.repeat_count }}
+        run: |
+          for i in $(seq 1 "$REPEAT_COUNT"); do
+            echo "::group::Iteration $i / $REPEAT_COUNT — nextest"
+            cargo nextest run --workspace --cargo-profile ci
+            echo "::endgroup::"
+            echo "::group::Iteration $i / $REPEAT_COUNT — doctests"
+            cargo test --doc --profile ci
+            echo "::endgroup::"
+          done

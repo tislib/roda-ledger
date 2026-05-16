@@ -1,7 +1,7 @@
 //! `Quorum` integration with the supervisor/leader/replication path.
 
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::{Duration, Instant};
 
 const ACCOUNT: u64 = 1;
@@ -23,13 +23,10 @@ async fn leader_counts_itself_in_quorum() {
         .expect("ClusterCommit");
     assert_eq!(r.fail_reason, 0);
 
-    // ClusterMirror::cluster_commit_index() must be >= the committed tx_id.
-    let mirror = ctl
-        .handles(0)
-        .unwrap()
-        .mirror()
-        .expect("ClusterMirror on single-node cluster");
-    assert!(mirror.cluster_commit_index() >= r.tx_id);
+    // `cluster_commit` (sourced from Quorum / ClusterMirror) must be
+    // >= the committed tx_id once `ClusterCommit` has acked.
+    let idx = ctl.pipeline_index_on(0).await.expect("pipeline_index");
+    assert!(idx.cluster_commit >= r.tx_id);
 }
 
 /// `cluster_commit_index` (mirrored from Quorum) advances on the leader
@@ -76,8 +73,11 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
             .await
             .expect("deposit");
     }
-    let mirror = ctl.handles(leader_idx).unwrap().mirror().unwrap();
-    let pre = mirror.cluster_commit_index();
+    let pre = ctl
+        .pipeline_index_on(leader_idx)
+        .await
+        .expect("pipeline_index")
+        .cluster_commit;
     assert!(pre >= 10);
 
     let follower_idx = ctl.first_follower_index().await.expect("follower");
@@ -85,26 +85,28 @@ async fn quorum_majority_never_regresses_under_follower_restart() {
     ctl.start_node(follower_idx).await.expect("restart");
     // Wait for the restarted follower to rejoin replication (its slot
     // in raft's quorum tracker repopulates from the leader's heartbeats).
+    let ctl_ref = &ctl;
     ctl.wait_for(
         Duration::from_secs(5),
         "follower's cluster commit index repopulates",
-        || {
-            let mirror = mirror.clone();
-            let target = pre;
-            async move { mirror.cluster_commit_index() >= target }
+        || async move {
+            ctl_ref
+                .pipeline_index_on(leader_idx)
+                .await
+                .map(|pi| pi.cluster_commit >= pre)
+                .unwrap_or(false)
         },
     )
     .await
     .expect("follower rejoined");
 
-    // cluster_commit_index must not regress.
-    let post = mirror.cluster_commit_index();
-    assert!(
-        post >= pre,
-        "cluster_commit_index regressed: {} -> {}",
-        pre,
-        post
-    );
+    // cluster_commit must not regress.
+    let post = ctl
+        .pipeline_index_on(leader_idx)
+        .await
+        .expect("pipeline_index")
+        .cluster_commit;
+    assert!(post >= pre, "cluster_commit regressed: {} -> {}", pre, post);
 }
 
 /// After a Leader transition, the new leader's own slot in `Quorum` is

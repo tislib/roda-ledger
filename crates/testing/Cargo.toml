@@ -33,7 +33,6 @@ harness = [
   "dep:ledger",
   "dep:client",
   "dep:cluster",
-  "dep:cluster-test-utils",
   "dep:tokio",
   "dep:tonic",
   "dep:serde",
@@ -54,7 +53,6 @@ storage            = { workspace = true, optional = true }
 ledger             = { workspace = true, optional = true }
 client             = { workspace = true, optional = true }
 cluster            = { workspace = true, optional = true }
-cluster-test-utils = { workspace = true, optional = true }
 tokio              = { workspace = true, optional = true }
 tonic              = { workspace = true, optional = true }
 serde              = { workspace = true, optional = true }

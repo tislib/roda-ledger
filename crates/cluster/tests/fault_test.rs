@@ -1,7 +1,7 @@
 //! Process / network / storage fault scenarios.
 
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 
 const ACCOUNT: u64 = 1;

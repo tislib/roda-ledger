@@ -2,7 +2,7 @@ use crate::config::StorageConfig;
 use crate::layout::{active_wal_path, parse_segment_id};
 use crate::wal_tail::WalTailer;
 use crate::{Segment, SegmentStaus};
-use spdlog::info;
+use spdlog::{info, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -397,7 +397,7 @@ impl Storage {
         let new_last = surviving_ids.last().copied().unwrap_or(0) + 1;
         self.last_segment_id.store(new_last, Ordering::Release);
 
-        info!(
+        warn!(
             "truncate_wal_above: complete (watermark={}, last_segment_id now={})",
             watermark, new_last
         );

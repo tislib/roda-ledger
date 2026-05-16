@@ -6,7 +6,7 @@
 //! - Follower's balances catch up to the leader's.
 
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 use storage::entities::SYSTEM_ACCOUNT_ID;
 

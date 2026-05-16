@@ -8,7 +8,7 @@
 //! addresses returned by [`Provisioner::provision`].
 //!
 //! Provisioners can be backed by anything — an in-process cluster
-//! spawned via `cluster-test-utils` for CI, a Docker swarm for local
+//! spawned via `cluster::testing` for CI, a Docker swarm for local
 //! integration runs, a long-running pre-provisioned cluster the
 //! provisioner just hands out addresses to, or the existing
 //! `roda-server` binary spawned as a child process. The runner does

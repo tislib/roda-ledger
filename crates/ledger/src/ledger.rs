@@ -12,7 +12,7 @@ pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
 pub use crate::wasm_runtime::FunctionInfo;
 use crate::wasm_runtime::{WasmRuntime, validate_name};
-use spdlog::{LevelFilter, debug};
+use spdlog::{LevelFilter, debug, info};
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -539,7 +539,7 @@ impl Ledger {
     /// `watermark = u64::MAX` is equivalent to `start()` (no
     /// truncation, no snapshot filter, no clamp).
     pub fn start_with_recovery_until(&mut self, watermark: u64) -> std::io::Result<()> {
-        debug!("Starting Ledger with recovery watermark = {}...", watermark);
+        info!("Starting Ledger with recovery watermark = {}...", watermark);
 
         // Crash recovery first: a torn tail in wal.bin should be fixed
         // before we reason about which records cross the watermark.

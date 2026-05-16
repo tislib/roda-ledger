@@ -415,7 +415,6 @@ dependencies = [
  "bytes",
  "clap",
  "client",
- "cluster-test-utils",
  "criterion",
  "ledger",
  "log",
@@ -425,33 +424,18 @@ dependencies = [
  "raft",
  "rand 0.8.5",
  "serde",
+ "signal-hook",
  "spdlog-rs",
  "storage",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-test",
+ "tokio-util",
  "toml",
  "tonic",
  "tonic-reflection",
-]
-
-[[package]]
-name = "cluster-test-utils"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "client",
- "cluster",
- "ledger",
- "proto",
- "rand 0.8.5",
- "spdlog-rs",
- "storage",
- "tempfile",
- "tokio",
- "tonic",
 ]
 
 [[package]]
@@ -2087,6 +2071,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2319,7 +2313,6 @@ dependencies = [
  "anyhow",
  "client",
  "cluster",
- "cluster-test-utils",
  "ledger",
  "libtest-mimic",
  "proto",

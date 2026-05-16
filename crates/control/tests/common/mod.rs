@@ -41,10 +41,13 @@ pub fn locate_roda_server() -> PathBuf {
 /// The cluster configuration tests bootstrap with by default. Matches the
 /// values used in `process_provisioner_smoke.rs`.
 pub fn default_cluster_config() -> ClusterConfig {
+    // transaction_count_per_segment drives the in-memory index buffer
+    // size (~16 bytes per slot × 4× the segment count). 50_000 keeps
+    // each child server at ~6 MB of index allocs vs ~120 MB at 1M.
     ClusterConfig {
         max_accounts: 10_000,
         queue_size: 1024,
-        transaction_count_per_segment: 1_000_000,
+        transaction_count_per_segment: 50_000,
         snapshot_frequency: 2,
         replication_poll_ms: 5,
         append_entries_max_bytes: 4 * 1024 * 1024,

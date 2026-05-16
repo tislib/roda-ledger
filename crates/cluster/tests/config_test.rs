@@ -4,7 +4,7 @@
 use ::proto::ledger::WaitLevel;
 use cluster::Config;
 use cluster::config::ConfigError;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use spdlog::error;
 use std::time::Duration;
 
@@ -93,10 +93,11 @@ async fn standalone_serves_writes_with_no_node_grpc() {
         .await
         .expect("start");
 
-    let h = ctl.handles(0).expect("handles");
-    assert!(!h.has_node_handle(), "standalone has no Node gRPC");
-    assert!(h.mirror().is_none(), "standalone has no ClusterMirror");
-    assert!(h.as_cluster().is_none(), "standalone is not clustered");
+    assert_eq!(
+        ctl.node_port(0).expect("node_port"),
+        0,
+        "standalone has no Node gRPC port"
+    );
 
     let tx_id = ctl.deposit(ACCOUNT, AMOUNT, 0).await.expect("deposit");
     assert_eq!(tx_id, 1);
@@ -264,13 +265,7 @@ async fn cluster_peer_list_is_symmetric_across_nodes() {
 
     let mut peer_lists: Vec<Vec<u64>> = Vec::new();
     for i in 0..ctl.len() {
-        let cfg = &ctl.handles(i).unwrap();
-        // Use Ping semantics — every real node should know about the
-        // same set of peer ids. Cross-check via cluster_size().
-        // (We don't have a public Config getter on Handles; the
-        // ClusterTestingControl confirms cluster sizing matches.)
         peer_lists.push(vec![ctl.node_id(i).unwrap()]);
-        assert!(cfg.as_cluster().is_some());
     }
     assert_eq!(peer_lists.len(), 3);
 }
