@@ -76,7 +76,11 @@ impl ClusterHandle {
         config: ClusterConfig,
         node_count: u32,
     ) -> Result<Arc<Self>, HandleError> {
-        let provisioner = Arc::new(ProcessProvisioner::new(server_bin).quiet(true));
+        // quiet(false): child stdout/stderr inherit the parent's. Under
+        // `cargo nextest`, output is captured per-test and surfaced only on
+        // failure — so passing runs stay clean, but CI flakes give us the
+        // child's real bootstrap error instead of a bare "transport error".
+        let provisioner = Arc::new(ProcessProvisioner::new(server_bin).quiet(false));
         // Disambiguate the trait-method call so rustc doesn't try the
         // `From<Vec<T>> for Arc<[T]>` coercion when looking up the
         // return type.
