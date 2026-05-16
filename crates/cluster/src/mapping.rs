@@ -1,8 +1,8 @@
 use ::proto::ledger as proto;
 use ledger::transaction::{Operation, TransactionStatus};
 use storage::entities::{
-    EntryKind, FailReason, FunctionRegistered, TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm,
-    WalEntry, encode_tag,
+    EntryKind, FunctionRegistered, TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry,
+    encode_tag,
 };
 
 pub fn deposit_to_op(d: proto::Deposit) -> Operation {
@@ -77,10 +77,6 @@ pub fn status_to_proto(status: TransactionStatus) -> proto::TransactionStatus {
         TransactionStatus::OnSnapshot => proto::TransactionStatus::OnSnapshot,
         TransactionStatus::Error(_) => proto::TransactionStatus::Error,
     }
-}
-
-pub fn fail_reason_to_u32(reason: FailReason) -> u32 {
-    reason.as_u8() as u32
 }
 
 pub fn wal_entry_to_proto(e: WalEntry) -> proto::WalLogRecord {

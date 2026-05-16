@@ -1,4 +1,4 @@
-use super::consensus::Consensus;
+use super::state::Consensus;
 use crate::config::Config;
 use ledger::transaction::Operation;
 use proto::node::RequestVoteRequest;
@@ -77,7 +77,7 @@ impl Consensus {
                             .as_ref()
                             .map(|c| c.peers.len())
                             .unwrap_or(0) as u16;
-                        self.ledger.submit(Operation::NewTerm {
+                        self.ledger.current().submit(Operation::NewTerm {
                             term: post_term,
                             node_id: self_id,
                             node_count,

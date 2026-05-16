@@ -1,26 +1,22 @@
-use crate::consensus::consensus::Consensus;
+use crate::consensus::state::Consensus;
 use ::proto::node::node_server::Node;
-use ledger::ledger::Ledger;
 use proto::node::{
     InstallSnapshotRequest, InstallSnapshotResponse, PingRequest, PingResponse,
     ReplicationFollowerMessage, ReplicationLeaderMessage, RequestVoteRequest, RequestVoteResponse,
 };
-use spdlog::error;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 /// Thin wrapper that owns an `Arc<NodeHandlerCore>` and implements the
 /// tonic `Node` service.
 pub struct NodeHandler {
-    ledger: Arc<Ledger>,
     consensus: Arc<Consensus>,
 }
 
 impl NodeHandler {
-    pub fn new(ledger: Arc<Ledger>, consensus: Arc<Consensus>) -> Self {
-        Self { ledger, consensus }
+    pub fn new(consensus: Arc<Consensus>) -> Self {
+        Self { consensus }
     }
 }
 

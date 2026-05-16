@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::consensus::durable::DurablePersistence;
 use crate::consensus::replication::ReplicationInputStream;
-use ledger::ledger::Ledger;
+use crate::ledger_slot::LedgerSlot;
 use proto::node::{NodeRole, PingRequest, PingResponse, RequestVoteRequest, RequestVoteResponse};
 use raft::{NodeId, RaftConfig, RaftNode, RequestVote, Role, Term, TxId};
 use spdlog::debug;
@@ -21,7 +21,7 @@ pub(super) struct HandshakeSnapshot {
 }
 
 pub struct Consensus {
-    pub(super) ledger: Arc<Ledger>,
+    pub(super) ledger: Arc<LedgerSlot>,
     pub(super) raft_node: Mutex<RaftNode<DurablePersistence>>,
     pub(super) durable: DurablePersistence,
     pub(super) config: Arc<Config>,
@@ -36,7 +36,7 @@ pub struct Consensus {
 }
 
 impl Consensus {
-    pub fn new(config: Config, ledger: Arc<Ledger>) -> Result<Self, String> {
+    pub fn new(config: Config, ledger: Arc<LedgerSlot>) -> Result<Self, String> {
         if config.is_clustered() {
             Consensus::new_clustered(config, ledger)
         } else {
@@ -44,7 +44,7 @@ impl Consensus {
         }
     }
 
-    pub fn new_clustered(config: Config, ledger: Arc<Ledger>) -> Result<Self, String> {
+    pub fn new_clustered(config: Config, ledger: Arc<LedgerSlot>) -> Result<Self, String> {
         let cluster = config
             .cluster
             .as_ref()
@@ -85,7 +85,7 @@ impl Consensus {
         })
     }
 
-    pub fn new_singleton(config: Config, ledger: Arc<Ledger>) -> Result<Self, String> {
+    pub fn new_singleton(config: Config, ledger: Arc<LedgerSlot>) -> Result<Self, String> {
         let self_id = 1;
         let durable = DurablePersistence::open(&config.ledger.storage.data_dir, self_id)
             .map_err(|e| format!("{}", e))?;
@@ -217,7 +217,7 @@ impl Consensus {
         PingResponse {
             node_id,
             term,
-            last_tx_id: self.ledger.last_snapshot_id(),
+            last_tx_id: self.ledger.current().last_snapshot_id(),
             role: role_to_proto(role) as i32,
             nonce: req.nonce,
         }
@@ -250,7 +250,7 @@ impl Consensus {
     }
 
     pub fn self_advance(&self) {
-        let ledger_index = self.ledger.last_snapshot_id();
+        let ledger_index = self.ledger.current().last_snapshot_id();
         let moved = self
             .raft_node
             .lock()

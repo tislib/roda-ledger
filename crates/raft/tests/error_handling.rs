@@ -23,7 +23,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{HandshakeDecision, RaftConfig, RaftNode};
+use raft::{RaftConfig, RaftNode};
 
 fn make_follower(persistence: MemPersistence) -> RaftNode<MemPersistence> {
     RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42)

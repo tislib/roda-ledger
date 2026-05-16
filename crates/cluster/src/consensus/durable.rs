@@ -174,39 +174,6 @@ impl Term {
         writer.cold_lookup(tx_id)
     }
 
-    /// Test/tooling convenience: open a fresh term at `current + 1`,
-    /// covering `start_tx_id`. Returns the new term. Production code
-    /// goes through `commit_term` with an explicit expected term —
-    /// `new_term` only exists so synthetic test seeders don't have to
-    /// thread the increment manually.
-    pub fn new_term(&self, start_tx_id: u64) -> io::Result<u64> {
-        let mut writer = self.writer.lock().expect("term: writer mutex poisoned");
-        let next = self
-            .current
-            .load(Ordering::Acquire)
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("term: u64 overflow"))?;
-        let rec = TermRecord {
-            term: next,
-            start_tx_id,
-        };
-        writer.append(rec)?;
-        writer.sync()?;
-        {
-            let mut ring = self.ring.write().expect("term: ring rwlock poisoned");
-            ring.push(rec);
-        }
-        self.current.store(next, Ordering::Release);
-        debug!(
-            "term[{}]: opened term {} at start_tx_id={} ({})",
-            self.node_id,
-            next,
-            start_tx_id,
-            writer.path().display()
-        );
-        Ok(next)
-    }
-
     /// Candidate-on-Won path: durably commit a term boundary at a
     /// **specific** expected term. Per ADR-0017 §"Required Invariants" #7
     /// the term log permits non-contiguous forward jumps — this method

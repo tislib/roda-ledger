@@ -1,7 +1,8 @@
 use crate::config::Config;
-use crate::consensus::consensus::Consensus;
+use crate::consensus::state::Consensus;
 use crate::handlers::ledger_handler::LedgerHandler;
 use crate::handlers::node_handler::NodeHandler;
+use crate::ledger_slot::LedgerSlot;
 use ledger::ledger::Ledger;
 use proto::ledger::ledger_server::LedgerServer;
 use proto::node::node_server::NodeServer;
@@ -16,7 +17,7 @@ use tonic::transport::Server as TonicServer;
 
 pub struct ClusterNode {
     config: Config,
-    ledger: Arc<Ledger>,
+    ledger: Arc<LedgerSlot>,
 
     // shutdown handling
     cancellation_token: CancellationToken,
@@ -28,7 +29,7 @@ impl ClusterNode {
     pub fn new(config: Config) -> Result<Self, String> {
         let mut ledger = Ledger::new(config.ledger.clone());
         ledger.start().map_err(|e| format!("{}", e))?;
-        let ledger = Arc::new(ledger);
+        let ledger = Arc::new(LedgerSlot::new(ledger, config.ledger.clone()));
 
         let consensus = Arc::new(Consensus::new(config.clone(), ledger.clone())?);
 
@@ -87,7 +88,6 @@ impl ClusterNode {
 
     fn start_node_server(&mut self) -> Result<(), String> {
         let config = self.config.clone();
-        let ledger = self.ledger.clone();
         let cancellation_token = self.cancellation_token.clone();
         let consensus = self.consensus.clone();
         let handle = thread::Builder::new()
@@ -99,7 +99,7 @@ impl ClusterNode {
                     .build()
                     .expect("build dedicated node gRPC runtime");
                 rt.block_on(async {
-                    let node_handler = NodeHandler::new(ledger, consensus);
+                    let node_handler = NodeHandler::new(consensus);
                     let server =
                         ClusterNode::run_node_server(config, node_handler, cancellation_token);
                     if let Err(e) = server.await {

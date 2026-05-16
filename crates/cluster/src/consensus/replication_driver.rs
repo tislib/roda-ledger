@@ -1,6 +1,6 @@
 use crate::config::PeerConfig;
-use crate::consensus::consensus::Consensus;
 use crate::consensus::replication::ReplicationInputStream;
+use crate::consensus::state::Consensus;
 use proto::node::node_client::NodeClient;
 use proto::node::{
     ReplicationFollowerMessage, ReplicationFollowerMessageIndexUpdate, ReplicationLeaderMessage,
@@ -254,14 +254,15 @@ async fn apply_wal_update(
     let nid = c.node_id();
     let entries = decode_records(&u.wal_binary);
     let count = entries.len();
-    if let Err(e) = c.ledger.append_wal_entries(entries) {
+    let ledger = c.ledger.current();
+    if let Err(e) = ledger.append_wal_entries(entries) {
         error!(
             "replication_follower[{}]: append_wal_entries failed: {}",
             nid, e
         );
         return false;
     }
-    let local_index = c.ledger.last_snapshot_id();
+    let local_index = ledger.last_snapshot_id();
     debug!(
         "replication_follower[{}]: WAL update applied bytes={} records={} local_commit={} leader_cluster_commit={}",
         nid,
@@ -293,7 +294,7 @@ async fn apply_heartbeat(
     h: ReplicationLeaderMessageHeartBeat,
 ) -> bool {
     let nid = c.node_id();
-    let local_index = c.ledger.last_snapshot_id();
+    let local_index = c.ledger.current().last_snapshot_id();
     {
         let mut node = c.raft_node.lock().expect("raft mutex poisoned");
         node.note_leader_activity(Instant::now());
@@ -317,6 +318,7 @@ async fn apply_heartbeat(
     .is_ok()
 }
 
+#[allow(clippy::large_enum_variant)]
 enum HandshakeOutcome {
     Active {
         out_tx: mpsc::Sender<ReplicationLeaderMessage>,
@@ -570,7 +572,7 @@ async fn run_peer_sender(
         .expect("run_peer_sender requires a clustered config");
     let idle_sleep = Duration::from_millis(cluster.replication_poll_ms);
     let max_bytes = cluster.append_entries_max_bytes;
-    let mut tailer = consensus.ledger.wal_tailer();
+    let mut tailer = consensus.ledger.current().wal_tailer();
     let mut next_tx = start_tx_id + 1;
     let mut buffer = vec![0u8; max_bytes];
     debug!(

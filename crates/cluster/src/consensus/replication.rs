@@ -1,4 +1,4 @@
-use crate::consensus::consensus::Consensus;
+use crate::consensus::state::Consensus;
 use proto::node::RejectReason as ProtoRejectReason;
 use proto::node::{
     ReplicationFollowerMessage, ReplicationFollowerMessageHandshakeResponse,
@@ -78,6 +78,23 @@ impl Consensus {
             d
         };
         self.notify_role();
+
+        // ADR-0016 §9 supervisor: when raft signals a divergent
+        // uncommitted tail, reseed the ledger BEFORE we report the
+        // watermark back so the leader's next WalUpdate lands on the
+        // truncated state.
+        let truncate_after = match &decision {
+            HandshakeDecision::Reject { truncate_after, .. } => *truncate_after,
+            _ => None,
+        };
+        if let Some(after) = truncate_after {
+            if let Err(e) = self.ledger.reseed(after) {
+                error!(
+                    "replication_follower[{}]: reseed(after={}) failed: {}",
+                    nid, after, e
+                );
+            }
+        }
 
         let (last_term, last_term_first_tx_id) = self
             .durable
