@@ -140,6 +140,11 @@ fn manual_replication_leader_to_follower() {
         Duration::from_secs(60),
         || follower.lock().unwrap().last_snapshot_id() >= last_leader_tx,
     );
+    wait_for(
+        "leader snapshot catches up",
+        Duration::from_secs(60),
+        || leader.last_snapshot_id() >= last_leader_tx,
+    );
 
     running.store(false, Ordering::Relaxed);
     repl.join().expect("repl thread");
