@@ -29,7 +29,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{NodeId, Persistence, RaftConfig, RaftNode, RequestVoteRequest, Role, TermRecord};
+use raft::{NodeId, Persistence, RaftConfig, RaftNode, RequestVote, Role, TermRecord};
 
 /// Build a candidate at term `T` with `local_log_index = 0` and
 /// `term_log = []`. The candidate will then observe a higher term
@@ -85,7 +85,7 @@ fn term_log_has_no_phantom_record_after_vote_log_race() {
     let bump_to = candidate_term + 4;
     let _ = node.election().handle_request_vote(
         t_election + Duration::from_millis(1),
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: bump_to,
             last_tx_id: 0,
@@ -168,7 +168,7 @@ fn no_synthetic_term_records_for_unobserved_terms() {
         t += Duration::from_millis(1);
         let _ = node.election().handle_request_vote(
             t,
-            RequestVoteRequest {
+            RequestVote {
                 from: 2,
                 term: candidate_term + k,
                 last_tx_id: 0,
@@ -236,7 +236,7 @@ fn term_log_records_have_unique_start_tx_id() {
     let mut t = t_election + Duration::from_millis(1);
     let _ = node.election().handle_request_vote(
         t,
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: candidate_term + 2,
             last_tx_id: 0,
@@ -295,14 +295,11 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     assert!(node.role().is_leader());
     assert_eq!(node.current_term(), 1);
 
-    node.advance_write_index(1);
-    node.advance_commit_index(1);
+    node.advance_local_index(1);
     common::drive_tick(&mut node, t0 + Duration::from_secs(61));
-    node.advance_write_index(2);
-    node.advance_commit_index(2);
+    node.advance_local_index(2);
     common::drive_tick(&mut node, t0 + Duration::from_secs(61));
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    node.advance_local_index(3);
     common::drive_tick(&mut node, t0 + Duration::from_secs(61));
     assert_eq!(node.commit_index(), 3);
 
@@ -316,12 +313,11 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
 
     let mut node = RaftNode::new(1, vec![1, 2, 3], p, RaftConfig::default(), 42);
     // Driver-side WAL recovery: the on-disk WAL has 3 entries from
-    // phase 1; the rebuilt node must learn its `local_write_index`
+    // phase 1; the rebuilt node must learn its `local_commit_index`
     // before any election runs, otherwise `start_tx_id` for the
     // post-election term boundary lands at 1 and shadows the
     // existing entries on `term_at_tx` lookups.
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    node.advance_local_index(3);
     common::drive_tick(&mut node, t0 + Duration::from_secs(119));
     common::drive_tick(&mut node, t0 + Duration::from_secs(120));
     common::drive_tick(&mut node, t0 + Duration::from_secs(180));
@@ -331,7 +327,7 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // Race the vote log forward.
     let _ = node.election().handle_request_vote(
         t0 + Duration::from_secs(181),
-        RequestVoteRequest {
+        RequestVote {
             from: 2,
             term: cand_term + 3,
             last_tx_id: 3,
@@ -344,8 +340,7 @@ fn term_at_tx_for_existing_entries_unaffected_by_catch_up() {
     // `local_log_index = 0`.
     let p = node.into_persistence();
     let mut node = RaftNode::new(1, vec![1], p, RaftConfig::default(), 42);
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
+    node.advance_local_index(3);
     common::drive_tick(&mut node, t0 + Duration::from_secs(181));
     common::drive_tick(&mut node, t0 + Duration::from_secs(182));
     common::drive_tick(&mut node, t0 + Duration::from_secs(240));

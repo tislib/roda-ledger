@@ -1,8 +1,6 @@
-use crate::LedgerSlot;
-use crate::cluster_mirror::ClusterMirror;
-use crate::durable::{Term, Vote};
+use crate::consensus::consensus::Consensus;
 use ::proto::ledger as proto;
-use ::proto::ledger::ledger_server::Ledger;
+use ledger::ledger::Ledger;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
 use spdlog::{trace, warn};
@@ -13,44 +11,19 @@ use tokio::task::yield_now;
 use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
-    /// Indirection to the live `Arc<Ledger>` (ADR-0016 §9). Cloned
-    /// out under a brief mutex on every RPC; supervisor swaps the
-    /// underlying `Arc` during a divergence reseed.
-    ledger_slot: Arc<LedgerSlot>,
-    /// Lock-free read surface for raft state (role, cluster commit
-    /// index, current term). Updated by the raft driver under the
-    /// raft mutex, observed atomically here.
-    mirror: Arc<ClusterMirror>,
-    /// Shared durable term log. Used for term-at-tx stamping in
-    /// status / wait responses. Reads go through `Term`'s internal
-    /// RwLock + AtomicU64 — independent of the raft mutex.
-    term: Arc<Term>,
-    /// Shared durable vote log. Read by `GetTerms` to surface this
-    /// node's per-term vote decisions for election observability.
-    vote: Arc<Vote>,
+    ledger: Arc<Ledger>,
+    consensus: Arc<Consensus>,
 }
 
 impl LedgerHandler {
-    /// Construct a role-aware handler. Writability is decided at every
-    /// RPC by reading `mirror.is_leader()`.
-    pub fn new(
-        ledger_slot: Arc<LedgerSlot>,
-        mirror: Arc<ClusterMirror>,
-        term: Arc<Term>,
-        vote: Arc<Vote>,
-    ) -> Self {
-        Self {
-            ledger_slot,
-            mirror,
-            term,
-            vote,
-        }
+    pub fn new(ledger: Arc<Ledger>, consensus: Arc<Consensus>) -> Self {
+        Self { ledger, consensus }
     }
 
     /// Convenience — current term as observed by the raft driver.
     #[inline]
     fn current_term(&self) -> u64 {
-        self.mirror.current_term()
+        self.consensus.current_term()
     }
 
     /// Resolve the term that covered `tx_id`. Hot-path ring read falls
@@ -61,7 +34,7 @@ impl LedgerHandler {
     /// fallback for single-node mode or unknown tx ids, matching the
     /// proto's "no term context" meaning.
     fn term_for_tx(&self, tx_id: u64) -> (u64, u64) {
-        match self.term.get_term_at_tx(tx_id) {
+        match self.consensus.get_term_at_tx(tx_id) {
             Ok(Some(rec)) => (rec.term, rec.start_tx_id),
             Ok(None) => (0, 0),
             Err(e) => {
@@ -76,7 +49,7 @@ impl LedgerHandler {
     // `.map_err` at every call site for no benefit.
     #[allow(clippy::result_large_err)]
     fn ensure_writable(&self) -> Result<(), Status> {
-        if self.mirror.is_leader() {
+        if self.consensus.is_leader() {
             Ok(())
         } else {
             // Initializing / Follower / Candidate all reject writes
@@ -113,7 +86,7 @@ impl LedgerHandler {
             };
         }
 
-        let status = self.ledger_slot.ledger().get_transaction_status(tx_id);
+        let status = self.ledger.get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
             status.error_reason().as_u8() as u32
         } else {
@@ -131,14 +104,14 @@ impl LedgerHandler {
 }
 
 #[tonic::async_trait]
-impl Ledger for LedgerHandler {
+impl proto::ledger_server::Ledger for LedgerHandler {
     async fn submit_operation(
         &self,
         request: Request<proto::SubmitOperationRequest>,
     ) -> Result<Response<proto::SubmitOperationResponse>, Status> {
         self.ensure_writable()?;
         let op = crate::mapping::submit_request_to_op(request.into_inner())?;
-        let transaction_id = self.ledger_slot.ledger().submit(op);
+        let transaction_id = self.ledger.submit(op);
         Ok(Response::new(proto::SubmitOperationResponse {
             transaction_id,
             term: self.current_term(),
@@ -154,10 +127,10 @@ impl Ledger for LedgerHandler {
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
         let op = crate::mapping::submit_and_wait_request_to_op(req)?;
 
-        let tx_id = self.ledger_slot.ledger().submit(op);
+        let tx_id = self.ledger.submit(op);
         self.wait_for_transaction_level(tx_id, level).await?;
 
-        let status = self.ledger_slot.ledger().get_transaction_status(tx_id);
+        let status = self.ledger.get_transaction_status(tx_id);
         let fail_reason = if status.is_err() {
             status.error_reason().as_u8() as u32
         } else {
@@ -186,7 +159,7 @@ impl Ledger for LedgerHandler {
             operations.push(op);
         }
 
-        let start_transaction_id = self.ledger_slot.ledger().submit_batch(operations);
+        let start_transaction_id = self.ledger.submit_batch(operations);
 
         for i in 0..len {
             let tx_id = start_transaction_id + i as u64;
@@ -218,7 +191,7 @@ impl Ledger for LedgerHandler {
             operations.push(op);
         }
 
-        let start_transaction_id = self.ledger_slot.ledger().submit_batch(operations);
+        let start_transaction_id = self.ledger.submit_batch(operations);
 
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
@@ -227,7 +200,7 @@ impl Ledger for LedgerHandler {
 
         let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| {
-                let status = self.ledger_slot.ledger().get_transaction_status(tx_id);
+                let status = self.ledger.get_transaction_status(tx_id);
                 let fail_reason = if status.is_err() {
                     status.error_reason().as_u8() as u32
                 } else {
@@ -252,8 +225,8 @@ impl Ledger for LedgerHandler {
         request: Request<proto::GetBalanceRequest>,
     ) -> Result<Response<proto::GetBalanceResponse>, Status> {
         let req = request.into_inner();
-        let balance = self.ledger_slot.ledger().get_balance(req.account_id);
-        let last_snapshot_tx_id = self.ledger_slot.ledger().last_snapshot_id();
+        let balance = self.ledger.get_balance(req.account_id);
+        let last_snapshot_tx_id = self.ledger.last_snapshot_id();
 
         Ok(Response::new(proto::GetBalanceResponse {
             balance,
@@ -269,10 +242,10 @@ impl Ledger for LedgerHandler {
         let mut balances = Vec::with_capacity(req.account_ids.len());
 
         for account_id in req.account_ids {
-            balances.push(self.ledger_slot.ledger().get_balance(account_id));
+            balances.push(self.ledger.get_balance(account_id));
         }
 
-        let last_snapshot_tx_id = self.ledger_slot.ledger().last_snapshot_id();
+        let last_snapshot_tx_id = self.ledger.last_snapshot_id();
 
         Ok(Response::new(proto::GetBalancesResponse {
             balances,
@@ -316,7 +289,7 @@ impl Ledger for LedgerHandler {
         // make progress; the proto's `WaitOutcome::NotFound` is exactly
         // for this case.
         if matches!(
-            self.ledger_slot.ledger().get_transaction_status(tx_id),
+            self.ledger.get_transaction_status(tx_id),
             ledger::transaction::TransactionStatus::NotFound
         ) {
             return Ok(Response::new(proto::WaitForTransactionResponse {
@@ -357,13 +330,14 @@ impl Ledger for LedgerHandler {
         &self,
         _request: Request<proto::GetPipelineIndexRequest>,
     ) -> Result<Response<proto::GetPipelineIndexResponse>, Status> {
+        self.consensus.self_advance();
         Ok(Response::new(proto::GetPipelineIndexResponse {
-            compute_index: self.ledger_slot.ledger().last_compute_id(),
-            commit_index: self.ledger_slot.ledger().last_commit_id(),
-            snapshot_index: self.ledger_slot.ledger().last_snapshot_id(),
+            compute_index: self.ledger.last_compute_id(),
+            commit_index: self.ledger.last_commit_id(),
+            snapshot_index: self.ledger.last_snapshot_id(),
             term: self.current_term(),
-            cluster_commit_index: self.mirror.cluster_commit_index(),
-            is_leader: self.mirror.is_leader(),
+            cluster_commit_index: self.consensus.cluster_commit_index(),
+            is_leader: self.consensus.is_leader(),
         }))
     }
 
@@ -374,7 +348,7 @@ impl Ledger for LedgerHandler {
         let tx_id = request.into_inner().tx_id;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        self.ledger_slot.ledger().query(QueryRequest {
+        self.ledger.query(QueryRequest {
             kind: QueryKind::GetTransaction { tx_id },
             respond: Box::new(move |resp| {
                 let _ = tx.send(resp);
@@ -424,7 +398,7 @@ impl Ledger for LedgerHandler {
         } as usize;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        self.ledger_slot.ledger().query(QueryRequest {
+        self.ledger.query(QueryRequest {
             kind: QueryKind::GetAccountHistory {
                 account_id: req.account_id,
                 from_tx_id: req.from_tx_id,
@@ -470,11 +444,10 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::RegisterFunctionResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        match self.ledger_slot.ledger().register_function(
-            &req.name,
-            &req.binary,
-            req.override_existing,
-        ) {
+        match self
+            .ledger
+            .register_function(&req.name, &req.binary, req.override_existing)
+        {
             Ok((version, crc32c)) => Ok(Response::new(proto::RegisterFunctionResponse {
                 version: version as u32,
                 crc32c,
@@ -489,7 +462,7 @@ impl Ledger for LedgerHandler {
     ) -> Result<Response<proto::UnregisterFunctionResponse>, Status> {
         self.ensure_writable()?;
         let req = request.into_inner();
-        match self.ledger_slot.ledger().unregister_function(&req.name) {
+        match self.ledger.unregister_function(&req.name) {
             Ok(version) => Ok(Response::new(proto::UnregisterFunctionResponse {
                 version: version as u32,
             })),
@@ -502,8 +475,7 @@ impl Ledger for LedgerHandler {
         _request: Request<proto::ListFunctionsRequest>,
     ) -> Result<Response<proto::ListFunctionsResponse>, Status> {
         let functions = self
-            .ledger_slot
-            .ledger()
+            .ledger
             .list_functions()
             .into_iter()
             .map(|info| proto::FunctionInfo {
@@ -537,9 +509,9 @@ impl Ledger for LedgerHandler {
         };
 
         // Snapshot commit watermark; never return uncommitted bytes.
-        let last_commit = self.ledger_slot.ledger().last_commit_id();
+        let last_commit = self.ledger.last_commit_id();
 
-        let mut tailer = self.ledger_slot.ledger().wal_tailer();
+        let mut tailer = self.ledger.wal_tailer();
         let mut buf = vec![0u8; (limit as usize) * storage::WAL_RECORD_SIZE];
         let mut next_from = req.from_tx_id;
         let mut emitted: Vec<storage::entities::WalEntry> = Vec::with_capacity(limit as usize);
@@ -634,12 +606,12 @@ impl Ledger for LedgerHandler {
         // after the merge without re-scanning.
         let fetch = limit.saturating_add(1);
         let term_records = self
-            .term
-            .list_records(from_term, fetch)
+            .consensus
+            .list_term_records(from_term, fetch)
             .map_err(|e| Status::internal(format!("term log scan failed: {e}")))?;
         let vote_records = self
-            .vote
-            .list_records(from_term, fetch)
+            .consensus
+            .list_vote_records(from_term, fetch)
             .map_err(|e| Status::internal(format!("vote log scan failed: {e}")))?;
 
         let mut by_term: BTreeMap<u64, proto::TermInfo> = BTreeMap::new();
@@ -713,11 +685,12 @@ impl LedgerHandler {
 
         loop {
             iter += 1;
-            let ledger = self.ledger_slot.ledger();
+            let ledger = &self.ledger;
             let compute = ledger.last_compute_id();
             let commit = ledger.last_commit_id();
             let snapshot = ledger.last_snapshot_id();
-            let cluster_commit = self.mirror.cluster_commit_index();
+            self.consensus.self_advance();
+            let cluster_commit = self.consensus.cluster_commit_index();
             let reached = match level {
                 proto::WaitLevel::Computed => compute >= transaction_id,
                 proto::WaitLevel::Committed => commit >= transaction_id,

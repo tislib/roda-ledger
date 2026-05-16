@@ -92,6 +92,10 @@ impl Persistence for MemPersistence {
         self.term_log.retain(|r| r.start_tx_id <= tx_id);
     }
 
+    fn iter_term_records(&self) -> Vec<TermRecord> {
+        self.term_log.clone()
+    }
+
     fn vote_term(&self) -> TermNum {
         self.vote_term
     }

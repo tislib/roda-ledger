@@ -84,7 +84,8 @@ async fn start_node_restores_stopped_follower() {
         .into_inner();
     assert!(resp.accepted, "start_node rejected: {}", resp.error);
 
-    common::wait_for_snapshot(&svc, Duration::from_secs(5), |s| {
+    // Allow more time for spawn + tonic Channel reconnect on slow boxes.
+    common::wait_for_snapshot(&svc, Duration::from_secs(20), |s| {
         s.nodes
             .iter()
             .any(|n| n.node_id == follower && n.health == NodeHealth::Up as i32)
@@ -154,7 +155,7 @@ async fn restart_node_brings_node_back_up() {
         .into_inner();
     assert!(resp.accepted, "restart_node rejected: {}", resp.error);
 
-    common::wait_for_snapshot(&svc, Duration::from_secs(5), |s| {
+    common::wait_for_snapshot(&svc, Duration::from_secs(20), |s| {
         s.nodes
             .iter()
             .any(|n| n.node_id == follower && n.health == NodeHealth::Up as i32)

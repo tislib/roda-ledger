@@ -34,8 +34,8 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use raft::{
-    AppendEntriesDecision, AppendResult, ElectionTimerConfig, LogEntryRange, NodeId, RaftConfig,
-    RaftNode, RejectReason, RequestVoteRequest, Role, Term, TxId, VoteOutcome,
+    AppendResult, ElectionTimerConfig, HandshakeDecision, LogEntryRange, NodeId, RaftConfig,
+    RaftNode, RejectReason, RequestVote, Role, Term, TermRecord, TxId, VoteOutcome,
 };
 // `Wakeup` is the return type of `Election::tick`; harness re-polls it
 // after every event to schedule the next `Delivery::Tick`.
@@ -56,6 +56,7 @@ enum Delivery {
     AppendEntries {
         from: NodeId,
         term: Term,
+        leader_term_records: Vec<TermRecord>,
         prev_log_tx_id: TxId,
         prev_log_term: Term,
         entries: LogEntryRange,
@@ -335,15 +336,10 @@ impl Sim {
             }
             let p = b.saved_persistence.take().expect("not crashed");
             let mut n = RaftNode::new(id, self.peer_list.clone(), p, self.cfg, b.seed);
-            // Hydrate both watermarks from the durable WAL extent
-            // before the first tick. The harness pretends the ledger
-            // tracks raft-log durability synchronously, so write and
-            // commit collapse at restore time. (ADR-0017 §"Required
-            // Invariants" notes the implicit recovery invariant
-            // `ledger.last_commit_id <= raft_wal.last_tx_id`.)
+            // Hydrate the commit watermark from the durable WAL
+            // extent before the first tick.
             if last_tx > 0 {
-                n.advance_write_index(last_tx);
-                n.advance_commit_index(last_tx);
+                n.advance_local_index(last_tx);
             }
             b.node = Some(n);
             b.last_observed_role = Role::Initializing;
@@ -393,10 +389,9 @@ impl Sim {
     }
 
     /// Inject a "client write" on `leader_id`: simulates the leader's
-    /// ledger appending the next tx_id, notifying raft via the
-    /// `advance(write, commit)` direct method, and refreshing
-    /// replication / wakeups. Skips silently if the named node is not
-    /// (or no longer) a leader.
+    /// ledger appending the next tx_id, notifying raft via
+    /// `advance_commit_index`, and refreshing replication / wakeups.
+    /// Skips silently if the named node is not (or no longer) a leader.
     pub fn client_write(&mut self, leader_id: NodeId, count: usize) {
         let term = self.current_term_of(leader_id);
         if !self.role_of(leader_id).is_leader() {
@@ -410,11 +405,7 @@ impl Sim {
             for i in 0..count {
                 let tx = start + 1 + i as u64;
                 b.entries.push(MirrorEntry::new(tx, term));
-                // Single direct call advances both watermarks. Write
-                // bounds the AE replication window, commit feeds the
-                // leader's quorum self-slot.
-                node.advance_write_index(tx);
-                node.advance_commit_index(tx);
+                node.advance_local_index(tx);
             }
         }
         self.observe_after_event(leader_id, now);
@@ -506,6 +497,7 @@ impl Sim {
             Delivery::AppendEntries {
                 from,
                 term,
+                leader_term_records,
                 prev_log_tx_id,
                 prev_log_term,
                 entries,
@@ -516,6 +508,7 @@ impl Sim {
                     now,
                     from,
                     term,
+                    &leader_term_records,
                     prev_log_tx_id,
                     prev_log_term,
                     entries,
@@ -547,7 +540,7 @@ impl Sim {
                 let reply = match self.nodes.get_mut(&s.target).and_then(|b| b.node.as_mut()) {
                     Some(n) => n.election().handle_request_vote(
                         now,
-                        RequestVoteRequest {
+                        RequestVote {
                             from,
                             term,
                             last_tx_id,
@@ -604,7 +597,7 @@ impl Sim {
             .unwrap_or(false);
 
         if started {
-            let requests: Vec<(NodeId, RequestVoteRequest)> = self
+            let requests: Vec<(NodeId, RequestVote)> = self
                 .nodes
                 .get_mut(&src)
                 .and_then(|b| b.node.as_mut())
@@ -668,10 +661,11 @@ impl Sim {
         }
     }
 
-    /// Cluster-driver-side handling of an inbound `AppendEntries` for
-    /// `target`. Mirrors the new follower flow: validate → mirror
-    /// truncation/append → `advance` on durability → re-poll wakeup
-    /// → synthesize and ship the wire reply.
+    /// Simulator follower flow under the handshake-only model. Each
+    /// AE delivery is a fresh handshake (term/§5.3 validation), then —
+    /// on Accept — mirror the entries, advance the local index, and
+    /// advance the cluster index from the leader's claimed
+    /// `leader_commit`.
     #[allow(clippy::too_many_arguments)]
     fn deliver_append_entries(
         &mut self,
@@ -679,26 +673,26 @@ impl Sim {
         now: Instant,
         from: NodeId,
         term: Term,
+        leader_term_records: &[TermRecord],
         prev_log_tx_id: TxId,
         prev_log_term: Term,
         entries: LogEntryRange,
         leader_commit: TxId,
     ) {
         let decision = match self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
-            Some(n) => n.validate_append_entries_request(
+            Some(n) => n.validate_handshake(
                 now,
                 from,
                 term,
+                leader_term_records,
                 prev_log_tx_id,
                 prev_log_term,
-                entries,
-                leader_commit,
             ),
             None => return,
         };
 
-        let (success, reject_reason): (bool, Option<RejectReason>) = match decision {
-            AppendEntriesDecision::Reject {
+        let (success, reject_reason) = match decision {
+            HandshakeDecision::Reject {
                 reason,
                 truncate_after,
             } => {
@@ -709,67 +703,65 @@ impl Sim {
                 }
                 (false, Some(reason))
             }
-            AppendEntriesDecision::Accept { append: None } => (true, None),
-            AppendEntriesDecision::Accept {
-                append: Some(range),
-            } => {
-                if !range.is_empty() {
+            HandshakeDecision::Accept => {
+                if !entries.is_empty() {
+                    // Pull each entry's term from the leader's own mirror
+                    // so multi-term catch-up scenarios preserve the right
+                    // (tx_id, term) pair — the wire AE no longer carries
+                    // per-entry term, and `term` here is just the leader's
+                    // current term.
+                    let leader_entries: Vec<MirrorEntry> = (0..entries.count)
+                        .map(|i| {
+                            let tx = entries.start_tx_id + i;
+                            self.nodes
+                                .get(&from)
+                                .and_then(|b| b.entries.get((tx - 1) as usize).copied())
+                                .unwrap_or(MirrorEntry::new(tx, term))
+                        })
+                        .collect();
                     if let Some(b) = self.nodes.get_mut(&target) {
-                        for i in 0..range.count {
-                            let tx = range.start_tx_id + i;
-                            while b.entries.len() < (tx as usize).saturating_sub(1) {
+                        for entry in &leader_entries {
+                            while b.entries.len() < (entry.tx_id as usize).saturating_sub(1) {
                                 b.entries.push(MirrorEntry::new(0, 0));
                             }
-                            let entry = MirrorEntry::new(tx, range.term);
-                            if (tx as usize) <= b.entries.len() {
-                                b.entries[(tx - 1) as usize] = entry;
+                            if (entry.tx_id as usize) <= b.entries.len() {
+                                b.entries[(entry.tx_id - 1) as usize] = *entry;
                             } else {
-                                b.entries.push(entry);
+                                b.entries.push(*entry);
                             }
                         }
                     }
-                    let last_tx = range.last_tx_id().unwrap();
-                    // Synchronous-apply harness model: ledger applies
-                    // AE entries the moment they're durable, so write
-                    // and commit watermarks move together.
+                    let last_tx = entries.last_tx_id().unwrap();
                     if let Some(node) = self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
-                        node.advance_write_index(last_tx);
-                        node.advance_commit_index(last_tx);
+                        node.advance_local_index(last_tx);
                     }
+                }
+                if let Some(node) = self.nodes.get_mut(&target).and_then(|b| b.node.as_mut()) {
+                    node.advance_cluster_index(leader_commit);
                 }
                 (true, None)
             }
         };
 
-        // Re-poll wakeup, drive replication, observe transitions.
         self.observe_after_event(target, now);
 
-        // Synthesize the reply from getters (ADR-0017 §"AE reply:
-        // write vs commit watermark" — the reply ships
-        // `last_commit_id` / `last_write_id` separately) and ship
-        // it back through the simulated network, subject to the
-        // drop / duplicate model. Translates the (success,
-        // reject_reason) pair into the `AppendResult` enum the
-        // leader's `Replication::append_result` expects.
         if self.is_dropped(target, from) || self.rolled_drop() {
             return;
         }
-        let (reply_term, last_commit_id, last_write_id) =
+        let (reply_term, last_commit_id) =
             match self.nodes.get(&target).and_then(|b| b.node.as_ref()) {
-                Some(n) => (n.current_term(), n.commit_index(), n.write_index()),
+                Some(n) => (n.current_term(), n.commit_index()),
                 None => return,
             };
         let result = if success {
             AppendResult::Success {
                 term: reply_term,
-                last_write_id,
                 last_commit_id,
             }
         } else {
             AppendResult::Reject {
                 term: reply_term,
                 reason: reject_reason.unwrap_or(RejectReason::LogMismatch),
-                last_write_id,
                 last_commit_id,
             }
         };
@@ -808,6 +800,14 @@ impl Sim {
             None => return,
         };
         for peer in peers {
+            let next_index = match self.nodes.get_mut(&src).and_then(|b| b.node.as_mut()) {
+                Some(n) => n
+                    .replication()
+                    .peer(peer)
+                    .map(|p| p.next_index())
+                    .unwrap_or(0),
+                None => return,
+            };
             let req = match self.nodes.get_mut(&src).and_then(|b| b.node.as_mut()) {
                 Some(n) => n
                     .replication()
@@ -817,6 +817,16 @@ impl Sim {
             };
             let Some(req) = req else { continue };
 
+            let (term, leader_term_records, prev_log_tx_id, prev_log_term) =
+                match self.nodes.get(&src).and_then(|b| b.node.as_ref()) {
+                    Some(n) => {
+                        let prev = next_index.saturating_sub(1);
+                        let prev_term = n.term_at_tx(prev).unwrap_or(0);
+                        (n.current_term(), n.term_log_snapshot(), prev, prev_term)
+                    }
+                    None => return,
+                };
+
             if self.is_dropped(src, peer) || self.rolled_drop() {
                 continue;
             }
@@ -824,9 +834,10 @@ impl Sim {
             let dup = self.rolled_duplicate();
             let delivery = Delivery::AppendEntries {
                 from: src,
-                term: req.term,
-                prev_log_tx_id: req.prev_log_tx_id,
-                prev_log_term: req.prev_log_term,
+                term,
+                leader_term_records,
+                prev_log_tx_id,
+                prev_log_term,
                 entries: req.entries,
                 leader_commit: req.leader_commit,
             };

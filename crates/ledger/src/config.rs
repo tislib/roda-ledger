@@ -71,12 +71,16 @@ impl LedgerConfig {
         let rand = rand::random::<u64>() % 1_000_000_000;
         dir.push(format!("temp_{}", rand));
 
+        // Smaller segment + account caps so parallel test processes
+        // don't each allocate ~1.7 GB of index buffers. Tests that need
+        // larger limits override these fields.
         Self {
+            max_accounts: 10_000,
             storage: StorageConfig {
                 data_dir: dir.to_string_lossy().to_string(),
                 temporary: true,
                 snapshot_frequency: 2,
-                transaction_count_per_segment: 10_000_000,
+                transaction_count_per_segment: 50_000,
             },
             log_level: Level::Critical,
             seal_check_internal: Duration::from_millis(10),

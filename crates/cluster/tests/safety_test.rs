@@ -9,7 +9,7 @@
 //! - `mid_election_cluster_commit_not_lost`
 
 use ::proto::ledger::WaitLevel;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl, ClusterTestingError};
 use std::time::Duration;
 use storage::entities::{FailReason, SYSTEM_ACCOUNT_ID};
 use tokio::time::sleep;

@@ -16,7 +16,7 @@
 
 use ::proto::ledger::WaitLevel;
 use client::{ClusterClient, NodeClient, RetryConfig};
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 use storage::entities::SYSTEM_ACCOUNT_ID;
 
@@ -71,10 +71,20 @@ async fn cluster_client_routes_writes_to_leader_and_reads_round_robin() {
     // consistent on every node, we wait for each follower's
     // snapshot_index to reach our tx_id first.
     for i in 0..ctl.len() {
-        let ledger = ctl.ledger(i).expect("ledger");
-        ctl.wait_for_snapshot_id(&ledger, target_tx, Duration::from_secs(15))
-            .await
-            .expect("follower snapshot");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let pi = ctl.pipeline_index_on(i).await.expect("pipeline_index");
+            if pi.snapshot >= target_tx {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "slot {} snapshot {} stuck below target {}",
+                    i, pi.snapshot, target_tx
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     // Round-robin reads — every node now has the deposit applied, so
@@ -183,7 +193,10 @@ async fn cluster_client_writes_survive_leader_failover() {
         .expect("second post-failover deposit");
     assert_eq!(r.fail_reason, 0);
 
-    let bal = cluster.get_balance(ACCOUNT_A).await.expect("balance");
+    let bal = cluster
+        .get_balance_at(ACCOUNT_A, r.tx_id)
+        .await
+        .expect("balance");
     assert_eq!(bal.balance, (AMOUNT as i64) * 3);
 
     ctl.stop_all().await;

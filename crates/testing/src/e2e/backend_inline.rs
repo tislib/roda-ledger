@@ -1,4 +1,4 @@
-//! Inline backend — nodes run in-process via `cluster-test-utils`.
+//! Inline backend — nodes run in-process via `cluster::testing`.
 //!
 //! Each `InlineNode` owns a `ClusterTestingControl` configured for a single
 //! standalone node. Fastest startup, easiest debugging, but cannot exercise
@@ -7,13 +7,13 @@
 
 use crate::e2e::profile::Profile;
 use client::NodeClient;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::net::SocketAddr;
 
 /// Handle for a single in-process ledger node with gRPC front-end.
 pub struct InlineNode {
     /// Owns the running node + data dir. Drop performs cooperative
-    /// shutdown via `cluster-test-utils`'s RAII teardown.
+    /// shutdown via `cluster::testing`'s RAII teardown.
     control: ClusterTestingControl,
     /// gRPC client connected to this node.
     client: NodeClient,

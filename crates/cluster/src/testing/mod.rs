@@ -1,21 +1,20 @@
 #![allow(clippy::result_large_err)]
-//! High-level test harness. `ClusterTestingControl` is the single
-//! entry point for cluster-style tests: it owns per-node data dirs,
-//! ports, configs, and either the running `ClusterNode`s or the
-//! bare components (Ledger / Term / Vote / ClusterMirror /
-//! LedgerSlot) needed to drive `LedgerHandler` directly without
-//! networking.
+//! High-level test harness. `ClusterTestingControl` owns per-node
+//! data dirs, ports, configs, and the running `ClusterNode`s.
 //!
-//! Three deployment shapes are supported via [`ClusterTestingMode`]:
-//! - [`ClusterTestingMode::Bare`] — single node, no servers. Each
-//!   slot gets the bare components only; tests construct
-//!   `LedgerHandler` / `NodeHandler` over them and call methods
-//!   directly (no networking).
+//! Two deployment shapes are supported via [`ClusterTestingMode`]:
 //! - [`ClusterTestingMode::Standalone`] — single node, no `[cluster]`
 //!   block, role pinned to Leader, only the client-facing Ledger
 //!   gRPC.
 //! - [`ClusterTestingMode::Cluster`] — `n`-node cluster with
 //!   election + replication.
+//!
+//! All test interaction with the cluster goes through gRPC: the
+//! ledger service via `client::ClusterClient` / `client::NodeClient`
+//! and, where the harness needs to identify the leader, the peer
+//! node service (`proto::node::Ping`). No test code reaches into
+//! in-process internals like `Arc<Ledger>`, `Arc<Term>`, or
+//! `LedgerHandler`.
 //!
 //! Data-directory ownership is *cluster-level*: when
 //! `config.data_dir_root` is `None`, the harness creates
@@ -24,17 +23,10 @@
 //! supplies a `data_dir_root`, the harness uses it as-is and does
 //! **not** remove it on drop.
 
+use crate::{ClusterNode, ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection};
 use ::proto::node::{self as nproto, node_client::NodeClient as ProtoNodeClient};
 use client::{ClusterClient, NodeClient, PipelineIndex, RetryConfig, SubmitResult};
-use cluster::Role;
-use cluster::cluster_mirror::ClusterMirror;
-use cluster::config::{ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection};
-use cluster::durable::{Term, Vote};
-use cluster::ledger_handler::LedgerHandler;
-use cluster::ledger_slot::LedgerSlot;
-use cluster::node::{ClusterNode, Handles};
 use ledger::config::LedgerConfig;
-use ledger::ledger::Ledger;
 use ledger::wait_strategy::WaitStrategy;
 use proto::ledger as lproto;
 use spdlog::{Level, info, warn};
@@ -76,14 +68,6 @@ pub enum ClusterTestingError {
         label: String,
         timeout: Duration,
     },
-    /// Operation is only valid for [`ClusterTestingMode::Bare`].
-    BareModeOnly {
-        op: &'static str,
-    },
-    /// Operation is not valid for [`ClusterTestingMode::Bare`].
-    NotInBareMode {
-        op: &'static str,
-    },
     /// `ensure_caught_up_at` did not observe the slot's `snapshot`
     /// watermark reach the harness's `last_tx_id` within the budget.
     /// `last_observed` is the most recent `PipelineIndex` we read.
@@ -97,6 +81,10 @@ pub enum ClusterTestingError {
         op: &'static str,
         source: tonic::Status,
     },
+    /// Embedded `ClusterClient` hasn't been built yet — call
+    /// `start_node` / `wait_for_bind` to bring up at least one slot
+    /// (or use `autostart = true`, the default).
+    ClientNotReady,
 }
 
 impl std::fmt::Display for ClusterTestingError {
@@ -120,12 +108,6 @@ impl std::fmt::Display for ClusterTestingError {
             Self::WaitTimeout { label, timeout } => {
                 write!(f, "timed out after {timeout:?} waiting for: {label}")
             }
-            Self::BareModeOnly { op } => {
-                write!(f, "{op} is only valid in Bare mode")
-            }
-            Self::NotInBareMode { op } => {
-                write!(f, "{op} is not valid in Bare mode")
-            }
             Self::CatchUpTimedOut {
                 slot,
                 target,
@@ -142,6 +124,11 @@ impl std::fmt::Display for ClusterTestingError {
                 last_observed.is_leader,
             ),
             Self::Rpc { op, source } => write!(f, "{op} RPC failed: {source}"),
+            Self::ClientNotReady => write!(
+                f,
+                "ClusterClient not built yet — use autostart=true or call \
+                 wait_for_bind after starting a node manually"
+            ),
         }
     }
 }
@@ -153,12 +140,6 @@ impl std::error::Error for ClusterTestingError {}
 /// Deployment shape selector for the harness.
 #[derive(Clone, Debug)]
 pub enum ClusterTestingMode {
-    /// Single node, no servers. Each slot gets `Ledger`, `Term`,
-    /// `Vote`, `ClusterMirror` (role pinned to `role`), and
-    /// `LedgerSlot` — enough to construct `LedgerHandler`
-    /// / `NodeHandler` and drive them directly. Used for handler-
-    /// level integration tests that don't go through gRPC.
-    Bare { role: Role },
     /// `Config { cluster: None, .. }`. Single node, role pinned to
     /// Leader, only the client-facing Ledger gRPC.
     Standalone,
@@ -168,9 +149,9 @@ pub enum ClusterTestingMode {
 }
 
 /// Knobs for [`ClusterTestingControl`]. Use [`Self::default`] for a
-/// 1-node cluster, [`Self::standalone`] / [`Self::cluster`] /
-/// [`Self::bare`] for the other shapes. All fields are public so
-/// callers can override individual knobs with struct-update syntax:
+/// 1-node cluster, [`Self::standalone`] / [`Self::cluster`] for the
+/// other shapes. All fields are public so callers can override
+/// individual knobs with struct-update syntax:
 /// `ClusterTestingConfig { label: "x".into(), ..Default::default() }`.
 #[derive(Clone, Debug)]
 pub struct ClusterTestingConfig {
@@ -189,10 +170,8 @@ pub struct ClusterTestingConfig {
     pub ledger_log_level: Level,
     /// If `false`, [`ClusterTestingControl::start`] only assembles
     /// configs and reserves ports — it does not call
-    /// `ClusterNode::new`, `node.run()`, or build Bare components.
-    /// Callers can then drive each node manually with
-    /// [`ClusterTestingControl::start_node`] / `build_node` /
-    /// `run_node`.
+    /// `ClusterNode::new` or `node.start()`. Callers can then drive
+    /// each node manually with [`ClusterTestingControl::start_node`].
     pub autostart: bool,
     /// If `Some`, use this absolute path as the cluster's root data
     /// directory and **do not remove it on `Drop`** — the caller
@@ -242,15 +221,6 @@ impl ClusterTestingConfig {
             ..Default::default()
         }
     }
-
-    /// Bare components (no servers) — for handler-level tests.
-    pub fn bare(role: Role) -> Self {
-        Self {
-            mode: ClusterTestingMode::Bare { role },
-            label: "bare".to_string(),
-            ..Default::default()
-        }
-    }
 }
 
 // ── Internal types ────────────────────────────────────────────────────────
@@ -260,20 +230,8 @@ struct NodeAddr {
     node_id: u64,
     host: String,
     client_port: u16,
-    /// Peer-facing Node gRPC port. `0` (unused) in standalone /
-    /// bare modes.
+    /// Peer-facing Node gRPC port. `0` (unused) in standalone mode.
     node_port: u16,
-}
-
-/// Bare-mode components. Populated by [`ClusterTestingControl::start_node`]
-/// when the harness is in [`ClusterTestingMode::Bare`].
-struct BareComponents {
-    ledger: Arc<Ledger>,
-    term: Arc<Term>,
-    #[allow(dead_code)]
-    vote: Arc<Vote>,
-    mirror: Arc<ClusterMirror>,
-    ledger_slot: Arc<LedgerSlot>,
 }
 
 struct NodeSlot {
@@ -283,11 +241,9 @@ struct NodeSlot {
     /// `config.ledger.storage.data_dir` but kept as a `PathBuf` for
     /// ergonomic test access.
     data_dir: PathBuf,
-    // Cluster/Standalone-mode bring-up state.
+    // `Some` once `start_node` has built and run the node; dropping
+    // it triggers cooperative shutdown via `ClusterNode::Drop`.
     node: Option<ClusterNode>,
-    handles: Option<Handles>,
-    // Bare-mode bring-up state.
-    bare: Option<BareComponents>,
 }
 
 #[derive(Clone, Debug)]
@@ -300,8 +256,8 @@ struct PhantomPeer {
 // ── Top-level harness ─────────────────────────────────────────────────────
 
 /// High-level harness that owns an in-process cluster end-to-end:
-/// per-node configs, ports, data dirs, and either the running
-/// `ClusterNode`s or the bare handler components.
+/// per-node configs, ports, data dirs, and the running
+/// `ClusterNode`s.
 pub struct ClusterTestingControl {
     mode: ClusterTestingMode,
     root_data_dir: PathBuf,
@@ -314,11 +270,10 @@ pub struct ClusterTestingControl {
     phantom_peers: Vec<PhantomPeer>,
     cached_leader_idx: Arc<Mutex<Option<usize>>>,
     /// The cluster-aware [`ClusterClient`] for tests. Built once in
-    /// [`Self::start`] (when autostart=true and the mode has servers)
-    /// against every node's client port. `None` in Bare mode and in
-    /// `autostart = false` flows where no servers have bound yet.
-    /// All test code that needs to talk to the cluster goes through
-    /// [`Self::client`].
+    /// [`Self::start`] (when autostart=true) against every node's
+    /// client port. `None` in `autostart = false` flows where no
+    /// servers have bound yet. All test code that needs to talk to
+    /// the cluster goes through this client.
     cluster_client: Option<ClusterClient>,
     /// Highest tx_id any submit through this harness has produced.
     /// Bumped via `fetch_max` on every successful `*_and_wait` /
@@ -339,7 +294,7 @@ impl ClusterTestingControl {
 
     /// Build a harness from a config. Unless
     /// [`ClusterTestingConfig::autostart`] is `false`, every slot's
-    /// components / servers are brought up before returning.
+    /// servers are brought up before returning.
     pub async fn start(config: ClusterTestingConfig) -> Result<Self, ClusterTestingError> {
         // 1) Resolve root data dir.
         let (root_data_dir, harness_owns_root_dir) = match config.data_dir_root {
@@ -350,13 +305,12 @@ impl ClusterTestingControl {
 
         // 2) Per-mode slot count + per-slot port allocation.
         let real_node_count = match config.mode {
-            ClusterTestingMode::Bare { .. } | ClusterTestingMode::Standalone => 1,
+            ClusterTestingMode::Standalone => 1,
             ClusterTestingMode::Cluster { nodes } => nodes,
         };
         let addrs: Vec<NodeAddr> = (0..real_node_count)
             .map(|i| {
                 let (client_port, node_port) = match config.mode {
-                    ClusterTestingMode::Bare { .. } => (0, 0),
                     ClusterTestingMode::Standalone => (free_port(), 0),
                     ClusterTestingMode::Cluster { .. } => (free_port(), free_port()),
                 };
@@ -370,7 +324,7 @@ impl ClusterTestingControl {
             .collect();
 
         // 3) For cluster mode, build the symmetric peer list (real
-        //    + phantom). Bare/Standalone skip this entirely.
+        //    + phantom). Standalone skips this entirely.
         let phantom_peers: Vec<PhantomPeer> = match config.mode {
             ClusterTestingMode::Cluster { .. } => (0..config.phantom_peer_count)
                 .map(|i| PhantomPeer {
@@ -401,7 +355,7 @@ impl ClusterTestingControl {
             data_dir.push(i.to_string());
 
             let cluster_section = match config.mode {
-                ClusterTestingMode::Bare { .. } | ClusterTestingMode::Standalone => None,
+                ClusterTestingMode::Standalone => None,
                 ClusterTestingMode::Cluster { .. } => Some(ClusterSection {
                     node: ClusterNodeSection {
                         node_id: a.node_id,
@@ -440,8 +394,6 @@ impl ClusterTestingControl {
                 config: cfg,
                 data_dir,
                 node: None,
-                handles: None,
-                bare: None,
             });
         }
 
@@ -457,17 +409,12 @@ impl ClusterTestingControl {
             retry_config: config.retry_config.clone(),
         };
 
-        // 5) Optionally start every slot. Standalone/Cluster also
-        //    waits for gRPC binds and then opens a ClusterClient
-        //    against every running node so tests can route through a
-        //    single `client()` accessor instead of resolving leader
-        //    vs follower channels by hand.
+        // 5) Optionally start every slot, then wait for gRPC binds
+        //    and open a ClusterClient against every running node.
         if config.autostart {
             ctl.start_all().await?;
-            if !matches!(ctl.mode, ClusterTestingMode::Bare { .. }) {
-                ctl.wait_for_all_tcp(Duration::from_secs(5)).await?;
-                ctl.rebuild_cluster_client().await?;
-            }
+            ctl.wait_for_all_tcp(Duration::from_secs(5)).await?;
+            ctl.rebuild_cluster_client().await?;
         }
         Ok(ctl)
     }
@@ -478,15 +425,10 @@ impl ClusterTestingControl {
     /// manually (`autostart = false`) should call this once after the
     /// first round of `start_node` so [`Self::client`] becomes usable.
     async fn rebuild_cluster_client(&mut self) -> Result<(), ClusterTestingError> {
-        if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
-            // Bare mode has no client gRPC; nothing to connect.
-            self.cluster_client = None;
-            return Ok(());
-        }
         let urls: Vec<String> = self
             .slots
             .iter()
-            .filter(|s| s.handles.is_some() && s.addr.client_port != 0)
+            .filter(|s| s.node.is_some() && s.addr.client_port != 0)
             .map(|s| format!("http://127.0.0.1:{}", s.addr.client_port))
             .collect();
         if urls.is_empty() {
@@ -502,57 +444,51 @@ impl ClusterTestingControl {
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
-    /// Bring slot `i` up. In Cluster/Standalone modes this builds
-    /// (`ClusterNode::new`), runs (`ClusterNode::run`) the node, and
-    /// waits for the gRPC servers to bind so the slot is immediately
-    /// usable on return. In Bare mode it constructs `Ledger`/`Term`/
-    /// `Vote`/`ClusterMirror`/`LedgerSlot`.
+    /// Bring slot `i` up: builds (`ClusterNode::new`), starts
+    /// (`ClusterNode::start`) the node, and waits for the gRPC
+    /// servers to bind so the slot is immediately usable on return.
     /// Idempotent.
     pub async fn start_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
-        match self.mode {
-            ClusterTestingMode::Bare { role } => {
-                self.bare_build(i, role)?;
-            }
-            _ => {
-                self.build_node(i)?;
-                self.run_node(i).await?;
-                self.wait_for_bind(i, Duration::from_secs(5)).await?;
-                // Refresh the embedded cluster client now that this
-                // slot is bound — covers the `autostart = false` flow
-                // where tests bring nodes up manually and expect
-                // `ctl.client()` to "just work" right after.
-                self.rebuild_cluster_client().await?;
+        {
+            let cfg = self.slot(i)?.config.clone();
+            if self.slot(i)?.node.is_none() {
+                let node = ClusterNode::new(cfg).map_err(ClusterTestingError::Run)?;
+                let node = node.run().map_err(ClusterTestingError::Run)?;
+                self.slot_mut(i)?.node = Some(node);
             }
         }
+        *self.cached_leader_idx.lock().await = None;
+        self.wait_for_bind(i, Duration::from_secs(5)).await?;
+        // Refresh the embedded cluster client now that this slot is
+        // bound — covers the `autostart = false` flow where tests
+        // bring nodes up manually and expect `ctl.client()` to "just
+        // work" right after.
+        self.rebuild_cluster_client().await?;
         Ok(())
     }
 
-    /// Aborts node `i`'s spawned tasks (Cluster/Standalone), awaits
-    /// their join handles so the runtime drives teardown to
-    /// completion, and waits for the OS to release the bound ports
-    /// before returning. Safe to call on already-stopped slots.
+    /// Shut down node `i`'s spawned threads by dropping its
+    /// `ClusterNode` — which cancels the cancellation token and
+    /// joins all spawned threads — and waits for the OS to release
+    /// the bound ports before returning. Safe to call on
+    /// already-stopped slots.
     ///
-    /// The shutdown + port-release waits are bounded so a stuck task
-    /// can't wedge the test harness. If a port doesn't release in
-    /// time we log and continue rather than fail the call — the
-    /// caller likely doesn't care about that specific port (it's
-    /// either restarting on a new free port via `start_all`, or it's
-    /// done with this slot for the rest of the test).
+    /// Port-release waits are bounded so a stuck task can't wedge the
+    /// test harness. If a port doesn't release in time we log and
+    /// continue rather than fail the call — the caller likely doesn't
+    /// care about that specific port (it's either restarting on a new
+    /// free port via `start_all`, or it's done with this slot).
     pub async fn stop_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
-        let (handles_opt, addr) = {
+        let (node_opt, addr) = {
             let slot = self.slot_mut(i)?;
-            let h = slot.handles.take();
-            slot.node = None;
-            slot.bare = None;
-            (h, slot.addr.clone())
+            let n = slot.node.take();
+            (n, slot.addr.clone())
         };
 
-        if let Some(h) = handles_opt {
-            // Dropping `h` triggers cooperative teardown via the
-            // `Drop` impls on `StandaloneHandles` / `SupervisorHandles`.
-            // The drop is bounded internally by `drain_in_drop`'s
-            // 5-second timeout, so a wedged task can't hang us.
-            drop(h);
+        if let Some(n) = node_opt {
+            // Dropping the `ClusterNode` cancels its `CancellationToken`
+            // and joins every spawned thread (`ClusterNode::Drop`).
+            drop(n);
             if addr.client_port != 0
                 && let Err(e) = wait_for_tcp_release(addr.client_port, Duration::from_secs(2)).await
             {
@@ -590,91 +526,6 @@ impl ClusterTestingControl {
         }
     }
 
-    // ── Pre-run access (Cluster/Standalone) ─────────────────────────────
-
-    /// Construct the `ClusterNode` for slot `i` (which builds and
-    /// starts the underlying `Ledger`) but do not call `run()` yet.
-    /// Cluster/Standalone modes only — errors with
-    /// [`ClusterTestingError::NotInBareMode`] in Bare mode.
-    pub fn build_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
-        if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
-            return Err(ClusterTestingError::NotInBareMode { op: "build_node" });
-        }
-        let slot = self.slot_mut(i)?;
-        if slot.node.is_some() {
-            return Ok(());
-        }
-        let node = ClusterNode::new(slot.config.clone()).map_err(ClusterTestingError::Build)?;
-        slot.node = Some(node);
-        Ok(())
-    }
-
-    /// `Arc<Ledger>` of a node that has been built but possibly not
-    /// yet `run()`. Useful for seeding the ledger between `new` and
-    /// `run` (see `divergence_reseed_test`).
-    pub fn pre_run_ledger(&self, i: usize) -> Result<Arc<Ledger>, ClusterTestingError> {
-        let slot = self.slot(i)?;
-        let node = slot
-            .node
-            .as_ref()
-            .ok_or(ClusterTestingError::NotStarted { idx: i })?;
-        Ok(node.ledger())
-    }
-
-    /// Call `node.run().await` on a slot already built via
-    /// [`build_node`] (or [`start_node`]). Errors if the slot was
-    /// never built. Cluster/Standalone modes only.
-    pub async fn run_node(&mut self, i: usize) -> Result<(), ClusterTestingError> {
-        if matches!(self.mode, ClusterTestingMode::Bare { .. }) {
-            return Err(ClusterTestingError::NotInBareMode { op: "run_node" });
-        }
-        let slot = self.slot_mut(i)?;
-        if slot.handles.is_some() {
-            return Ok(());
-        }
-        let node = slot
-            .node
-            .as_ref()
-            .ok_or(ClusterTestingError::NotStarted { idx: i })?;
-        let handles = node
-            .run()
-            .await
-            .map_err(|e| ClusterTestingError::Run(format!("{e}")))?;
-        slot.handles = Some(handles);
-        *self.cached_leader_idx.lock().await = None;
-        Ok(())
-    }
-
-    // ── Bare-mode bring-up (internal) ────────────────────────────────────
-
-    fn bare_build(&mut self, i: usize, role: Role) -> Result<(), ClusterTestingError> {
-        let slot = self.slot_mut(i)?;
-        if slot.bare.is_some() {
-            return Ok(());
-        }
-        std::fs::create_dir_all(&slot.data_dir).map_err(ClusterTestingError::Build)?;
-        let dir_str = slot.data_dir.to_string_lossy().into_owned();
-
-        let mut ledger = Ledger::new(slot.config.ledger.clone());
-        ledger.start().map_err(ClusterTestingError::Build)?;
-        let ledger = Arc::new(ledger);
-
-        let term = Arc::new(Term::open_in_dir(&dir_str).map_err(ClusterTestingError::Build)?);
-        let vote = Arc::new(Vote::open_in_dir(&dir_str).map_err(ClusterTestingError::Build)?);
-        let mirror = ClusterMirror::new();
-        mirror.set_role_for_standalone(role);
-        let ledger_slot = Arc::new(LedgerSlot::new(ledger.clone()));
-
-        slot.bare = Some(BareComponents {
-            ledger,
-            term,
-            vote,
-            mirror,
-            ledger_slot,
-        });
-        Ok(())
-    }
-
     // ── Per-index queries ────────────────────────────────────────────────
 
     pub fn len(&self) -> usize {
@@ -698,7 +549,7 @@ impl ClusterTestingControl {
     }
 
     /// Peer-facing Node gRPC port for slot `i`. Returns `0` for
-    /// standalone / bare modes (no Node gRPC binds).
+    /// standalone mode (no Node gRPC binds).
     pub fn node_port(&self, i: usize) -> Result<u16, ClusterTestingError> {
         Ok(self.slot(i)?.addr.node_port)
     }
@@ -712,77 +563,8 @@ impl ClusterTestingControl {
         &self.root_data_dir
     }
 
-    /// Direct (sync) access to a started node's live `Arc<Ledger>`.
-    /// Works in all modes — Bare returns the `BareComponents.ledger`,
-    /// Cluster/Standalone returns the running node's ledger.
-    pub fn ledger(&self, i: usize) -> Result<Arc<Ledger>, ClusterTestingError> {
-        let slot = self.slot(i)?;
-        if let Some(b) = &slot.bare {
-            return Ok(b.ledger.clone());
-        }
-        let node = slot
-            .node
-            .as_ref()
-            .ok_or(ClusterTestingError::NotStarted { idx: i })?;
-        Ok(node.ledger())
-    }
-
-    /// Live `Arc<LedgerSlot>` (the swap point used by divergence
-    /// reseed). Works in all modes.
-    pub fn ledger_slot(&self, i: usize) -> Result<Arc<LedgerSlot>, ClusterTestingError> {
-        let slot = self.slot(i)?;
-        if let Some(b) = &slot.bare {
-            return Ok(b.ledger_slot.clone());
-        }
-        let node = slot
-            .node
-            .as_ref()
-            .ok_or(ClusterTestingError::NotStarted { idx: i })?;
-        Ok(node.ledger_slot())
-    }
-
-    /// Bare-mode-only accessors (the running modes hide these
-    /// inside the supervisor).
-    pub fn term(&self, i: usize) -> Result<Arc<Term>, ClusterTestingError> {
-        let bare = self.bare(i)?;
-        Ok(bare.term.clone())
-    }
-
-    pub fn vote(&self, i: usize) -> Result<Arc<Vote>, ClusterTestingError> {
-        let bare = self.bare(i)?;
-        Ok(bare.vote.clone())
-    }
-
-    /// Bare-mode-only — read the cluster mirror that backs this slot's
-    /// `LedgerHandler`. The mirror is constructed pinned to the role
-    /// passed into [`ClusterTestingMode::Bare`]; `mirror.is_leader()`
-    /// gates writes through the handler.
-    pub fn mirror(&self, i: usize) -> Result<Arc<ClusterMirror>, ClusterTestingError> {
-        let bare = self.bare(i)?;
-        Ok(bare.mirror.clone())
-    }
-
-    /// Build a `LedgerHandler` over slot `i`'s bare components.
-    /// Bare-mode-only.
-    pub fn ledger_handler(&self, i: usize) -> Result<LedgerHandler, ClusterTestingError> {
-        let bare = self.bare(i)?;
-        Ok(LedgerHandler::new(
-            bare.ledger_slot.clone(),
-            bare.mirror.clone(),
-            bare.term.clone(),
-            bare.vote.clone(),
-        ))
-    }
-
     pub fn index_of(&self, node_id: u64) -> Option<usize> {
         self.slots.iter().position(|s| s.addr.node_id == node_id)
-    }
-
-    pub fn handles(&self, i: usize) -> Result<&Handles, ClusterTestingError> {
-        let slot = self.slot(i)?;
-        slot.handles
-            .as_ref()
-            .ok_or(ClusterTestingError::NotStarted { idx: i })
     }
 
     /// **Internal-only** accessor for the embedded `ClusterClient`.
@@ -803,13 +585,10 @@ impl ClusterTestingControl {
     // ── Leader resolution ────────────────────────────────────────────────
 
     /// Block until exactly one Leader is observed (or `timeout`
-    /// elapses). In single-node modes (Standalone / Bare) returns
-    /// slot 0 immediately without polling.
+    /// elapses). In Standalone mode returns slot 0 immediately
+    /// without polling.
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<usize, ClusterTestingError> {
-        if matches!(
-            self.mode,
-            ClusterTestingMode::Standalone | ClusterTestingMode::Bare { .. }
-        ) {
+        if matches!(self.mode, ClusterTestingMode::Standalone) {
             if self.slots.is_empty() || !self.slot_started(&self.slots[0]) {
                 return Err(ClusterTestingError::NotStarted { idx: 0 });
             }
@@ -821,7 +600,7 @@ impl ClusterTestingControl {
         loop {
             let mut leaders: Vec<usize> = Vec::new();
             for (i, slot) in self.slots.iter().enumerate() {
-                if slot.handles.is_none() {
+                if slot.node.is_none() {
                     continue;
                 }
                 if let Some(nproto::NodeRole::Leader) = ping_role(slot.addr.node_port).await {
@@ -858,11 +637,6 @@ impl ClusterTestingControl {
     pub async fn leader_node_id(&self) -> Result<u64, ClusterTestingError> {
         let i = self.leader_index().await?;
         self.node_id(i)
-    }
-
-    pub async fn leader_ledger(&self) -> Result<Arc<Ledger>, ClusterTestingError> {
-        let i = self.leader_index().await?;
-        self.ledger(i)
     }
 
     /// Index of an arbitrary follower (running, non-leader) slot.
@@ -919,49 +693,15 @@ impl ClusterTestingControl {
         }
     }
 
-    /// Wait for `ledger.last_commit_id()` to reach `tx_id`. Polls at
-    /// 10ms via [`Self::wait_for`]. Replaces the duplicated
-    /// `wait_committed` helpers that used to live in each test file.
-    pub async fn wait_for_commit(
-        &self,
-        ledger: &Ledger,
-        tx_id: u64,
-        timeout: Duration,
-    ) -> Result<(), ClusterTestingError> {
-        self.wait_for(timeout, &format!("commit ≥ {tx_id}"), || async {
-            ledger.last_commit_id() >= tx_id
-        })
-        .await
-    }
-
-    /// Wait for `ledger.last_snapshot_id()` to reach `tx_id`. Mirrors
-    /// [`Self::wait_for_commit`] but waits on the snapshot stage —
-    /// the one that actually publishes balance changes that
-    /// `get_balance` reads. Use whenever a test reads a balance after
-    /// a write that targeted a level below `WaitLevel::Snapshot`.
-    pub async fn wait_for_snapshot_id(
-        &self,
-        ledger: &Ledger,
-        tx_id: u64,
-        timeout: Duration,
-    ) -> Result<(), ClusterTestingError> {
-        self.wait_for(timeout, &format!("snapshot ≥ {tx_id}"), || async {
-            ledger.last_snapshot_id() >= tx_id
-        })
-        .await
-    }
-
     /// Log a per-node table of pipeline progression watermarks
     /// (compute, commit, snapshot) followed by the cluster-wide
     /// `cluster_commit_index`. Useful for diagnosing where a
     /// stalled pipeline is stuck.
     ///
-    /// Works in all modes: in Cluster/Standalone the values are
-    /// fetched per-node over gRPC via `ClusterClient::node(i)`; in
-    /// Bare mode they're read directly from the bare components.
-    /// Never fails for individual node RPC errors — unreachable
-    /// nodes show dashes so the rest of the matrix is still
-    /// visible.
+    /// Values are fetched per-node over gRPC via
+    /// `ClusterClient::node(i)`. Never fails for individual node
+    /// RPC errors — unreachable nodes show dashes so the rest of the
+    /// matrix is still visible.
     pub async fn show_pipeline_matrix(&self) -> Result<(), ClusterTestingError> {
         info!(
             "{:<8} {:<26} {:<14} {:<13} {:<14}",
@@ -971,22 +711,9 @@ impl ClusterTestingControl {
         let mut cluster_commit: u64 = 0;
         for (i, slot) in self.slots.iter().enumerate() {
             let node_id = slot.addr.node_id;
-            let url = if slot.addr.client_port == 0 {
-                "<bare>".to_string()
-            } else {
-                format!("http://{}:{}", slot.addr.host, slot.addr.client_port)
-            };
+            let url = format!("http://{}:{}", slot.addr.host, slot.addr.client_port);
 
-            if let Some(b) = &slot.bare {
-                let compute = b.ledger.last_compute_id();
-                let commit = b.ledger.last_commit_id();
-                let snapshot = b.ledger.last_snapshot_id();
-                cluster_commit = cluster_commit.max(b.mirror.cluster_commit_index());
-                info!(
-                    "{:<8} {:<26} {:<14} {:<13} {:<14}",
-                    node_id, url, compute, commit, snapshot
-                );
-            } else if slot.handles.is_some() {
+            if slot.node.is_some() {
                 match self.client().node(i).get_pipeline_index().await {
                     Ok(pi) => {
                         cluster_commit = cluster_commit.max(pi.cluster_commit);
@@ -1115,9 +842,7 @@ impl ClusterTestingControl {
     fn cluster_client_or_err(&self) -> Result<&ClusterClient, ClusterTestingError> {
         self.cluster_client
             .as_ref()
-            .ok_or(ClusterTestingError::NotInBareMode {
-                op: "cluster client access",
-            })
+            .ok_or(ClusterTestingError::ClientNotReady)
     }
 
     /// Escape hatch: borrow slot `i`'s raw [`NodeClient`]. Tests that
@@ -1671,14 +1396,14 @@ impl ClusterTestingControl {
     }
 
     /// Wait for slot `i`'s gRPC servers to bind. Useful after a
-    /// manual [`run_node`] call (`autostart = false` flow).
+    /// manual [`Self::start_node`] call (`autostart = false` flow).
     pub async fn wait_for_bind(
         &mut self,
         i: usize,
         timeout: Duration,
     ) -> Result<(), ClusterTestingError> {
         let slot = self.slot(i)?;
-        if slot.handles.is_none() {
+        if slot.node.is_none() {
             return Err(ClusterTestingError::NotStarted { idx: i });
         }
         wait_for_tcp(format!("127.0.0.1:{}", slot.addr.client_port), timeout).await?;
@@ -1689,7 +1414,7 @@ impl ClusterTestingControl {
         // so `client()` reflects the new node. Covers both the
         // `start()`-internal autostart loop and the
         // `autostart = false` flow where tests bring nodes up
-        // manually via `build_node` + `run_node` + `wait_for_bind`.
+        // manually via `start_node` + `wait_for_bind`.
         self.rebuild_cluster_client().await?;
         Ok(())
     }
@@ -1698,7 +1423,7 @@ impl ClusterTestingControl {
 
     async fn wait_for_all_tcp(&self, timeout: Duration) -> Result<(), ClusterTestingError> {
         for slot in &self.slots {
-            if slot.handles.is_none() {
+            if slot.node.is_none() {
                 continue;
             }
             wait_for_tcp(format!("127.0.0.1:{}", slot.addr.client_port), timeout).await?;
@@ -1710,7 +1435,7 @@ impl ClusterTestingControl {
     }
 
     fn slot_started(&self, slot: &NodeSlot) -> bool {
-        slot.handles.is_some() || slot.bare.is_some()
+        slot.node.is_some()
     }
 
     fn slot(&self, i: usize) -> Result<&NodeSlot, ClusterTestingError> {
@@ -1732,28 +1457,15 @@ impl ClusterTestingControl {
                 len,
             })
     }
-
-    fn bare(&self, i: usize) -> Result<&BareComponents, ClusterTestingError> {
-        if !matches!(self.mode, ClusterTestingMode::Bare { .. }) {
-            return Err(ClusterTestingError::BareModeOnly {
-                op: "bare component access",
-            });
-        }
-        let slot = self.slot(i)?;
-        slot.bare
-            .as_ref()
-            .ok_or(ClusterTestingError::NotStarted { idx: i })
-    }
 }
 
 impl Drop for ClusterTestingControl {
     fn drop(&mut self) {
-        // Drop slots (and their nested `ClusterNode` / `Ledger` /
-        // `Handles`) before removing the temp dir so the cooperative
-        // teardown finishes flushing to disk while the data dir is
-        // still there. Each `slot.handles: Option<Handles>` runs its
-        // own RAII shutdown via `StandaloneHandles::Drop` /
-        // `SupervisorHandles::Drop`, so we don't manually abort.
+        // Drop slots (and their nested `ClusterNode`s) before removing
+        // the temp dir so the cooperative teardown finishes flushing to
+        // disk while the data dir is still there. Each `ClusterNode`
+        // runs its own RAII shutdown in `ClusterNode::Drop` — cancels
+        // its cancellation token and joins every spawned thread.
         self.cluster_client = None;
         self.slots.clear();
         if self.harness_owns_root_dir {

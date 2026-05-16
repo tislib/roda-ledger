@@ -1,7 +1,7 @@
 use ::proto::ledger::WaitLevel;
 use ::proto::ledger::wal_log_record::Entry as LogEntry;
 use client::NodeClient;
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 
 async fn setup() -> (ClusterTestingControl, NodeClient) {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig::standalone())

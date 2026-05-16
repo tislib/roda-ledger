@@ -19,6 +19,7 @@ proto.workspace = true
 storage.workspace = true
 ledger.workspace = true
 raft.workspace = true
+client.workspace = true
 
 tokio.workspace = true
 tonic.workspace = true
@@ -33,18 +34,19 @@ rand.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+tempfile.workspace = true
 
 # Binary-only deps. They could be split out with feature flags but the win
 # is too small to be worth the complexity.
 clap.workspace = true
 log = "0.4.29"
+tokio-util = "0.7.18"
+tokio-stream = "0.1"
+signal-hook = "0.3"
 
 [dev-dependencies]
-cluster-test-utils.workspace = true
-client.workspace = true
 proto.workspace = true
 storage.workspace = true
-tempfile.workspace = true
 tokio-test.workspace = true
 proptest.workspace = true
 criterion.workspace = true

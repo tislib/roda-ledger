@@ -37,7 +37,7 @@ use crate::follower::FollowerState;
 use crate::leader::LeaderState;
 use crate::node::{NodeState, RaftNode};
 use crate::persistence::Persistence;
-use crate::request_vote::{RequestVoteReply, RequestVoteRequest};
+use crate::request_vote::{RequestVote, RequestVoteResult};
 use crate::types::{NodeId, Term};
 
 // ─── Public types ────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ impl<'a, P: Persistence> Election<'a, P> {
     /// when not Candidate. Pure read — caller may invoke many times.
     /// The cluster sends these concurrently and feeds the outcomes
     /// back via [`Self::handle_votes`].
-    pub fn get_requests(&self) -> Vec<(NodeId, RequestVoteRequest)> {
+    pub fn get_requests(&self) -> Vec<(NodeId, RequestVote)> {
         self.node.election_get_requests()
     }
 
@@ -166,11 +166,7 @@ impl<'a, P: Persistence> Election<'a, P> {
     /// Voter-side handler for an inbound `RequestVote`. §5.4.1
     /// up-to-date check, term observation, durable vote, election-
     /// timer reset on grant.
-    pub fn handle_request_vote(
-        &mut self,
-        now: Instant,
-        req: RequestVoteRequest,
-    ) -> RequestVoteReply {
+    pub fn handle_request_vote(&mut self, now: Instant, req: RequestVote) -> RequestVoteResult {
         self.node.election_handle_request_vote(now, req)
     }
 }
@@ -206,12 +202,12 @@ impl<P: Persistence> RaftNode<P> {
         self.start_election_round(now)
     }
 
-    pub(crate) fn election_get_requests(&self) -> Vec<(NodeId, RequestVoteRequest)> {
+    pub(crate) fn election_get_requests(&self) -> Vec<(NodeId, RequestVote)> {
         let term = match &self.state {
             NodeState::Candidate(c) => c.election_term,
             _ => return Vec::new(),
         };
-        let last_tx_id = self.local_write_index;
+        let last_tx_id = self.local_commit_index;
         let last_term = self.local_last_term();
         self.peers
             .iter()
@@ -220,7 +216,7 @@ impl<P: Persistence> RaftNode<P> {
             .map(|peer| {
                 (
                     peer,
-                    RequestVoteRequest {
+                    RequestVote {
                         from: self.self_id,
                         term,
                         last_tx_id,
@@ -277,9 +273,9 @@ impl<P: Persistence> RaftNode<P> {
     pub(crate) fn election_handle_request_vote(
         &mut self,
         now: Instant,
-        req: RequestVoteRequest,
-    ) -> RequestVoteReply {
-        let RequestVoteRequest {
+        req: RequestVote,
+    ) -> RequestVoteResult {
+        let RequestVote {
             from,
             term,
             last_tx_id,
@@ -289,7 +285,7 @@ impl<P: Persistence> RaftNode<P> {
         let current_term = self.current_term();
 
         if term < current_term {
-            return RequestVoteReply {
+            return RequestVoteResult {
                 term: current_term,
                 granted: false,
             };
@@ -300,16 +296,15 @@ impl<P: Persistence> RaftNode<P> {
             self.transition_to_follower(now, None);
         }
 
-        // §5.4.1 up-to-date check. Compare against our durable write
-        // extent (`local_write_index`), not the commit watermark — a
-        // voter with durably-written-but-uncommitted entries still
-        // votes against a candidate whose log is shorter.
-        let our_last_tx = self.local_write_index;
+        // §5.4.1 up-to-date check. Compare against our durable
+        // commit watermark (`local_commit_index`) — the collapsed
+        // single watermark serves as both "written" and "applied".
+        let our_last_tx = self.local_commit_index;
         let our_last_term = self.local_last_term();
         let candidate_up_to_date = (last_term > our_last_term)
             || (last_term == our_last_term && last_tx_id >= our_last_tx);
         if !candidate_up_to_date {
-            return RequestVoteReply {
+            return RequestVoteResult {
                 term: self.current_term(),
                 granted: false,
             };
@@ -320,7 +315,7 @@ impl<P: Persistence> RaftNode<P> {
             self.election_timer.reset(now);
         }
 
-        RequestVoteReply {
+        RequestVoteResult {
             term: self.current_term(),
             granted,
         }
@@ -329,18 +324,20 @@ impl<P: Persistence> RaftNode<P> {
     // ── Helpers also called from node.rs (validate_append_entries,
     //    on_append_entries_reply) ──────────────────────────────────
 
-    /// Term of the local log entry at `local_write_index`. `0` means
-    /// the log is empty (required by §5.4.1's up-to-date check). When
-    /// `local_write_index > 0` there is, by construction, a covering
-    /// term-log record — a `None` here means the persistence layer
-    /// is corrupted, so we `expect`.
+    /// Term of the local log entry at `local_commit_index`. `0`
+    /// means the log is empty (required by §5.4.1's up-to-date
+    /// check). When `local_commit_index > 0` there is, by
+    /// construction, a covering term-log record (the leader ships
+    /// its full term log on every handshake; the follower applies
+    /// it). A `None` here means the persistence layer is corrupted,
+    /// so we `expect`.
     pub(crate) fn local_last_term(&self) -> Term {
-        if self.local_write_index == 0 {
+        if self.local_commit_index == 0 {
             return 0;
         }
         self.persistence
-            .term_at_tx(self.local_write_index)
-            .expect("term_at_tx must cover local_write_index when local_write_index > 0")
+            .term_at_tx(self.local_commit_index)
+            .expect("term_at_tx must cover local_commit_index when local_commit_index > 0")
             .term
     }
 
@@ -420,9 +417,9 @@ impl<P: Persistence> RaftNode<P> {
 
     fn become_leader_after_win(&mut self, new_term: Term, now: Instant) {
         // §5.4.2 / Figure 8: anchor the new leader's term-log
-        // boundary at `local_write_index + 1` so existing entries
+        // boundary at `local_commit_index + 1` so existing entries
         // keep their original term in `term_at_tx` lookups.
-        let start_tx_id = self.local_write_index + 1;
+        let start_tx_id = self.local_commit_index + 1;
 
         if !self.persistence.commit_term(new_term, start_tx_id) {
             debug!(
@@ -438,11 +435,9 @@ impl<P: Persistence> RaftNode<P> {
         self.election_timer.disarm();
         self.quorum.reset_peers(self.self_slot);
         self.current_term_first_tx = start_tx_id;
-        // Seed the quorum self-slot from the new leader's *commit*
-        // watermark, not the write watermark. Written-but-uncommitted
-        // entries must not contribute their replica count to
-        // `cluster_commit`; the §5.4.2 gate below blocks any advance
-        // below `current_term_first_tx`.
+        // Seed the quorum self-slot from the local commit watermark
+        // (the §5.4.2 gate below blocks any advance below
+        // `current_term_first_tx`).
         if let Some(adv) = self.quorum.advance(self.self_slot, self.local_commit_index)
             && !(self.peers.len() > 1 && adv < self.current_term_first_tx)
             && adv > self.cluster_commit_index
@@ -458,7 +453,7 @@ impl<P: Persistence> RaftNode<P> {
             .collect();
         let leader = LeaderState::new(
             &other_peers,
-            self.local_write_index,
+            self.local_commit_index,
             now,
             self.cfg.heartbeat_interval,
             self.cfg.rpc_timeout,

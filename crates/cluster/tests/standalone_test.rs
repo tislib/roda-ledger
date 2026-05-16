@@ -6,7 +6,7 @@
 //! still advances on every restart in lock-step with the cluster
 //! path (ADR-0016 §11).
 
-use cluster_test_utils::{ClusterTestingConfig, ClusterTestingControl};
+use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn standalone_serves_writes_with_no_node_grpc() {
@@ -17,11 +17,12 @@ async fn standalone_serves_writes_with_no_node_grpc() {
     .await
     .expect("standalone bring-up");
 
-    // No Node gRPC handle exposed in standalone.
-    let handles = ctl.handles(0).expect("handles");
-    assert!(!handles.has_node_handle());
-    assert!(handles.mirror().is_none());
-    assert!(handles.as_cluster().is_none());
+    // Standalone reserves no peer-facing port.
+    assert_eq!(
+        ctl.node_port(0).expect("node_port"),
+        0,
+        "standalone has no Node gRPC port"
+    );
 
     // Standalone is writable: a client can submit and observe a tx_id.
     let tx_id = ctl.deposit(1, 100, 0).await.expect("deposit");

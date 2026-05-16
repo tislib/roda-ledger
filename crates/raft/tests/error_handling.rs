@@ -2,14 +2,14 @@
 //! the consensus refactor.
 //!
 //! Pre-refactor this file pinned `Action::FatalError` /
-//! `AppendEntriesDecision::Fatal` propagation paths for persistence
+//! `HandshakeDecision::Fatal` propagation paths for persistence
 //! I/O failures. After the refactor:
 //!
 //! - The `Persistence` trait no longer returns `io::Result` — an
 //!   implementation that cannot durably persist a write must panic
 //!   internally; the supervisor restarts the process. There is no
 //!   "fatal but still running" state for the library to model.
-//! - `Action::FatalError` and `AppendEntriesDecision::Fatal` are
+//! - `Action::FatalError` and `HandshakeDecision::Fatal` are
 //!   gone with the rest of the action stream.
 //!
 //! What survives: the `RaftConfig::validate` panic-at-construction
@@ -23,7 +23,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mem_persistence::MemPersistence;
-use raft::{AppendEntriesDecision, LogEntryRange, RaftConfig, RaftNode};
+use raft::{HandshakeDecision, RaftConfig, RaftNode};
 
 fn make_follower(persistence: MemPersistence) -> RaftNode<MemPersistence> {
     RaftNode::new(1, vec![1, 2], persistence, RaftConfig::default(), 42)
@@ -52,18 +52,19 @@ fn truncation_below_cluster_commit_index_panics_in_debug() {
     let mut node = make_follower(persistence);
     let now = Instant::now();
 
-    // Hydrate watermarks to 10.
-    node.advance_write_index(10);
-    node.advance_commit_index(10);
+    // Hydrate watermark to 10.
+    node.advance_local_index(10);
 
-    // First AE: matching prev_log to advance cluster_commit_index to 5.
-    let _ = node.validate_append_entries_request(now, 2, 1, 10, 1, LogEntryRange::empty(), 5);
+    // First handshake: matching prev_log; driver then advances cluster
+    // commit to 5.
+    let _ = node.validate_handshake(now, 2, 1, &[], 10, 1);
+    node.advance_cluster_index(5);
     assert_eq!(node.cluster_commit_index(), 5);
 
-    // Second AE: deliberately mismatched prev_log_term, forcing
+    // Second handshake: deliberately mismatched prev_log_term, forcing
     // truncation to tx_id 1 — strictly below cluster_commit_index=5.
     // Triggers the debug_assert.
-    let _ = node.validate_append_entries_request(now, 2, 1, 2, 99, LogEntryRange::empty(), 5);
+    let _ = node.validate_handshake(now, 2, 1, &[], 2, 99);
 }
 
 // ─── RaftConfig::validate panics at construction ───────────────────────
@@ -86,71 +87,6 @@ fn raftnode_new_panics_on_misconfigured_heartbeat_interval() {
 }
 
 // ─── pending_leader_commit lifecycle ─────────────────────────────────────
-
-/// A `Follower → Candidate` transition (election timeout fires while
-/// the follower's last-validated AE still holds a `pending_leader_commit`
-/// awaiting durability) discards the staged value along with the rest
-/// of the FollowerState. The cluster's eventual `advance` MUST NOT
-/// bump `cluster_commit_index` from the stale leader_commit — there is
-/// no follower state to consult anymore.
-#[test]
-fn pending_leader_commit_lost_on_follower_to_candidate_transition() {
-    let mut node = make_follower(MemPersistence::new());
-    let now = Instant::now();
-
-    // First validate stages `leader_commit=3` waiting on durability.
-    let decision =
-        node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 3, 1), 3);
-    assert_eq!(
-        decision,
-        AppendEntriesDecision::Accept {
-            append: Some(LogEntryRange::new(1, 3, 1)),
-        }
-    );
-    assert_eq!(node.cluster_commit_index(), 0);
-
-    // Election timeout fires → Follower → Candidate. The transition
-    // discards FollowerState including `pending_leader_commit`.
-    common::drive_tick(&mut node, now + Duration::from_secs(60));
-    assert_eq!(node.role(), raft::Role::Candidate);
-
-    // Cluster (which does not know about the role change) finally
-    // reports durability. cluster_commit must stay put — no stale
-    // follower state to drain.
-    node.advance_write_index(3);
-    node.advance_commit_index(3);
-    assert_eq!(
-        node.cluster_commit_index(),
-        0,
-        "candidate must not pick up the stale leader_commit"
-    );
-}
-
-/// Two `validate_append_entries_request` calls arrive in rapid
-/// succession before the cluster acks durability via `advance`. The
-/// second `leader_commit` overwrites the first.
-#[test]
-fn pending_leader_commit_overwritten_when_second_ae_arrives_before_advance() {
-    let mut node = make_follower(MemPersistence::new());
-    let now = Instant::now();
-
-    // First AE: prev=0, entries 1..3, leader_commit=2.
-    let _ = node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 3, 1), 2);
-
-    // Second AE before any advance: same prev=0 but an extended
-    // range 1..5, leader_commit=5.
-    let _ = node.validate_append_entries_request(now, 2, 1, 0, 0, LogEntryRange::new(1, 5, 1), 5);
-
-    // Cluster acks durability up to 5. Drain inside `advance` picks
-    // up the second AE's leader_commit (5), not the first's (2).
-    node.advance_write_index(5);
-    node.advance_commit_index(5);
-    assert_eq!(
-        node.cluster_commit_index(),
-        5,
-        "second AE's leader_commit must overwrite the first"
-    );
-}
 
 // ─── current_term composition ────────────────────────────────────────────
 
