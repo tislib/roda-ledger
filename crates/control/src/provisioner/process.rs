@@ -313,13 +313,23 @@ fn create_cluster_dir(base: &Path) -> Result<PathBuf, ProvisionerError> {
 }
 
 fn pick_free_addr() -> Result<SocketAddr, ProvisionerError> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| ProvisionerError::ProvisionFailed(format!("bind 127.0.0.1:0: {e}")))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| ProvisionerError::ProvisionFailed(format!("local_addr: {e}")))?;
-    drop(listener);
-    Ok(addr)
+    use std::collections::HashSet;
+    use std::sync::LazyLock;
+    static ALLOCATED: LazyLock<std::sync::Mutex<HashSet<u16>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    let mut allocated = ALLOCATED.lock().expect("port set");
+    let mut held: Vec<TcpListener> = Vec::new();
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| ProvisionerError::ProvisionFailed(format!("bind 127.0.0.1:0: {e}")))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| ProvisionerError::ProvisionFailed(format!("local_addr: {e}")))?;
+        if allocated.insert(addr.port()) {
+            return Ok(addr);
+        }
+        held.push(listener);
+    }
 }
 
 fn spawn_server(bin: &Path, config_path: &Path, quiet: bool) -> Result<Child, ProvisionerError> {
