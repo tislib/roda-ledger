@@ -2,6 +2,10 @@
 
 **A programmable financial ledger engine that treats correctness guarantees as a choice, not a constraint — and performance as a consequence of good design, not a tradeoff.**
 
+[Documentation](https://tislib.net/roda-ledger/) · [Live demo](http://roda-ledger.tislib.net)
+
+[![roda-ledger demo](docs/resources/demo.png)](http://roda-ledger.tislib.net)
+
 roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic by uploading sandboxed WebAssembly functions that execute atomically inside the ledger as first-class operations. Get 2.49 million transactions per second out of the box.
 
 ---
@@ -52,7 +56,7 @@ Stop the container, restart it — the balance is still there. That is the durab
 
 ## Demo
 
-Spin up the multi-node control plane with a web UI:
+Try the hosted demo at [roda-ledger.tislib.net](http://roda-ledger.tislib.net), or spin up the multi-node control plane locally with a web UI:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/tislib/roda-ledger/master/docker-compose.control.yml | docker compose -f - up --no-build
