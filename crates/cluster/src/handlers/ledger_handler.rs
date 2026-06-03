@@ -7,7 +7,6 @@ use spdlog::{trace, warn};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::yield_now;
 use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
@@ -519,15 +518,22 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         let ledger = self.ledger.current();
         let last_commit = ledger.last_commit_id();
 
-        let mut tailer = ledger.wal_tailer();
+        // Tailer is pre-positioned at `req.from_tx_id`; subsequent
+        // `tail()` calls just advance the cursor.
+        let mut tailer = ledger.wal_tailer(req.from_tx_id);
         let mut buf = vec![0u8; (limit as usize) * storage::WAL_RECORD_SIZE];
-        let mut next_from = req.from_tx_id;
         let mut emitted: Vec<storage::entities::WalEntry> = Vec::with_capacity(limit as usize);
         // Index past the last whole-tx boundary; truncate here on overflow.
         let mut last_whole_tx_end: usize = 0;
 
+        // tx_id is carried only by `TxMetadata`. Track the running
+        // tx_id (the most recent metadata's tx_id) and stamp it onto
+        // every follower record in the iteration's range / limit
+        // logic — pre-refactor the `WalEntry::tx_id()` helper did this
+        // implicitly via a per-record field; now the loop is explicit.
+        let mut running_tx: u64 = 0;
         'outer: loop {
-            let n = tailer.tail(next_from, &mut buf) as usize;
+            let n = tailer.tail(&mut buf) as usize;
             if n == 0 {
                 break;
             }
@@ -535,13 +541,12 @@ impl proto::ledger_server::Ledger for LedgerHandler {
             if entries.is_empty() {
                 break;
             }
-            let mut chunk_max_tx = next_from;
 
             for e in entries {
-                let tx = e.tx_id();
-                if tx != 0 {
-                    chunk_max_tx = chunk_max_tx.max(tx);
+                if let storage::entities::WalEntry::Metadata(m) = &e {
+                    running_tx = m.tx_id;
                 }
+                let tx = running_tx;
 
                 if tx != 0 && tx > to_tx_id {
                     break 'outer;
@@ -560,12 +565,6 @@ impl proto::ledger_server::Ledger for LedgerHandler {
                     break 'outer;
                 }
             }
-
-            let advanced = chunk_max_tx.saturating_add(1);
-            if advanced <= next_from {
-                break;
-            }
-            next_from = advanced;
         }
 
         // Roll back to last whole-tx boundary on overflow; if a single tx
@@ -579,16 +578,31 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         };
         emitted.truncate(truncate_to);
 
+        // Scan from the tail for the last TxMetadata to set
+        // `next_tx_id`; non-metadata trailing records inherit it.
         let next_tx_id = emitted
-            .last()
-            .map(|e| e.tx_id())
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                storage::entities::WalEntry::Metadata(m) => Some(m.tx_id),
+                _ => None,
+            })
             .filter(|&tx| tx > 0 && tx < to_tx_id)
             .map(|tx| tx + 1)
             .unwrap_or(0);
 
+        // The proto encoding for `WalTxEntry` / `WalTxLink` still
+        // carries `tx_id`, so we have to stamp it onto each emitted
+        // record from the most recent metadata before mapping.
+        let mut current_tx: u64 = 0;
         let records = emitted
             .into_iter()
-            .map(crate::mapping::wal_entry_to_proto)
+            .map(|e| {
+                if let storage::entities::WalEntry::Metadata(m) = &e {
+                    current_tx = m.tx_id;
+                }
+                crate::mapping::wal_entry_to_proto(e, current_tx)
+            })
             .collect();
 
         Ok(Response::new(proto::GetLogResponse {
@@ -731,6 +745,8 @@ impl LedgerHandler {
             }
 
             // Periodic progress log so multi-second waits aren't silent.
+            // With a 100µs poll a 2 s wait can hit ~20 000 iters, so
+            // bump the log cadence to keep it once-per-second-ish.
             if iter.is_multiple_of(10_000) {
                 trace!(
                     "wait_for_transaction_level: tx_id={} level={:?} still waiting after {}ms — compute={} commit={} snapshot={} cluster_commit={}",
@@ -744,7 +760,13 @@ impl LedgerHandler {
                 );
             }
 
-            yield_now().await;
+            // Poll, don't spin. `yield_now` only re-queues the task —
+            // when many `*_and_wait` handlers are in flight, that
+            // produces a CPU storm of raft-mutex acquisitions. 100µs
+            // is well below typical cluster-commit latency (a few ms
+            // on LAN, fdatasync-bound) so the latency hit is
+            // negligible while CPU drops by orders of magnitude.
+            tokio::time::sleep(Duration::from_micros(100)).await;
 
             if start_time.elapsed() >= timeout {
                 warn!(

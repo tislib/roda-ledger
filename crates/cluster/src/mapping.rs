@@ -79,12 +79,17 @@ pub fn status_to_proto(status: TransactionStatus) -> proto::TransactionStatus {
     }
 }
 
-pub fn wal_entry_to_proto(e: WalEntry) -> proto::WalLogRecord {
+/// Convert a `WalEntry` into its proto record. Storage-side
+/// `TxEntry` / `TxLink` no longer carry a `tx_id` field — it lives
+/// only on the preceding `TxMetadata`. Callers stream-decode and pass
+/// the running `tx_id` so the proto representation (which still has
+/// the field on each message for client convenience) stays correct.
+pub fn wal_entry_to_proto(e: WalEntry, tx_id: u64) -> proto::WalLogRecord {
     use proto::wal_log_record::Entry as E;
     let entry = match e {
         WalEntry::Metadata(m) => E::Metadata(metadata_to_proto(m)),
-        WalEntry::Entry(x) => E::TxEntry(entry_to_proto(x)),
-        WalEntry::Link(l) => E::Link(link_to_proto(l)),
+        WalEntry::Entry(x) => E::TxEntry(entry_to_proto(x, tx_id)),
+        WalEntry::Link(l) => E::Link(link_to_proto(l, tx_id)),
         WalEntry::Term(t) => E::Term(term_to_proto(t)),
         WalEntry::FunctionRegistered(f) => E::FunctionRegistered(function_registered_to_proto(f)),
     };
@@ -103,13 +108,13 @@ fn metadata_to_proto(m: TxMetadata) -> proto::WalTxMetadata {
     }
 }
 
-fn entry_to_proto(x: TxEntry) -> proto::WalTxEntry {
+fn entry_to_proto(x: TxEntry, tx_id: u64) -> proto::WalTxEntry {
     let kind = match x.kind {
         EntryKind::Credit => proto::EntryKind::Credit,
         EntryKind::Debit => proto::EntryKind::Debit,
     };
     proto::WalTxEntry {
-        tx_id: x.tx_id,
+        tx_id,
         account_id: x.account_id,
         amount: x.amount,
         kind: kind as i32,
@@ -117,13 +122,13 @@ fn entry_to_proto(x: TxEntry) -> proto::WalTxEntry {
     }
 }
 
-fn link_to_proto(l: TxLink) -> proto::WalTxLink {
+fn link_to_proto(l: TxLink, tx_id: u64) -> proto::WalTxLink {
     let kind = match l.kind() {
         TxLinkKind::Duplicate => proto::LinkKind::Duplicate,
         TxLinkKind::Reversal => proto::LinkKind::Reversal,
     };
     proto::WalTxLink {
-        tx_id: l.tx_id,
+        tx_id,
         to_tx_id: l.to_tx_id,
         kind: kind as i32,
     }

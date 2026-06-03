@@ -79,85 +79,6 @@ makes the WAL stream `[record][record][record]…` self-describing without a
 separate length-prefix or framing layer. Records are laid out for zero-copy
 serialization: the bytes on the wire are the bytes in memory.
 
-### §1.7 The five WAL record kinds
-
-`WalEntryKind` enumerates the only five record types that may appear in the
-log: `TxMetadata = 0`, `TxEntry = 1`, `Link = 4`, `FunctionRegistered = 5`,
-`TxTerm = 6`. Discriminants `2` and `3` are retired (formerly `SegmentHeader`
-and `SegmentSealed`). New record types must extend this enum; the discriminant
-is the first byte of the record (§1.6). Segment boundaries are determined from
-file names and the `.seal` / `.crc` sidecars, not from in-band records.
-
-### §1.8 TxMetadata
-
-`TxMetadata` is the per-transaction header record. Its fields:
-
-- `entry_count: u8` — number of `TxEntry` records that follow.
-- `link_count: u8` — number of `TxLink` records that follow the entries.
-- `fail_reason: FailReason` — `0` on success, otherwise see §1.12.
-- `crc32c: u32` — covers `TxMetadata` (with this field zeroed) plus all
-  following entries plus all following links.
-- `tx_id: u64`, `timestamp: u64`, `user_ref: u64`.
-- `tag: [u8; 8]` — execution-engine identification (e.g. `b"fnw\n" ++ crc[0..4]`
-  for WASM-produced transactions; see §6.14).
-
-The `u8` widths of `entry_count` and `link_count` are hard limits: a transaction
-cannot emit more than 255 entries or 255 links. The Transactor rejects
-overflow with `ENTRY_LIMIT_EXCEEDED` (§1.12).
-
-### §1.9 TxEntry
-
-`TxEntry` is the per-credit/per-debit record produced by the Transactor:
-
-- `kind: EntryKind` — `Credit = 0` or `Debit = 1`.
-- `tx_id: u64` — links back to the owning `TxMetadata`.
-- `account_id: u64`, `amount: u64` — integer minor units; no floats, no decimals.
-- `computed_balance: i64` — the running balance of `account_id` *after* this
-  entry is applied. The Transactor computes it on the write side; the
-  Snapshotter and recovery use it directly without re-running operation logic.
-  This field is what makes recovery O(entries) rather than O(operations) and
-  is the foundation of the entries-based execution model. [ADR-0001]
-
-### §1.10 TxLink
-
-`TxLink` records a relationship between two transactions. `link_kind` is
-either `Duplicate(0)` (this transaction was rejected as a duplicate of
-`to_tx_id` — see §5.5) or `Reversal(1)` (this transaction reverses
-`to_tx_id`). Links are immutable WAL records and form the audit trail of
-non-trivial transaction relationships. [ADR-0009]
-
-### §1.11 FunctionRegistered
-
-`FunctionRegistered` is the WAL record for a register/unregister event. It
-carries `name: [u8; 32]` (null-padded ASCII snake_case, validated ≤ 32 bytes
-at registration), `version: u16` (per-name monotonic, starting at 1, max
-65535), and `crc32c: u32` of the WASM binary. A `crc32c == 0` value signals
-*unregister* — the audit trail is preserved as a versioned event rather than
-a deletion. The on-disk binary file is the secondary signal; if the two
-disagree the WAL wins. `FunctionRegistered` carries no `tx_id`, and the
-pipeline's commit/snapshot indexes do not advance on it (it is not a
-financial transaction). [ADR-0014]
-
-### §1.12 FailReason space
-
-`FailReason` is a `u8`. The space is partitioned:
-
-| Code | Meaning |
-|---|---|
-| `0` | `NONE` (success) |
-| `1` | `INSUFFICIENT_FUNDS` — balance check failed in `Withdrawal`/`Transfer` |
-| `2` | `ACCOUNT_NOT_FOUND` |
-| `3` | `ZERO_SUM_VIOLATION` — credits ≠ debits for the transaction (§4.11) |
-| `4` | `ENTRY_LIMIT_EXCEEDED` — > 255 `TxEntry` records (§1.8) |
-| `5` | `INVALID_OPERATION` — also wasmtime-layer failure: link, instantiation, trap (§6.11) |
-| `6` | `ACCOUNT_LIMIT_EXCEEDED` — `account_id ≥ max_accounts` (§4.4) |
-| `7` | `DUPLICATE` — `user_ref` matched within the active window (§5.5) |
-| `8..=127` | reserved for future standard reasons |
-| `128..=255` | user-defined; returned by WASM functions and passed through unchanged |
-
-Anything in `128..=255` is the WASM author's contract with their callers; the
-ledger never reinterprets it. [ADR-0001]
-
 ---
 
 ## §2 Pipeline structure
@@ -308,7 +229,7 @@ construction and never grows. [ADR-0002]
 ### §4.4 The `max_accounts` ceiling
 
 Any operation referencing an `account_id ≥ max_accounts` is rejected with
-`ACCOUNT_LIMIT_EXCEEDED` (§1.12) before the operation can mutate any state.
+`ACCOUNT_LIMIT_EXCEEDED` before the operation can mutate any state.
 This is the price of the direct-indexed array layout (§4.3) — the
 account-ID space must be sized at startup. Resizing would require pausing
 the Transactor and reallocating every read-side cache (§8.3), which is not
@@ -353,7 +274,7 @@ For built-in operation types the Transactor runs native Rust:
   on success, `debit(from, amount)`, `credit(to, amount)`; on failure,
   fail with `INSUFFICIENT_FUNDS`.
 
-Each `credit` / `debit` produces one `TxEntry` record (§1.9) with the
+Each `credit` / `debit` produces one `TxEntry` record with the
 running `computed_balance` field already populated.
 
 ### §4.9 Default INSUFFICIENT_FUNDS protection
@@ -382,7 +303,7 @@ zero it before recomputing.
 Every transaction must net to zero: `sum(credits) == sum(debits)` across
 all `TxEntry` records of that transaction. The Transactor verifies this
 after operation execution and before any state is committed; a violation
-raises `ZERO_SUM_VIOLATION` (§1.12) and the transaction is rolled back
+raises `ZERO_SUM_VIOLATION` and the transaction is rolled back
 (§4.12). The invariant is per-transaction — there is no cross-transaction
 arithmetic. Because each individual transaction nets to zero, the sum of
 all balances across all accounts is always zero — an emergent property,
@@ -553,7 +474,7 @@ Every registered binary must export exactly one function:
 `execute(i64, i64, i64, i64, i64, i64, i64, i64) → i32`. The eight
 parameters correspond to the `Function` operation's `[i64; 8]` (§1.5).
 The `i32` return is the function's status: `0` is success, anything
-else is mapped per §1.12 / §6.12. [ADR-0014]
+else is mapped per §6.12. [ADR-0014]
 
 ### §6.7 Host imports
 
@@ -601,7 +522,7 @@ execution.
 ### §6.11 Wasmtime-layer failure mapping
 
 A wasmtime layer failure — link error, instantiation error, or runtime
-trap — is mapped to `INVALID_OPERATION = 5` (§1.12) and rolled back. The
+trap — is mapped to `INVALID_OPERATION = 5` and rolled back. The
 mapping is single-valued by design: from outside the runtime, *any*
 infrastructure-level WASM failure looks the same. The function author's
 own status codes (§6.12) live in a disjoint range.
@@ -611,7 +532,7 @@ own status codes (§6.12) live in a disjoint range.
 The `i32` return of `execute` is interpreted as follows:
 
 - `0` → success (provided zero-sum holds; §4.11).
-- `1..=7` → mapped to the corresponding standard `FailReason` (§1.12).
+- `1..=7` → mapped to the corresponding standard `FailReason`.
 - `8..=127` → reserved; treated as `INVALID_OPERATION`.
 - `128..=255` → user-defined; passed through into `TxMetadata.fail_reason`
   unchanged.
@@ -623,9 +544,9 @@ ledger never reinterprets them. [ADR-0014]
 ### §6.13 Entry-limit enforcement
 
 If a function emits more than 255 `credit`/`debit` calls in a single
-execution, the `entry_count: u8` field of `TxMetadata` (§1.8) cannot
+execution, the `u8` `entry_count` field of `TxMetadata` cannot
 encode the count. The Transactor fails the transaction with
-`ENTRY_LIMIT_EXCEEDED` (§1.12) and rolls it back. Function authors who
+`ENTRY_LIMIT_EXCEEDED` and rolls it back. Function authors who
 need more than 255 entries must split the work across multiple
 transactions.
 
@@ -633,14 +554,14 @@ transactions.
 
 Every committed function-produced transaction stamps `TxMetadata.tag`
 with `b"fnw\n" ++ crc32c[0..4]` — the four-byte literal `"fnw\n"`
-followed by the first four bytes of the executing binary's CRC32C
-(§1.11). Any past transaction can therefore be traced back to the exact
-binary that produced it, even after registrations have changed.
+followed by the first four bytes of the executing binary's CRC32C. Any
+past transaction can therefore be traced back to the exact binary that
+produced it, even after registrations have changed.
 
 ### §6.15 Names and versions
 
 Function names are validated at registration: ASCII snake_case, ≤ 32
-bytes, null-padded to 32 in the WAL record (§1.11). Each register or
+bytes, null-padded to 32 in the WAL record. Each register or
 override bumps the per-name `version` by one, starting at `1`, with a
 ceiling of `65535`. The `(name, version, crc32c)` triple uniquely
 identifies the executing binary in every transaction. [ADR-0014]
@@ -659,7 +580,7 @@ the live runtime always matches what the WAL says it should be.
 ### §6.17 Unregistration
 
 Unregistration emits a `FunctionRegistered` record with `crc32c = 0`
-(§1.11) and writes a 0-byte file under the next version on disk. The
+and writes a 0-byte file under the next version on disk. The
 binary history is preserved as a sequence of versions; the function
 registry's *current* state is the last record seen. The WAL is
 authoritative; the on-disk file is a secondary signal. [ADR-0014]
@@ -714,21 +635,14 @@ memory footprint is fixed.
 
 ### §7.4 Writer per-iteration loop
 
-On each iteration the Writer does the following, in order:
-
-1. Pop entries from the transactor→wal queue, append each to the active
-   segment's pending-write buffer, and push it onto the local buffer.
-   While popping, the per-record bookkeeping (§7.5) tracks which
-   transactions are now complete.
-2. Flush the segment's pending-write buffer (one syscall per
-   iteration, not per record) and publish *last-written*.
-3. If the transaction-count threshold is met, rotate the segment
-   (§7.6).
-4. Drain the local buffer toward the Snapshotter, but only entries
-   whose `tx_id ≤ last-committed`. Entries whose transaction is still
-   pending an `fdatasync` are left in the buffer and retried next
-   iteration. As each entry is forwarded, `commit_index` (§2.5)
-   advances.
+Each iteration the Writer batches incoming records into the active
+segment's pending-write buffer, performs a single buffered `write`
+syscall (one per iteration, not per record), rotates the segment if
+the transaction-count threshold is met (§7.6), and drains records to
+the Snapshotter — but only those whose `tx_id ≤ last-committed`.
+Entries still awaiting `fdatasync` stay in the local buffer for the
+next iteration. The drain is the gate that enforces the durability
+rule (§7.5); as entries flow, `commit_index` (§2.5) advances.
 
 ### §7.5 Forwarding rule and per-record bookkeeping
 
@@ -758,23 +672,18 @@ and the open of the next file. [ADR-0013]
 
 ### §7.7 Committer loop
 
-The Committer runs a tight loop driven by the shared wait strategy
-(§13.2). On each iteration:
-
-1. If *last-written* has not advanced past *last-committed*, there is
-   nothing to sync; back off and continue.
-2. Pick up a new sync handle from the Writer if rotation has happened.
-3. Sample *last-written*, call `fdatasync`, publish that sample as
-   *last-committed*.
-
-The Committer never parses entries, never touches the Writer's buffer,
-never inspects any queue. Its single responsibility is moving
-*last-committed* forward as fast as the storage allows.
+Driven by the shared wait strategy (§13.2), the Committer samples
+*last-written*, calls `fdatasync`, and publishes the sample as
+*last-committed*; it picks up a fresh sync handle whenever rotation
+swaps the active file. It never parses entries, never touches the
+Writer's buffer, and never inspects any queue — its single
+responsibility is moving *last-committed* forward as fast as storage
+allows.
 
 ### §7.8 Backpressure on the outbound queue
 
 A persistently slow Snapshotter fills the wal→snapshot queue, which
-slows the Writer's drain (§7.4 step 4), which fills the Writer's local
+slows the Writer's drain (§7.4), which fills the Writer's local
 buffer, which throttles intake from the inbound queue, which
 back-pressures the Transactor (§2.6). The same mechanism that gives the
 WAL its throughput is the one that protects it from a slow reader.
@@ -796,7 +705,7 @@ restart.
 
 The Snapshotter applies committed entries to the read-side state. It does
 no business logic and never re-executes operations. Because every
-`TxEntry` carries `computed_balance` (§1.9), the Snapshotter's job is a
+`TxEntry` carries `computed_balance`, the Snapshotter's job is a
 sequence of `store(account_id, computed_balance)` operations plus index
 maintenance (§9). This is the entries-based execution model and the reason
 recovery and replication are cheap. [ADR-0001]
@@ -831,22 +740,14 @@ queue, no priority lane, no out-of-band query path.
 
 ### §8.5 Apply algorithm
 
-For each WAL entry the Snapshotter dispatches by record kind:
-
-- `TxMetadata` — register the transaction in the hot index, remember
-  how many records are still expected (`entry_count + link_count`),
-  remember the current `tx_id`.
-- `TxEntry` — write the entry into the hot index (updating circle2 and
-  the per-account chain — §9.4) and publish the carried
-  `computed_balance` to the read-side balance cache.
-- `TxLink` — record the link against the current `tx_id` in the hot
-  index.
-- `FunctionRegistered` — handled per §8.7.
-
-Once every record of a transaction has been applied, the Snapshotter
-publishes that `tx_id` as the new `snapshot_index` (§2.5). This is the
-*only* point at which the pipeline's read-side index advances — readers
-therefore never observe a partially-applied transaction.
+The Snapshotter dispatches each WAL entry by record kind, updating
+the hot index (§9.4) and, for `TxEntry`, publishing the carried
+`computed_balance` to the read-side balance cache. `FunctionRegistered`
+takes the registry path of §8.7. Once every record of a transaction
+has been applied, the Snapshotter publishes that `tx_id` as the new
+`snapshot_index` (§2.5). This is the *only* point at which the
+pipeline's read-side index advances — readers therefore never observe
+a partially-applied transaction.
 
 ### §8.6 `last_tx_id` as the freshness signal
 
@@ -863,7 +764,7 @@ caller waits for `last_tx_id` to pass their `tx_id`, or uses
 `FunctionRegistered` records are not financial transactions and do not
 advance `snapshot_index`. On a register record, the Snapshotter reads
 the binary off disk and installs it in the shared WASM registry
-(§6.4). On an unregister record (`crc32c == 0`, §1.11), the Snapshotter
+(§6.4). On an unregister record (`crc32c == 0`, §6.17), the Snapshotter
 unloads the function from the registry. Errors at either step are
 logged; they do not stop the apply loop. The Snapshotter is therefore
 the *only* stage that mutates the live runtime registry while the
@@ -1081,22 +982,14 @@ interval.
 
 ### §11.3 Per-segment seal procedure
 
-For each closed-but-unsealed segment, Seal performs:
-
-1. Open the closed segment.
-2. Compute its file-level CRC and write the integrity sidecar files
-   that mark the segment as sealed. Disk format details: Stage 2.
-3. Build the on-disk transaction index and account index files for
-   this segment. These are what cold-tier queries (§10.4) walk when
-   the hot index misses.
-4. Replay the segment's WAL records into Seal's own balance vector and
-   function map (§11.4) so the next snapshot has accurate state.
-5. If this segment's id is on the snapshot boundary (§11.5), write a
-   balance snapshot and a function snapshot.
-6. Publish the sealed segment id (advances `seal_index`, §2.5).
-
-A failure in steps 2 or 3 is logged; the segment is left unsealed and
-retried on the next poll.
+For each closed-but-unsealed segment, Seal computes the file-level
+CRC, writes the `.crc` and `.seal` sidecars, builds the on-disk
+transaction and account indexes (§22), replays the segment into
+Seal's private balance vector and function map (§11.4), and — at the
+snapshot frequency boundary (§11.5) — writes the paired snapshot
+files. The sealed segment id is then published (advances `seal_index`,
+§2.5). A failure during sidecar or index construction is logged; the
+segment is left unsealed and retried on the next poll.
 
 ### §11.4 Why Seal owns its own balance vector and function map
 
@@ -1186,29 +1079,14 @@ segment on disk except the active one is sealed.
 
 ### §12.3 Snapshot load and WAL replay
 
-Recovery proceeds in this fixed order:
-
-1. **Find the latest balance snapshot** — its segment id defines the
-   replay starting point. The snapshot's records are loaded into the
-   Transactor's balance cache (§4.3), Seal's balance vector (§11.4),
-   and the read-side balance cache (§8.3).
-2. **Find the latest function snapshot** — load each
-   `(name, version, crc32c)` triple. Seal's function map is seeded;
-   each binary is read off disk and installed in the WASM runtime.
-3. **Replay sealed segments after the snapshot** — for every segment
-   strictly newer than the snapshot's segment id, walk every record:
-   - `TxEntry`: update each balance cache; update the hot index;
-     update dedup if the owning transaction has `user_ref ≠ 0`.
-   - `TxMetadata`: advance `last_tx_id`; update the hot index; update
-     dedup.
-   - `TxLink`: update the hot index.
-   - `FunctionRegistered`: load or unload through the WASM runtime;
-     update Seal's function map.
-4. **Replay the active segment** — same as step 3 but against the
-   active (un-rotated) segment file. Per-record CRC validation governs
-   how far the active segment can be trusted; details (sidecar,
-   broken-tail tolerance) are in Stage 2.
-5. **Restore `sequencer_index`** to `last_tx_id + 1` (§16.2).
+Recovery loads the latest balance and function snapshots — seeding the
+Transactor's balance cache (§4.3), Seal's balance vector (§11.4), the
+read-side balance cache (§8.3), and the live WASM runtime — then
+replays sealed segments newer than the snapshot's segment id, then
+replays the active segment with per-record CRC validation governing
+how far the tail can be trusted (Stage 2). Finally `sequencer_index`
+is restored to `last_tx_id + 1` (§16.2). The fixed ordering is the
+load-bearing constraint (§12.4).
 
 ### §12.4 Order requirement
 
@@ -1334,35 +1212,31 @@ reads.
 ### §15.1 `max_accounts`
 
 Pre-allocated capacity of every balance vector and read-side atomic
-vector. Default `1_000_000`. Fixed at startup; cannot grow at runtime
-(§4.4). Accounts referencing IDs ≥ this value are rejected with
-`ACCOUNT_LIMIT_EXCEEDED`. The 1M default chosen because 1M × 8 bytes =
-8 MB per balance vector, which fits comfortably in L2/L3 even with
-read-side and seal-side duplicates.
+vector. Fixed at startup; cannot grow at runtime (§4.4). Accounts
+referencing IDs ≥ this value are rejected with
+`ACCOUNT_LIMIT_EXCEEDED`. Sized so the balance vector fits comfortably
+in L2/L3 even with read-side and seal-side duplicates.
 
 ### §15.2 `queue_size`
 
-Capacity of every inter-stage queue. Default `16 384`. Not exposed via
-`config.toml`; an internal tuning knob. The Sequencer→Transactor,
-Transactor→WAL, and WAL→Snapshot queues are all sized from this single
-value.
+Capacity of every inter-stage queue. Not exposed via `config.toml`;
+an internal tuning knob. The Sequencer→Transactor, Transactor→WAL,
+and WAL→Snapshot queues are all sized from this single value to keep
+backpressure symmetric across the pipeline.
 
 ### §15.3 `wait_strategy`
 
-Pipeline-mode for every stage's idle/backpressure loop. Default
-`Balanced` (§13.2). One value is shared across every stage of a single
-Pipeline.
+Pipeline-mode for every stage's idle/backpressure loop (§13.2). One
+value is shared across every stage of a single Pipeline.
 
 ### §15.4 `log_level`
 
-Default `Info`. Not exposed via `config.toml`; set programmatically.
-The temp and bench config presets both lower this to `Critical` to
-keep test output clean.
+Not exposed via `config.toml`; set programmatically. The temp and
+bench config presets both lower this to keep test output clean.
 
 ### §15.5 `transaction_count_per_segment` (drives multiple subsystems)
 
-Set on `StorageConfig`. Default `10_000_000`. Controls three things at
-once:
+Set on `StorageConfig`. Controls three things at once:
 
 - WAL segment rotation threshold (§7.6).
 - Dedup active window size (§5.2).
@@ -1373,24 +1247,22 @@ should not desynchronise any of the three.
 
 ### §15.6 `seal_check_internal`
 
-Interval between Seal polls (§11.2). Default `1 s`. Not exposed via
-`config.toml`. The Committer (§7.7) does not use this; it is purely
-the Seal thread's poll interval.
+Interval between Seal polls (§11.2). Not exposed via `config.toml`.
+The Committer (§7.7) does not use this; it is purely the Seal
+thread's poll interval and is not on the hot path.
 
 ### §15.7 `disable_seal`
 
-When `true`, the Seal thread is not started (§11.8). Default `false`.
-Not exposed via `config.toml`. Benchmark-only: a ledger with
-`disable_seal = true` is not crash-recoverable past the active
-segment.
+When `true`, the Seal thread is not started (§11.8). Not exposed via
+`config.toml`. Benchmark-only: a ledger with `disable_seal = true` is
+not crash-recoverable past the active segment.
 
 ### §15.8 `snapshot_frequency`
 
-Set on `StorageConfig`. Default `4`. Controls the Seal stage's snapshot
-emission rule (§11.5): emit when `segment_id % snapshot_frequency == 0`.
-`0` disables snapshots entirely. Smaller values mean less WAL replay on
-recovery (faster startup) at the cost of more snapshot I/O during
-operation.
+Set on `StorageConfig`. Controls the Seal stage's snapshot emission
+rule (§11.5): emit when `segment_id % snapshot_frequency == 0`.
+Smaller values mean less WAL replay on recovery (faster startup) at
+the cost of more snapshot I/O during operation.
 
 ### §15.9 Hot-index sizes are derived
 
@@ -1545,87 +1417,17 @@ conversion between in-memory and on-disk representation. The same
 pattern is used on the read side: a 40-byte slice is cast back to the
 appropriate struct once the discriminant has been examined.
 
-### §18.3 `TxMetadata` (`entry_type = 0`)
+### §18.3 CRC envelope and torn-write detection
 
-| Bytes | Field | Purpose |
-|---|---|---|
-| `[0]` | `entry_type = 0` (u8) | discriminant |
-| `[1]` | `entry_count` (u8) | number of `TxEntry` records that follow |
-| `[2]` | `link_count` (u8) | number of `TxLink` records after the entries |
-| `[3]` | `fail_reason` (u8) | success = 0; see §1.12 |
-| `[4..8]` | `crc32c` (u32) | covers this record (with this field zeroed) plus all entries plus all links |
-| `[8..16]` | `tx_id` (u64) |  |
-| `[16..24]` | `timestamp` (u64) |  |
-| `[24..32]` | `user_ref` (u64) | dedup key (§5) |
-| `[32..40]` | `tag` (8 bytes) | execution-engine identification (§6.14) |
-
-The `crc32c` field's position inside its own coverage is what forces
-the zero-while-computing convention: any reader that wants to verify
-the CRC must zero those four bytes in a working copy before
-recomputing. The `u8` widths of `entry_count` and `link_count` are
-hard caps of 255 entries and 255 links per transaction (§1.8).
-
-### §18.4 `TxEntry` (`entry_type = 1`)
-
-| Bytes | Field |
-|---|---|
-| `[0]` | `entry_type = 1` (u8) |
-| `[1]` | `kind` (u8) — `Credit = 0` or `Debit = 1` |
-| `[2..8]` | `_pad0` (6 bytes) |
-| `[8..16]` | `tx_id` (u64) |
-| `[16..24]` | `account_id` (u64) |
-| `[24..32]` | `amount` (u64) |
-| `[32..40]` | `computed_balance` (i64, signed) |
-
-`computed_balance` is signed because the WASM path can drive a balance
-negative (§4.9); the built-in operations cannot. The `tx_id` field is
-duplicated on every entry so a reader that joins on a tx boundary
-(account-history walks, §10.3) does not need to look back at the
-owning `TxMetadata`.
-
-### §18.5 Retired record kinds (`entry_type = 2` and `3`)
-
-Discriminants `2` and `3` previously encoded `SegmentHeader` and
-`SegmentSealed` records that bracketed every segment file. They have
-been removed: a WAL stream now consists solely of transaction-rooted
-records. Segment identification comes from the file name (e.g.
-`wal_000042.bin`); integrity comes from the `.crc` sidecar (which
-carries magic, size, and CRC32C — see §17.4); and clean closure is
-signalled by the presence of the `.seal` marker file. A parser that
-encounters discriminant `2` or `3` treats it as corruption.
-
-### §18.7 `TxLink` (`entry_type = 4`)
-
-| Bytes | Field |
-|---|---|
-| `[0]` | `entry_type = 4` (u8) |
-| `[1]` | `link_kind` (u8) — `Duplicate = 0`, `Reversal = 1` |
-| `[2..8]` | `_pad` (6 bytes) |
-| `[8..16]` | `tx_id` (u64) — the transaction that *owns* this link |
-| `[16..24]` | `to_tx_id` (u64) — the transaction this link points at |
-| `[24..40]` | `_pad2` (16 bytes) |
-
-A link record always follows the `TxMetadata` of its owning
-transaction and is included in the metadata's CRC32C coverage (§18.3).
-A torn write that lands somewhere inside a multi-record transaction is
-detected by the metadata CRC failing — the reader does not need a
-per-record CRC to spot the corruption.
-
-### §18.8 `FunctionRegistered` (`entry_type = 5`)
-
-| Bytes | Field |
-|---|---|
-| `[0]` | `entry_type = 5` (u8) |
-| `[1]` | `_pad0` (1 byte) |
-| `[2..4]` | `version` (u16) — per-name monotonic, `1..=65535` |
-| `[4..8]` | `crc32c` (u32) — CRC32C of the WASM binary; `0` ⇒ unregister |
-| `[8..40]` | `name` (32 bytes) — ASCII snake_case, null-padded |
-
-`FunctionRegistered` carries no `tx_id` and is not part of any
-transaction's CRC envelope (§1.11). The `crc32c == 0` convention
-preserves the audit trail for unregistration without introducing a
-separate record kind. The 32-byte `name` width is a hard limit at
-registration time (§6.15). [ADR-0001, ADR-0014]
+`TxMetadata.crc32c` covers the metadata record (with that field zeroed
+for the digest) plus every following `TxEntry` and `TxLink`. The CRC
+field sitting inside its own coverage forces the zero-while-computing
+convention. A torn write that lands somewhere inside a multi-record
+transaction is detected by the metadata CRC failing — there is no
+per-record CRC, and none is needed. `FunctionRegistered` carries no
+`tx_id` and is outside any transaction's CRC envelope; the
+`crc32c == 0` value is the unregister signal (§6.17). [ADR-0001,
+ADR-0014]
 
 ---
 
@@ -1633,20 +1435,13 @@ registration time (§6.15). [ADR-0001, ADR-0014]
 
 ### §19.1 The CRC sidecar
 
-Every Sealed segment has a paired `wal_NNNNNN.crc` file of exactly
-16 bytes:
-
-| Bytes | Field |
-|---|---|
-| `[0..4]` | `crc32c` (u32) — CRC32C of the entire segment binary |
-| `[4..12]` | `file_size` (u64) — size in bytes of the segment file at seal time |
-| `[12..16]` | `magic` (u32) — `WAL_MAGIC = 0x524F4441` |
-
-The sidecar is written by the per-segment seal procedure (§11.3,
-§25.5) after the segment file itself has been closed. The `file_size`
-field catches truncation that does not change the CRC of the surviving
-prefix; the `magic` field disambiguates a `.crc` against any unrelated
-16-byte file that might end up in the directory.
+Every Sealed segment has a paired `wal_NNNNNN.crc` file carrying the
+segment's full-file CRC, the segment size at seal time, and a magic
+constant. The sidecar is written by the per-segment seal procedure
+(§11.3, §25.5) after the segment file itself has been closed. The
+size field catches truncation that does not change the CRC of the
+surviving prefix; the magic disambiguates a `.crc` against any
+unrelated file of the same width that might end up in the directory.
 
 ### §19.2 The `.seal` marker
 
@@ -1671,7 +1466,7 @@ tail-trimming (§23.4) versus full-trust load.
 
 A Sealed segment that is missing its `.crc` sidecar is loaded with a
 warning, not a failure. The rationale: the sidecar is a redundant
-check; the segment's own per-record CRCs (§18.3) are still
+check; the segment's own per-transaction CRCs (§18.3) are still
 authoritative. Missing sidecars are most commonly produced by a crash
 after the segment was renamed but before Seal ran, or by external tools
 that copied a segment without copying its sidecar. Neither case
@@ -1692,34 +1487,19 @@ through the end of that segment. A pair is the unit of trust: a
 snapshot whose `.crc` is missing is not loaded, even if the `.bin`
 parses cleanly.
 
-### §20.2 Balance snapshot header
+### §20.2 Double-CRC discipline
 
-Each `snapshot_NNNNNN.bin` begins with a 36-byte header followed by
-an LZ4-compressed body:
+A balance snapshot file carries two independent CRCs: an inline
+`data_crc32c` in the header validates the records independent of the
+compression layer, and the sidecar CRC (§20.5) validates the written
+file as a whole. The first catches corruption introduced by a buggy
+decompressor; the second catches truncation or bit-rot after the
+rename.
 
-| Bytes | Field |
-|---|---|
-| `[0..4]` | `magic` (u32) — `SNAPSHOT_MAGIC = 0x534E4150` (`"SNAP"`) |
-| `[4]` | `version` (u8) — `SNAPSHOT_VERSION = 1` |
-| `[5..9]` | `segment_id` (u32) |
-| `[9..17]` | `last_tx_id` (u64) — the highest `tx_id` reflected in the snapshot |
-| `[17..25]` | `account_count` (u64) — number of `(account_id, balance)` pairs in the body |
-| `[25]` | `compressed` (u8) — `1` = LZ4, `0` reserved |
-| `[26..32]` | `_pad` (6 bytes) |
-| `[32..36]` | `data_crc32c` (u32) — CRC32C of the *uncompressed* body |
+### §20.3 Body sort and non-zero filter
 
-Two CRCs cover the file: this `data_crc32c` validates the records
-themselves independent of the compression layer; the sidecar CRC
-(§20.5) validates the written file as a whole.
-
-### §20.3 Balance snapshot body
-
-The body is LZ4-compressed bytes prefixed by a 4-byte little-endian
-uncompressed-size word. Decompressed, the body is a flat array of
-`account_count` records, each 16 bytes:
-`[account_id:8 LE][balance:8 LE]`, sorted by `account_id`. Sorting is
-for determinism — the same set of balances always produces the same
-bytes — which makes the file reproducible across restarts and amenable
+The body is sorted by `account_id` so the same set of balances always
+produces the same bytes — reproducible across restarts and amenable
 to offline diffing. Only non-zero balances are emitted; account ids
 that have never been touched are omitted.
 
@@ -1772,9 +1552,9 @@ WASM binaries live in `{data_dir}/functions/`. This is the only
 subdirectory of the data directory; it is created on first
 registration. Each binary is a file named `{name}_v{N}.wasm` where
 `name` is the ASCII snake_case identifier from the
-`FunctionRegistered` record (§18.8) and `N` is the per-name monotonic
+`FunctionRegistered` record and `N` is the per-name monotonic
 version starting at `1`. The directory is the secondary signal of the
-registry's history; the WAL is authoritative (§1.11).
+registry's history; the WAL is authoritative.
 
 ### §21.2 Atomic write on registration
 
@@ -1791,7 +1571,7 @@ final states.
 
 Unregistration writes a 0-byte `{name}_v{N}.wasm` (where `N` is the
 *next* version after the last registered one) and emits a
-`FunctionRegistered` record with `crc32c == 0` (§18.8). The 0-byte
+`FunctionRegistered` record with `crc32c == 0` (§6.17). The 0-byte
 file is the on-disk audit trail; the WAL record is the authoritative
 signal. Past versions of the binary are preserved; the on-disk history
 of a function is therefore the directory listing of `{name}_v*.wasm`
@@ -1813,36 +1593,15 @@ segment that contains the requested `tx_id` or account history. The
 boundary between hot and cold is not bytes-on-disk — it is *eviction
 in the hot tier*.
 
-### §22.2 Transaction index format
+### §22.2 Query path
 
-`wal_index_NNNNNN.bin` is a flat sorted array prefixed by a count:
-
-```
-[record_count: u64 LE]
-[ tx_id: u64 LE | byte_offset: u64 LE ] × record_count
-```
-
-Records are in WAL order — i.e., naturally sorted by `tx_id`. The
-`byte_offset` field points to the start of the transaction's
-`TxMetadata` record inside the segment file. A cold-tier
-`GetTransaction` binary-searches the index on `tx_id`, then issues a
-positional read at the resulting offset to fetch the metadata plus
-its dependent entries and links.
-
-### §22.3 Account index format
-
-`account_index_NNNNNN.bin` is the same shape but sorted differently:
-
-```
-[record_count: u64 LE]
-[ account_id: u64 LE | tx_id: u64 LE ] × record_count
-```
-
-Records are sorted lexicographically by `(account_id, tx_id)`. A
-cold-tier `GetAccountHistory` partition-points on `account_id` to
-find the range, then iterates forward in `tx_id` order until either
-the lower bound is hit or the limit is reached. Iteration order is
-ascending in `tx_id`; the caller reverses if it wants newest-first.
+A cold-tier `GetTransaction` binary-searches the per-segment
+transaction index on `tx_id` and issues a positional read into the
+segment file to fetch the metadata plus its dependent entries and
+links. A cold-tier `GetAccountHistory` partition-points the per-segment
+account index on `account_id`, then iterates the `tx_id` range
+forward until the lower bound or limit is hit. Iteration order is
+ascending in `tx_id`; the caller reverses for newest-first.
 
 ### §22.4 Why flat sorted arrays
 
@@ -1937,16 +1696,12 @@ cluster (§28). Keeping them as separate files means the hot path that
 queries the current term (§36.4) does not pay the cost of pollution
 from a vote-grant write.
 
-### §24.2 40-byte records, magic per file
+### §24.2 Records share the WAL's 40-byte width
 
-Both records are exactly 40 bytes — the same width as a WAL record
-(§18.1) — so the same offline tooling can inspect them. A
-`TermRecord` is `(term: u64, start_tx_id: u64, magic: u32 = "TERM",
-crc32c: u32)` in its first 24 bytes, with the remaining 16 bytes
-reserved zero-pad. A `VoteRecord` is `(term: u64, voted_for: u64,
-magic: u32 = "VOTE", crc32c: u32)` in the same first 24 bytes, also
-with 16 bytes of pad. The CRC covers bytes `[0..20]` only; it does
-not include the `crc32c` field itself.
+Term and vote records are exactly 40 bytes — the same width as a WAL
+record (§18.1) — so the same offline tooling can inspect them. Each
+file has its own magic constant (`"TERM"` / `"VOTE"`) so a misrouted
+record is rejected on read.
 
 ### §24.3 Append, then `fdatasync`, then publish
 
@@ -2220,8 +1975,8 @@ to the cold path more often but still see correct answers.
 
 Every node not in `Leader` role runs an election timer with a
 randomised deadline in `[election_timer_min_ms,
-election_timer_max_ms]` (default 150–300 ms). The deadline is
-re-randomised on every reset. Reset triggers: any valid
+election_timer_max_ms]`. The deadline is re-randomised on every
+reset. Reset triggers: any valid
 `AppendEntries` from a current leader (empty heartbeat included), and
 the granting of a `RequestVote`. Without a reset, the timer fires and
 the node transitions to `Candidate`. The randomisation defeats split
@@ -2251,18 +2006,13 @@ independently — the election's vote count is not the running quorum.
 
 ### §29.4 `RequestVote` grant rule
 
-`RequestVote` grants iff *all three* hold (Raft §5.4.1):
-
-1. `request.term ≥ current_term`.
-2. `voted_for` is `None`, or `voted_for == request.candidate_id`
-   (within this term).
-3. The candidate's log is at least as up-to-date as ours:
-   `(request.last_term, request.last_tx_id) ≥ (our_last_term,
-   our_last_tx_id)` lexicographically.
-
-A granted vote fsyncs `vote.log` *before* the RPC reply is sent
-(§28.2). The third clause is what enforces leader completeness: a
-candidate whose log lacks a quorum-committed transaction cannot win.
+Implements Raft §5.4.1 verbatim — grant iff the request's term is at
+least the current term, `voted_for` is unset or already this candidate
+within the term, and the candidate's `(last_term, last_tx_id)` is
+lexicographically at least ours. The log-up-to-date clause is what
+enforces leader completeness: a candidate whose log lacks a
+quorum-committed transaction cannot win. A granted vote fsyncs
+`vote.log` *before* the RPC reply is sent (§28.2).
 
 ### §29.5 Pre-vote round
 
@@ -2589,38 +2339,30 @@ could race on `vote.log` and grant the same term to two candidates.
 
 ### §35.2 `AppendEntries`
 
-Request fields: `leader_id`, `term`, `prev_tx_id`, `prev_term`,
-`from_tx_id`, `to_tx_id`, `wal_bytes`, `leader_commit_tx_id`.
-Response fields: `term`, `success` (bool), `last_tx_id` (the
-follower's *current* fsynced commit id, see §31.4), `reject_reason`.
 An empty `wal_bytes` is a valid heartbeat: the follower runs the
 consistency check and returns its commit id without queueing any
-records.
+records. The reply's `last_tx_id` carries the follower's *current*
+fsynced commit id, which lags the shipped batch by one round (§31.4).
 
 ### §35.3 `RequestVote`
 
-Request fields: `term`, `candidate_id`, `last_tx_id`, `last_term`.
-Response fields: `term`, `vote_granted`. The handler implements the
-grant rule of §29.4 verbatim and persists the vote via `Vote::vote`
-before replying. A grant that requires a term observation also
-durably bumps the term via `Vote::observe_term`.
+Implements the grant rule of §29.4 verbatim and persists the vote via
+`Vote::vote` before replying. A grant that requires a term observation
+also durably bumps the term via `Vote::observe_term`.
 
 ### §35.4 `Ping`
 
-Request fields: `from_node_id`, `nonce`. Response fields: `node_id`,
-`term`, `last_tx_id`, `role`, `nonce`. The handler reads only atomics
-— no WAL, no vote log — and bypasses the per-node mutex. Its purpose
-is operational: health checks, RTT measurement, and leader discovery
-without the cost of the full Raft handler stack.
+Reads only atomics — no WAL, no vote log — and bypasses the per-node
+mutex. Its purpose is operational: health checks, RTT measurement, and
+leader discovery without the cost of the full Raft handler stack.
 
 ### §35.5 `InstallSnapshot`
 
-Request and response fields are modelled after Raft's
-`InstallSnapshot` and exist in the proto to lock in the wire format.
-The handler is scaffolded but not fully implemented; followers that
-fall too far behind a leader's retention window will need this RPC to
-catch up via a snapshot rather than via WAL backfill. The protocol is
-in place; the handler currently returns `UNIMPLEMENTED`.
+The wire format mirrors Raft's `InstallSnapshot` and exists in the
+proto to lock in the shape. The handler is scaffolded but not fully
+implemented; followers that fall too far behind a leader's retention
+window will need this RPC to catch up via a snapshot rather than via
+WAL backfill. Currently returns `UNIMPLEMENTED`.
 
 ---
 

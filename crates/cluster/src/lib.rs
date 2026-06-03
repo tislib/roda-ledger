@@ -1,6 +1,8 @@
 pub mod config;
 mod consensus;
 mod entry;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 mod handlers;
 mod ledger_slot;
 mod mapping;

@@ -2,7 +2,49 @@
 
 **Status:** Proposed  
 **Date:** 2026-04-24  
+**Last-Updated:** 2026-05-26  
 **Author:** Taleh Ibrahimli
+
+---
+
+## 2026-05-26 Decisions
+
+These decisions amend ADR-016 to match what shipped.
+
+1. **Term fencing happens once at the replication handshake, not on
+   every AppendEntries.** Supersedes §8's per-AE term /
+   `prev_tx_id` / `prev_term` enforcement. The handshake carries the
+   §5.3 anchor and the leader's term; subsequent updates and
+   heartbeats on the open stream are trusted. Any term or leader
+   change requires the leader to close the stream and re-handshake.
+
+2. **The role state machine lives inside the consensus library, not
+   the cluster module.** Supersedes §2's "long-running loop in
+   `node.rs`" shape and narrows §3's drop-and-rebuild scope. The
+   library owns `Initializing` / `Follower` / `Candidate` / `Leader`
+   internally; cluster-level loops observe role changes through a
+   subscription and branch accordingly. At runtime only the Ledger
+   is re-created (via the recovery-mode reseed); gRPC servers and
+   driver loops stay up across role transitions.
+
+3. **Pre-vote remains deferred.** Supersedes §5's "enabled by
+   default" and §13 in full. The current election issues a single
+   real `RequestVote` round; pre-vote will land in a follow-up.
+
+4. **Leader-hint redirection remains deferred.** Supersedes §12.
+   Responses do not yet carry a leader hint; clients retry against
+   another peer on a precondition-style failure for the moment.
+
+5. **Persistent vote state is owned by the storage layer, surfaced
+   through the cluster layer.** Confirms §4's intent; called out
+   because the durable file is owned by the shared storage crate
+   rather than the cluster module directly. No semantic change.
+
+6. **`Ledger::start_with_recovery_until(watermark)` is invoked via a
+   ledger-slot indirection.** Confirms §9 / §10 but notes the
+   indirection: the running ledger is held inside a slot value that
+   swaps in a freshly-recovered ledger when the handshake reports a
+   truncate-after watermark. No new decision; clarifies the wiring.
 
 ---
 

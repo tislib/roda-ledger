@@ -21,17 +21,16 @@
 
 pub mod metrics;
 
+use client::ClusterClient;
+use proto::ledger as proto_ledger;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use client::ClusterClient;
-use proto::ledger as proto_ledger;
 use tokio::task::JoinHandle;
 
 use testing::scenario::{
     Action, AssertBalance, AssertBalanceSum, AssertLeader, AssertPipelineCaughtUp, AssertTxStatus,
-    AsyncBranch, BatchKind, GetBalance, GetPipelineIndex, HealPartition, NodeSelector,
+    AsyncBranch, BatchKind, Concurrent, GetBalance, GetPipelineIndex, HealPartition, NodeSelector,
     PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit, SubmitBatch, SubmitOp,
     TxRef, TxStatus, WaitForLevel, WaitLevel,
 };
@@ -269,6 +268,7 @@ impl ScenarioRunner {
                 ctx.branches.push(handle);
                 Ok(())
             }
+            Action::Concurrent(c) => self.run_concurrent(client, metrics, ctx, c).await,
             Action::Wait(w) => {
                 tokio::time::sleep(w.duration).await;
                 Ok(())
@@ -356,50 +356,30 @@ impl ScenarioRunner {
         ctx: &mut RunCtx,
         s: &SubmitBatch,
     ) -> Result<(), RunError> {
-        // Batched-RPC fast path. When `BatchKind::Dynamic { batch_size > 0 }`,
-        // dispatch one `submit_batch` RPC per outer iteration carrying
-        // `base.len() * batch_size` ops. Amortizes the ~55 µs per-RPC tonic
-        // framing across many ops; without this, 1M ops sequential would
-        // take ~55 s at the gRPC layer regardless of how fast the ledger is.
-        if let BatchKind::Dynamic {
-            base,
-            repeat,
-            batch_size,
-        } = &s.kind
-            && *batch_size > 0
-        {
-            return self
-                .run_submit_batched(client, metrics, ctx, s, base, *repeat, *batch_size)
-                .await;
-        }
-
-        // Per-op path: submit each expanded op individually. Used for
-        // `BatchKind::Static` and `Dynamic { batch_size: 0 }` — preserves
-        // existing behavior for scenarios that need rate-throttled or
-        // mixed-variant submission.
-        let ops = expand_batch(&s.kind);
-        let rate_start = if s.rate > 0 {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        for (i, op) in ops.into_iter().enumerate() {
-            if let (Some(start), Some(target)) = (rate_start, rate_target_delay(i, s.rate)) {
-                let elapsed = start.elapsed();
-                if elapsed < target {
-                    tokio::time::sleep(target - elapsed).await;
+        match s.kind.clone() {
+            BatchKind::Dynamic {
+                base,
+                repeat,
+                mut batch_size,
+            } => {
+                if batch_size == 0 {
+                    batch_size = base.len() as u32;
                 }
+                self.run_submit_batched(client, metrics, ctx, s, &base, repeat, batch_size)
+                    .await
             }
-            let started = Instant::now();
-            let tx_id = self.do_submit(client, &op, s.wait, s.retry).await?;
-            if s.wait != WaitLevel::None {
-                metrics.record_submit_latency(started.elapsed());
+            BatchKind::Static(base) => {
+                self.run_submit_batched(client, metrics, ctx, s, &base, 1, base.len() as u32)
+                    .await
             }
-            ctx.bindings.insert(user_ref_of(&op), tx_id);
         }
-        Ok(())
     }
 
+    /// Dispatch `base.len() * repeat` ops in `submit_batch` RPCs of at
+    /// most `batch_size` ops each. `batch_size` is a *chunk size*, not a
+    /// multiplier: changing it changes how many RPCs go out and how big
+    /// each one is, but never the total op count. Chunk boundaries do
+    /// not have to align with base boundaries.
     #[allow(clippy::too_many_arguments)]
     async fn run_submit_batched(
         &self,
@@ -411,35 +391,43 @@ impl ScenarioRunner {
         repeat: u32,
         batch_size: u32,
     ) -> Result<(), RunError> {
+        if base.is_empty() || repeat == 0 {
+            return Ok(());
+        }
+        let chunk_cap = batch_size.max(1) as usize;
         let stride = base.len() as u64;
+        let total_ops: u64 = stride * repeat as u64;
+        let total_chunks: u64 = total_ops.div_ceil(chunk_cap as u64);
         let rate_start = if s.rate > 0 {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        let mut chunk: Vec<SubmitOp> = Vec::with_capacity(base.len() * batch_size as usize);
-        let mut global_iter: u64 = 0;
-        for batch_idx in 0..repeat {
-            // Rate throttle is per-op-rate; convert to per-batch:
-            // batch `batch_idx` should start no earlier than
-            // `(batch_idx * batch_size) / rate` seconds after the first.
-            if let (Some(start), Some(target)) = (
-                rate_start,
-                rate_target_delay((batch_idx as usize) * (batch_size as usize), s.rate),
-            ) {
+        let mut chunk: Vec<SubmitOp> = Vec::with_capacity(chunk_cap);
+
+        for chunk_idx in 0..total_chunks {
+            let start_op = chunk_idx * chunk_cap as u64;
+            let end_op = (start_op + chunk_cap as u64).min(total_ops);
+
+            // Rate throttle: chunk `i` starts no earlier than
+            // `(i * chunk_cap) / rate` seconds after the first.
+            if let (Some(start), Some(target)) =
+                (rate_start, rate_target_delay(start_op as usize, s.rate))
+            {
                 let elapsed = start.elapsed();
                 if elapsed < target {
                     tokio::time::sleep(target - elapsed).await;
                 }
             }
+
             chunk.clear();
-            for _ in 0..batch_size {
-                let offset = global_iter * stride;
-                for op in base {
-                    chunk.push(with_user_ref_offset(op.clone(), offset));
-                }
-                global_iter += 1;
+            for global_op_idx in start_op..end_op {
+                let iter = global_op_idx / stride;
+                let base_idx = (global_op_idx % stride) as usize;
+                let offset = iter * stride;
+                chunk.push(with_user_ref_offset(base[base_idx].clone(), offset));
             }
+
             let started = Instant::now();
             let tx_ids = submit_batch_once(client, &chunk, s.wait).await?;
             if s.wait != WaitLevel::None {
@@ -499,6 +487,99 @@ impl ScenarioRunner {
         })
     }
 
+    /// Fork-join concurrent step block. Each branch runs in its own
+    /// task with a private `RunCtx`. After every branch has finished,
+    /// their bindings are merged into the parent `ctx` (later-finishing
+    /// branches win on conflicting `user_ref`). The first error
+    /// encountered is propagated; remaining branches are awaited first
+    /// so spawned work doesn't leak past the step boundary.
+    ///
+    /// Returns a `Pin<Box<...>>` rather than `impl Future` to break the
+    /// recursive type cycle through `dispatch` — without it the
+    /// compiler can't prove the spawned futures are `Send`.
+    fn run_concurrent<'a>(
+        &'a self,
+        client: &'a ClusterClient,
+        metrics: &'a Arc<MetricsCollector>,
+        ctx: &'a mut RunCtx,
+        c: &'a Concurrent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RunError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+        let mut handles: Vec<JoinHandle<Result<RunCtx, RunError>>> =
+            Vec::with_capacity(c.branches.len());
+        for branch_steps in &c.branches {
+            let provisioner = self.provisioner.clone();
+            let client = client.clone();
+            let metrics = metrics.clone();
+            let steps = branch_steps.clone();
+            handles.push(tokio::spawn(async move {
+                let runner = ScenarioRunner::new(provisioner);
+                let mut local = RunCtx::default();
+                for step in &steps {
+                    runner.dispatch(&client, &metrics, &mut local, step).await?;
+                }
+                // Drain any AsyncBranches spawned inside this branch so
+                // nothing escapes the `Concurrent` step boundary.
+                let branches = std::mem::take(&mut local.branches);
+                let mut first_err: Option<RunError> = None;
+                for h in branches {
+                    match h.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                        Err(join_err) => {
+                            if first_err.is_none() {
+                                first_err = Some(RunError::Client(format!(
+                                    "branch panicked: {join_err}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                if let Some(e) = first_err {
+                    return Err(e);
+                }
+                Ok(local)
+            }));
+        }
+
+        let mut first_error: Option<RunError> = None;
+        let mut joined: Vec<RunCtx> = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.await {
+                Ok(Ok(local)) => joined.push(local),
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(RunError::Client(format!("branch panicked: {join_err}")));
+                    }
+                }
+            }
+        }
+        for local in joined {
+            for (user_ref, tx_id) in local.bindings {
+                ctx.bindings.insert(user_ref, tx_id);
+            }
+            if let Some(idx) = local.last_killed {
+                ctx.last_killed = Some(idx);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+        })
+    }
+
     // ============================================================
     // Synchronization
     // ============================================================
@@ -515,12 +596,29 @@ impl ScenarioRunner {
         let timeout = Duration::from_secs(30);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let (status, _) = client
+            // Proto `TransactionStatus`: PENDING=0, COMPUTED=1,
+            // COMMITTED=2, ON_SNAPSHOT=3, ERROR=4, TX_NOT_FOUND=5.
+            // Only 1..=3 are pipeline-stage progress; 4 and 5 are
+            // terminal tags, NOT higher levels — treating the field
+            // as an ordering would let `TX_NOT_FOUND=5 >= ON_SNAPSHOT=3`
+            // silently satisfy the wait when the queried node has no
+            // record of the tx (e.g. post-failover loss).
+            let (status, fail_reason) = client
                 .get_transaction_status(tx)
                 .await
                 .map_err(client_err)?;
-            if status >= target {
-                return Ok(());
+            match status {
+                s if (1..=3).contains(&s) && s >= target => return Ok(()),
+                4 => {
+                    return Err(RunError::AssertionFailed(format!(
+                        "tx {tx} reached ERROR status (fail_reason={fail_reason}) while \
+                         waiting for level >= {target}"
+                    )));
+                }
+                // 0 (PENDING) or 5 (TX_NOT_FOUND): keep polling. A
+                // freshly-elected leader may briefly not know the tx;
+                // the outer deadline caps the wait.
+                _ => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(RunError::Timeout(timeout));
@@ -854,38 +952,6 @@ fn with_user_ref_offset(op: SubmitOp, offset: u64) -> SubmitOp {
     }
 }
 
-/// Expand `BatchKind` into a flat `Vec<SubmitOp>`. Used by the per-op
-/// fallback path (`Static`, or `Dynamic { batch_size: 0 }`); the
-/// batched path in `run_submit_batched` builds chunks itself without
-/// allocating the full flattened vector.
-///
-/// For `Dynamic`, each emitted op's `user_ref` is offset by
-/// `iter * base.len()` so all emitted user_refs are unique. When
-/// `batch_size > 0` the total iteration count is `repeat * batch_size`;
-/// when `batch_size == 0` it falls back to legacy `repeat`-only.
-fn expand_batch(kind: &BatchKind) -> Vec<SubmitOp> {
-    match kind {
-        BatchKind::Static(ops) => ops.clone(),
-        BatchKind::Dynamic {
-            base,
-            repeat,
-            batch_size,
-        } => {
-            let inner = (*batch_size).max(1) as u64;
-            let total_iters = (*repeat as u64) * inner;
-            let stride = base.len() as u64;
-            let mut out = Vec::with_capacity(base.len() * total_iters as usize);
-            for iter in 0..total_iters {
-                let offset = iter * stride;
-                for op in base {
-                    out.push(with_user_ref_offset(op.clone(), offset));
-                }
-            }
-            out
-        }
-    }
-}
-
 fn resolve_tx(ctx: &RunCtx, tx: &TxRef) -> Result<u64, RunError> {
     match tx {
         TxRef::UserRef(ur) => ctx
@@ -902,6 +968,7 @@ fn wait_to_proto(w: WaitLevel) -> Option<proto_ledger::WaitLevel> {
         WaitLevel::Computed => Some(proto_ledger::WaitLevel::Computed),
         WaitLevel::Committed => Some(proto_ledger::WaitLevel::Committed),
         WaitLevel::OnSnapshot => Some(proto_ledger::WaitLevel::Snapshot),
+        WaitLevel::ClusterCommit => Some(proto_ledger::WaitLevel::ClusterCommit),
     }
 }
 
@@ -981,6 +1048,14 @@ fn check_capabilities(scenario: &Scenario, caps: Capabilities) -> Result<(), Run
                 }
                 Ok(())
             }
+            Action::Concurrent(c) => {
+                for branch in &c.branches {
+                    for nested in branch {
+                        walk(nested, caps)?;
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1055,12 +1130,11 @@ async fn submit_once(
 /// Send a homogeneous batch as a single `submit_batch` RPC. Returns one
 /// transaction id per op, in input order.
 ///
-/// Today this only supports all-Deposit batches, because the cluster
-/// client's other batch APIs either don't exist (Withdraw, Function) or
-/// drop the per-op `user_ref` on the wire (`transfer_batch_and_wait`
-/// hardcodes user_ref = 0), which breaks `user_ref → tx_id` bindings.
-/// `BatchKind::Dynamic { batch_size: 0 }` keeps any of those scenarios
-/// working through the per-op fallback path.
+/// Today this only supports all-Deposit batches: the cluster client's
+/// other batch APIs either don't exist (Withdraw, Function) or drop
+/// the per-op `user_ref` on the wire (`transfer_batch_and_wait`
+/// hardcodes `user_ref = 0`), which would break `user_ref → tx_id`
+/// bindings.
 async fn submit_batch_once(
     client: &ClusterClient,
     ops: &[SubmitOp],
@@ -1079,8 +1153,8 @@ async fn submit_batch_once(
             } => deposits.push((*account, *amount, *user_ref)),
             _ => {
                 return Err(RunError::Client(
-                    "BatchKind::Dynamic { batch_size > 0 } only supports Deposit ops today; \
-                     use batch_size: 0 for other variants"
+                    "submit_batch only supports Deposit ops today \
+                     (Transfer, Withdraw, Function batch APIs not yet wired)"
                         .into(),
                 ));
             }
@@ -1259,23 +1333,5 @@ mod tests {
             100,
         );
         assert_eq!(user_ref_of(&shifted), 101);
-    }
-
-    #[test]
-    fn expand_batch_preserves_zero_user_ref() {
-        let kind = BatchKind::Dynamic {
-            base: vec![SubmitOp::Deposit {
-                account: 1,
-                amount: 1,
-                user_ref: 0,
-            }],
-            repeat: 3,
-            batch_size: 2,
-        };
-        let ops = expand_batch(&kind);
-        assert_eq!(ops.len(), 6);
-        for op in &ops {
-            assert_eq!(user_ref_of(op), 0);
-        }
     }
 }

@@ -3,10 +3,10 @@ name: E2E Test
 on:
   workflow_dispatch:
     inputs:
-      profile:
-        description: "Profile from profiles.toml (e.g. single_node, three_node_cluster)"
+      nodes:
+        description: "Nodes per scenario cluster (default 3; needs ≥3 for failover scenarios)"
         required: false
-        default: "single_node"
+        default: "3"
 
 env:
   HETZNER_SERVER_NAME: "e2e-test-${{ github.run_id }}"
@@ -71,7 +71,7 @@ jobs:
       - name: Setup server and run E2E tests
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/e2e_test_key root@$SERVER_IP \
-            "BRANCH='$BRANCH' REPO='$REPO' bash -s" << 'SETUP_EOF'
+            "BRANCH='$BRANCH' REPO='$REPO' NODES='$NODES' bash -s" << 'SETUP_EOF'
           set -euo pipefail
 
           # Install dependencies
@@ -85,22 +85,32 @@ jobs:
           git clone --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" /root/roda-ledger
           cd /root/roda-ledger
 
-          # Pre-build both bins so the runner can resolve its sibling
-          # `e2e-cluster-process` via `current_exe()` on the first
-          # spawn — they land in the same target/release/ directory.
-          /root/.cargo/bin/cargo build -p testing \
-            --bin e2e --bin e2e-cluster-process --release
+          # Pre-build both bins so `scenario` can resolve its sibling
+          # `roda-server` via `current_exe()` on the first spawn —
+          # they land in the same target/release/ directory.
+          # `-p` is required: `--bin scenario` alone searches only the
+          # workspace's default-run packages, which doesn't include
+          # `control`.
+          /root/.cargo/bin/cargo build --release \
+            -p cluster --bin roda-server \
+            -p control --bin scenario
 
-          # Run E2E tests with Process backend
+          # Run every e2e scenario against a fresh N-node localhost
+          # cluster per scenario. Each scenario provisions its own
+          # cluster via the process provisioner, runs to completion,
+          # tears down. NODES defaults to 3 (set by the workflow
+          # input) — failover scenarios need ≥ 3 for quorum.
           echo "::group::E2E Test Output"
-          E2E_BACKEND=process /root/.cargo/bin/cargo run \
-            -p testing --bin e2e --release \
-            -- --test-threads=1 --nocapture 2>&1 | tee /root/e2e-test-output.txt
+          /root/.cargo/bin/cargo run --release \
+            -p control --bin scenario \
+            -- --nodes "$NODES" run-all --group e2e 2>&1 \
+            | tee /root/e2e-test-output.txt
           echo "::endgroup::"
           SETUP_EOF
         env:
           BRANCH: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
+          NODES: ${{ inputs.nodes }}
 
       - name: Retrieve results
         if: always()

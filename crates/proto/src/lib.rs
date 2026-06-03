@@ -10,6 +10,12 @@ pub mod node {
         include_bytes!(concat!(env!("OUT_DIR"), "/node_descriptor.bin"));
 }
 
+pub mod fault {
+    tonic::include_proto!("roda.fault.v1");
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/fault_descriptor.bin"));
+}
+
 pub mod control {
     tonic::include_proto!("roda.control.v1");
     pub const FILE_DESCRIPTOR_SET: &[u8] =

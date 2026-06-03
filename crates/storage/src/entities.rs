@@ -123,7 +123,7 @@ pub struct TxEntry {
     pub entry_type: u8,        // 1 @ 0  — WalEntryKind::TxEntry
     pub kind: EntryKind,       // 1 @ 1  — Credit or Debit
     pub _pad0: [u8; 6],        // 6 @ 2
-    pub tx_id: u64,            // 8 @ 8  — links back to TxMetadata
+    pub _pad1: [u8; 8],        // 8 @ 8  — reserved (tx_id is on the preceding TxMetadata)
     pub account_id: u64,       // 8 @ 16
     pub amount: u64,           // 8 @ 24 — integer minor units, no floats, no decimals
     pub computed_balance: i64, // 8 @ 32 — running balance after this entry, set by Transactor
@@ -142,9 +142,9 @@ pub struct TxLink {
     pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Link (4)
     pub link_kind: u8,   // 1 @ 1  — TxLinkKind as u8
     pub _pad: [u8; 6],   // 6 @ 2
-    pub tx_id: u64,      // 8 @ 8  — links back to TxMetadata
+    pub _pad1: [u8; 8],  // 8 @ 8  — reserved (tx_id is on the preceding TxMetadata)
     pub to_tx_id: u64,   // 8 @ 16  — referenced transaction
-    pub _pad2: [u8; 16], // 24 @ 16
+    pub _pad2: [u8; 16], // 16 @ 24
 } // total: 40 bytes
 
 impl TxLink {
@@ -241,17 +241,6 @@ impl WalEntry {
             WalEntry::Link(_) => WalEntryKind::Link,
             WalEntry::FunctionRegistered(_) => WalEntryKind::FunctionRegistered,
             WalEntry::Term(_) => WalEntryKind::TxTerm,
-        }
-    }
-
-    pub fn tx_id(&self) -> u64 {
-        match self {
-            WalEntry::Metadata(m) => m.tx_id,
-            WalEntry::Entry(e) => e.tx_id,
-            WalEntry::Link(e) => e.tx_id,
-            // FunctionRegistered and TxTerm are structural records with no tx_id.
-            WalEntry::FunctionRegistered(_) => 0,
-            WalEntry::Term(_) => 0,
         }
     }
 }

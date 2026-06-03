@@ -14,8 +14,45 @@ pub fn all() -> Vec<Scenario> {
         deposit_burst_1k(),
         sustained_transfer_load(),
         load_sustained_2min(),
+        load_sustained_10min(),
         load_spike(),
     ]
+}
+
+/// 10-minute sustained deposit stream at the same rate as
+/// `load_sustained_2min` (500 ops/s). Used to give CPU profilers a
+/// long, steady-state target so per-thread cost stabilises.
+fn load_sustained_10min() -> Scenario {
+    const RATE_OPS_PER_SEC: u32 = 500;
+    const DURATION_SECS: u32 = 600;
+    const TOTAL_OPS: u64 = (RATE_OPS_PER_SEC as u64) * (DURATION_SECS as u64);
+
+    Scenario::new("load_sustained_10min")
+        .with_description(
+            "500 ops/s deposit stream sustained for 10 minutes — long-running target for CPU profiling.",
+        )
+        .with_steps(vec![
+            Step::new(Action::SubmitBatch(SubmitBatch {
+                wait: WaitLevel::None,
+                retry: None,
+                rate: RATE_OPS_PER_SEC,
+                kind: BatchKind::Dynamic {
+                    base: vec![SubmitOp::Deposit {
+                        account: 1,
+                        amount: 1,
+                        user_ref: 1,
+                    }],
+                    repeat: TOTAL_OPS as u32,
+                    batch_size: 0,
+                },
+            }))
+            .with_label("300k deposits at 500 ops/s over 10 min"),
+            Step::new(Action::WaitForLevel(WaitForLevel {
+                node: NodeSelector::Leader,
+                tx: TxRef::UserRef(TOTAL_OPS),
+                level: PipelineLevel::OnSnapshot,
+            })),
+        ])
 }
 
 /// 1000 deposits driven from a single async branch with retry. Cheap
@@ -159,17 +196,16 @@ fn load_sustained_2min() -> Scenario {
         ])
 }
 
-/// 1M deposits, dispatched as 1000 batches of 1000 ops each (one
-/// `submit_batch` RPC per outer iteration). Amortizes per-RPC gRPC
-/// framing across 1000 ops so the run exercises the cluster's commit
-/// path, not the runner's per-op tonic round-trip cost.
+/// 1M deposits, dispatched as 1000 batches of 1000 ops each. The
+/// runner's `submit_batch` chunking groups `CHUNK_SIZE` ops per RPC,
+/// so per-RPC gRPC framing is amortized across 1000 ops and the run
+/// exercises the cluster's commit path, not tonic round-trip cost.
 fn load_spike() -> Scenario {
-    const BATCH_SIZE: u32 = 1_000;
-    const REPEAT: u32 = 10_000;
-    // base.len() * batch_size * repeat — last user_ref offset is
-    // `(BATCH_SIZE * REPEAT) - 1`, so the last emitted user_ref is
-    // `1 + (BATCH_SIZE * REPEAT) - 1 = BATCH_SIZE * REPEAT`.
-    const TOTAL_OPS: u64 = (BATCH_SIZE as u64) * (REPEAT as u64);
+    // Total ops = base.len() * TOTAL_OPS = 1 * 1_000_000 = 1_000_000.
+    // CHUNK_SIZE is the on-wire chunk: 1M ops / 1000 ops-per-chunk =
+    // 1000 `submit_batch` RPCs.
+    const CHUNK_SIZE: u32 = 1_000;
+    const TOTAL_OPS: u32 = 1_000_000;
 
     Scenario::new("load_spike")
         .with_description("1M-op spike at full speed via 1000 batches of 1000 deposits.")
@@ -179,21 +215,25 @@ fn load_spike() -> Scenario {
                 retry: None,
                 rate: 0,
                 kind: BatchKind::Dynamic {
+                    // user_ref: 1 (non-zero) so the runner's per-base
+                    // `iter * stride` offset produces unique user_refs
+                    // 1..=TOTAL_OPS and the drain step below can
+                    // resolve the last one.
                     base: vec![SubmitOp::Deposit {
                         account: 1,
                         amount: 1,
-                        user_ref: 0,
+                        user_ref: 1,
                     }],
-                    repeat: REPEAT,
-                    batch_size: BATCH_SIZE,
+                    repeat: TOTAL_OPS,
+                    batch_size: CHUNK_SIZE,
                 },
             }))
-            .with_label("10k batches × 1k deposits"),
+            .with_label("1k batches × 1k deposits"),
             // Drain so the report measures the full burst settling,
             // not just submission.
             Step::new(Action::WaitForLevel(WaitForLevel {
                 node: NodeSelector::Leader,
-                tx: TxRef::UserRef(TOTAL_OPS),
+                tx: TxRef::UserRef(TOTAL_OPS as u64),
                 level: PipelineLevel::OnSnapshot,
             })),
         ])

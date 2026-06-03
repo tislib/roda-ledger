@@ -80,6 +80,7 @@ message ReplicationLeaderMessage {
 
 message ReplicationLeaderMessageWalUpdate {
   bytes wal_binary = 1;
+//  uint32 wal_binary_crc32 = 2;
   uint64 cluster_commit_id = 4;
 }
 

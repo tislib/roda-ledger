@@ -1,0 +1,397 @@
+syntax = "proto3";
+
+// Per-node fault-injection control surface (ADR-018).
+//
+// **Cluster-level only**. There is no `Ledger` scope exposed on the
+// wire; the disk-affecting buckets (`DISK_ACCESS`, `WAL_ACCESS`)
+// internally route to the storage-layer ledger fault hooks
+// (`TermStorage::append`, `VoteStorage::append`,
+// `Segment::write_pending_entries`, `Segment::sync`, `WalTailer::tail`).
+// A test that wants to stress a follower's disk does so by setting
+// the matching cluster bucket on that node — it never reaches the
+// ledger trait directly.
+//
+// **Single-level model**. There is no rule registry. A fault has
+// exactly two operations: `SetFault` (install / replace the single
+// fault on a level) and `ClearFault` (remove it). Each level is at
+// most one active fault at a time; reusing `SetFault` on the same
+// level atomically replaces what was there. No "list", no "add",
+// no per-rule ids beyond the `stuck_id` handle returned for parked
+// operations.
+//
+// Available **only** when the server is compiled with the workspace
+// `fault-injection` Cargo feature. Production binaries return
+// `UNIMPLEMENTED` for every RPC here and the trait hooks the
+// injector binds to compile to nothing in the call sites. See
+// ADR-018 for the scenario catalogue this surface is meant to
+// unlock.
+package roda.fault.v1;
+
+service Fault {
+  // ── Per-level rule lifecycle ───────────────────────────────
+
+  // Install or replace the fault on a single level. Idempotent —
+  // re-issuing with the same `level` replaces atomically.
+  rpc SetFault(SetFaultRequest) returns (SetFaultResponse);
+
+  // Remove the fault on a single level. Idempotent — clearing an
+  // already-clear level is a no-op (returns `removed=false`).
+  rpc ClearFault(ClearFaultRequest) returns (ClearFaultResponse);
+
+  // Clear every level on this node and release every parked Stuck*
+  // operation. Useful as test teardown; not a "list" operation —
+  // returns only counts, never per-level detail.
+  rpc ClearAllFaults(ClearAllFaultsRequest) returns (ClearAllFaultsResponse);
+
+  // Release one parked Stuck* operation by id. The id is either
+  // the value the caller put in `Stuck.stuck_id` when setting the
+  // fault, or the id returned in `SetFaultResponse.assigned_stuck_id`
+  // when the caller passed an empty one.
+  rpc UnstuckOperation(UnstuckOperationRequest) returns (UnstuckOperationResponse);
+
+  // ── Out-of-band one-shots ──────────────────────────────────
+
+  // Synchronous mutation of on-disk state. Not a level (there's
+  // nothing to "clear" — the byte change is permanent). Returns
+  // after the change has hit disk.
+  rpc ApplyFileEvent(ApplyFileEventRequest) returns (ApplyFileEventResponse);
+
+  // ── Cross-cutting clock ────────────────────────────────────
+
+  // Apply a per-node offset to every wrapped `Instant::now()` read
+  // on this node. `offset_ms = 0` resets to wall clock. Negative
+  // values shift the clock into the past.
+  rpc SetClockSkew(SetClockSkewRequest) returns (SetClockSkewResponse);
+
+  // One-shot forward jump in milliseconds. Trips a single timer
+  // without leaving the clock permanently skewed.
+  rpc ClockJump(ClockJumpRequest) returns (ClockJumpResponse);
+}
+
+// ─── Level identifier ───────────────────────────────────────────
+
+// A single addressable "fault slot" on this node. `bucket` picks
+// the injection hook; `peer_id` qualifies the slot for per-peer
+// buckets and is ignored for node-wide ones (the matching column
+// in the table below).
+//
+// | bucket                | peer_id used? | internally exercises             |
+// |-----------------------|---------------|----------------------------------|
+// | DISK_ACCESS           | no            | TermStorage / VoteStorage append |
+// | WAL_ACCESS            | no            | Segment::write / Segment::sync   |
+// | LEADER_PUSH           | yes           | run_peer_sender + WalTailer::tail|
+// | FOLLOWER_REPLICATION  | yes           | apply_wal_update                 |
+// | MESSAGE               | yes           | wire-level rewrite               |
+// | PARTITION             | yes           | peer↔peer connectivity gate      |
+// | CONSENSUS_STATE       | no            | Consensus::self_advance          |
+// | ELECTION_REQUEST_VOTE | yes           | RequestVote send/recv            |
+// | ELECTION_HANDSHAKE    | yes           | first Handshake on a session     |
+// | PING                  | no            | Node::Ping                       |
+message FaultLevel {
+  enum Bucket {
+    BUCKET_UNSPECIFIED = 0;
+    DISK_ACCESS = 1;
+    WAL_ACCESS = 2;
+    LEADER_PUSH = 3;
+    FOLLOWER_REPLICATION = 4;
+    MESSAGE = 5;
+    PARTITION = 6;
+    CONSENSUS_STATE = 7;
+    ELECTION_REQUEST_VOTE = 8;
+    ELECTION_HANDSHAKE = 9;
+    PING = 10;
+  }
+  Bucket bucket = 1;
+
+  // Per-peer buckets: counterparty peer id. `0` means "every peer"
+  // — the fault fires on the slot for any peer not already covered
+  // by a more-specific (non-zero) level. Ignored for node-wide
+  // buckets.
+  uint64 peer_id = 2;
+}
+
+// ─── SetFault / ClearFault ──────────────────────────────────────
+
+message SetFaultRequest {
+  FaultLevel level = 1;
+  FaultOutcome outcome = 2;
+}
+
+message SetFaultResponse {
+  // For `Stuck` outcomes where the caller passed an empty
+  // `stuck_id`: the server-assigned id, ready to feed back into
+  // `UnstuckOperation`. Empty for non-Stuck outcomes.
+  string assigned_stuck_id = 1;
+}
+
+message ClearFaultRequest {
+  FaultLevel level = 1;
+}
+
+message ClearFaultResponse {
+  // True iff there was a fault on the level before this call.
+  bool removed = 1;
+}
+
+message ClearAllFaultsRequest {}
+message ClearAllFaultsResponse {
+  uint32 cleared_levels = 1;
+  uint32 released_stuck_ops = 2;
+}
+
+message UnstuckOperationRequest {
+  string stuck_id = 1;
+}
+message UnstuckOperationResponse {
+  bool released = 1;
+}
+
+// ─── Outcome ────────────────────────────────────────────────────
+
+// The server validates that the chosen outcome variant is valid
+// for the level's bucket — e.g. `MessageOutcome` is only valid on
+// `MESSAGE` and `ELECTION_*`, `ConsensusOutcome` only on
+// `CONSENSUS_STATE`, etc. Calls with mismatched (level, outcome)
+// pairs return `INVALID_ARGUMENT`.
+message FaultOutcome {
+  oneof kind {
+    // The `{ Normal, Error, Slow, Stuck }` axis from ADR-018.
+    // Valid on every bucket.
+    Empty normal = 1;
+    IoError error = 2;
+    Slow slow = 3;
+    Stuck stuck = 4;
+
+    // Write-side data corruption — valid on `WAL_ACCESS` only.
+    WriteCorruption corruption = 5;
+
+    // Message-shaped — valid on `MESSAGE` and `ELECTION_*`.
+    MessageOutcome message = 6;
+
+    // Consensus tweaks — valid on `CONSENSUS_STATE`.
+    ConsensusOutcome consensus = 7;
+
+    // Election lies / handshake reject — valid on `ELECTION_*`.
+    ElectionOutcome election = 8;
+
+    // Partition direction — valid on `PARTITION`. `PARTITION`
+    // accepts only this and `Empty normal` (clear).
+    PartitionOutcome partition = 9;
+
+    // Ping-level outcomes (drop / delay) — valid on `PING`.
+    // Subset of `MessageOutcome`; named separately so callers
+    // can't accidentally pass `reorder`/`duplicate` on a request-
+    // response RPC.
+    PingOutcome ping = 10;
+  }
+}
+
+// ─── Axis outcomes ──────────────────────────────────────────────
+
+// Mapped to `std::io::ErrorKind` on the Rust side; codes match
+// the most common production errnos for IO faults.
+message IoError {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    IO_OTHER = 1;             // generic
+    IO_NOT_FOUND = 2;         // ENOENT
+    IO_PERMISSION_DENIED = 3; // EACCES
+    IO_NO_SPACE = 4;          // ENOSPC
+    IO_OUT_OF_MEMORY = 5;     // ENOMEM
+    IO_INTERRUPTED = 6;       // EINTR
+  }
+  Kind kind = 1;
+  string message = 2;
+}
+
+message Slow {
+  uint64 delay_ms = 1;
+}
+
+message Stuck {
+  // Caller-supplied id (so `UnstuckOperation` knows what to
+  // release). Empty: server assigns one and returns it in
+  // `SetFaultResponse.assigned_stuck_id`.
+  string stuck_id = 1;
+}
+
+message WriteCorruption {
+  oneof kind {
+    // Flip every bit of the bytes about to be written.
+    Empty flip_all_bits = 1;
+    // Zero the bytes about to be written.
+    Empty zero = 2;
+    // Truncate the write to the first N bytes (short write).
+    uint32 truncate_to = 3;
+    // Substitute the writer's payload with these exact bytes.
+    bytes replace_with = 4;
+  }
+}
+
+// ─── Message / consensus / election / partition / ping ──────────
+
+message MessageOutcome {
+  oneof kind {
+    Empty drop = 1;
+    // Keep only the first N bytes of the message body
+    // (`wal_binary` for `WalUpdate`). 0 = strip body entirely.
+    uint32 truncate = 2;
+    // Queue this message; emit AFTER the next `swap_with` messages
+    // from the same peer.
+    uint32 reorder_swap_with = 3;
+    // Deliver `copies` additional copies of the message.
+    uint32 duplicate_copies = 4;
+    // Hold for `delay_ms` before delivering.
+    uint64 delay_ms = 5;
+  }
+}
+
+message ConsensusOutcome {
+  oneof kind {
+    // Force this node's role at the next `self_advance` tick.
+    ForceRole force_role = 1;
+    // Suppress outbound heartbeats for `ticks` self_advance cycles.
+    uint32 suppress_heartbeat_ticks = 2;
+    // Inject a strictly-stale term into the next outbound message.
+    uint64 inject_stale_term = 3;
+    // Force a peer's slot in `Quorum` to report a stale
+    // `match_index` for one tick — exercises the `fetch_max`
+    // monotonicity guard.
+    QuorumStaleMatchIndex quorum_stale_match_index = 4;
+  }
+}
+
+message ForceRole {
+  enum Role {
+    ROLE_UNSPECIFIED = 0;
+    FOLLOWER = 1;
+    CANDIDATE = 2;
+    LEADER = 3;
+  }
+  Role role = 1;
+}
+
+message QuorumStaleMatchIndex {
+  uint64 peer_id = 1;
+  uint64 stale_match_index = 2;
+}
+
+message ElectionOutcome {
+  oneof kind {
+    VoteLie vote_lie = 1;
+    HandshakeReject handshake_reject = 2;
+  }
+}
+
+message VoteLie {
+  oneof kind {
+    // Reply with a strictly higher term than the candidate's.
+    uint64 higher_term = 1;
+    // Reply granted=true even when the §5.4.1 check should refuse.
+    Empty wrong_grant = 2;
+  }
+}
+
+message HandshakeReject {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    TERM_STALE = 1;
+    LOG_MISMATCH = 2;
+    INDEX_OUT_OF_RANGE = 3;
+  }
+  Reason reason = 1;
+}
+
+message PartitionOutcome {
+  // True: block only traffic FROM peer to us (asymmetric).
+  // False: drop both directions (the `Partition::TwoWay` shape).
+  bool one_way = 1;
+}
+
+message PingOutcome {
+  oneof kind {
+    Empty drop = 1;
+    uint64 delay_ms = 2;
+  }
+}
+
+// ─── File-level events (synchronous one-shots) ──────────────────
+
+message ApplyFileEventRequest {
+  oneof event {
+    Empty delete_active_wal = 1;
+    DeleteSealedWal delete_sealed_wal = 2;
+    DeleteSnapshot delete_snapshot = 3;
+    DeleteFunctionSnapshot delete_function_snapshot = 4;
+    CorruptWalFile corrupt_wal_file = 5;
+    OverwriteSegmentBytes overwrite_segment_bytes = 6;
+  }
+}
+
+message ApplyFileEventResponse {
+  bool applied = 1;
+  // Bytes affected by the mutation (informational, for test
+  // assertions).
+  uint64 bytes_affected = 2;
+}
+
+message DeleteSealedWal {
+  uint32 segment_id = 1;
+}
+
+message DeleteSnapshot {
+  uint32 segment_id = 1;
+  // When true, also remove the .crc sidecar. Default: leave it,
+  // so the snapshot loader sees a present sidecar with no .bin.
+  bool delete_crc = 2;
+}
+
+message DeleteFunctionSnapshot {
+  uint32 segment_id = 1;
+}
+
+message CorruptWalFile {
+  uint32 segment_id = 1;
+  // Byte range inside `wal_NNNNNN.bin` to mutate.
+  uint64 offset = 2;
+  uint32 length = 3;
+  CorruptionPattern pattern = 4;
+}
+
+message OverwriteSegmentBytes {
+  uint32 segment_id = 1;
+  uint64 offset = 2;
+  // Exact bytes to write at `offset`. `bytes.len()` is the length.
+  bytes replacement = 3;
+}
+
+enum CorruptionPattern {
+  PATTERN_UNSPECIFIED = 0;
+  // Flip every byte: `b ^= 0xFF`.
+  FLIP_ALL_BITS = 1;
+  // Zero the range.
+  ZERO = 2;
+  // Random bytes from the injector's seeded RNG (deterministic
+  // across runs when the seed has been set).
+  RANDOM = 3;
+}
+
+// ─── Clock control ──────────────────────────────────────────────
+
+message SetClockSkewRequest {
+  // Per-node offset applied to every wrapped `Instant::now()`
+  // read. 0 resets. Negative shifts the clock into the past.
+  int64 offset_ms = 1;
+}
+message SetClockSkewResponse {}
+
+message ClockJumpRequest {
+  // Forward jump in milliseconds.
+  uint64 delta_ms = 1;
+}
+message ClockJumpResponse {}
+
+// Reusable empty marker for oneof variants that only need a tag.
+// proto3 disallows oneof arms with no body, and a shared `Empty`
+// keeps the schema readable.
+message Empty {}

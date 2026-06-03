@@ -60,6 +60,13 @@ pub struct WalRunner {
     retry_count: u64,
     active_segment: Segment,
     buffer: VecDeque<WalEntry>,
+    /// Fixed upper bound on `buffer` occupancy, used to budget how many
+    /// entries we pull from `wal_input` per iteration. NOT read from
+    /// `buffer.capacity()`: a `VecDeque` grows on overflow, so a live
+    /// `capacity()` budget would expand every time the buffer
+    /// reallocated — letting a stuck/slow sync (which blocks the drain
+    /// loop) pull unboundedly from upstream and defeat backpressure.
+    buffer_limit: usize,
     /// `tx_id` of the most-recently-ingested `TxMetadata`. Used as the
     /// authoritative tx_id when the closing sub-item of a transaction
     /// is a structural record (`TxTerm`, `FunctionRegistered`) whose
@@ -82,7 +89,8 @@ impl WalRunner {
         let active_segment = storage.active_segment().unwrap();
         let syncer = active_segment.syncer().expect("Failed to get syncer");
         active_segment_sync.store(Arc::new(Some(syncer)));
-        let buffer = VecDeque::with_capacity(ctx.input_capacity() * 16);
+        let buffer_limit = ctx.input_capacity() * 16;
+        let buffer = VecDeque::with_capacity(buffer_limit);
         let wait_strategy = ctx.wait_strategy();
 
         Self {
@@ -93,6 +101,7 @@ impl WalRunner {
             retry_count: 0,
             active_segment,
             buffer,
+            buffer_limit,
             current_tx_id: 0,
             last_received_tx_id: 0,
             segment_start_tx_id: 0,
@@ -104,9 +113,14 @@ impl WalRunner {
         while ctx.is_running() {
             // Each slot is a WalInput::{Single,Multi}; Multi carries a follower batch.
             let inbound = ctx.input();
+            // Budget against the FIXED limit, not `buffer.capacity()` —
+            // the VecDeque grows on overflow and a live-capacity budget
+            // would ratchet open under a stalled drain (see field docs).
+            // `saturating_sub` so a buffer already at/over the limit
+            // (it can overshoot by one in-flight tx group) yields 0.
             let available = inbound
                 .len()
-                .min(self.buffer.capacity() - self.buffer.len());
+                .min(self.buffer_limit.saturating_sub(self.buffer.len()));
 
             let mut entries_ingested: u32 = 0;
             let mut k = available;
@@ -155,11 +169,15 @@ impl WalRunner {
                 self.rotate(&ctx);
             }
 
-            // Push committed entries to the outbound queue.
+            // Push committed entries to the outbound queue. tx_id is
+            // carried only by `TxMetadata`; followers inherit it
+            // from the preceding metadata, which by FIFO order has
+            // already passed the commit-index gate by the time we
+            // see them.
             while let Some(entry) = self.buffer.pop_front() {
-                let tx_id = entry.tx_id();
-                if tx_id > ctx.commit_index() {
-                    // return back
+                if let WalEntry::Metadata(m) = &entry
+                    && m.tx_id > ctx.commit_index()
+                {
                     self.buffer.push_front(entry);
                     break;
                 }

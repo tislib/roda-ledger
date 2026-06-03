@@ -76,7 +76,7 @@ mod tests {
             entry_type: WalEntryKind::TxEntry as u8,
             kind: EntryKind::Credit,
             _pad0: [0; 6],
-            tx_id: 42,
+            _pad1: [0; 8],
             account_id: 7,
             amount: 1000,
             computed_balance: 5000,

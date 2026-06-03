@@ -4,7 +4,7 @@ use crate::consensus::replication::ReplicationInputStream;
 use crate::ledger_slot::LedgerSlot;
 use proto::node::{NodeRole, PingRequest, PingResponse, RequestVoteRequest, RequestVoteResponse};
 use raft::{NodeId, RaftConfig, RaftNode, RequestVote, Role, Term, TxId};
-use spdlog::debug;
+use spdlog::{debug, trace};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -257,7 +257,7 @@ impl Consensus {
             .expect("raft mutex poisoned")
             .advance_local_index(ledger_index);
         if moved {
-            debug!(
+            trace!(
                 "consensus[{}]: self_advance to {}",
                 self.node_id, ledger_index
             );

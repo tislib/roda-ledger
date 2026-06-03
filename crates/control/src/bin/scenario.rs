@@ -92,7 +92,7 @@ enum Group {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    configure_logging(cli.verbose);
+    configure_logging();
     match cli.cmd {
         Command::List { group } => {
             list_scenarios(group);
@@ -659,15 +659,29 @@ fn print_node_lag_block(metrics: &Snapshot) {
     }
 }
 
-/// Tame the in-process `spdlog-rs` output (used by `client` /
-/// `cluster`) so retry warnings during cluster bring-up don't fight
-/// the CLI's structured progress lines. Genuine RPC failures still
-/// reach the user via `RunError::Client(..)`.
-fn configure_logging(verbose: bool) {
-    let level = if verbose {
-        spdlog::Level::Info
-    } else {
-        spdlog::Level::Critical
-    };
+/// Default the in-process `spdlog-rs` output (used by `client` /
+/// `cluster`) to `Debug`. The scenario harness is the e2e entry
+/// point — debug-level logs are the right baseline for diagnosing
+/// failed runs, and the `--verbose` flag (which forwards the
+/// spawned servers' stdout/stderr) controls *child* output, not
+/// this process's. Override via `RODA_SCENARIO_LOG_LEVEL` when a
+/// tighter or looser filter is needed.
+fn configure_logging() {
+    let level = std::env::var("RODA_SCENARIO_LOG_LEVEL")
+        .ok()
+        .and_then(|s| parse_log_level(&s))
+        .unwrap_or(spdlog::Level::Debug);
     spdlog::default_logger().set_level_filter(spdlog::LevelFilter::MoreSevereEqual(level));
+}
+
+fn parse_log_level(s: &str) -> Option<spdlog::Level> {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => Some(spdlog::Level::Trace),
+        "debug" => Some(spdlog::Level::Debug),
+        "info" => Some(spdlog::Level::Info),
+        "warn" | "warning" => Some(spdlog::Level::Warn),
+        "error" => Some(spdlog::Level::Error),
+        "critical" | "crit" => Some(spdlog::Level::Critical),
+        _ => None,
+    }
 }

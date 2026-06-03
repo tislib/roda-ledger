@@ -68,7 +68,8 @@ fn manual_replication_leader_to_follower() {
     let running = Arc::new(AtomicBool::new(true));
 
     // 2 + 3. Background replication: WalTailer on leader → decode → follower.
-    let mut tailer = leader.wal_tailer();
+    // Tailer is pre-positioned at tx_id=1 and just streams forward.
+    let mut tailer = leader.wal_tailer(1);
     let fol_repl = follower.clone();
     let run = running.clone();
     let repl = thread::spawn(move || {
@@ -77,7 +78,7 @@ fn manual_replication_leader_to_follower() {
         let mut buf = vec![0u8; 40 * 4096];
         let mut idle_retries = 0u32;
         while run.load(Ordering::Relaxed) {
-            let n = tailer.tail(1, &mut buf) as usize;
+            let n = tailer.tail(&mut buf) as usize;
             if n == 0 {
                 idle_retries = idle_retries.saturating_add(1);
                 let sleep_us = (idle_retries.min(100) as u64) * 50;
@@ -97,7 +98,7 @@ fn manual_replication_leader_to_follower() {
         // Final drain once shutdown is requested so we don't lose records
         // committed between the last iteration and the flag flip.
         loop {
-            let n = tailer.tail(1, &mut buf) as usize;
+            let n = tailer.tail(&mut buf) as usize;
             if n == 0 {
                 break;
             }

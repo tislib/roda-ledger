@@ -1447,6 +1447,151 @@ impl ClusterTestingControl {
         })
     }
 
+    /// ── Fault-injection API (gated by `fault-injection`) ─────────
+    ///
+    /// Tests reach the per-node `ClusterFaultInjector` directly —
+    /// no gRPC round-trip — through these helpers. The injector is
+    /// the same `Arc` the node's `FaultHandler` is backed by, so
+    /// either driving channel produces the same observable effect.
+
+    /// Per-node fault injector handle for slot `i`. Errors if the
+    /// slot is out of range or the node hasn't been started yet.
+    #[cfg(feature = "fault-injection")]
+    pub fn fault_injector(
+        &self,
+        i: usize,
+    ) -> Result<std::sync::Arc<crate::fault::ClusterFaultInjector>, ClusterTestingError> {
+        let slot = self.slot(i)?;
+        let node = slot
+            .node
+            .as_ref()
+            .ok_or(ClusterTestingError::NotStarted { idx: i })?;
+        Ok(node.fault_injector())
+    }
+
+    /// Convenience: park `fdatasync` on slot `i` (the
+    /// `DISK_ACCESS` bucket from ADR-018 — covers both term + vote
+    /// log writes via the WAL syncer the storage layer shares).
+    /// Returns `Ok(())` — DISK_ACCESS stuck doesn't need a
+    /// per-call id because there's no other test handle in flight
+    /// on this slot.
+    #[cfg(feature = "fault-injection")]
+    pub fn stick_disk_access(&self, i: usize) -> Result<(), ClusterTestingError> {
+        use proto::fault::fault_level::Bucket;
+        use proto::fault::{FaultLevel, FaultOutcome, Stuck, fault_outcome};
+        let level = FaultLevel {
+            bucket: Bucket::DiskAccess as i32,
+            peer_id: 0,
+        };
+        let outcome = FaultOutcome {
+            kind: Some(fault_outcome::Kind::Stuck(Stuck {
+                stuck_id: String::new(),
+            })),
+        };
+        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
+            |e| ClusterTestingError::Run(format!("set_fault disk_access: {e}")),
+        )?;
+        Ok(())
+    }
+
+    /// Undo `stick_disk_access` on slot `i`. Idempotent.
+    #[cfg(feature = "fault-injection")]
+    pub fn unstick_disk_access(&self, i: usize) -> Result<(), ClusterTestingError> {
+        use proto::fault::FaultLevel;
+        use proto::fault::fault_level::Bucket;
+        let level = FaultLevel {
+            bucket: Bucket::DiskAccess as i32,
+            peer_id: 0,
+        };
+        self.fault_injector(i)?.clear_fault(&level);
+        Ok(())
+    }
+
+    /// Convenience: park *both* WAL `write_all` and `fdatasync` on
+    /// slot `i` (the `WAL_ACCESS` bucket). Unlike `DISK_ACCESS`
+    /// (sync only), this also blocks the WAL writer's append — so
+    /// the leader can't even replicate the new bytes out to its
+    /// peers. Use this when a test needs `cluster_commit` to stop
+    /// advancing on a single-node fault, not just `commit`.
+    #[cfg(feature = "fault-injection")]
+    pub fn stick_wal_access(&self, i: usize) -> Result<(), ClusterTestingError> {
+        use proto::fault::fault_level::Bucket;
+        use proto::fault::{FaultLevel, FaultOutcome, Stuck, fault_outcome};
+        let level = FaultLevel {
+            bucket: Bucket::WalAccess as i32,
+            peer_id: 0,
+        };
+        let outcome = FaultOutcome {
+            kind: Some(fault_outcome::Kind::Stuck(Stuck {
+                stuck_id: String::new(),
+            })),
+        };
+        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
+            |e| ClusterTestingError::Run(format!("set_fault wal_access: {e}")),
+        )?;
+        Ok(())
+    }
+
+    /// Undo `stick_wal_access` on slot `i`. Idempotent.
+    #[cfg(feature = "fault-injection")]
+    pub fn unstick_wal_access(&self, i: usize) -> Result<(), ClusterTestingError> {
+        use proto::fault::FaultLevel;
+        use proto::fault::fault_level::Bucket;
+        let level = FaultLevel {
+            bucket: Bucket::WalAccess as i32,
+            peer_id: 0,
+        };
+        self.fault_injector(i)?.clear_fault(&level);
+        Ok(())
+    }
+
+    /// Add a per-call sleep to the WAL writer on slot `i` (routes
+    /// through `LedgerFaultInjector::set_write_delay`). Use `None` /
+    /// `clear_all_faults` to release.
+    #[cfg(feature = "fault-injection")]
+    pub fn slow_wal_access(&self, i: usize, delay_ms: u64) -> Result<(), ClusterTestingError> {
+        use proto::fault::fault_level::Bucket;
+        use proto::fault::{FaultLevel, FaultOutcome, Slow, fault_outcome};
+        let level = FaultLevel {
+            bucket: Bucket::WalAccess as i32,
+            peer_id: 0,
+        };
+        let outcome = FaultOutcome {
+            kind: Some(fault_outcome::Kind::Slow(Slow { delay_ms })),
+        };
+        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
+            |e| ClusterTestingError::Run(format!("set_fault wal_access slow: {e}")),
+        )?;
+        Ok(())
+    }
+
+    /// Add a per-call sleep to the WAL syncer on slot `i` (routes
+    /// through `LedgerFaultInjector::set_sync_delay`).
+    #[cfg(feature = "fault-injection")]
+    pub fn slow_disk_access(&self, i: usize, delay_ms: u64) -> Result<(), ClusterTestingError> {
+        use proto::fault::fault_level::Bucket;
+        use proto::fault::{FaultLevel, FaultOutcome, Slow, fault_outcome};
+        let level = FaultLevel {
+            bucket: Bucket::DiskAccess as i32,
+            peer_id: 0,
+        };
+        let outcome = FaultOutcome {
+            kind: Some(fault_outcome::Kind::Slow(Slow { delay_ms })),
+        };
+        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
+            |e| ClusterTestingError::Run(format!("set_fault disk_access slow: {e}")),
+        )?;
+        Ok(())
+    }
+
+    /// Wipe every active fault on slot `i` and release every parked
+    /// stuck op. Mirrors the `ClearAllFaults` RPC.
+    #[cfg(feature = "fault-injection")]
+    pub fn clear_all_faults(&self, i: usize) -> Result<(u32, u32), ClusterTestingError> {
+        Ok(self.fault_injector(i)?.clear_all())
+    }
+
+
     fn slot_mut(&mut self, i: usize) -> Result<&mut NodeSlot, ClusterTestingError> {
         let len = self.slots.len();
         self.slots

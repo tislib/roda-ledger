@@ -63,6 +63,7 @@ pub enum Action {
 
     // ---- Concurrency ----
     AsyncBranch(AsyncBranch),
+    Concurrent(Concurrent),
 
     // ---- Synchronization ----
     Wait(Wait),
@@ -100,6 +101,7 @@ impl Action {
             Action::Submit(_) => "submit",
             Action::SubmitBatch(_) => "submit_batch",
             Action::AsyncBranch(_) => "async_branch",
+            Action::Concurrent(_) => "concurrent",
             Action::Wait(_) => "wait",
             Action::WaitForLevel(_) => "wait_for_level",
             Action::GetBalance(_) => "get_balance",
@@ -160,20 +162,18 @@ pub struct SubmitBatch {
 /// How the batch's operation list is produced.
 #[derive(Clone, Debug)]
 pub enum BatchKind {
-    /// A literal list. Submitted once, in declared order.
+    /// A literal list. Submitted as one `submit_batch` RPC.
     Static(Vec<SubmitOp>),
-    /// Repeat `base` to produce `repeat * batch_size` copies in total.
+    /// Repeat `base` `repeat` times for a total of `base.len() * repeat`
+    /// ops, dispatched in `submit_batch` RPCs of at most `batch_size`
+    /// ops each. `batch_size` is a *chunk size*, not a multiplier: it
+    /// changes how many RPCs go out and how big each one is, never the
+    /// total op count. `batch_size: 0` is treated as `base.len()` —
+    /// one RPC per base copy.
     ///
-    /// `batch_size` controls the on-wire grouping:
-    /// - `0` or `1` → one RPC per `base` copy (legacy per-op submission).
-    ///   Total ops = `base.len() * repeat`.
-    /// - `>= 2` → one batched RPC per outer iteration, carrying
-    ///   `base.len() * batch_size` ops. Total ops =
-    ///   `base.len() * batch_size * repeat`.
-    ///
-    /// In both modes the runner offsets each emitted op's `user_ref` by
-    /// the cumulative `iter * base.len()` so every emitted op has a
-    /// unique `user_ref` across the whole batch.
+    /// Each emitted op's `user_ref` is offset by `iter * base.len()` so
+    /// every op has a unique `user_ref` across the whole batch. Chunk
+    /// boundaries do not have to align with base boundaries.
     Dynamic {
         base: Vec<SubmitOp>,
         repeat: u32,
@@ -195,6 +195,29 @@ pub struct AsyncBranch {
     /// only awaitable implicitly at end-of-scenario.
     pub name: Option<String>,
     pub steps: Vec<Step>,
+}
+
+/// Fork N step-lists, run them in parallel, join all before the step
+/// returns. Each branch runs its steps sequentially; branches do not
+/// share a `RunCtx` while in flight — they build private bindings
+/// that the runner merges into the parent context after every branch
+/// has finished. Any branch returning an error fails the whole step;
+/// the other branches are still awaited before the error propagates.
+///
+/// Contrast with [`AsyncBranch`], which is fire-and-forget and joined
+/// only at end-of-scenario. Use `Concurrent` when the *correctness*
+/// of subsequent steps depends on every branch having completed —
+/// e.g. parallel submits racing a kill/restart cycle, where the
+/// scenario's drain and assertions must run only after both have
+/// settled.
+#[derive(Clone, Debug)]
+pub struct Concurrent {
+    /// Each inner `Vec<Step>` is one branch. Steps within a branch
+    /// are sequential; branches are concurrent.
+    pub branches: Vec<Vec<Step>>,
+    /// Optional per-branch labels for trace output. Length must
+    /// equal `branches.len()` if set.
+    pub labels: Option<Vec<String>>,
 }
 
 // ============================================================
@@ -370,6 +393,10 @@ mod tests {
             Action::AsyncBranch(AsyncBranch {
                 name: None,
                 steps: vec![],
+            }),
+            Action::Concurrent(Concurrent {
+                branches: vec![],
+                labels: None,
             }),
             Action::Wait(Wait {
                 duration: Duration::from_millis(0),

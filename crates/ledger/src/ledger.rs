@@ -33,6 +33,11 @@ pub struct Ledger {
     handles: Vec<JoinHandle<()>>,
     #[allow(dead_code)]
     config: LedgerConfig,
+    /// See [`crate::fault::LedgerFaultInjector`]. Installed on
+    /// `Storage` at construction so the WAL committer's
+    /// `Syncer::sync` reaches it via the propagated hook.
+    #[cfg(feature = "fault-injection")]
+    fault_injector: Arc<crate::fault::LedgerFaultInjector>,
 }
 
 impl Ledger {
@@ -43,6 +48,13 @@ impl Ledger {
 
         let storage = Storage::new(config.storage.clone()).unwrap();
         let storage = Arc::new(storage);
+
+        #[cfg(feature = "fault-injection")]
+        let fault_injector = {
+            let injector = crate::fault::LedgerFaultInjector::new();
+            storage.set_fault(Some(injector.clone()));
+            injector
+        };
 
         let pipeline = Pipeline::new(&config);
         let wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
@@ -61,7 +73,17 @@ impl Ledger {
             wasm_runtime,
             handles: Vec::new(),
             config,
+            #[cfg(feature = "fault-injection")]
+            fault_injector,
         }
+    }
+
+    /// Test-only accessor; gated by the `fault-injection` feature.
+    /// See [`crate::fault::LedgerFaultInjector`] for the supported
+    /// fault axes (v1: stuck `fdatasync`).
+    #[cfg(feature = "fault-injection")]
+    pub fn fault_injector(&self) -> Arc<crate::fault::LedgerFaultInjector> {
+        self.fault_injector.clone()
     }
 
     pub fn submit(&self, operation: Operation) -> u64 {
@@ -372,10 +394,12 @@ impl Ledger {
         }
     }
 
-    /// Build a stateful `WalTailer` bound to this ledger's storage.
+    /// Build a stateful `WalTailer` pre-positioned at the first
+    /// `TxMetadata` with `tx_id >= from_tx_id`. After construction,
+    /// `tail()` just reads from the cursor and advances.
     /// See [`WalTailer`] for cursor semantics (ADR-015).
-    pub fn wal_tailer(&self) -> WalTailer {
-        self.storage.wal_tailer()
+    pub fn wal_tailer(&self, from_tx_id: u64) -> WalTailer {
+        self.storage.wal_tailer(from_tx_id)
     }
 
     /// DIAG-flake-replication: storage's current active-segment id.

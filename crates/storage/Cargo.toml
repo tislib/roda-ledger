@@ -9,6 +9,13 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enables the `SyncFault` hook in `Syncer::sync` and related test
+# seams. Gated so production builds compile out the hook entirely.
+# See ADR-018.
+fault-injection = []
+
 [dependencies]
 serde.workspace = true
 spdlog-rs.workspace = true
@@ -23,3 +30,7 @@ lz4_flex = "0.11"
 tempfile.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+
+[[bench]]
+name = "wal_tail_bench"
+harness = false

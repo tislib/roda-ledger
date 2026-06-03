@@ -1,5 +1,72 @@
 # roda-raft Design
 
+**Last-Updated:** 2026-05-26
+
+## 2026-05-26 Decisions
+
+These decisions amend ADR-017 to match what shipped. The drift here
+is larger than for the cluster ADRs because the library's API took a
+different shape than originally proposed.
+
+1. **Driver entry points are split borrow-view methods, not one
+   `step(now, event) -> Vec<Action>`.** Supersedes §"Architectural
+   Boundary" and §"Driver call pattern"'s unified-step description.
+   The library exposes separate election-side, replication-side, and
+   handshake-validation entry points, plus distinct local-index /
+   cluster-index advance methods and a leader-activity notice. There
+   is no `Action` enum; state mutates in place and the driver reads
+   getters.
+
+2. **Two commit indexes, not three.** Supersedes §"Three Indexes"
+   and the consumption sites called out in §"AE reply: write vs
+   commit watermark". The library tracks a local-commit watermark
+   and a cluster-commit watermark; the proposed third index
+   (`local_write_index`, intended to decouple the replication window
+   from quorum) was not adopted. Every site the ADR delegated to the
+   write-index currently reads the local-commit watermark.
+
+3. **Append reply carries one watermark, not two.** Supersedes
+   §"AE reply: write vs commit watermark". The success and reject
+   results carry only the follower's durable commit watermark; there
+   is no separate accepted-but-not-yet-fsync'd watermark. Today's
+   invariant is that the follower's success reply is gated on its
+   own durability ack; future split-ack work would re-open this.
+
+4. **Validation happens once per replication stream, at the
+   handshake.** Supersedes §"One Range Per AppendEntries" and
+   §"Driver call pattern"'s `validate_append_entries_request`
+   cadence. The handshake runs the §5.1 / §5.3 / §5.4 checks at
+   stream opening; subsequent WAL bytes and heartbeats on the stream
+   are trusted. A §5.3 mismatch still produces a reject carrying a
+   truncate-after watermark, distinct from a stale-term reject.
+
+5. **Persistence-failure handling is panic, not a recoverable
+   fatal-action.** Supersedes §"Required Invariants" item 6 and
+   §"Persistence trait contract"'s `Result`-returning writes. The
+   persistence trait's mutating methods do not surface a recoverable
+   error; unrecoverable storage failures panic the process. There
+   is no fatal-terminal role variant.
+
+6. **The leader ships its full term-log snapshot on every
+   handshake.** Net-new decision (no prior ADR section). The library
+   exposes a term-log snapshot accessor consumed by the leader at
+   handshake construction so the follower can resolve §5.3 anchors
+   that fall outside its own term-log window. Marked as a stop-gap
+   until `InstallSnapshot` covers cross-term catch-up.
+
+7. **Leader-activity notice is a separate driver call.** Net-new
+   decision. Followers reset their election timer from steady-state
+   WAL traffic via a dedicated `note_leader_activity` call without
+   re-running handshake validation; keeps the steady-state path off
+   the single validation site.
+
+8. **Roles are `Initializing` / `Follower` / `Candidate` / `Leader`;
+   no fatal terminal role.** Confirms most of §"What raft Owns" but
+   explicitly retires the §"Required Invariants" hint at a frozen
+   terminal state — superseded by item 5 above.
+
+---
+
 ## Goals
 
 Extract a pure, deterministic Raft state machine as a separate crate inside the roda-ledger workspace. The library is specialised to roda-ledger (not generalised), independent of cluster/ledger code, and testable in isolation with a deterministic simulator. The previous `cluster::raft` module is replaced; specific known bugs (term-bump-before-win race, ghost-term bumping on boot, missing §5.3 truncation logic, term log drifting from the entry log) cannot recur under the new design.

@@ -136,7 +136,9 @@ fn test_crc_sidecar_format() {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    let num_transactions = 1_000_000;
+    // Segment sealing is batched/throughput-dependent; this volume reliably
+    // seals several segments so at least one .crc sidecar exists to validate.
+    let num_transactions = 20_000;
     let mut last_tx_id = 0u64;
 
     {

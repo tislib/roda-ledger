@@ -1,9 +1,14 @@
 //! Raw WAL byte streaming for ADR-015 Cluster Mode leader shipping.
 //!
 //! The tailer is a cursor — it holds one open `File` handle and a byte
-//! position. Each `tail()` call does a positional read (`pread`) of only the
-//! new bytes and filters/compacts them in place. It never parses records
-//! beyond checking the 1-byte kind tag and the 8-byte `tx_id` field.
+//! position. The starting `from_tx_id` is set once at construction (via
+//! [`Storage::wal_tailer`] / [`crate::WalTailer::new`]); the constructor
+//! walks back through sealed segments to the one containing `from_tx_id`
+//! and scans forward inside it to position the cursor at the first
+//! `TxMetadata` whose `tx_id >= from_tx_id`. Subsequent [`tail`](WalTailer::tail)
+//! calls do a positional read (`pread`) of new bytes from the current
+//! cursor and advance the cursor — there is no re-filtering and the
+//! caller does not pass `from_tx_id` again.
 //!
 //! Rotation detection is inode-based: when the file we opened as `wal.bin`
 //! is renamed to `wal_{id:06}.bin` by a segment rotation, our `File` still
@@ -14,16 +19,13 @@ use crate::engine::Storage;
 use crate::entities::{WalEntry, WalEntryKind};
 use crate::layout::{active_wal_path, segment_wal_path};
 use crate::wal_serializer::parse_wal_record;
+use crate::wal_zero_copy::{WalEntryRef, iter_records};
 use spdlog::{debug, trace};
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Every WAL record is `#[repr(C)]` and exactly 40 bytes (entities.rs asserts).
-pub const WAL_RECORD_SIZE: usize = 40;
-/// `tx_id` offset shared by TxMetadata, TxEntry, TxLink.
-const TX_ID_OFFSET: usize = 8;
+use crate::constants::{TX_ID_OFFSET, WAL_RECORD_SIZE};
 
 /// Decode a buffer returned by [`WalTailer::tail`] into `WalEntry` values.
 /// Malformed 40-byte records are skipped; extra trailing bytes are ignored.
@@ -39,18 +41,21 @@ pub fn decode_records(bytes: &[u8]) -> Vec<WalEntry> {
     out
 }
 
-/// Stateful raw-byte WAL tailer. Holds one open `File` + byte position so
-/// successive `tail()` calls pay only for the new bytes, not for re-scanning
-/// the whole segment.
+/// Stateful raw-byte WAL tailer. Holds one open `File` + byte position
+/// so successive [`tail`](WalTailer::tail) calls only pay for new
+/// bytes. The starting `from_tx_id` is bound at construction and the
+/// cursor is pre-positioned at the first `TxMetadata` with `tx_id >=
+/// from_tx_id`; the tail loop is purely "read-from-cursor, advance".
 pub struct WalTailer {
     storage: Arc<Storage>,
+    /// The `from_tx_id` this tailer was built for — kept so
+    /// [`reset`](WalTailer::reset) can re-locate without the caller
+    /// having to pass it again.
+    from_tx_id: u64,
     cursor: Option<Cursor>,
 }
 
 struct Cursor {
-    /// The `from_tx_id` the caller is currently streaming for. A strictly
-    /// smaller value on the next call triggers a re-seek.
-    from_tx_id: u64,
     /// Open file handle to either `wal.bin` (when `is_active`) or
     /// `wal_{segment_id:06}.bin` (when sealed/closed).
     file: File,
@@ -67,47 +72,68 @@ struct Cursor {
     /// True when the file was opened as `wal.bin`. Becomes irrelevant
     /// after we advance to the next segment.
     is_active: bool,
-    /// Most recent `TxMetadata.tx_id` observed while filtering. Sub-items
-    /// (`TxTerm`, `FunctionRegistered`) carry no tx_id of their own and
-    /// inherit this for the `>= from_tx_id` filter.
-    last_meta_tx_id: u64,
 }
 
 impl WalTailer {
-    pub fn new(storage: Arc<Storage>) -> Self {
-        Self {
+    /// Build a tailer positioned at the first `TxMetadata` whose
+    /// `tx_id >= from_tx_id`. After construction, [`tail`](Self::tail)
+    /// just reads forward from the cursor.
+    ///
+    /// Locate semantics:
+    /// - `from_tx_id == 0` → open the active segment, position 0 (no
+    ///   walk-back through sealed segments — preserves the "from current
+    ///   active" sentinel the cluster heartbeat path relied on).
+    /// - `from_tx_id > 0` → walk back through sealed segments until we
+    ///   reach the one whose first `TxMetadata` is `<= from_tx_id`,
+    ///   then scan forward inside it to land on the first record with
+    ///   `tx_id >= from_tx_id`.
+    ///
+    /// Failures during locate (missing file, IO error) leave the cursor
+    /// `None`; subsequent tails return 0.
+    pub fn new(storage: Arc<Storage>, from_tx_id: u64) -> Self {
+        let mut t = Self {
             storage,
+            from_tx_id,
             cursor: None,
-        }
+        };
+        let _ = t.locate();
+        t
     }
 
-    /// Reset the cursor; the next `tail()` re-seeks.
+    /// Re-run the initial locate. Useful for tests that want to rewind a
+    /// tailer back to its construction-time position without rebuilding it.
     pub fn reset(&mut self) {
         self.cursor = None;
+        let _ = self.locate();
     }
 
-    /// Stream WAL bytes from `from_tx_id` into `buffer`; returns bytes written.
-    /// Resumes from the cached cursor on a monotonic non-decreasing `from_tx_id`.
-    pub fn tail(&mut self, from_tx_id: u64, buffer: &mut [u8]) -> u32 {
+    /// Stream WAL bytes into `buffer` starting from the cursor; returns
+    /// the number of bytes written. The cursor advances by that amount,
+    /// so the next call resumes immediately after.
+    ///
+    /// The returned slice is always trimmed to a whole-transaction
+    /// boundary. If the read ends inside a `TxMetadata + followers`
+    /// group whose final follower hasn't been written yet, that
+    /// partial group is excluded from the count and the cursor is
+    /// rewound to its start — the next `tail()` will pick it up once
+    /// the writer has appended the missing followers. This prevents
+    /// shipping torn groups to a peer (the bug class that produced
+    /// `[meta_X, follower_X1, meta_X, …]` corruption on followers
+    /// when the leader's tailer split a tx).
+    ///
+    /// **Buffer-size contract.** `buffer` must be large enough to
+    /// hold at least one complete tx group `(meta + sub_item_count
+    /// followers)` end-to-end. If it isn't, the trim path will
+    /// reject every read as partial and `tail()` will return `0` in
+    /// a loop without making progress. Production callers
+    /// (replication driver) size `buffer` from
+    /// `append_entries_max_bytes` (4 MiB default) which dwarfs any
+    /// real tx group. Tests can drop as low as `40 * (1 +
+    /// max_sub_item_count)` bytes.
+    pub fn tail(&mut self, buffer: &mut [u8]) -> u32 {
         let capacity = buffer.len() - (buffer.len() % WAL_RECORD_SIZE);
-        if capacity == 0 {
+        if capacity == 0 || self.cursor.is_none() {
             return 0;
-        }
-
-        // Seek on first call or regression; otherwise keep the existing
-        // cursor. Either way, stamp the caller's `from_tx_id` onto the
-        // cursor so the filter below uses the correct value — a freshly
-        // seeded cursor starts at 0 and would otherwise leak structural
-        // records when `from_tx_id > 0`.
-        let regressed = self
-            .cursor
-            .as_ref()
-            .is_some_and(|c| from_tx_id < c.from_tx_id);
-        if (self.cursor.is_none() || regressed) && self.seek(from_tx_id).is_err() {
-            return 0;
-        }
-        if let Some(c) = self.cursor.as_mut() {
-            c.from_tx_id = from_tx_id;
         }
 
         let mut written = 0usize;
@@ -132,7 +158,7 @@ impl WalTailer {
                     trace!(
                         "DIAG-flake-replication: tailer.tail advance_segment=false \
                          from_tx_id={} segment_id={} is_active={} position={} file_len={}",
-                        from_tx_id, pre_segment_id, pre_is_active, pre_position, pre_file_len,
+                        self.from_tx_id, pre_segment_id, pre_is_active, pre_position, pre_file_len,
                     );
                     break;
                 }
@@ -158,41 +184,32 @@ impl WalTailer {
                 break;
             }
             cursor.position += n_aligned as u64;
+            written += n_aligned;
+        }
 
-            // In-place filter: keep records whose tx_id (own or inherited
-            // from the preceding meta) is >= from_tx_id.
-            let from_tx_id = cursor.from_tx_id;
-            let records = n_aligned / WAL_RECORD_SIZE;
-            let mut w = 0usize;
-            for r in 0..records {
-                let src = r * WAL_RECORD_SIZE;
-                let rec = &dst[src..src + WAL_RECORD_SIZE];
-                if rec[0] == WalEntryKind::TxMetadata as u8 {
-                    cursor.last_meta_tx_id = u64::from_le_bytes(
-                        rec[TX_ID_OFFSET..TX_ID_OFFSET + 8]
-                            .try_into()
-                            .expect("WAL record is exactly 40 bytes"),
-                    );
-                }
-                let keep = record_matches(rec, from_tx_id, cursor.last_meta_tx_id);
-                if keep {
-                    if w != r {
-                        dst.copy_within(src..src + WAL_RECORD_SIZE, w * WAL_RECORD_SIZE);
-                    }
-                    w += 1;
-                }
+        // Trim a trailing partial tx group, if any. The bytes after
+        // `complete_end` are a `TxMetadata` whose followers haven't all
+        // arrived yet (or, defensively, a stray follower without a
+        // preceding metadata — also discarded). Rewind the cursor so
+        // those bytes are re-read on the next call.
+        let complete_end = last_complete_tx_end(&buffer[..written]);
+        if complete_end < written {
+            let partial = (written - complete_end) as u64;
+            if let Some(c) = self.cursor.as_mut() {
+                c.position -= partial;
             }
-            written += w * WAL_RECORD_SIZE;
+            written = complete_end;
         }
 
         written as u32
     }
 
-    /// Position the cursor at the start of the segment most likely to contain
-    /// `from_tx_id`. Starts at the active segment and walks backward through
-    /// sealed segments until the first transactional record's tx_id is
-    /// `<= from_tx_id` (or we run out of segments).
-    fn seek(&mut self, from_tx_id: u64) -> std::io::Result<()> {
+    /// Open the segment that holds `self.from_tx_id` (walking back
+    /// through sealed segments if needed) and advance the cursor's
+    /// `position` to the first `TxMetadata` with `tx_id >= from_tx_id`.
+    ///
+    /// Idempotent — safe to call from [`reset`](Self::reset).
+    fn locate(&mut self) -> std::io::Result<()> {
         // DIAG-flake-replication: capture pre-seek state so we can see
         // both the path being opened and the storage's view of the
         // current segment id.
@@ -200,15 +217,15 @@ impl WalTailer {
         let active_path_for_diag = active_wal_path(Path::new(&data_dir_for_diag));
         let last_segment_id_for_diag = self.storage.last_segment_id();
         debug!(
-            "DIAG-flake-replication: tailer.seek BEGIN from_tx_id={} \
+            "DIAG-flake-replication: tailer.locate BEGIN from_tx_id={} \
              active_path={:?} last_segment_id={}",
-            from_tx_id, active_path_for_diag, last_segment_id_for_diag
+            self.from_tx_id, active_path_for_diag, last_segment_id_for_diag
         );
 
         self.open_active()?;
-        if from_tx_id == 0 {
+        if self.from_tx_id == 0 {
             debug!(
-                "DIAG-flake-replication: tailer.seek END from_tx_id=0 (no walk-back) \
+                "DIAG-flake-replication: tailer.locate END from_tx_id=0 (no walk-back) \
                  segment_id={} is_active={}",
                 self.cursor.as_ref().map_or(0, |c| c.segment_id),
                 self.cursor.as_ref().is_some_and(|c| c.is_active),
@@ -221,53 +238,65 @@ impl WalTailer {
         loop {
             let Some(cursor) = self.cursor.as_ref() else {
                 debug!(
-                    "DIAG-flake-replication: tailer.seek END cursor=None from_tx_id={}",
-                    from_tx_id
+                    "DIAG-flake-replication: tailer.locate END cursor=None from_tx_id={}",
+                    self.from_tx_id
                 );
                 return Ok(());
             };
             let first_tx_in_active = first_tx_id_in_file(&cursor.file);
             match first_tx_in_active {
-                Some(first) if first > from_tx_id => {
+                Some(first) if first > self.from_tx_id => {
                     if cursor.segment_id <= 1 {
                         debug!(
-                            "DIAG-flake-replication: tailer.seek END walk-back stopped \
+                            "DIAG-flake-replication: tailer.locate END walk-back stopped \
                              at segment_id<=1 (segment_id={}, first_tx_in_segment={}, \
                              from_tx_id={})",
-                            cursor.segment_id, first, from_tx_id
+                            cursor.segment_id, first, self.from_tx_id
                         );
-                        return Ok(());
+                        break;
                     }
                     let prev = cursor.segment_id - 1;
                     let prev_path = segment_wal_path(data_dir, prev);
                     if !prev_path.exists() {
                         debug!(
-                            "DIAG-flake-replication: tailer.seek END walk-back missing \
+                            "DIAG-flake-replication: tailer.locate END walk-back missing \
                              prev segment file {:?} (from_tx_id={})",
-                            prev_path, from_tx_id
+                            prev_path, self.from_tx_id
                         );
-                        return Ok(());
+                        break;
                     }
                     debug!(
-                        "DIAG-flake-replication: tailer.seek walking back to sealed \
+                        "DIAG-flake-replication: tailer.locate walking back to sealed \
                          segment {} (current first={}, from_tx_id={})",
-                        prev, first, from_tx_id
+                        prev, first, self.from_tx_id
                     );
                     self.open_sealed(prev)?;
                 }
                 // `None` (no tx records in this file yet) — caller is asking
-                // for tx_id in the future; nothing to do.
+                // for tx_id in the future; or `Some(first) <= from_tx_id` —
+                // this is the segment we want.
                 other => {
                     debug!(
-                        "DIAG-flake-replication: tailer.seek END parking cursor \
+                        "DIAG-flake-replication: tailer.locate END parking on segment \
                          from_tx_id={} segment_id={} is_active={} \
-                         first_tx_in_segment={:?} (None == only-header / no-tx-records)",
-                        from_tx_id, cursor.segment_id, cursor.is_active, other,
+                         first_tx_in_segment={:?}",
+                        self.from_tx_id, cursor.segment_id, cursor.is_active, other,
                     );
-                    return Ok(());
+                    break;
                 }
             }
         }
+
+        // Scan the located segment forward to find the byte offset of
+        // the first `TxMetadata` with `tx_id >= from_tx_id`; that's our
+        // tail start point. If no such record exists yet, we park at
+        // end-of-file and `tail()` will return 0 until the writer
+        // appends one.
+        let Some(cursor) = self.cursor.as_mut() else {
+            return Ok(());
+        };
+        cursor.position = first_meta_offset_at_or_after(&cursor.file, self.from_tx_id);
+        Ok(())
     }
 
     fn open_active(&mut self) -> std::io::Result<()> {
@@ -290,16 +319,12 @@ impl WalTailer {
     ) -> std::io::Result<()> {
         let file = File::open(path)?;
         let inode = file.metadata()?.ino();
-        let carried_from_tx = self.cursor.as_ref().map_or(0, |c| c.from_tx_id);
-        let carried_last_meta = self.cursor.as_ref().map_or(0, |c| c.last_meta_tx_id);
         self.cursor = Some(Cursor {
-            from_tx_id: carried_from_tx,
             file,
             inode,
             position: 0,
             segment_id,
             is_active,
-            last_meta_tx_id: carried_last_meta,
         });
         Ok(())
     }
@@ -348,8 +373,58 @@ impl WalTailer {
     }
 }
 
-/// First transactional record's `tx_id` in `file`, or `None` if there are
-/// no tx records yet (an empty active segment).
+/// Walks `bytes` as a sequence of 40-byte WAL records and returns the
+/// byte offset immediately after the last complete `TxMetadata +
+/// followers` group. Bytes from this offset to `bytes.len()` are a
+/// trailing partial group — either a `TxMetadata` whose followers are
+/// still pending on disk, or (defensively) a stray non-metadata record
+/// with no preceding metadata.
+///
+/// Uses [`iter_records`] for record decoding so the structural rules
+/// (metadata starts a group, `sub_item_count` followers complete it)
+/// live in one place. Returns `0` if no complete group is present.
+fn last_complete_tx_end(bytes: &[u8]) -> usize {
+    let mut last_complete_end: usize = 0;
+    let mut in_group = false;
+    let mut pending_followers: u16 = 0;
+
+    for (idx, rec) in iter_records(bytes).enumerate() {
+        let end_off = (idx + 1) * WAL_RECORD_SIZE;
+        match rec {
+            WalEntryRef::Metadata(m) => {
+                in_group = true;
+                pending_followers = m.sub_item_count;
+                if pending_followers == 0 {
+                    last_complete_end = end_off;
+                    in_group = false;
+                }
+            }
+            WalEntryRef::Entry(_)
+            | WalEntryRef::Link(_)
+            | WalEntryRef::FunctionRegistered(_)
+            | WalEntryRef::Term(_) => {
+                if !in_group {
+                    // Orphan follower — the cursor invariant says this
+                    // shouldn't happen, but if it does we refuse to ship
+                    // it and stop trimming here.
+                    break;
+                }
+                pending_followers = pending_followers.saturating_sub(1);
+                if pending_followers == 0 {
+                    last_complete_end = end_off;
+                    in_group = false;
+                }
+            }
+        }
+    }
+
+    last_complete_end
+}
+
+/// First `TxMetadata.tx_id` in `file`, or `None` if there are no
+/// metadata records yet (an empty active segment, or one populated
+/// only with structural / follower records — pre-refactor this also
+/// honoured `TxEntry` / `TxLink` but those no longer carry tx_id).
 fn first_tx_id_in_file(file: &File) -> Option<u64> {
     let mut buf = [0u8; WAL_RECORD_SIZE];
     let mut off = 0u64;
@@ -359,11 +434,7 @@ fn first_tx_id_in_file(file: &File) -> Option<u64> {
             _ => return None,
         }
         off += WAL_RECORD_SIZE as u64;
-        let kind = buf[0];
-        let has_tx = kind == WalEntryKind::TxMetadata as u8
-            || kind == WalEntryKind::TxEntry as u8
-            || kind == WalEntryKind::Link as u8;
-        if has_tx {
+        if buf[0] == WalEntryKind::TxMetadata as u8 {
             return Some(u64::from_le_bytes(
                 buf[TX_ID_OFFSET..TX_ID_OFFSET + 8].try_into().ok()?,
             ));
@@ -371,55 +442,39 @@ fn first_tx_id_in_file(file: &File) -> Option<u64> {
     }
 }
 
-#[inline]
-fn record_matches(record: &[u8], from_tx_id: u64, last_meta_tx_id: u64) -> bool {
-    debug_assert_eq!(record.len(), WAL_RECORD_SIZE);
-    let kind = record[0];
-    let has_own_tx_id = kind == WalEntryKind::TxMetadata as u8
-        || kind == WalEntryKind::TxEntry as u8
-        || kind == WalEntryKind::Link as u8;
-
-    if has_own_tx_id {
-        let tx_id = u64::from_le_bytes(
-            record[TX_ID_OFFSET..TX_ID_OFFSET + 8]
-                .try_into()
-                .expect("WAL record is exactly 40 bytes"),
-        );
-        return tx_id >= from_tx_id;
+/// Byte offset within `file` of the first `TxMetadata` whose
+/// `tx_id >= from_tx_id`. Used by [`WalTailer::locate`] to position
+/// the cursor so subsequent `tail()` calls return only records the
+/// caller is interested in — no in-line filtering required.
+///
+/// Returns the file length when no such metadata exists (yet); the
+/// cursor parks at EOF and reads zero bytes until the writer appends
+/// a new transaction.
+fn first_meta_offset_at_or_after(file: &File, from_tx_id: u64) -> u64 {
+    const CHUNK: usize = 1 << 22;       // 4 MiB = 100k records / read
+    let mut buf = vec![0u8; CHUNK];
+    let mut off: u64 = 0;
+    loop {
+        let n = match file.read_at(&mut buf, off) {
+            Ok(0) | Err(_) => return off,
+            Ok(n) => n - (n % WAL_RECORD_SIZE),
+        };
+        if n == 0 { return off; }
+        // walk the in-memory chunk using iter_records (zero-copy)
+        for (i, rec) in iter_records(&buf[..n]).enumerate() {
+            if let WalEntryRef::Metadata(m) = rec
+                && m.tx_id >= from_tx_id
+            {
+                return off + (i * WAL_RECORD_SIZE) as u64;
+            }
+        }
+        off += n as u64;
     }
-
-    // TxTerm and FunctionRegistered inherit tx_id from the preceding TxMetadata.
-    last_meta_tx_id >= from_tx_id
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn record_matches_filters_by_tx_id() {
-        let mut rec = [0u8; WAL_RECORD_SIZE];
-        rec[0] = WalEntryKind::TxMetadata as u8;
-        rec[TX_ID_OFFSET..TX_ID_OFFSET + 8].copy_from_slice(&5u64.to_le_bytes());
-        assert!(record_matches(&rec, 0, 0));
-        assert!(record_matches(&rec, 5, 0));
-        assert!(!record_matches(&rec, 6, 0));
-    }
-
-    #[test]
-    fn sub_item_inherits_parent_meta_tx_id() {
-        let mut term = [0u8; WAL_RECORD_SIZE];
-        term[0] = WalEntryKind::TxTerm as u8;
-        // last_meta_tx_id = 10, from_tx_id = 5 → keep
-        assert!(record_matches(&term, 5, 10));
-        // last_meta_tx_id = 10, from_tx_id = 11 → drop
-        assert!(!record_matches(&term, 11, 10));
-
-        let mut func = [0u8; WAL_RECORD_SIZE];
-        func[0] = WalEntryKind::FunctionRegistered as u8;
-        assert!(record_matches(&func, 5, 10));
-        assert!(!record_matches(&func, 11, 10));
-    }
 
     use crate::config::StorageConfig;
     use crate::entities::{
@@ -428,11 +483,16 @@ mod tests {
     use crate::wal_serializer::serialize_wal_records;
     use std::io::Write;
 
-    fn meta(tx_id: u64) -> WalEntry {
+    /// Build a `TxMetadata` whose `sub_item_count` matches the number
+    /// of follower records the test writes immediately after it.
+    /// `tail()` trims trailing partial groups (meta whose declared
+    /// followers haven't all landed), so each test fixture must be
+    /// structurally consistent on this count.
+    fn meta(tx_id: u64, sub_item_count: u16) -> WalEntry {
         WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
             fail_reason: FailReason::NONE,
-            sub_item_count: 3,
+            sub_item_count,
             crc32c: 0,
             tx_id,
             timestamp: 0,
@@ -440,23 +500,26 @@ mod tests {
             tag: [0; 8],
         })
     }
-    fn entry(tx_id: u64) -> WalEntry {
+    fn entry(_tx_id: u64) -> WalEntry {
+        // The `_tx_id` arg is kept for callsite readability; the field
+        // is no longer stored on `TxEntry` (it lives only on the
+        // preceding `TxMetadata`).
         WalEntry::Entry(TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
             kind: EntryKind::Credit,
             _pad0: [0; 6],
-            tx_id,
+            _pad1: [0; 8],
             account_id: 1,
             amount: 1,
             computed_balance: 1,
         })
     }
-    fn link(tx_id: u64) -> WalEntry {
+    fn link(_tx_id: u64) -> WalEntry {
         WalEntry::Link(TxLink {
             entry_type: WalEntryKind::Link as u8,
             link_kind: TxLinkKind::Duplicate as u8,
             _pad: [0; 6],
-            tx_id,
+            _pad1: [0; 8],
             to_tx_id: 0,
             _pad2: [0; 16],
         })
@@ -491,57 +554,106 @@ mod tests {
 
     #[test]
     fn tail_bridges_sealed_segment_to_active() {
-        // segment 1 (sealed): tx=1 records ending with a structural TxTerm.
-        // active (wal.bin): tx=2 records. The carried last_meta_tx_id=1
-        // from segment 1 must not leak any tx=1 sub-items into the result
-        // when the caller asks for from_tx_id=2.
+        // segment 1 (sealed): tx=1 = meta(sub=3) + 3 followers — a
+        // complete group.
+        // active (wal.bin): tx=2 = meta(sub=2) + 2 followers — also
+        // complete. The cursor must position past sealed and emit
+        // exactly tx=2's three records without leaking any tx=1.
         let dir = tempfile::tempdir().unwrap();
         write_segment(
             &segment_wal_path(dir.path(), 1),
-            &[meta(1), entry(1), link(1), term()],
+            &[meta(1, 3), entry(1), link(1), term()],
         );
-        write_segment(&active_wal_path(dir.path()), &[meta(2), entry(2), link(2)]);
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[meta(2, 2), entry(2), link(2)],
+        );
 
         let storage = open_storage(&dir);
-        let mut tailer = storage.wal_tailer();
+        let mut tailer = storage.wal_tailer(2);
         let mut buf = vec![0u8; 64 * WAL_RECORD_SIZE];
 
         // from_tx_id=2 should yield exactly the three tx=2 records.
-        let n = tailer.tail(2, &mut buf) as usize;
+        let n = tailer.tail(&mut buf) as usize;
         assert_eq!(n, 3 * WAL_RECORD_SIZE, "expected 3 records for tx=2");
         let decoded = decode_records(&buf[..n]);
         assert_eq!(decoded.len(), 3);
-        for e in &decoded {
-            assert_eq!(e.tx_id(), 2);
-        }
+        // First record must be the TxMetadata carrying tx_id=2; the
+        // follower records belong to it implicitly.
+        assert!(
+            matches!(decoded[0], WalEntry::Metadata(m) if m.tx_id == 2),
+            "expected first record to be TxMetadata(tx_id=2), got {:?}",
+            decoded[0]
+        );
     }
 
     #[test]
     fn tail_returns_records_spanning_segments() {
-        // segment 1 (sealed): tx=1 ... tx=2 records.
-        // active (wal.bin): tx=3 records.
-        // from_tx_id=2 must cross the boundary and emit tx=2 (sealed) + tx=3 (active).
+        // segment 1 (sealed): tx=1 (meta + entry) + tx=2 (meta + entry
+        // + term). Two complete groups.
+        // active (wal.bin): tx=3 (meta + entry + link). Complete group.
+        // from_tx_id=2 must cross the boundary and emit tx=2 (sealed)
+        // + tx=3 (active).
         let dir = tempfile::tempdir().unwrap();
         write_segment(
             &segment_wal_path(dir.path(), 1),
-            &[meta(1), entry(1), meta(2), entry(2), term()],
+            &[meta(1, 1), entry(1), meta(2, 2), entry(2), term()],
         );
-        write_segment(&active_wal_path(dir.path()), &[meta(3), entry(3), link(3)]);
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[meta(3, 2), entry(3), link(3)],
+        );
 
         let storage = open_storage(&dir);
-        let mut tailer = storage.wal_tailer();
+        let mut tailer = storage.wal_tailer(2);
         let mut buf = vec![0u8; 64 * WAL_RECORD_SIZE];
 
-        let n = tailer.tail(2, &mut buf) as usize;
+        let n = tailer.tail(&mut buf) as usize;
         let decoded = decode_records(&buf[..n]);
         // Expected: TxMetadata(2), TxEntry(2), TxTerm (inherits 2),
         // TxMetadata(3), TxEntry(3), TxLink(3) = 6 records.
         assert_eq!(decoded.len(), 6, "got {:?}", decoded);
-        // First three are tx=2 (or inherit 2 via TxTerm).
+        // First three are tx=2 (TxEntry/TxTerm inherit tx_id from the
+        // preceding TxMetadata).
         assert!(matches!(decoded[0], WalEntry::Metadata(m) if m.tx_id == 2));
-        assert!(matches!(decoded[1], WalEntry::Entry(e) if e.tx_id == 2));
+        assert!(matches!(decoded[1], WalEntry::Entry(_)));
         assert!(matches!(decoded[2], WalEntry::Term(_)));
         // Then tx=3.
         assert!(matches!(decoded[3], WalEntry::Metadata(m) if m.tx_id == 3));
+    }
+
+    #[test]
+    fn tail_trims_partial_trailing_group() {
+        // active (wal.bin): tx=1 complete + tx=2 partial (meta
+        // declares 3 followers, only 1 has been written so far).
+        // tail() must return only tx=1's records and rewind the
+        // cursor to the start of tx=2's metadata; the next call
+        // (after the writer appends the missing followers) sees the
+        // complete group.
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[meta(1, 1), entry(1), meta(2, 3), entry(2)],
+        );
+
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer(1);
+        let mut buf = vec![0u8; 64 * WAL_RECORD_SIZE];
+
+        let n = tailer.tail(&mut buf) as usize;
+        assert_eq!(
+            n,
+            2 * WAL_RECORD_SIZE,
+            "expected only tx=1's 2 records; partial tx=2 must be trimmed",
+        );
+        let decoded = decode_records(&buf[..n]);
+        assert!(matches!(decoded[0], WalEntry::Metadata(m) if m.tx_id == 1));
+        assert!(matches!(decoded[1], WalEntry::Entry(_)));
+
+        // A subsequent call with nothing new appended returns 0 (the
+        // partial is still partial). The cursor sits at the partial
+        // metadata's offset, ready to re-read once it's complete.
+        let again = tailer.tail(&mut buf) as usize;
+        assert_eq!(again, 0);
     }
 }

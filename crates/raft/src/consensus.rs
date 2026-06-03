@@ -346,6 +346,15 @@ impl<P: Persistence> RaftNode<P> {
     /// back to `now + heartbeat_interval` when nothing is pending —
     /// the cluster's tight loop expects an `Instant`, not an
     /// `Option`.
+    ///
+    /// The returned deadline is floored at `now + heartbeat_interval`
+    /// even when leader peers report past deadlines. The cluster
+    /// drives heartbeats through its own WAL-tailing path rather than
+    /// raft's [`Self::append_entries_request_for`], so
+    /// `peer.next_heartbeat` is never advanced and would otherwise
+    /// stay perpetually in the past — turning the cluster's
+    /// `tokio::time::sleep_until(deadline)` into a no-op and pegging
+    /// the consensus thread at 100 % CPU.
     pub(crate) fn next_pending_wakeup(&self, now: Instant) -> Instant {
         let mut best: Option<Instant> = None;
         if let Some(d) = self.election_timer.deadline() {
@@ -356,7 +365,16 @@ impl<P: Persistence> RaftNode<P> {
         {
             best = Some(best.map(|b| b.min(d)).unwrap_or(d));
         }
-        best.unwrap_or_else(|| now + self.cfg.heartbeat_interval)
+        let deadline = best.unwrap_or_else(|| now + self.cfg.heartbeat_interval);
+        // Past deadlines turn the cluster's `sleep_until` into a
+        // no-op; push them forward by one heartbeat interval. Future
+        // deadlines pass through untouched so a follower whose
+        // election timer is about to fire isn't artificially delayed.
+        if deadline <= now {
+            now + self.cfg.heartbeat_interval
+        } else {
+            deadline
+        }
     }
 
     /// Observe a higher term via inbound RPC (request OR reply).

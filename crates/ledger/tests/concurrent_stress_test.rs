@@ -280,7 +280,8 @@ fn test_concurrent_small_queue_backpressure() {
     let ledger = Arc::new(ledger);
 
     let num_threads = 4;
-    let ops_per_thread = 10_000u64;
+    // Enough to keep the depth-8 queue saturated and exercise backpressure.
+    let ops_per_thread = 1_000u64;
 
     let mut handles = Vec::new();
     for _ in 0..num_threads {

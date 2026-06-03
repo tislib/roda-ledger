@@ -22,9 +22,9 @@ pub mod types;
 
 pub use step::{
     Action, AssertBalance, AssertBalanceSum, AssertLeader, AssertPipelineCaughtUp, AssertTxStatus,
-    AsyncBranch, BatchKind, GetBalance, GetPipelineIndex, HealPartition, KillNode, PartitionPair,
-    RegisterFunction, RestartNode, StartNode, Step, StepMeta, StopNode, Submit, SubmitBatch,
-    UnregisterFunction, Wait, WaitForLevel,
+    AsyncBranch, BatchKind, Concurrent, GetBalance, GetPipelineIndex, HealPartition, KillNode,
+    PartitionPair, RegisterFunction, RestartNode, StartNode, Step, StepMeta, StopNode, Submit,
+    SubmitBatch, UnregisterFunction, Wait, WaitForLevel,
 };
 pub use types::{NodeSelector, PipelineLevel, RetryConfig, SubmitOp, TxRef, TxStatus, WaitLevel};
 

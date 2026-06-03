@@ -1,7 +1,10 @@
 mod config;
+mod constants;
 mod engine;
 pub mod entities;
 pub mod entries;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 mod index;
 mod layout;
 mod segment;
@@ -13,6 +16,7 @@ pub mod vote;
 mod wal_reader;
 pub mod wal_serializer;
 pub mod wal_tail;
+mod wal_zero_copy;
 
 pub use crate::config::StorageConfig;
 pub use engine::*;
@@ -21,4 +25,6 @@ pub use snapshot::*;
 pub use syncer::*;
 pub use term::{TERM_MAGIC, TERM_RECORD_SIZE, TermRecord, TermStorage};
 pub use vote::{VOTE_MAGIC, VOTE_RECORD_SIZE, VoteRecord, VoteStorage};
-pub use wal_tail::{WAL_RECORD_SIZE, WalTailer, decode_records};
+pub use wal_tail::{WalTailer, decode_records};
+pub use wal_zero_copy::*;
+pub use constants::*;
