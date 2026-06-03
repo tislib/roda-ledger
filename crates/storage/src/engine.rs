@@ -93,11 +93,7 @@ impl Storage {
         let mut segment = Segment::open_active(self.config.data_dir.clone(), last_segment_id)?;
         #[cfg(feature = "fault-injection")]
         {
-            let hook = self
-                .fault
-                .lock()
-                .expect("fault mutex poisoned")
-                .clone();
+            let hook = self.fault.lock().expect("fault mutex poisoned").clone();
             segment.set_fault(hook);
         }
         Ok(segment)

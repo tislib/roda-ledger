@@ -10,9 +10,7 @@
 //! shape so callers can treat the two parsers interchangeably.
 
 use crate::constants::WAL_RECORD_SIZE;
-use crate::entities::{
-    FunctionRegistered, TxEntry, TxLink, TxMetadata, TxTerm, WalEntryKind,
-};
+use crate::entities::{FunctionRegistered, TxEntry, TxLink, TxMetadata, TxTerm, WalEntryKind};
 
 /// Borrowed view of a single WAL record. Lifetime is tied to the
 /// backing byte slice; nothing here owns its data.
@@ -50,9 +48,9 @@ pub fn read_entry(data: &[u8]) -> Result<WalEntryRef<'_>, std::io::Error> {
         }
         k if k == WalEntryKind::TxEntry as u8 => Ok(WalEntryRef::Entry(bytemuck::from_bytes(rec))),
         k if k == WalEntryKind::Link as u8 => Ok(WalEntryRef::Link(bytemuck::from_bytes(rec))),
-        k if k == WalEntryKind::FunctionRegistered as u8 => Ok(WalEntryRef::FunctionRegistered(
-            bytemuck::from_bytes(rec),
-        )),
+        k if k == WalEntryKind::FunctionRegistered as u8 => {
+            Ok(WalEntryRef::FunctionRegistered(bytemuck::from_bytes(rec)))
+        }
         k if k == WalEntryKind::TxTerm as u8 => Ok(WalEntryRef::Term(bytemuck::from_bytes(rec))),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

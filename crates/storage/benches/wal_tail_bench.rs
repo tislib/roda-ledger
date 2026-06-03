@@ -93,8 +93,7 @@ fn build() -> Dataset {
         tx_in_segment += 1;
 
         let buf_records = buf.len() as u64;
-        let need_flush =
-            buf_records >= FLUSH_EVERY_RECORDS || tx_in_segment == TX_PER_SEGMENT;
+        let need_flush = buf_records >= FLUSH_EVERY_RECORDS || tx_in_segment == TX_PER_SEGMENT;
         if need_flush {
             segment.write_entries(&buf);
             buf.clear();

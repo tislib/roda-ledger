@@ -339,7 +339,9 @@ enum PushOutcome {
     /// hand us this round and the next iteration would almost
     /// certainly come up empty. The sender backs off in that case so
     /// the loop doesn't spin between trivial pushes when load is light.
-    Sent { drained: bool },
+    Sent {
+        drained: bool,
+    },
     Idle,
     StreamClosed,
 }
@@ -729,10 +731,7 @@ async fn push_one(
     }
     debug!(
         "replication_leader[{} peer={}]: WalUpdate bytes={} cluster_commit={}",
-        nid,
-        peer_id,
-        n,
-        cluster_commit_id
+        nid, peer_id, n, cluster_commit_id
     );
     if out_tx
         .send(wal_update_msg(&buffer[..n], cluster_commit_id))

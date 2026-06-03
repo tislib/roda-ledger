@@ -9,8 +9,8 @@
 
 use ::proto::ledger::WaitLevel;
 use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
-use std::time::Duration;
 use spdlog::Level::Critical;
+use std::time::Duration;
 use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

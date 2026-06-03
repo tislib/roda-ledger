@@ -8,10 +8,10 @@
 use crate::fault::{ClusterFaultInjector, FaultError};
 use proto::fault::fault_server::Fault;
 use proto::fault::{
-    apply_file_event_request, ApplyFileEventRequest, ApplyFileEventResponse,
-    ClearAllFaultsRequest, ClearAllFaultsResponse, ClearFaultRequest, ClearFaultResponse,
-    ClockJumpRequest, ClockJumpResponse, SetClockSkewRequest, SetClockSkewResponse,
-    SetFaultRequest, SetFaultResponse, UnstuckOperationRequest, UnstuckOperationResponse,
+    ApplyFileEventRequest, ApplyFileEventResponse, ClearAllFaultsRequest, ClearAllFaultsResponse,
+    ClearFaultRequest, ClearFaultResponse, ClockJumpRequest, ClockJumpResponse,
+    SetClockSkewRequest, SetClockSkewResponse, SetFaultRequest, SetFaultResponse,
+    UnstuckOperationRequest, UnstuckOperationResponse, apply_file_event_request,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -181,15 +181,13 @@ fn apply_file_event(
     }
 }
 
-fn corrupt_range(
-    path: &Path,
-    offset: u64,
-    length: u64,
-    pattern: i32,
-) -> std::io::Result<()> {
+fn corrupt_range(path: &Path, offset: u64, length: u64, pattern: i32) -> std::io::Result<()> {
     use proto::fault::CorruptionPattern;
     use std::os::unix::fs::FileExt;
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let mut buf = vec![0u8; length as usize];
     file.read_at(&mut buf, offset)?;
     match CorruptionPattern::try_from(pattern).unwrap_or(CorruptionPattern::PatternUnspecified) {
@@ -207,7 +205,9 @@ fn corrupt_range(
             // Seed = (offset ^ length); cheap and reproducible.
             let mut x: u64 = offset ^ length ^ 0xDEAD_BEEF_CAFE_BABE;
             for b in buf.iter_mut() {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *b = (x >> 33) as u8;
             }
         }

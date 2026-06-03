@@ -172,11 +172,7 @@ impl ClusterNode {
                     .expect("build dedicated fault gRPC runtime");
                 rt.block_on(async {
                     let handler = FaultHandler::new(injector, data_dir);
-                    let server = ClusterNode::run_fault_server(
-                        config,
-                        handler,
-                        cancellation_token,
-                    );
+                    let server = ClusterNode::run_fault_server(config, handler, cancellation_token);
                     // Optional debug-only infra — never load-bearing.
                     // Tests drive the injector in-process via
                     // `fault_injector()`, never over this socket, and
@@ -348,7 +344,10 @@ impl Drop for ClusterNode {
             // Reporting it keeps shutdown best-effort and the root
             // cause visible.
             if let Err(e) = handle.join() {
-                error!("ClusterNode worker thread panicked during shutdown: {:?}", e);
+                error!(
+                    "ClusterNode worker thread panicked during shutdown: {:?}",
+                    e
+                );
             }
         }
     }

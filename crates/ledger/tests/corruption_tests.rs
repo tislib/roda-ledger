@@ -351,7 +351,11 @@ fn pick_replayable_wal(dir: &str) -> (u32, u32) {
         .filter_map(|n| parse_id(n, "snapshot_", ".bin"))
         .collect();
     snap_ids.sort_unstable_by(|a, b| b.cmp(a));
-    assert!(snap_ids.len() >= 2, "need ≥2 snapshots, got {}", snap_ids.len());
+    assert!(
+        snap_ids.len() >= 2,
+        "need ≥2 snapshots, got {}",
+        snap_ids.len()
+    );
 
     let latest_snap_id = snap_ids[0];
     let fallback_snap_id = snap_ids[1];
@@ -365,7 +369,9 @@ fn pick_replayable_wal(dir: &str) -> (u32, u32) {
         .filter(|id| *id > fallback_snap_id)
         .collect();
     replayable.sort_unstable();
-    let target = *replayable.last().expect("expected at least one replayable WAL .crc");
+    let target = *replayable
+        .last()
+        .expect("expected at least one replayable WAL .crc");
     (target, fallback_snap_id)
 }
 

@@ -506,77 +506,77 @@ impl ScenarioRunner {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RunError>> + Send + 'a>>
     {
         Box::pin(async move {
-        let mut handles: Vec<JoinHandle<Result<RunCtx, RunError>>> =
-            Vec::with_capacity(c.branches.len());
-        for branch_steps in &c.branches {
-            let provisioner = self.provisioner.clone();
-            let client = client.clone();
-            let metrics = metrics.clone();
-            let steps = branch_steps.clone();
-            handles.push(tokio::spawn(async move {
-                let runner = ScenarioRunner::new(provisioner);
-                let mut local = RunCtx::default();
-                for step in &steps {
-                    runner.dispatch(&client, &metrics, &mut local, step).await?;
-                }
-                // Drain any AsyncBranches spawned inside this branch so
-                // nothing escapes the `Concurrent` step boundary.
-                let branches = std::mem::take(&mut local.branches);
-                let mut first_err: Option<RunError> = None;
-                for h in branches {
-                    match h.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
+            let mut handles: Vec<JoinHandle<Result<RunCtx, RunError>>> =
+                Vec::with_capacity(c.branches.len());
+            for branch_steps in &c.branches {
+                let provisioner = self.provisioner.clone();
+                let client = client.clone();
+                let metrics = metrics.clone();
+                let steps = branch_steps.clone();
+                handles.push(tokio::spawn(async move {
+                    let runner = ScenarioRunner::new(provisioner);
+                    let mut local = RunCtx::default();
+                    for step in &steps {
+                        runner.dispatch(&client, &metrics, &mut local, step).await?;
+                    }
+                    // Drain any AsyncBranches spawned inside this branch so
+                    // nothing escapes the `Concurrent` step boundary.
+                    let branches = std::mem::take(&mut local.branches);
+                    let mut first_err: Option<RunError> = None;
+                    for h in branches {
+                        match h.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
                             }
-                        }
-                        Err(join_err) => {
-                            if first_err.is_none() {
-                                first_err = Some(RunError::Client(format!(
-                                    "branch panicked: {join_err}"
-                                )));
+                            Err(join_err) => {
+                                if first_err.is_none() {
+                                    first_err = Some(RunError::Client(format!(
+                                        "branch panicked: {join_err}"
+                                    )));
+                                }
                             }
                         }
                     }
-                }
-                if let Some(e) = first_err {
-                    return Err(e);
-                }
-                Ok(local)
-            }));
-        }
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
+                    Ok(local)
+                }));
+            }
 
-        let mut first_error: Option<RunError> = None;
-        let mut joined: Vec<RunCtx> = Vec::with_capacity(handles.len());
-        for h in handles {
-            match h.await {
-                Ok(Ok(local)) => joined.push(local),
-                Ok(Err(e)) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
+            let mut first_error: Option<RunError> = None;
+            let mut joined: Vec<RunCtx> = Vec::with_capacity(handles.len());
+            for h in handles {
+                match h.await {
+                    Ok(Ok(local)) => joined.push(local),
+                    Ok(Err(e)) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                    Err(join_err) => {
+                        if first_error.is_none() {
+                            first_error =
+                                Some(RunError::Client(format!("branch panicked: {join_err}")));
+                        }
                     }
                 }
-                Err(join_err) => {
-                    if first_error.is_none() {
-                        first_error =
-                            Some(RunError::Client(format!("branch panicked: {join_err}")));
-                    }
+            }
+            for local in joined {
+                for (user_ref, tx_id) in local.bindings {
+                    ctx.bindings.insert(user_ref, tx_id);
+                }
+                if let Some(idx) = local.last_killed {
+                    ctx.last_killed = Some(idx);
                 }
             }
-        }
-        for local in joined {
-            for (user_ref, tx_id) in local.bindings {
-                ctx.bindings.insert(user_ref, tx_id);
+            match first_error {
+                Some(e) => Err(e),
+                None => Ok(()),
             }
-            if let Some(idx) = local.last_killed {
-                ctx.last_killed = Some(idx);
-            }
-        }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
         })
     }
 

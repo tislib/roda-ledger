@@ -72,11 +72,7 @@ fn deposit_entries(tx_id: u64, account: u64, amount: u64) -> Vec<WalEntry> {
 /// record in the stream.
 fn record_tx_id(record: &[u8], running: &mut u64) -> u64 {
     if record[0] == WalEntryKind::TxMetadata as u8 {
-        *running = u64::from_le_bytes(
-            record[TX_ID_OFFSET..TX_ID_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
+        *running = u64::from_le_bytes(record[TX_ID_OFFSET..TX_ID_OFFSET + 8].try_into().unwrap());
     }
     *running
 }
@@ -145,10 +141,7 @@ fn append_wal_entries_multi_slot_batches_multiple_tx() {
     assert_eq!(n, WAL_RECORD_SIZE * 6);
     let mut running = 0u64;
     for (i, tx) in [1u64, 1, 2, 2, 3, 3].iter().enumerate() {
-        assert_eq!(
-            record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running),
-            *tx
-        );
+        assert_eq!(record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running), *tx);
     }
 }
 

@@ -15,6 +15,7 @@
 //! points at the same inode. We detect this by comparing our stashed inode
 //! with `stat(wal.bin)` and advance to the next segment file.
 
+use crate::constants::{TX_ID_OFFSET, WAL_RECORD_SIZE};
 use crate::engine::Storage;
 use crate::entities::{WalEntry, WalEntryKind};
 use crate::layout::{active_wal_path, segment_wal_path};
@@ -25,7 +26,6 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use crate::constants::{TX_ID_OFFSET, WAL_RECORD_SIZE};
 
 /// Decode a buffer returned by [`WalTailer::tail`] into `WalEntry` values.
 /// Malformed 40-byte records are skipped; extra trailing bytes are ignored.
@@ -451,7 +451,7 @@ fn first_tx_id_in_file(file: &File) -> Option<u64> {
 /// cursor parks at EOF and reads zero bytes until the writer appends
 /// a new transaction.
 fn first_meta_offset_at_or_after(file: &File, from_tx_id: u64) -> u64 {
-    const CHUNK: usize = 1 << 22;       // 4 MiB = 100k records / read
+    const CHUNK: usize = 1 << 22; // 4 MiB = 100k records / read
     let mut buf = vec![0u8; CHUNK];
     let mut off: u64 = 0;
     loop {
@@ -459,7 +459,9 @@ fn first_meta_offset_at_or_after(file: &File, from_tx_id: u64) -> u64 {
             Ok(0) | Err(_) => return off,
             Ok(n) => n - (n % WAL_RECORD_SIZE),
         };
-        if n == 0 { return off; }
+        if n == 0 {
+            return off;
+        }
         // walk the in-memory chunk using iter_records (zero-copy)
         for (i, rec) in iter_records(&buf[..n]).enumerate() {
             if let WalEntryRef::Metadata(m) = rec

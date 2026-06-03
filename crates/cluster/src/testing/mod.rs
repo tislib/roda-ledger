@@ -1447,12 +1447,12 @@ impl ClusterTestingControl {
         })
     }
 
-    /// ── Fault-injection API (gated by `fault-injection`) ─────────
-    ///
-    /// Tests reach the per-node `ClusterFaultInjector` directly —
-    /// no gRPC round-trip — through these helpers. The injector is
-    /// the same `Arc` the node's `FaultHandler` is backed by, so
-    /// either driving channel produces the same observable effect.
+    // ── Fault-injection API (gated by `fault-injection`) ─────────
+    //
+    // Tests reach the per-node `ClusterFaultInjector` directly —
+    // no gRPC round-trip — through these helpers. The injector is
+    // the same `Arc` the node's `FaultHandler` is backed by, so
+    // either driving channel produces the same observable effect.
 
     /// Per-node fault injector handle for slot `i`. Errors if the
     /// slot is out of range or the node hasn't been started yet.
@@ -1488,9 +1488,9 @@ impl ClusterTestingControl {
                 stuck_id: String::new(),
             })),
         };
-        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
-            |e| ClusterTestingError::Run(format!("set_fault disk_access: {e}")),
-        )?;
+        self.fault_injector(i)?
+            .set_fault(&level, &outcome)
+            .map_err(|e| ClusterTestingError::Run(format!("set_fault disk_access: {e}")))?;
         Ok(())
     }
 
@@ -1526,9 +1526,9 @@ impl ClusterTestingControl {
                 stuck_id: String::new(),
             })),
         };
-        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
-            |e| ClusterTestingError::Run(format!("set_fault wal_access: {e}")),
-        )?;
+        self.fault_injector(i)?
+            .set_fault(&level, &outcome)
+            .map_err(|e| ClusterTestingError::Run(format!("set_fault wal_access: {e}")))?;
         Ok(())
     }
 
@@ -1559,9 +1559,9 @@ impl ClusterTestingControl {
         let outcome = FaultOutcome {
             kind: Some(fault_outcome::Kind::Slow(Slow { delay_ms })),
         };
-        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
-            |e| ClusterTestingError::Run(format!("set_fault wal_access slow: {e}")),
-        )?;
+        self.fault_injector(i)?
+            .set_fault(&level, &outcome)
+            .map_err(|e| ClusterTestingError::Run(format!("set_fault wal_access slow: {e}")))?;
         Ok(())
     }
 
@@ -1578,9 +1578,9 @@ impl ClusterTestingControl {
         let outcome = FaultOutcome {
             kind: Some(fault_outcome::Kind::Slow(Slow { delay_ms })),
         };
-        self.fault_injector(i)?.set_fault(&level, &outcome).map_err(
-            |e| ClusterTestingError::Run(format!("set_fault disk_access slow: {e}")),
-        )?;
+        self.fault_injector(i)?
+            .set_fault(&level, &outcome)
+            .map_err(|e| ClusterTestingError::Run(format!("set_fault disk_access slow: {e}")))?;
         Ok(())
     }
 
@@ -1590,7 +1590,6 @@ impl ClusterTestingControl {
     pub fn clear_all_faults(&self, i: usize) -> Result<(u32, u32), ClusterTestingError> {
         Ok(self.fault_injector(i)?.clear_all())
     }
-
 
     fn slot_mut(&mut self, i: usize) -> Result<&mut NodeSlot, ClusterTestingError> {
         let len = self.slots.len();

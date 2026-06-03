@@ -40,7 +40,10 @@ impl MatrixGrid {
             .flat_map(|r| (0..m).map(move |c| r * m + c + 1))
             .collect();
 
-        let deposits: Vec<(u64, u64)> = account_ids.iter().map(|&id| (id, initial_balance)).collect();
+        let deposits: Vec<(u64, u64)> = account_ids
+            .iter()
+            .map(|&id| (id, initial_balance))
+            .collect();
 
         let mut transfers = Vec::new();
         for r in 0..n {

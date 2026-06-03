@@ -8,8 +8,8 @@
 //! Companion to `corruption_tests.rs`, which covers file-deletion /
 //! sidecar-corruption cases but not partial-byte-stream tails.
 
-use ledger::ledger::Ledger;
 use ledger::config::LedgerConfig;
+use ledger::ledger::Ledger;
 use ledger::transaction::Operation;
 use std::fs::{self, OpenOptions};
 use std::io::Write;

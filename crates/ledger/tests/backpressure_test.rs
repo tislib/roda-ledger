@@ -193,11 +193,7 @@ fn run_backpressure_scenario(
 /// retry. Both in-flight and submitter progress assertions pin this.
 #[test]
 fn sync_stall_caps_submission() {
-    run_backpressure_scenario(
-        "sync_stall",
-        |f| f.stick_sync(),
-        |f| f.unstuck_sync(),
-    );
+    run_backpressure_scenario("sync_stall", |f| f.stick_sync(), |f| f.unstuck_sync());
 }
 
 /// `before_sync` sleeps for `SLOW` per call — the committer makes
@@ -219,11 +215,7 @@ fn sync_slow_caps_submission() {
 /// never even gets to absorb its first batch.
 #[test]
 fn write_stall_caps_submission() {
-    run_backpressure_scenario(
-        "write_stall",
-        |f| f.stick_write(),
-        |f| f.unstuck_write(),
-    );
+    run_backpressure_scenario("write_stall", |f| f.stick_write(), |f| f.unstuck_write());
 }
 
 /// `before_write` sleeps for `SLOW` per call — the WAL writer makes

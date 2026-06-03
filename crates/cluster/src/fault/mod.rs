@@ -20,7 +20,7 @@
 use crate::ledger_slot::LedgerSlot;
 use parking_lot::Mutex;
 use proto::fault::{
-    fault_level::Bucket, fault_outcome, write_corruption, FaultLevel, FaultOutcome, Stuck,
+    FaultLevel, FaultOutcome, Stuck, fault_level::Bucket, fault_outcome, write_corruption,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -204,20 +204,11 @@ impl ClusterFaultInjector {
     /// Apply the outcome to whichever underlying primitive owns the
     /// effect. Returns the assigned stuck_id when the outcome is
     /// `Stuck` with an empty caller-supplied id.
-    fn apply_backing(
-        &self,
-        key: LevelKey,
-        outcome: &FaultOutcome,
-    ) -> Result<String, FaultError> {
+    fn apply_backing(&self, key: LevelKey, outcome: &FaultOutcome) -> Result<String, FaultError> {
         let assigned_id = match outcome.kind.as_ref() {
             Some(fault_outcome::Kind::Stuck(Stuck { stuck_id })) if stuck_id.is_empty() => {
                 let n = self.next_stuck_id.fetch_add(1, Ordering::AcqRel);
-                format!(
-                    "auto-{}-{}-{}",
-                    bucket_short(key.bucket),
-                    key.peer_id,
-                    n
-                )
+                format!("auto-{}-{}-{}", bucket_short(key.bucket), key.peer_id, n)
             }
             Some(fault_outcome::Kind::Stuck(Stuck { stuck_id })) => stuck_id.clone(),
             _ => String::new(),
@@ -265,10 +256,7 @@ impl ClusterFaultInjector {
                         key.bucket
                     );
                 }
-                (
-                    Bucket::WalAccess,
-                    Some(fault_outcome::Kind::Corruption(c)),
-                ) => {
+                (Bucket::WalAccess, Some(fault_outcome::Kind::Corruption(c))) => {
                     spdlog::warn!(
                         "fault: WriteCorruption requested ({:?}) — \
                          stored but not yet enforced",
