@@ -844,7 +844,7 @@ impl ClusterLeaderClient {
 /// a message containing the substring `"not a leader"` — the
 /// handler at `src/cluster/ledger_handler.rs::ensure_writable` is the
 /// only producer.
-fn is_not_leader_error(status: &tonic::Status) -> bool {
+pub(crate) fn is_not_leader_error(status: &tonic::Status) -> bool {
     status.code() == Code::FailedPrecondition && status.message().contains("not a leader")
 }
 
@@ -864,6 +864,35 @@ fn should_rotate_leader(status: &tonic::Status) -> bool {
     )
 }
 
+/// True when an RPC that failed with `status` is worth retrying — the
+/// error is transient and a later attempt could plausibly succeed.
+/// Covers transport/availability failures plus the explicit "not a
+/// leader" rejection (which retries so the caller can fail over to the
+/// real leader). Deterministic rejections — `InvalidArgument` from an
+/// invalid WASM binary, `AlreadyExists`, `NotFound`, a plain
+/// `FailedPrecondition`, and friends — return `false` so callers fail
+/// fast instead of burning the whole backoff schedule on an error that
+/// will never change.
+///
+/// This is the single classifier shared by the standalone
+/// [`NodeClient`] retry loop and the cluster-level loops above;
+/// `should_rotate_leader` is a subset that additionally answers
+/// "should I switch nodes?" for leader-routed writes.
+pub(crate) fn is_retryable(status: &tonic::Status) -> bool {
+    if is_not_leader_error(status) {
+        return true;
+    }
+    matches!(
+        status.code(),
+        Code::Unavailable
+            | Code::Cancelled
+            | Code::Unknown
+            | Code::Internal
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+    )
+}
+
 /// Parse the optional `leader-node-index` metadata hint into a node
 /// index. Returns `None` when the metadata is absent, malformed, or
 /// out of range for the current cluster size.
@@ -872,4 +901,66 @@ fn read_leader_hint(status: &tonic::Status, n_nodes: usize) -> Option<usize> {
     let s = meta.to_str().ok()?;
     let id: usize = s.parse().ok()?;
     if id < n_nodes { Some(id) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_errors_are_not_retryable() {
+        // Codes that mean "this request is wrong / already settled" —
+        // retrying can only ever return the same error.
+        for status in [
+            tonic::Status::invalid_argument("invalid wasm binary"),
+            tonic::Status::already_exists("function already registered"),
+            tonic::Status::not_found("no such transaction"),
+            tonic::Status::out_of_range("page out of range"),
+            tonic::Status::permission_denied("denied"),
+            tonic::Status::unauthenticated("missing token"),
+            tonic::Status::aborted("conflict"),
+            // A bare FailedPrecondition (not the "not a leader" variant).
+            tonic::Status::failed_precondition("balance too low"),
+        ] {
+            assert!(
+                !is_retryable(&status),
+                "expected code {:?} to be non-retryable",
+                status.code()
+            );
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        for status in [
+            tonic::Status::unavailable("node restarting"),
+            tonic::Status::cancelled("cancelled"),
+            tonic::Status::unknown("unknown"),
+            tonic::Status::internal("internal"),
+            tonic::Status::deadline_exceeded("slow peer"),
+            tonic::Status::resource_exhausted("overloaded"),
+        ] {
+            assert!(
+                is_retryable(&status),
+                "expected code {:?} to be retryable",
+                status.code()
+            );
+        }
+    }
+
+    #[test]
+    fn not_a_leader_is_retryable_despite_being_failed_precondition() {
+        // FailedPrecondition is deterministic in general, but the
+        // "not a leader" rejection must retry so a leader-routed write
+        // can fail over to the real leader.
+        let plain = tonic::Status::failed_precondition("balance too low");
+        assert!(!is_not_leader_error(&plain));
+        assert!(!is_retryable(&plain));
+
+        let not_leader = tonic::Status::failed_precondition("node 2 is not a leader");
+        assert!(is_not_leader_error(&not_leader));
+        assert!(is_retryable(&not_leader));
+        // It also routes the cluster write loop to a different node.
+        assert!(should_rotate_leader(&not_leader));
+    }
 }

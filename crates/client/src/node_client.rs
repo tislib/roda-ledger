@@ -5,12 +5,15 @@
 //! exposes every RPC as a simple async method.
 //!
 //! Every public RPC method is wrapped with [`NodeClient::with_retry`],
-//! which retries on any `tonic::Status` error using exponential
+//! which retries *transient* `tonic::Status` errors using exponential
 //! backoff. This shields callers from transient cluster-side hiccups
 //! (a node that's restarting, an in-flight leader election, a peer
 //! that hasn't finished its first heartbeat) without them having to
-//! hand-roll a retry loop. Tune via [`RetryConfig`] on construction.
+//! hand-roll a retry loop. Deterministic rejections (an invalid WASM
+//! binary, an already-registered function) come straight back instead
+//! of being retried. Tune via [`RetryConfig`] on construction.
 
+use crate::cluster_client::is_retryable;
 use ::proto::ledger as proto;
 use ::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
 use ledger::tools::backoff::{Backoff, BackoffPolicy};
@@ -27,8 +30,8 @@ pub type Result<T> = std::result::Result<T, tonic::Status>;
 // ---------------------------------------------------------------------------
 
 /// Retry policy for [`NodeClient`] and `ClusterClient` RPCs. Every
-/// public method runs through a retry loop that retries on any
-/// `tonic::Status` error using exponential backoff. Internally each
+/// public method runs through a retry loop that retries transient
+/// `tonic::Status` errors using exponential backoff. Internally each
 /// loop drives a [`ledger::tools::backoff::Backoff`] built from
 /// [`Self::backoff_policy`] — the same primitive the cluster's
 /// peer-replication loop uses.
@@ -263,13 +266,19 @@ impl NodeClient {
     /// Run `op` with retry + exponential backoff. Logs a `warn` on
     /// every retry and on final give-up. Backoff before retry N
     /// (1-indexed) is `base_backoff_ms * 2^(N-1)` — defaults give
-    /// 100 ms, 200 ms, 400 ms, 800 ms, 1600 ms across the 5
-    /// configured retries.
+    /// 100 ms, 200 ms, 400 ms, 800 ms, 1600 ms for the first five
+    /// retries, then hold at the 1600 ms cap.
     ///
-    /// Retries on any `tonic::Status` error. Application-level
-    /// rejections (insufficient funds, dedup duplicates, etc.) come
-    /// back as `fail_reason` fields on `Ok` responses, not as
-    /// `tonic::Status`, so they are NOT retried.
+    /// Only *transient* errors are retried, as classified by
+    /// `cluster_client::is_retryable`: transport/availability failures
+    /// plus the "not a leader" rejection. Deterministic rejections
+    /// (`InvalidArgument` from an invalid WASM binary, `AlreadyExists`,
+    /// `NotFound`, …) return immediately rather than stalling the
+    /// caller through the whole backoff schedule.
+    ///
+    /// Application-level rejections (insufficient funds, dedup
+    /// duplicates, etc.) come back as `fail_reason` fields on `Ok`
+    /// responses, not as `tonic::Status`, so they are never retried.
     async fn with_retry<F, Fut, T>(&self, op_name: &str, op: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -281,6 +290,21 @@ impl NodeClient {
             match op().await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    // Only retry transient failures. A deterministic
+                    // rejection (an invalid WASM binary → InvalidArgument,
+                    // AlreadyExists, NotFound, …) returns the same error
+                    // on every attempt, so retrying just stalls the
+                    // caller through the whole backoff schedule (~11s with
+                    // the defaults) before surfacing the inevitable error.
+                    if !is_retryable(&e) {
+                        warn!(
+                            "client::{}: non-retryable error, giving up: {} (code={:?})",
+                            op_name,
+                            e.message(),
+                            e.code()
+                        );
+                        return Err(e);
+                    }
                     if attempt == max {
                         warn!(
                             "client::{}: failed after {} retries, giving up: {} (code={:?})",
@@ -950,5 +974,92 @@ impl NodeClient {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `NodeClient` over a lazily-connected channel that is never
+    /// actually dialed — the test ops below return synthetic errors
+    /// without issuing an RPC. Backoff is squashed to ~1 ms so the
+    /// retry path runs fast.
+    fn fast_retry_client() -> NodeClient {
+        NodeClient::connect_lazy("http://127.0.0.1:1")
+            .expect("lazy connect builds a channel without dialing")
+            .with_retry_config(RetryConfig {
+                max_retry_count: 10,
+                base_backoff_ms: 1,
+                max_backoff_ms: 1,
+            })
+    }
+
+    #[tokio::test]
+    async fn deterministic_error_is_attempted_once() {
+        let client = fast_retry_client();
+        let attempts = AtomicUsize::new(0);
+        let res: Result<()> = client
+            .with_retry("test", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(tonic::Status::invalid_argument("invalid wasm binary")) }
+            })
+            .await;
+        assert_eq!(res.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a deterministic rejection must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_error_is_retried_to_exhaustion() {
+        let client = fast_retry_client();
+        let attempts = AtomicUsize::new(0);
+        let res: Result<()> = client
+            .with_retry("test", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(tonic::Status::unavailable("node restarting")) }
+            })
+            .await;
+        assert_eq!(res.unwrap_err().code(), tonic::Code::Unavailable);
+        // 1 initial attempt + max_retry_count (10) retries.
+        assert_eq!(attempts.load(Ordering::SeqCst), 11);
+    }
+
+    #[tokio::test]
+    async fn not_a_leader_is_retried() {
+        let client = fast_retry_client();
+        let attempts = AtomicUsize::new(0);
+        let res: Result<()> = client
+            .with_retry("test", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(tonic::Status::failed_precondition("node is not a leader")) }
+            })
+            .await;
+        assert!(res.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 11);
+    }
+
+    #[tokio::test]
+    async fn succeeds_after_a_few_transient_errors() {
+        let client = fast_retry_client();
+        let attempts = AtomicUsize::new(0);
+        let res: Result<u64> = client
+            .with_retry("test", || {
+                let prior = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if prior < 3 {
+                        Err(tonic::Status::unavailable("warming up"))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(res.unwrap(), 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
     }
 }
