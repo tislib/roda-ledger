@@ -13,19 +13,7 @@ fn entry(tx_id: u64) -> WalEntry {
     })
 }
 
-// Collect the tx_ids the writer walks over its pending window after `skip`,
-// reading each entry by reference (no copy).
-fn pending_ids(w: &TxRingWriter, skip: usize) -> Vec<u64> {
-    let mut got = Vec::new();
-    w.walk_pending(skip, |e| {
-        if let WalEntry::Entry(te) = e {
-            got.push(te.tx_id);
-        }
-    });
-    got
-}
-
-// Collect the tx_ids the writer walks over an explicit logical range.
+// Collect the tx_ids the writer walks over an explicit ring_index range.
 fn range_ids(w: &TxRingWriter, start: usize, end: usize) -> Vec<u64> {
     let mut got = Vec::new();
     w.walk(start, end, |e| {
@@ -227,36 +215,15 @@ fn wrap_around() {
 }
 
 #[test]
-fn walk_pending_reads_pushed_entries() {
+fn push_returns_the_ring_index_written() {
     let (_ring, mut writer, _releaser) = TxRing::new(8);
     writer.reserve();
-    writer.push(entry(10));
-    writer.push(entry(11));
-    writer.push(entry(12));
-    assert_eq!(writer.pending(), 3);
-    assert_eq!(pending_ids(&writer, 0), vec![10, 11, 12]);
-}
-
-#[test]
-fn walk_pending_skips_prefix() {
-    let (_ring, mut writer, _releaser) = TxRing::new(8);
-    writer.reserve();
-    for id in 10..13 {
-        writer.push(entry(id));
-    }
-    assert_eq!(pending_ids(&writer, 1), vec![11, 12]);
-    assert_eq!(pending_ids(&writer, 2), vec![12]);
-    // skip == pending and skip > pending both walk nothing, never wrap.
-    assert!(pending_ids(&writer, 3).is_empty());
-    assert!(pending_ids(&writer, 99).is_empty());
-}
-
-#[test]
-fn walk_pending_empty_when_idle() {
-    let (_ring, mut writer, _releaser) = TxRing::new(8);
-    writer.reserve();
-    assert_eq!(writer.pending(), 0);
-    assert!(pending_ids(&writer, 0).is_empty());
+    assert_eq!(writer.push(entry(10)), 0);
+    assert_eq!(writer.push(entry(11)), 1);
+    assert_eq!(writer.push(entry(12)), 2);
+    assert_eq!(writer.cursor(), 3);
+    let head = writer.cursor();
+    assert_eq!(range_ids(&writer, 0, head), vec![10, 11, 12]);
 }
 
 #[test]
@@ -272,20 +239,7 @@ fn walk_explicit_range_is_half_open() {
 }
 
 #[test]
-fn commit_empties_pending_window() {
-    let (_ring, mut writer, _releaser) = TxRing::new(8);
-    writer.reserve();
-    for id in 10..13 {
-        writer.push(entry(id));
-    }
-    assert_eq!(writer.pending(), 3);
-    writer.commit();
-    assert_eq!(writer.pending(), 0);
-    assert!(pending_ids(&writer, 0).is_empty());
-}
-
-#[test]
-fn walk_pending_wraps_around_the_buffer() {
+fn walk_wraps_around_the_buffer() {
     const CAP: usize = 4;
     let (_ring, mut writer, mut releaser) = TxRing::new(CAP);
     writer.reserve();
@@ -296,59 +250,47 @@ fn walk_pending_wraps_around_the_buffer() {
     releaser.advance_to(CAP); // free the whole buffer
     assert_eq!(writer.reserve(), CAP);
 
-    // These land in physical slots 0,1,2 even though their logical indices wrapped.
-    writer.push(entry(40));
-    writer.push(entry(41));
-    writer.push(entry(42));
-    assert_eq!(writer.pending(), 3);
-    assert_eq!(pending_ids(&writer, 0), vec![40, 41, 42]);
+    // Absolute ring_indexes 4,5,6 map to physical slots 0,1,2.
+    assert_eq!(writer.push(entry(40)), 4);
+    assert_eq!(writer.push(entry(41)), 5);
+    assert_eq!(writer.push(entry(42)), 6);
+    assert_eq!(range_ids(&writer, 4, 7), vec![40, 41, 42]);
 }
 
 #[test]
-fn rollback_moves_head_back_and_reuses_slots() {
+fn rollback_to_discards_tail_and_reuses_slots() {
     let (ring, mut writer, _releaser) = TxRing::new(8);
     writer.reserve();
     for id in 10..14 {
-        writer.push(entry(id));
+        writer.push(entry(id)); // ring_index 0..4
     }
-    assert_eq!(writer.pending(), 4);
+    assert_eq!(writer.cursor(), 4);
     assert_eq!(writer.capacity(), 4);
 
-    assert_eq!(writer.rollback(2), 2); // drop entry(12), entry(13)
-    assert_eq!(writer.pending(), 2);
+    writer.rollback_to(2); // drop entry(12), entry(13)
+    assert_eq!(writer.cursor(), 2);
     assert_eq!(writer.capacity(), 6); // their slots are free again
 
-    writer.push(entry(99)); // overwrites the slot entry(12) used
-    assert_eq!(pending_ids(&writer, 0), vec![10, 11, 99]);
+    assert_eq!(writer.push(entry(99)), 2); // reuses ring_index 2
+    assert_eq!(range_ids(&writer, 0, 3), vec![10, 11, 99]);
 
     writer.commit();
     assert_eq!(ring.write_index(), 3);
 }
 
 #[test]
-fn rollback_clamps_to_pending_and_spares_committed() {
+fn rollback_to_commit_point_spares_committed_entries() {
     let (_ring, mut writer, _releaser) = TxRing::new(8);
     writer.reserve();
     writer.push(entry(10));
     writer.push(entry(11));
-    writer.commit(); // [10, 11] are now committed, out of rollback's reach
-    writer.push(entry(12));
-    assert_eq!(writer.pending(), 1);
+    writer.commit(); // ring_index 0,1 committed, out of reach
+    let committed_head = writer.cursor(); // 2
+    writer.push(entry(12)); // ring_index 2, uncommitted
+    assert_eq!(writer.cursor(), 3);
 
-    assert_eq!(writer.rollback(5), 1); // clamped: only the uncommitted entry(12)
-    assert_eq!(writer.pending(), 0);
-}
-
-#[test]
-fn rollback_zero_is_a_noop() {
-    let (_ring, mut writer, _releaser) = TxRing::new(8);
-    writer.reserve();
-    for id in 10..13 {
-        writer.push(entry(id));
-    }
-    assert_eq!(writer.rollback(0), 0);
-    assert_eq!(writer.pending(), 3);
-    assert_eq!(pending_ids(&writer, 0), vec![10, 11, 12]);
+    writer.rollback_to(committed_head); // discard only the uncommitted entry(12)
+    assert_eq!(writer.cursor(), 2);
 }
 
 // Collect tx_ids a reader walks from `from` up to the published write_index.

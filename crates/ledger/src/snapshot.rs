@@ -146,10 +146,10 @@ impl SnapshotRunner {
     pub fn run(&mut self, ctx: SnapshotContext) {
         let mut retry_count = 0;
         let inbound = ctx.query();
-        let mut last_ring_id = 0;
+        let mut last_ring_index = 0;
         let mut last_processed_tx_id = 0;
         while ctx.is_running() {
-            ctx.ring().walk_entries(last_ring_id, |wal_entry| {
+            ctx.ring().walk_entries(last_ring_index, |wal_entry| {
                 match wal_entry {
                     WalEntry::Metadata(m) => {
                         if m.tx_id > ctx.commit_index() { // process only committed txns
@@ -202,11 +202,11 @@ impl SnapshotRunner {
                     ctx.set_processed_index(last_processed_tx_id);
                 }
 
-                last_ring_id += 1;
+                last_ring_index += 1;
 
                 true
             });
-            self.ring_releaser.advance_to(last_ring_id);
+            self.ring_releaser.advance_to(last_ring_index);
 
             if let Some(q) = inbound.pop() {
                 retry_count = 0;

@@ -111,14 +111,16 @@ window.
 |---|---|---|
 | `writer.reserve() -> usize` | `Release` + `Acquire` | commit, then grant all free slots from the head; returns new `capacity()` |
 | `writer.capacity() -> usize` | — | remaining slots you may still `push` (`0` = full) |
-| `writer.pending() -> usize` | `Relaxed` read of `write` | pushed-but-uncommitted entries, the `[commit, cursor)` window |
-| `writer.push(entry: WalEntry)` | — | write next slot; **panics if `capacity() == 0`** |
-| `writer.walk(start, end, handler)` | — | visit `[start, end)` (wrapping) lending each `&WalEntry` — no copy |
-| `writer.walk_pending(skip, handler)` | — | `walk` the pending window after `skip`: `[commit + skip, cursor)` |
-| `writer.patch_pending(skip, f)` | — | back-patch the uncommitted entry at `[commit + skip]` (e.g. a metadata CRC) |
-| `writer.commit()` | `Release` | publish the cursor so readers/releaser observe it |
-| `writer.rollback(count) -> usize` | — | drop the last `count` uncommitted pushes (clamped); returns count rolled back |
+| `writer.cursor() -> usize` | — | the next `ring_index` this writer will write to (the head) |
+| `writer.push(entry: WalEntry) -> usize` | — | write at the head, return the `ring_index` written; **panics if `capacity() == 0`** |
+| `writer.walk(start, end, handler)` | — | visit `ring_index` range `[start, end)` (wrapping) lending each `&WalEntry` — no copy |
+| `writer.patch(ring_index, f)` | — | back-patch the uncommitted entry at absolute `ring_index` (e.g. a metadata CRC) |
+| `writer.commit()` | `Release` | publish the head so readers/releaser observe it |
+| `writer.rollback_to(ring_index)` | — | move the head back to `ring_index`, discarding the uncommitted tail |
 | `drop(writer)` | `Release` | auto-`commit()` of whatever was pushed |
+
+All positions are absolute `ring_index`es — monotonic `usize`s starting at 0, masked to
+physical slots only on access.
 
 > `walk` is the one place a `&WalEntry` into a slot is handed out, and only to the **writer**:
 > its target `[commit, cursor)` is pushed-but-unpublished, so no reader's window (`[release,

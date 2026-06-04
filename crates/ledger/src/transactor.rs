@@ -40,16 +40,14 @@ use storage::wal_serializer::serialize_wal_records;
 ///
 /// Fields:
 /// - `balances` — mutable account balances vector indexed by `account_id`.
-/// - `entries`  — accumulating WAL entry buffer for the current step.
 /// - `fail_reason` — current transaction's failure flag (`NONE` = ok).
-/// - `position` — index into `entries` of the current `TxMetadata`; used
-///   by `verify()` and `rollback()` to scope their iteration to the
-///   entries belonging to the in-flight transaction.
+/// - `position` — `ring_index` of the current transaction's `TxMetadata`;
+///   `verify`/`rollback`/`finalize` scope to `[position, cursor)`.
 /// - `tx_id` — current transaction id, set by [`init`].
 pub struct TransactorState {
     pub balances: Vec<Balance>,
     pub fail_reason: FailReason,
-    pub position: usize,
+    pub last_ring_index: usize,
     pub tx_id: u64,
     pub tx_ring_pusher: TxRingWriter,
     wait_strategy: WaitStrategy,
@@ -67,7 +65,7 @@ impl TransactorState {
         Self {
             balances,
             fail_reason: FailReason::NONE,
-            position: 0,
+            last_ring_index: 0,
             tx_id: 0,
             tx_ring_pusher,
             wait_strategy,
@@ -84,7 +82,7 @@ impl TransactorState {
         Self {
             balances,
             fail_reason: FailReason::NONE,
-            position: 0,
+            last_ring_index: 0,
             tx_id: 0,
             tx_ring_pusher,
             wait_strategy,
@@ -112,7 +110,7 @@ impl TransactorState {
 
     #[inline]
     pub fn meta(&mut self, tag: [u8; 8], user_ref: u64, timestamp: u64) {
-        self.push_entry(WalEntry::Metadata(TxMetadata {
+        self.last_ring_index = self.push_entry(WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
             fail_reason: FailReason::NONE,
             sub_item_count: 0,
@@ -124,9 +122,9 @@ impl TransactorState {
         }));
     }
 
-    pub fn push_entry(&mut self, entry: WalEntry) {
+    pub fn push_entry(&mut self, entry: WalEntry) -> usize {
         self.ensure_capacity();
-        self.tx_ring_pusher.push(entry);
+        self.tx_ring_pusher.push(entry)
     }
 
     // Make room for one push: when the grant is exhausted, reserve (which commits
@@ -170,15 +168,15 @@ impl TransactorState {
         let mut sum_credits: u128 = 0;
         let mut sum_debits: u128 = 0;
 
-        self.tx_ring_pusher
-            .walk_pending(self.position + 1, |entry| {
-                if let WalEntry::Entry(e) = entry {
-                    match e.kind {
-                        EntryKind::Credit => sum_credits += e.amount as u128,
-                        EntryKind::Debit => sum_debits += e.amount as u128,
-                    }
+        let end = self.tx_ring_pusher.cursor();
+        self.tx_ring_pusher.walk(self.last_ring_index + 1, end, |entry| {
+            if let WalEntry::Entry(e) = entry {
+                match e.kind {
+                    EntryKind::Credit => sum_credits += e.amount as u128,
+                    EntryKind::Debit => sum_debits += e.amount as u128,
                 }
-            });
+            }
+        });
         if sum_credits != sum_debits {
             self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
         }
@@ -186,25 +184,23 @@ impl TransactorState {
     }
 
     pub fn rollback(&mut self) {
-        self.tx_ring_pusher
-            .walk_pending(self.position + 1, |entry| {
-                if let WalEntry::Entry(e) = entry
-                    && let Some(balance) = self.balances.get_mut(e.account_id as usize)
-                {
-                    match e.kind {
-                        EntryKind::Credit => {
-                            *balance = balance.saturating_add(e.amount as i64);
-                        }
-                        EntryKind::Debit => {
-                            *balance = balance.saturating_sub(e.amount as i64);
-                        }
+        let end = self.tx_ring_pusher.cursor();
+        self.tx_ring_pusher.walk(self.last_ring_index + 1, end, |entry| {
+            if let WalEntry::Entry(e) = entry
+                && let Some(balance) = self.balances.get_mut(e.account_id as usize)
+            {
+                match e.kind {
+                    EntryKind::Credit => {
+                        *balance = balance.saturating_add(e.amount as i64);
+                    }
+                    EntryKind::Debit => {
+                        *balance = balance.saturating_sub(e.amount as i64);
                     }
                 }
-            });
-        // Discard this tx's sub-items (everything after its metadata), keeping
-        // the metadata and any prior committed-this-step entries.
-        let drop_count = self.tx_ring_pusher.pending().saturating_sub(self.position + 1);
-        self.tx_ring_pusher.rollback(drop_count);
+            }
+        });
+        // Discard this tx's sub-items, keeping its metadata at `position`.
+        self.tx_ring_pusher.rollback_to(self.last_ring_index + 1);
     }
 
     pub fn emit_duplicate(&mut self, user_ref: u64, timestamp: u64, original_tx_id: u64) {
@@ -235,22 +231,18 @@ impl TransactorState {
 
         self.push_entry(WalEntry::Metadata(meta));
         self.push_entry(WalEntry::Link(link));
-        self.position += 2;
     }
 
-    /// Reset per-step state. Balances persist across steps.
+    /// Reset per-step state. Balances persist across steps; `position` is set
+    /// per-transaction by `meta`, so nothing ring-related needs resetting here.
     pub fn reset_step(&mut self) {
-        // Drop any uncommitted entries; a committed step already emptied the window.
-        let pending = self.tx_ring_pusher.pending();
-        self.tx_ring_pusher.rollback(pending);
         self.fail_reason = FailReason::NONE;
-        self.position = 0;
     }
 
     // Stamp a rejected tx's metadata: clear sub-items, record the reason, and
     // reseal its CRC over the (now zero-sub-item) record.
     fn finalize_failed_meta(&mut self, meta_idx: usize, fail_reason: FailReason) {
-        self.tx_ring_pusher.patch_pending(meta_idx, |entry| {
+        self.tx_ring_pusher.patch(meta_idx, |entry| {
             if let WalEntry::Metadata(m) = entry {
                 m.fail_reason = fail_reason;
                 m.sub_item_count = 0;
@@ -261,11 +253,11 @@ impl TransactorState {
     }
 
     // Stamp a committed tx's metadata: its sub-item count and a CRC over the
-    // metadata plus every sub-item. Returns the sub-item count.
+    // metadata plus every sub-item (`[meta_idx, cursor)`). Returns the count.
     fn finalize_committed_meta(&mut self, meta_idx: usize) -> usize {
-        let pending = self.tx_ring_pusher.pending();
-        let sub_item_count = pending - meta_idx - 1;
-        self.tx_ring_pusher.patch_pending(meta_idx, |entry| {
+        let head = self.tx_ring_pusher.cursor();
+        let sub_item_count = head - meta_idx - 1;
+        self.tx_ring_pusher.patch(meta_idx, |entry| {
             if let WalEntry::Metadata(m) = entry {
                 m.sub_item_count = sub_item_count as u16;
                 m.crc32c = 0;
@@ -273,7 +265,7 @@ impl TransactorState {
         });
         let mut digest = 0u32;
         let mut first = true;
-        self.tx_ring_pusher.walk_pending(meta_idx, |entry| {
+        self.tx_ring_pusher.walk(meta_idx, head, |entry| {
             if first {
                 first = false;
                 if let WalEntry::Metadata(m) = entry {
@@ -283,7 +275,7 @@ impl TransactorState {
                 digest = crc32c::crc32c_append(digest, serialize_wal_records(entry));
             }
         });
-        self.tx_ring_pusher.patch_pending(meta_idx, |entry| {
+        self.tx_ring_pusher.patch(meta_idx, |entry| {
             if let WalEntry::Metadata(m) = entry {
                 m.crc32c = digest;
             }
@@ -728,9 +720,6 @@ impl TransactorRunner {
     /// in this batch (0 if none).
     fn process(&mut self, timestamp: u64) -> u64 {
         let mut max_tx_id = 0;
-        // Grant the whole step a clean window up front, so verify/finalize see
-        // every entry uncommitted (a mid-step reserve would commit early).
-        self.state.borrow_mut().tx_ring_pusher.reserve();
         for idx in 0..self.transaction_buffer.len() {
             let tx_id = self.transaction_buffer[idx].id;
             max_tx_id = max_tx_id.max(tx_id);
@@ -741,6 +730,9 @@ impl TransactorRunner {
             // (including those made by WASM host imports) stamp it onto
             // the records they emit.
             self.state.borrow_mut().init(tx_id);
+            // Publish the previous tx and re-grant, so this tx's records form a
+            // fresh window with its metadata at offset 0.
+            self.state.borrow_mut().tx_ring_pusher.reserve();
 
             // --- Deduplication check ---
             match self.dedup.check(user_ref, tx_id) {
@@ -904,7 +896,7 @@ impl TransactorRunner {
                                 // more than 65,535 times. Reject those
                                 // here so the meta's sub_item_count can
                                 // losslessly encode the real count.
-                                let entry_count = s.tx_ring_pusher.pending() - s.position - 1;
+                                let entry_count = s.tx_ring_pusher.cursor() - s.last_ring_index - 1;
                                 if entry_count > u16::MAX as usize {
                                     s.fail(FailReason::ENTRY_LIMIT_EXCEEDED);
                                 }
@@ -917,7 +909,7 @@ impl TransactorRunner {
             // ── Verify + commit/rollback bookkeeping ──────────────────────
             let mut s = self.state.borrow_mut();
             let fail_reason = s.verify();
-            let meta_idx = s.position;
+            let meta_idx = s.last_ring_index;
 
             if fail_reason.is_failure() {
                 s.rollback();
@@ -926,13 +918,11 @@ impl TransactorRunner {
                 drop(s);
                 self.rejected_transactions.insert(tx_id, fail_reason);
                 self.dedup.insert(user_ref, tx_id);
-                self.state.borrow_mut().position += 1;
             } else {
-                let sub_item_count = s.finalize_committed_meta(meta_idx);
+                s.finalize_committed_meta(meta_idx);
 
                 drop(s);
                 self.dedup.insert(user_ref, tx_id);
-                self.state.borrow_mut().position += 1 + sub_item_count;
             }
         }
 
@@ -984,8 +974,8 @@ mod tests {
         s.credit(5, 100); // credit subtracts from the account
         assert_eq!(s.get_balance(3), 100);
         assert_eq!(s.get_balance(5), -100);
-        // metadata + the two entries are buffered in the ring's pending window
-        assert_eq!(s.tx_ring_pusher.pending(), 3);
+        // metadata at ring_index 0, then the two entries — cursor advanced to 3
+        assert_eq!(s.tx_ring_pusher.cursor(), 3);
     }
 
     #[test]
@@ -1012,16 +1002,16 @@ mod tests {
     fn rollback_reverts_balances_and_discards_sub_items() {
         let (_ring, mut s) = fixture(16, 64);
         s.init(1);
-        s.meta(*b"TEST\0\0\0\0", 7, 0); // step offset 0
-        s.debit(3, 100); // offset 1
-        s.credit(5, 100); // offset 2
-        assert_eq!(s.tx_ring_pusher.pending(), 3);
+        s.meta(*b"TEST\0\0\0\0", 7, 0); // ring_index 0
+        s.debit(3, 100); // ring_index 1
+        s.credit(5, 100); // ring_index 2
+        assert_eq!(s.tx_ring_pusher.cursor(), 3);
 
         s.rollback();
         assert_eq!(s.get_balance(3), 0);
         assert_eq!(s.get_balance(5), 0);
-        // the metadata stays; only its two sub-items are dropped
-        assert_eq!(s.tx_ring_pusher.pending(), 1);
+        // the metadata stays at ring_index 0; only its two sub-items are dropped
+        assert_eq!(s.tx_ring_pusher.cursor(), 1);
     }
 
     #[test]
@@ -1063,40 +1053,42 @@ mod tests {
 
         // capacity() == 0 here, so push_entry reserves (commit + re-grant) then pushes.
         s.debit(4, 7);
-        assert_eq!(s.tx_ring_pusher.pending(), 1);
+        assert_eq!(s.tx_ring_pusher.cursor(), 5);
         assert_eq!(s.get_balance(4), 7);
     }
 
     #[test]
-    fn finalize_handles_multiple_txs_without_underflow() {
-        // Two transactions accumulate in one uncommitted step window. As long as
-        // nothing commits mid-step, pending() keeps growing and the step-relative
-        // meta offset stays valid — `finalize_committed_meta` never underflows.
+    fn each_tx_finalizes_at_its_own_ring_index() {
+        // meta() records the metadata's absolute ring_index in `position`; a
+        // reserve() between transactions publishes the prior one. finalize spans
+        // [position, cursor), which is always valid — no underflow.
         let (ring, mut writer, _releaser) = TxRing::new(64);
         writer.reserve();
         let mut s = TransactorState::new(16, writer, WaitStrategy::LowLatency);
 
-        // tx1 at step offset 0: meta + two sub-items.
+        // tx1 — metadata at ring_index 0.
         s.init(1);
         s.meta(*b"TX1\0\0\0\0\0", 0, 0);
         s.debit(1, 10);
         s.credit(2, 10);
-        assert_eq!(s.finalize_committed_meta(s.position), 2);
-        s.position += 1 + 2; // mirror the runner's per-tx advance
+        assert_eq!(s.last_ring_index, 0);
+        assert_eq!(s.finalize_committed_meta(s.last_ring_index), 2);
 
-        // tx2 at step offset 3: meta + two sub-items, nothing committed in between.
+        // reserve() publishes tx1; tx2's metadata lands at ring_index 3.
+        s.tx_ring_pusher.reserve();
         s.init(2);
         s.meta(*b"TX2\0\0\0\0\0", 0, 0);
         s.debit(3, 5);
         s.credit(4, 5);
-        assert_eq!(s.tx_ring_pusher.pending(), 6);
-        assert_eq!(s.finalize_committed_meta(s.position), 2); // 6 - 3 - 1, no underflow
-
+        assert_eq!(s.last_ring_index, 3);
+        assert_eq!(s.finalize_committed_meta(s.last_ring_index), 2);
         s.tx_ring_pusher.commit();
+
+        assert_eq!(ring.write_index(), 6);
         for meta_idx in [0usize, 3usize] {
             match ring.get(meta_idx) {
                 WalEntry::Metadata(m) => assert_eq!(m.sub_item_count, 2),
-                _ => panic!("expected metadata at offset {meta_idx}"),
+                _ => panic!("expected metadata at ring_index {meta_idx}"),
             }
         }
     }

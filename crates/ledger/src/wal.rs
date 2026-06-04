@@ -95,14 +95,14 @@ impl WalRunner {
     }
 
     pub fn run(&mut self, ctx: WalContext) {
-        let mut last_ring_id = 0;
+        let mut last_ring_index = 0;
         while ctx.is_running() {
             let ring = ctx.tx_ring();
             let mut entries_ingested = 0;
-            ring.walk_entries(last_ring_id, |entry| {
+            ring.walk_entries(last_ring_index, |entry| {
                 self.ingest_entry(entry);
                 entries_ingested += 1;
-                last_ring_id += 1;
+                last_ring_index += 1;
 
                 true
             });
