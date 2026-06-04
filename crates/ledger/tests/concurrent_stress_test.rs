@@ -271,7 +271,7 @@ fn test_concurrent_monotonic_tx_ids() {
 #[test]
 fn test_concurrent_small_queue_backpressure() {
     let config = LedgerConfig {
-        queue_size: 8,
+        ring_size: 8,
         seal_check_internal: Duration::from_millis(10),
         ..LedgerConfig::temp()
     };

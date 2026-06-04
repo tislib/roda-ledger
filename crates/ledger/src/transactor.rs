@@ -3,21 +3,21 @@ use crate::config::LedgerConfig;
 use crate::dedup::{DedupCache, DedupResult};
 use crate::pipeline::TransactorContext;
 use crate::transaction::{Operation, Transaction, TransactionInput};
+use crate::tx_ring::writer::TxRingWriter;
+use crate::wait_strategy::WaitStrategy;
 use crate::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
 use crossbeam_skiplist::SkipMap;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::hint::spin_loop;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use storage::entities::{
     EntryKind, FailReason, FunctionRegistered, SYSTEM_ACCOUNT_ID, TxEntry, TxLink, TxLinkKind,
-    TxMetadata, WalEntry, WalEntryKind, WalInput,
+    TxMetadata, WalEntry, WalEntryKind,
 };
 use storage::entries::wal_tx_term_entry;
 use storage::wal_serializer::serialize_wal_records;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // TransactorState — shared inter-state buffer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,32 +48,47 @@ use storage::wal_serializer::serialize_wal_records;
 /// - `tx_id` — current transaction id, set by [`init`].
 pub struct TransactorState {
     pub balances: Vec<Balance>,
-    pub entries: Vec<WalEntry>,
     pub fail_reason: FailReason,
     pub position: usize,
     pub tx_id: u64,
+    pub tx_ring_pusher: TxRingWriter,
+    wait_strategy: WaitStrategy,
+    ring_retry_count: u64,
 }
 
 impl TransactorState {
-    pub fn new(max_accounts: usize) -> Self {
+    pub fn new(
+        max_accounts: usize,
+        tx_ring_pusher: TxRingWriter,
+        wait_strategy: WaitStrategy,
+    ) -> Self {
         let mut balances = Vec::with_capacity(max_accounts);
         balances.resize(max_accounts, Balance::default());
         Self {
             balances,
-            entries: Vec::with_capacity(16),
             fail_reason: FailReason::NONE,
             position: 0,
             tx_id: 0,
+            tx_ring_pusher,
+            wait_strategy,
+            ring_retry_count: 0,
         }
     }
 
-    pub fn from_balances(balances: Vec<Balance>, entries_capacity: usize) -> Self {
+    pub fn from_balances(
+        balances: Vec<Balance>,
+        _entries_capacity: usize,
+        tx_ring_pusher: TxRingWriter,
+        wait_strategy: WaitStrategy,
+    ) -> Self {
         Self {
             balances,
-            entries: Vec::with_capacity(entries_capacity),
             fail_reason: FailReason::NONE,
             position: 0,
             tx_id: 0,
+            tx_ring_pusher,
+            wait_strategy,
+            ring_retry_count: 0,
         }
     }
 
@@ -97,7 +112,7 @@ impl TransactorState {
 
     #[inline]
     pub fn meta(&mut self, tag: [u8; 8], user_ref: u64, timestamp: u64) {
-        self.entries.push(WalEntry::Metadata(TxMetadata {
+        self.push_entry(WalEntry::Metadata(TxMetadata {
             entry_type: WalEntryKind::TxMetadata as u8,
             fail_reason: FailReason::NONE,
             sub_item_count: 0,
@@ -107,6 +122,24 @@ impl TransactorState {
             user_ref,
             tag,
         }));
+    }
+
+    pub fn push_entry(&mut self, entry: WalEntry) {
+        self.ensure_capacity();
+        self.tx_ring_pusher.push(entry);
+    }
+
+    // Make room for one push: when the grant is exhausted, reserve (which commits
+    // + re-grants); while the releaser has freed nothing, back off via the wait strategy.
+    fn ensure_capacity(&mut self) {
+        while self.tx_ring_pusher.capacity() == 0 {
+            if self.tx_ring_pusher.reserve() > 0 {
+                self.ring_retry_count = 0;
+                return;
+            }
+            self.ring_retry_count += 1;
+            self.wait_strategy.retry(self.ring_retry_count);
+        }
     }
 
     #[inline]
@@ -136,14 +169,16 @@ impl TransactorState {
 
         let mut sum_credits: u128 = 0;
         let mut sum_debits: u128 = 0;
-        for entry in self.entries.iter().skip(self.position + 1) {
-            if let WalEntry::Entry(e) = entry {
-                match e.kind {
-                    EntryKind::Credit => sum_credits += e.amount as u128,
-                    EntryKind::Debit => sum_debits += e.amount as u128,
+
+        self.tx_ring_pusher
+            .walk_pending(self.position + 1, |entry| {
+                if let WalEntry::Entry(e) = entry {
+                    match e.kind {
+                        EntryKind::Credit => sum_credits += e.amount as u128,
+                        EntryKind::Debit => sum_debits += e.amount as u128,
+                    }
                 }
-            }
-        }
+            });
         if sum_credits != sum_debits {
             self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
         }
@@ -151,21 +186,25 @@ impl TransactorState {
     }
 
     pub fn rollback(&mut self) {
-        for entry in self.entries.iter().skip(self.position + 1) {
-            if let WalEntry::Entry(e) = entry
-                && let Some(balance) = self.balances.get_mut(e.account_id as usize)
-            {
-                match e.kind {
-                    EntryKind::Credit => {
-                        *balance = balance.saturating_add(e.amount as i64);
-                    }
-                    EntryKind::Debit => {
-                        *balance = balance.saturating_sub(e.amount as i64);
+        self.tx_ring_pusher
+            .walk_pending(self.position + 1, |entry| {
+                if let WalEntry::Entry(e) = entry
+                    && let Some(balance) = self.balances.get_mut(e.account_id as usize)
+                {
+                    match e.kind {
+                        EntryKind::Credit => {
+                            *balance = balance.saturating_add(e.amount as i64);
+                        }
+                        EntryKind::Debit => {
+                            *balance = balance.saturating_sub(e.amount as i64);
+                        }
                     }
                 }
-            }
-        }
-        self.entries.truncate(self.position + 1);
+            });
+        // Discard this tx's sub-items (everything after its metadata), keeping
+        // the metadata and any prior committed-this-step entries.
+        let drop_count = self.tx_ring_pusher.pending().saturating_sub(self.position + 1);
+        self.tx_ring_pusher.rollback(drop_count);
     }
 
     pub fn emit_duplicate(&mut self, user_ref: u64, timestamp: u64, original_tx_id: u64) {
@@ -194,16 +233,62 @@ impl TransactorState {
         let digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&link));
         meta.crc32c = digest;
 
-        self.entries.push(WalEntry::Metadata(meta));
-        self.entries.push(WalEntry::Link(link));
+        self.push_entry(WalEntry::Metadata(meta));
+        self.push_entry(WalEntry::Link(link));
         self.position += 2;
     }
 
     /// Reset per-step state. Balances persist across steps.
     pub fn reset_step(&mut self) {
-        self.entries.clear();
+        // Drop any uncommitted entries; a committed step already emptied the window.
+        let pending = self.tx_ring_pusher.pending();
+        self.tx_ring_pusher.rollback(pending);
         self.fail_reason = FailReason::NONE;
         self.position = 0;
+    }
+
+    // Stamp a rejected tx's metadata: clear sub-items, record the reason, and
+    // reseal its CRC over the (now zero-sub-item) record.
+    fn finalize_failed_meta(&mut self, meta_idx: usize, fail_reason: FailReason) {
+        self.tx_ring_pusher.patch_pending(meta_idx, |entry| {
+            if let WalEntry::Metadata(m) = entry {
+                m.fail_reason = fail_reason;
+                m.sub_item_count = 0;
+                m.crc32c = 0;
+                m.crc32c = crc32c::crc32c(bytemuck::bytes_of(m));
+            }
+        });
+    }
+
+    // Stamp a committed tx's metadata: its sub-item count and a CRC over the
+    // metadata plus every sub-item. Returns the sub-item count.
+    fn finalize_committed_meta(&mut self, meta_idx: usize) -> usize {
+        let pending = self.tx_ring_pusher.pending();
+        let sub_item_count = pending - meta_idx - 1;
+        self.tx_ring_pusher.patch_pending(meta_idx, |entry| {
+            if let WalEntry::Metadata(m) = entry {
+                m.sub_item_count = sub_item_count as u16;
+                m.crc32c = 0;
+            }
+        });
+        let mut digest = 0u32;
+        let mut first = true;
+        self.tx_ring_pusher.walk_pending(meta_idx, |entry| {
+            if first {
+                first = false;
+                if let WalEntry::Metadata(m) = entry {
+                    digest = crc32c::crc32c(bytemuck::bytes_of(m));
+                }
+            } else {
+                digest = crc32c::crc32c_append(digest, serialize_wal_records(entry));
+            }
+        });
+        self.tx_ring_pusher.patch_pending(meta_idx, |entry| {
+            if let WalEntry::Metadata(m) = entry {
+                m.crc32c = digest;
+            }
+        });
+        sub_item_count
     }
 }
 
@@ -217,14 +302,15 @@ impl TransactorState {
         }
         if let Some(balance) = self.balances.get_mut(account_id as usize) {
             *balance = balance.saturating_sub(amount as i64);
-            self.entries.push(WalEntry::Entry(TxEntry {
+            let computed_balance = *balance;
+            self.push_entry(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
                 tx_id: self.tx_id,
                 account_id,
                 amount,
                 kind: EntryKind::Credit,
                 _pad0: [0; 6],
-                computed_balance: *balance,
+                computed_balance,
             }));
         } else {
             self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
@@ -238,14 +324,15 @@ impl TransactorState {
         }
         if let Some(balance) = self.balances.get_mut(account_id as usize) {
             *balance = balance.saturating_add(amount as i64);
-            self.entries.push(WalEntry::Entry(TxEntry {
+            let computed_balance = *balance;
+            self.push_entry(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
                 tx_id: self.tx_id,
                 account_id,
                 amount,
                 kind: EntryKind::Debit,
                 _pad0: [0; 6],
-                computed_balance: *balance,
+                computed_balance,
             }));
         } else {
             self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
@@ -272,6 +359,7 @@ pub struct Transactor {
     balances: Vec<Balance>,
     dedup: DedupCache,
     wasm_runtime: Arc<WasmRuntime>,
+    ring_writer: Option<TxRingWriter>,
 }
 
 pub struct TransactorRunner {
@@ -286,7 +374,11 @@ pub struct TransactorRunner {
 }
 
 impl Transactor {
-    pub fn new(config: &LedgerConfig, wasm_runtime: Arc<WasmRuntime>) -> Self {
+    pub fn new(
+        config: &LedgerConfig,
+        wasm_runtime: Arc<WasmRuntime>,
+        ring_writer: TxRingWriter,
+    ) -> Self {
         let mut accounts = Vec::with_capacity(config.max_accounts);
         accounts.resize(config.max_accounts, Balance::default());
         Self {
@@ -294,6 +386,7 @@ impl Transactor {
             balances: accounts,
             dedup: DedupCache::new(config.storage.transaction_count_per_segment),
             wasm_runtime,
+            ring_writer: Some(ring_writer),
         }
     }
 
@@ -346,13 +439,19 @@ impl Transactor {
         let dedup = std::mem::replace(&mut self.dedup, DedupCache::new(0));
         let wasm_runtime = self.wasm_runtime.clone();
         let expected_next_id = ctx.get_processed_index() + 1;
+        let ring_writer = self.ring_writer.take().unwrap();
         // `Rc<RefCell<>>` and `WasmRuntimeEngine` are `!Send`; build them
         // inside the spawned thread so nothing non-`Send` ever crosses the
         // thread boundary.
         std::thread::Builder::new()
             .name("transactor".to_string())
             .spawn(move || {
-                let state = Rc::new(RefCell::new(TransactorState::from_balances(balances, cap)));
+                let state = Rc::new(RefCell::new(TransactorState::from_balances(
+                    balances,
+                    cap,
+                    ring_writer,
+                    ctx.wait_strategy(),
+                )));
                 let wasm_engine = WasmRuntimeEngine::new(wasm_runtime, Rc::clone(&state));
                 let mut runner = TransactorRunner {
                     rejected_transactions,
@@ -371,8 +470,16 @@ impl Transactor {
 
 impl TransactorRunner {
     /// Standalone constructor used by benches (no pipeline / no queues).
-    pub fn new(max_accounts: usize, wasm_runtime: Arc<WasmRuntime>) -> Self {
-        let state = Rc::new(RefCell::new(TransactorState::new(max_accounts)));
+    pub fn new(
+        max_accounts: usize,
+        wasm_runtime: Arc<WasmRuntime>,
+        ring_writer: TxRingWriter,
+    ) -> Self {
+        let state = Rc::new(RefCell::new(TransactorState::new(
+            max_accounts,
+            ring_writer,
+            WaitStrategy::default(),
+        )));
         let wasm_engine = WasmRuntimeEngine::new(wasm_runtime, Rc::clone(&state));
         Self {
             expected_next_id: 1,
@@ -505,27 +612,9 @@ impl TransactorRunner {
 
         let max_tx_id = self.process(timestamp);
 
-        // push all accumulated entries to outbound at the end of the step
-        let output = ctx.output();
-        let entries_len = self.state.borrow().entries.len();
-        let mut i = 0;
-        while i < entries_len {
-            let entry = self.state.borrow().entries[i];
-            let mut pending = WalInput::Single(entry);
-            let mut retry_count = 0u64;
-            loop {
-                retry_count += 1;
-                match output.push(pending) {
-                    Ok(()) => break,
-                    Err(returned) => pending = returned,
-                }
-                if retry_count.is_multiple_of(10_000) && !ctx.is_running() {
-                    return;
-                }
-                spin_loop();
-            }
-            i += 1;
-        }
+        // Publish the whole step's records to readers in one commit. The slots
+        // were granted at the head of process().
+        self.state.borrow_mut().tx_ring_pusher.commit();
 
         if max_tx_id > 0 {
             ctx.set_processed_index(max_tx_id);
@@ -611,20 +700,14 @@ impl TransactorRunner {
             }
         }
 
-        // Forward the entire batch to the WAL stage as Multi.
-        let output = ctx.output();
-        let mut pending = WalInput::Multi(entries);
-        let mut retry_count = 0u64;
-        loop {
-            match output.push(pending) {
-                Ok(()) => break,
-                Err(returned) => pending = returned,
+        // Forward the entire batch to readers via the ring, then publish it.
+        // push_entry handles capacity/backpressure per entry.
+        {
+            let mut s = self.state.borrow_mut();
+            for entry in &entries {
+                s.push_entry(*entry);
             }
-            retry_count += 1;
-            if retry_count.is_multiple_of(10_000) && !ctx.is_running() {
-                return;
-            }
-            spin_loop();
+            s.tx_ring_pusher.commit();
         }
 
         if max_tx_id > 0 {
@@ -645,6 +728,9 @@ impl TransactorRunner {
     /// in this batch (0 if none).
     fn process(&mut self, timestamp: u64) -> u64 {
         let mut max_tx_id = 0;
+        // Grant the whole step a clean window up front, so verify/finalize see
+        // every entry uncommitted (a mid-step reserve would commit early).
+        self.state.borrow_mut().tx_ring_pusher.reserve();
         for idx in 0..self.transaction_buffer.len() {
             let tx_id = self.transaction_buffer[idx].id;
             max_tx_id = max_tx_id.max(tx_id);
@@ -753,8 +839,7 @@ impl TransactorRunner {
                             let record = FunctionRegistered::new(&name, version, crc);
                             self.state
                                 .borrow_mut()
-                                .entries
-                                .push(WalEntry::FunctionRegistered(record));
+                                .push_entry(WalEntry::FunctionRegistered(record));
                         }
                         Err(_) => {
                             self.state.borrow_mut().fail(FailReason::INVALID_OPERATION);
@@ -775,7 +860,7 @@ impl TransactorRunner {
                     let record = wal_tx_term_entry(term, node_id, node_count, node_voted);
                     let mut s = self.state.borrow_mut();
                     s.meta(*b"NEWTERM\0", 0, timestamp);
-                    s.entries.push(WalEntry::Term(record));
+                    s.push_entry(WalEntry::Term(record));
                 }
                 Operation::Function {
                     name,
@@ -819,7 +904,7 @@ impl TransactorRunner {
                                 // more than 65,535 times. Reject those
                                 // here so the meta's sub_item_count can
                                 // losslessly encode the real count.
-                                let entry_count = s.entries.len() - s.position - 1;
+                                let entry_count = s.tx_ring_pusher.pending() - s.position - 1;
                                 if entry_count > u16::MAX as usize {
                                     s.fail(FailReason::ENTRY_LIMIT_EXCEEDED);
                                 }
@@ -836,37 +921,14 @@ impl TransactorRunner {
 
             if fail_reason.is_failure() {
                 s.rollback();
-
-                if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
-                    m.fail_reason = fail_reason;
-                    m.sub_item_count = 0;
-                    m.crc32c = 0;
-                    let digest = crc32c::crc32c(bytemuck::bytes_of(m));
-                    m.crc32c = digest;
-                }
+                s.finalize_failed_meta(meta_idx, fail_reason);
 
                 drop(s);
                 self.rejected_transactions.insert(tx_id, fail_reason);
                 self.dedup.insert(user_ref, tx_id);
                 self.state.borrow_mut().position += 1;
             } else {
-                let sub_item_count = s.entries.len() - meta_idx - 1;
-
-                if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
-                    m.sub_item_count = sub_item_count as u16;
-                    m.crc32c = 0;
-                }
-                let mut digest = if let Some(WalEntry::Metadata(m)) = s.entries.get(meta_idx) {
-                    crc32c::crc32c(bytemuck::bytes_of(m))
-                } else {
-                    0
-                };
-                for i in (meta_idx + 1)..s.entries.len() {
-                    digest = crc32c::crc32c_append(digest, serialize_wal_records(&s.entries[i]));
-                }
-                if let Some(WalEntry::Metadata(m)) = s.entries.get_mut(meta_idx) {
-                    m.crc32c = digest;
-                }
+                let sub_item_count = s.finalize_committed_meta(meta_idx);
 
                 drop(s);
                 self.dedup.insert(user_ref, tx_id);
@@ -898,4 +960,144 @@ pub fn build_wasm_tag(crc32c: u32) -> [u8; 8] {
     [
         b'f', b'n', b'w', b'\n', bytes[0], bytes[1], bytes[2], bytes[3],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx_ring::ring::TxRing;
+
+    // A TransactorState wired to a fresh ring with `cap` slots already granted,
+    // so the per-step ops can push straight into the ring's pending window.
+    fn fixture(max_accounts: usize, cap: usize) -> (Arc<TxRing>, TransactorState) {
+        let (ring, mut writer, _releaser) = TxRing::new(cap);
+        writer.reserve();
+        (ring, TransactorState::new(max_accounts, writer, WaitStrategy::LowLatency))
+    }
+
+    #[test]
+    fn credit_debit_update_balances_and_emit_entries() {
+        let (_ring, mut s) = fixture(16, 64);
+        s.init(1);
+        s.meta(*b"TEST\0\0\0\0", 7, 0);
+        s.debit(3, 100); // debit adds to the account
+        s.credit(5, 100); // credit subtracts from the account
+        assert_eq!(s.get_balance(3), 100);
+        assert_eq!(s.get_balance(5), -100);
+        // metadata + the two entries are buffered in the ring's pending window
+        assert_eq!(s.tx_ring_pusher.pending(), 3);
+    }
+
+    #[test]
+    fn verify_passes_when_credits_equal_debits() {
+        let (_ring, mut s) = fixture(16, 64);
+        s.init(1);
+        s.meta(*b"TEST\0\0\0\0", 7, 0);
+        s.debit(3, 100);
+        s.credit(5, 100);
+        assert_eq!(s.verify(), FailReason::NONE);
+    }
+
+    #[test]
+    fn verify_flags_zero_sum_violation() {
+        let (_ring, mut s) = fixture(16, 64);
+        s.init(1);
+        s.meta(*b"TEST\0\0\0\0", 7, 0);
+        s.debit(3, 100);
+        s.credit(5, 40); // debits != credits
+        assert_eq!(s.verify(), FailReason::ZERO_SUM_VIOLATION);
+    }
+
+    #[test]
+    fn rollback_reverts_balances_and_discards_sub_items() {
+        let (_ring, mut s) = fixture(16, 64);
+        s.init(1);
+        s.meta(*b"TEST\0\0\0\0", 7, 0); // step offset 0
+        s.debit(3, 100); // offset 1
+        s.credit(5, 100); // offset 2
+        assert_eq!(s.tx_ring_pusher.pending(), 3);
+
+        s.rollback();
+        assert_eq!(s.get_balance(3), 0);
+        assert_eq!(s.get_balance(5), 0);
+        // the metadata stays; only its two sub-items are dropped
+        assert_eq!(s.tx_ring_pusher.pending(), 1);
+    }
+
+    #[test]
+    fn commit_publishes_records_to_a_reader() {
+        let (ring, mut s) = fixture(16, 64);
+        s.init(1);
+        s.meta(*b"TEST\0\0\0\0", 7, 0);
+        s.debit(3, 100);
+        s.credit(5, 100);
+        s.tx_ring_pusher.commit();
+
+        assert_eq!(ring.write_index(), 3);
+        // slot 1 is the debit entry pushed right after the metadata
+        match ring.get(1) {
+            WalEntry::Entry(e) => {
+                assert_eq!(e.amount, 100);
+                assert!(matches!(e.kind, EntryKind::Debit));
+            }
+            _ => panic!("expected a TxEntry at slot 1"),
+        }
+    }
+
+    #[test]
+    fn push_entry_reserves_when_grant_is_exhausted() {
+        // A 4-slot ring: fill the grant, then publish + release so the next
+        // push must reclaim space via the in-push reserve path.
+        let (_ring, mut writer, mut releaser) = TxRing::new(4);
+        writer.reserve();
+        let mut s = TransactorState::new(8, writer, WaitStrategy::LowLatency);
+        s.init(1);
+        s.meta(*b"TEST\0\0\0\0", 1, 0);
+        s.debit(1, 10);
+        s.credit(2, 10);
+        s.debit(3, 5);
+        assert_eq!(s.tx_ring_pusher.capacity(), 0);
+
+        s.tx_ring_pusher.commit();
+        releaser.advance_to(4); // reader caught up; 4 slots are free again
+
+        // capacity() == 0 here, so push_entry reserves (commit + re-grant) then pushes.
+        s.debit(4, 7);
+        assert_eq!(s.tx_ring_pusher.pending(), 1);
+        assert_eq!(s.get_balance(4), 7);
+    }
+
+    #[test]
+    fn finalize_handles_multiple_txs_without_underflow() {
+        // Two transactions accumulate in one uncommitted step window. As long as
+        // nothing commits mid-step, pending() keeps growing and the step-relative
+        // meta offset stays valid — `finalize_committed_meta` never underflows.
+        let (ring, mut writer, _releaser) = TxRing::new(64);
+        writer.reserve();
+        let mut s = TransactorState::new(16, writer, WaitStrategy::LowLatency);
+
+        // tx1 at step offset 0: meta + two sub-items.
+        s.init(1);
+        s.meta(*b"TX1\0\0\0\0\0", 0, 0);
+        s.debit(1, 10);
+        s.credit(2, 10);
+        assert_eq!(s.finalize_committed_meta(s.position), 2);
+        s.position += 1 + 2; // mirror the runner's per-tx advance
+
+        // tx2 at step offset 3: meta + two sub-items, nothing committed in between.
+        s.init(2);
+        s.meta(*b"TX2\0\0\0\0\0", 0, 0);
+        s.debit(3, 5);
+        s.credit(4, 5);
+        assert_eq!(s.tx_ring_pusher.pending(), 6);
+        assert_eq!(s.finalize_committed_meta(s.position), 2); // 6 - 3 - 1, no underflow
+
+        s.tx_ring_pusher.commit();
+        for meta_idx in [0usize, 3usize] {
+            match ring.get(meta_idx) {
+                WalEntry::Metadata(m) => assert_eq!(m.sub_item_count, 2),
+                _ => panic!("expected metadata at offset {meta_idx}"),
+            }
+        }
+    }
 }

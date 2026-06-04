@@ -19,7 +19,7 @@ pub struct LedgerConfig {
 
     // ---- Fields not exposed via config.toml (internal tuning / runtime) ----
     #[serde(skip)]
-    pub queue_size: usize,
+    pub ring_size: usize,
     #[serde(skip, default = "default_log_level")]
     pub log_level: Level,
     #[serde(skip, default = "default_seal_check_internal")]
@@ -39,7 +39,7 @@ impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
             max_accounts: 1_000_000,
-            queue_size: 1 << 14,
+            ring_size: 1 << 14,
             storage: StorageConfig::default(),
             wait_strategy: WaitStrategy::Balanced,
             log_level: default_log_level(),

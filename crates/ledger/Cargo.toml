@@ -36,6 +36,7 @@ roda-latency-tracker.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+ringbuf = "0.4"                 # experimental: SPSC ring-buffer throughput bench
 
 [[bench]]
 name = "transactor_bench"
@@ -55,4 +56,20 @@ harness = false
 
 [[bench]]
 name = "snapshot_bench"
+harness = false
+
+[[bench]]
+name = "ringbuf_bench"
+harness = false
+
+[[bench]]
+name = "array_queue_bench"
+harness = false
+
+[[bench]]
+name = "simple_ringbuf_bench"
+harness = false
+
+[[bench]]
+name = "simple_spmc_bench"
 harness = false

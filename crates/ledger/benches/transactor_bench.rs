@@ -15,7 +15,7 @@ fn transactor_bench(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(10));
 
-    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
+    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced, );
 
     let config = LedgerConfig {
         max_accounts: 10_000_000,
@@ -30,7 +30,7 @@ fn transactor_bench(c: &mut Criterion) {
         .expect("storage"),
     );
     let runtime = Arc::new(WasmRuntime::new(storage));
-    let mut transactor = Transactor::new(&config, runtime);
+    let mut transactor = Transactor::new(&config, runtime, );
 
     let handle = transactor.start(pipeline.transactor_context()).unwrap();
 

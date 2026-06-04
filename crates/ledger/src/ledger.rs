@@ -5,9 +5,10 @@ use crate::pipeline::Pipeline;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
-use crate::snapshot::{QueryRequest, QueryResponse, Snapshot, SnapshotMessage};
+use crate::snapshot::{QueryRequest, QueryResponse, Snapshot};
 use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
 use crate::transactor::Transactor;
+use crate::tx_ring::ring::TxRing;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
 pub use crate::wasm_runtime::FunctionInfo;
@@ -44,11 +45,13 @@ impl Ledger {
         let storage = Storage::new(config.storage.clone()).unwrap();
         let storage = Arc::new(storage);
 
-        let pipeline = Pipeline::new(&config);
+        let (ring, ring_writer, ring_releaser) = TxRing::new(config.ring_size);
+
+        let pipeline = Pipeline::new(&config, ring);
         let wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
-        let snapshot = Snapshot::new(&config, storage.clone());
+        let snapshot = Snapshot::new(&config, storage.clone(), ring_releaser);
         let seal = Seal::new(&config, storage.clone());
-        let transactor = Transactor::new(&config, wasm_runtime.clone());
+        let transactor = Transactor::new(&config, wasm_runtime.clone(), ring_writer);
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
@@ -196,14 +199,13 @@ impl Ledger {
     /// The caller is responsible for creating the `QueryRequest` with a response
     /// channel and blocking on `rx.recv()`. Ledger is a thin passthrough — it
     /// wraps the request in `SnapshotMessage::Query` and handles backpressure.
-    pub fn query(&self, request: QueryRequest) {
-        let mut msg = SnapshotMessage::Query(request);
+    pub fn query(&self, mut request: QueryRequest) {
         let mut retry_count = 0u64;
         while self.pipeline.is_running() {
-            match self.pipeline.try_push_query(msg) {
+            match self.pipeline.try_push_query(request) {
                 Ok(_) => return,
                 Err(returned) => {
-                    msg = returned;
+                    request = returned;
                     self.pipeline.wait_strategy().retry(retry_count);
                     retry_count += 1;
                 }

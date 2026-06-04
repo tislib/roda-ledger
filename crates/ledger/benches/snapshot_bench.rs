@@ -45,7 +45,7 @@ fn snapshot_bench(c: &mut Criterion) {
         max_accounts: 1_000_000,
         ..LedgerConfig::default()
     };
-    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
+    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced, );
 
     // The Snapshot stage needs an Arc<WasmRuntime> + Arc<Storage> to
     // load/unload WASM handlers on FunctionRegistered commits. This
@@ -63,7 +63,7 @@ fn snapshot_bench(c: &mut Criterion) {
     // takes one.
     let _wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
 
-    let mut snapshot = Snapshot::new(&config, storage);
+    let mut snapshot = Snapshot::new(&config, storage, );
     let handle = snapshot.start(pipeline.snapshot_context()).unwrap();
 
     let snapshot_ctx = pipeline.snapshot_context();
@@ -76,7 +76,7 @@ fn snapshot_bench(c: &mut Criterion) {
             let messages = make_snapshot_messages(current_id, account_id, 100);
             for msg in messages {
                 let mut m = msg;
-                while let Err(returned) = snapshot_ctx.input().push(m) {
+                while let Err(returned) = snapshot_ctx.query().push(m) {
                     m = returned;
                     spin_loop();
                 }

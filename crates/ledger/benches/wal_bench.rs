@@ -42,7 +42,7 @@ fn wal_bench(c: &mut Criterion) {
 
     let config = LedgerConfig::bench();
     let storage = Arc::new(Storage::new(config.storage.clone()).unwrap());
-    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced);
+    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced, );
 
     let wal = Wal::new(storage);
     let handles = wal.start(pipeline.wal_context()).unwrap();
@@ -51,8 +51,8 @@ fn wal_bench(c: &mut Criterion) {
     let drain_ctx = pipeline.snapshot_context();
     let drain_handle = thread::spawn(move || {
         let mut retry_count = 0;
-        while drain_ctx.is_running() || !drain_ctx.input().is_empty() {
-            while drain_ctx.input().pop().is_some() {
+        while drain_ctx.is_running() || !drain_ctx.query().is_empty() {
+            while drain_ctx.query().pop().is_some() {
                 retry_count = 0;
             }
             retry_count += 1;
