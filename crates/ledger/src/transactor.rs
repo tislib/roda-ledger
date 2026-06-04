@@ -127,11 +127,11 @@ impl TransactorState {
         self.tx_ring_pusher.push(entry)
     }
 
-    // Make room for one push: when the grant is exhausted, reserve (which commits
-    // + re-grants); while the releaser has freed nothing, back off via the wait strategy.
+    // Make room for one push by re-granting freed space WITHOUT committing, so the
+    // in-flight tx stays uncommitted for verify/finalize; back off until space frees.
     fn ensure_capacity(&mut self) {
         while self.tx_ring_pusher.capacity() == 0 {
-            if self.tx_ring_pusher.reserve() > 0 {
+            if self.tx_ring_pusher.grant() > 0 {
                 self.ring_retry_count = 0;
                 return;
             }
@@ -692,14 +692,15 @@ impl TransactorRunner {
             }
         }
 
-        // Forward the entire batch to readers via the ring, then publish it.
-        // push_entry handles capacity/backpressure per entry.
+        // Forward the batch to readers via the ring. Replicated records are
+        // complete (no verify/finalize), so publish each as it lands — a backed-up
+        // reader can then drain and free space for the rest of the batch.
         {
             let mut s = self.state.borrow_mut();
             for entry in &entries {
                 s.push_entry(*entry);
+                s.tx_ring_pusher.commit();
             }
-            s.tx_ring_pusher.commit();
         }
 
         if max_tx_id > 0 {

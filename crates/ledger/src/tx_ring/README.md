@@ -109,7 +109,8 @@ window.
 
 | Method | Ordering | Description |
 |---|---|---|
-| `writer.reserve() -> usize` | `Release` + `Acquire` | commit, then grant all free slots from the head; returns new `capacity()` |
+| `writer.grant() -> usize` | `Acquire` | extend the window to all free slots **without** publishing; returns new `capacity()` |
+| `writer.reserve() -> usize` | `Release` + `Acquire` | `commit`, then `grant`; returns new `capacity()` |
 | `writer.capacity() -> usize` | — | remaining slots you may still `push` (`0` = full) |
 | `writer.cursor() -> usize` | — | the next `ring_index` this writer will write to (the head) |
 | `writer.push(entry: WalEntry) -> usize` | — | write at the head, return the `ring_index` written; **panics if `capacity() == 0`** |

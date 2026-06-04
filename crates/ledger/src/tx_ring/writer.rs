@@ -96,13 +96,20 @@ impl TxRingWriter {
         self.cursor = ring_index;
     }
 
-    /// Publish progress, then grant all currently-free slots from the head.
+    /// Grant all currently-free slots from the head **without** publishing — picks
+    /// up space the releaser has freed, leaving the uncommitted tail in place.
     /// Returns the new `capacity()`.
-    pub fn reserve(&mut self) -> usize {
-        self.commit();
+    pub fn grant(&mut self) -> usize {
         let granted = self.ring.free_from(self.cursor);
         self.limit = self.cursor.wrapping_add(granted);
         granted
+    }
+
+    /// Publish progress (`commit`), then `grant` all free slots from the head.
+    /// Returns the new `capacity()`.
+    pub fn reserve(&mut self) -> usize {
+        self.commit();
+        self.grant()
     }
 }
 
