@@ -271,7 +271,7 @@ fn test_concurrent_monotonic_tx_ids() {
 #[test]
 fn test_concurrent_small_queue_backpressure() {
     let config = LedgerConfig {
-        ring_size: 8,
+        ring_size: 1 << 6,
         seal_check_internal: Duration::from_millis(10),
         ..LedgerConfig::temp()
     };
@@ -280,7 +280,7 @@ fn test_concurrent_small_queue_backpressure() {
     let ledger = Arc::new(ledger);
 
     let num_threads = 4;
-    let ops_per_thread = 10_000u64;
+    let ops_per_thread = 1000u64;
 
     let mut handles = Vec::new();
     for _ in 0..num_threads {

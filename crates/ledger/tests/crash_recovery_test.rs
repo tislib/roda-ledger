@@ -23,7 +23,6 @@ fn crash_recovery_test() {
     // Phase 1: Insert transactions — WAL replay will be used on restart (no snapshot at 64MB segments)
     {
         let config = LedgerConfig {
-            ring_size: 1024,
             max_accounts: 1_000_000,
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
@@ -59,7 +58,6 @@ fn crash_recovery_test() {
     // Phase 2: Start again and add more transactions
     {
         let config = LedgerConfig {
-            ring_size: 1024,
             max_accounts: 1_000_000,
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
@@ -94,7 +92,6 @@ fn crash_recovery_test() {
     // Phase 3: Start again and verify
     {
         let config = LedgerConfig {
-            ring_size: 1024,
             max_accounts: 1_000_000,
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
