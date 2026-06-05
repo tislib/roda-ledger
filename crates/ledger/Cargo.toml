@@ -43,6 +43,10 @@ name = "transactor_bench"
 harness = false
 
 [[bench]]
+name = "crc32_bench"
+harness = false
+
+[[bench]]
 name = "transaction_runner_bench"
 harness = false
 

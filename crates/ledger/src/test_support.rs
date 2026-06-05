@@ -12,6 +12,7 @@ use crate::wait_strategy::WaitStrategy;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use storage::entities::WalEntry;
 
 /// Background thread that keeps a `TxRing` drained by advancing its releaser to
 /// the writer's committed frontier, so a producer under benchmark never blocks
@@ -74,4 +75,30 @@ pub fn mock_pipeline(
 pub fn mock_transactor_ctx() -> TransactorContext {
     let (ring, _writer, _releaser) = TxRing::new(2);
     Pipeline::with_sizes(8, WaitStrategy::LowLatency, ring).transactor_context()
+}
+
+/// A standalone `Pipeline` wired to a fresh ring, returning the ring's writer and
+/// releaser **without** a drain — for benches that feed the ring directly and wire
+/// the releaser into a real consumer stage (WAL/snapshot) that frees slots itself.
+pub fn ring_pipeline(
+    queue_size: usize,
+    ring_size: usize,
+    wait_strategy: WaitStrategy,
+) -> (Arc<Pipeline>, TxRingWriter, TxRingReleaser) {
+    let (ring, writer, releaser) = TxRing::new(ring_size);
+    let pipeline = Pipeline::with_sizes(queue_size, wait_strategy, ring);
+    (pipeline, writer, releaser)
+}
+
+/// Push one entry, reclaiming freed slots (blocking on the releaser) when the
+/// granted window is exhausted, so a feeder never panics on a full ring.
+pub fn ring_push(writer: &mut TxRingWriter, entry: WalEntry) {
+    while writer.capacity() == 0 {
+        writer.commit(); // publish so the consumer can free slots
+        if writer.grant() > 0 {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    writer.push(entry);
 }

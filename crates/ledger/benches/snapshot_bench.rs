@@ -1,16 +1,14 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::config::{LedgerConfig, StorageConfig};
 use ledger::ledger::WaitStrategy;
-use ledger::pipeline::Pipeline;
-use ledger::snapshot::{Snapshot, SnapshotMessage};
-use ledger::wasm_runtime::WasmRuntime;
-use std::hint::spin_loop;
+use ledger::snapshot::Snapshot;
+use ledger::test_support::{ring_pipeline, ring_push};
 use std::sync::Arc;
 use std::time::Duration;
 use storage::Storage;
 use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 
-fn make_snapshot_messages(tx_id: u64, account_id: u64, amount: u64) -> [SnapshotMessage; 2] {
+fn make_deposit_entries(tx_id: u64, account_id: u64, amount: u64) -> [WalEntry; 2] {
     let metadata = TxMetadata {
         entry_type: WalEntryKind::TxMetadata as u8,
         fail_reason: FailReason::NONE,
@@ -30,12 +28,12 @@ fn make_snapshot_messages(tx_id: u64, account_id: u64, amount: u64) -> [Snapshot
         amount,
         computed_balance: amount as i64,
     };
-    [
-        SnapshotMessage::Entry(WalEntry::Metadata(metadata)),
-        SnapshotMessage::Entry(WalEntry::Entry(entry)),
-    ]
+    [WalEntry::Metadata(metadata), WalEntry::Entry(entry)]
 }
 
+/// Isolates the snapshot stage: the bench feeds meta+entry pairs into the ring and
+/// advances `commit_index` directly (standing in for the WAL), so the snapshot
+/// stage indexes the entries and drives the ring releaser.
 fn snapshot_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("snapshot");
     group.throughput(Throughput::Elements(1));
@@ -45,12 +43,9 @@ fn snapshot_bench(c: &mut Criterion) {
         max_accounts: 1_000_000,
         ..LedgerConfig::default()
     };
-    let pipeline = Pipeline::with_sizes(10_240_000, 10_240_000, WaitStrategy::Balanced, );
 
-    // The Snapshot stage needs an Arc<WasmRuntime> + Arc<Storage> to
-    // load/unload WASM handlers on FunctionRegistered commits. This
-    // bench never emits such records; a fresh storage in a tempdir and
-    // an empty WasmRuntime suffice.
+    // The Snapshot constructor needs an Arc<Storage>, but its run loop only touches
+    // the in-memory indexer + releaser — a throwaway temp storage suffices.
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let storage_cfg = StorageConfig {
         data_dir: tmp_dir.path().to_string_lossy().into_owned(),
@@ -58,29 +53,25 @@ fn snapshot_bench(c: &mut Criterion) {
         ..StorageConfig::default()
     };
     let storage = Arc::new(Storage::new(storage_cfg).unwrap());
-    // Built once for completeness even though this bench doesn't
-    // exercise the wasm runtime — the Snapshot constructor no longer
-    // takes one.
-    let _wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
 
-    let mut snapshot = Snapshot::new(&config, storage, );
+    let (pipeline, mut writer, releaser) = ring_pipeline(1 << 20, 1 << 16, WaitStrategy::Balanced);
+
+    let mut snapshot = Snapshot::new(&config, storage, releaser);
     let handle = snapshot.start(pipeline.snapshot_context()).unwrap();
 
-    let snapshot_ctx = pipeline.snapshot_context();
+    // Stands in for the WAL: lets the snapshot's `tx_id > commit_index` gate pass.
+    let wal_ctx = pipeline.wal_context();
     let mut current_id = 0u64;
 
     group.bench_function("process", |b| {
         b.iter(|| {
             current_id += 1;
             let account_id = rand::random::<u64>() % 1_000_000;
-            let messages = make_snapshot_messages(current_id, account_id, 100);
-            for msg in messages {
-                let mut m = msg;
-                while let Err(returned) = snapshot_ctx.query().push(m) {
-                    m = returned;
-                    spin_loop();
-                }
-            }
+            let [meta, entry] = make_deposit_entries(current_id, account_id, 100);
+            ring_push(&mut writer, meta);
+            ring_push(&mut writer, entry);
+            writer.commit();
+            wal_ctx.set_commit_index(current_id);
         });
     });
 
