@@ -441,10 +441,10 @@ impl Ledger {
         self.wait_for_pass();
 
         let mut retry_count = 0;
+        let last_seal_step_id = self.seal.seal_step_id();
         while self.pipeline.is_running() {
-            let segment_count = self.storage.last_segment_id() - 1;
-            if segment_count == self.pipeline.last_sealed_id() {
-                return;
+            if last_seal_step_id != self.seal.seal_step_id() {
+                break;
             }
 
             retry_count += 1;

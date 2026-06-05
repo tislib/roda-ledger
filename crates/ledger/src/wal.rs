@@ -136,12 +136,12 @@ impl WalRunner {
         }
     }
 
-    fn is_rotation_needed(&mut self) -> bool {
+    fn is_rotation_needed(&self) -> bool {
         let tx_per_seg = self.storage.config().transaction_count_per_segment;
         let is_rotation_needed = self.last_received_tx_id > 0
             && self.segment_start_tx_id > 0
             && tx_per_seg > 0
-            && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg;
+            && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg - 1;
         is_rotation_needed
     }
 
