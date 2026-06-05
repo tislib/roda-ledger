@@ -157,9 +157,6 @@ impl SealRunner {
 
         let mut pending = self.storage.list_all_segments()?;
         for segment in pending.iter_mut() {
-            if !ctx.is_running() {
-                break;
-            }
             if segment.status() == SEALED {
                 continue;
             }
