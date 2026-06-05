@@ -1,9 +1,9 @@
-// Lock-free SPSC-gated ring; not yet wired into the pipeline.
+// Lock-free SPSC-gated ring: single writer, single releaser, copy-out readers.
 #![allow(dead_code)]
 
-pub(crate) mod releaser;
-pub(crate) mod ring;
-pub(crate) mod writer;
+pub mod releaser;
+pub mod ring;
+pub mod writer;
 
 #[cfg(test)]
 mod tests;

@@ -39,7 +39,7 @@ impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
             max_accounts: 1_000_000,
-            ring_size: 1 << 14,
+            ring_size: 1 << 20,
             storage: StorageConfig::default(),
             wait_strategy: WaitStrategy::Balanced,
             log_level: default_log_level(),

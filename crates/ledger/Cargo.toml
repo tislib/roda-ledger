@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "simple_spmc_bench"
 harness = false
+
+[[bench]]
+name = "tx_ring_bench"
+harness = false

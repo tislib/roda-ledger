@@ -123,21 +123,25 @@ impl TransactorState {
     }
 
     pub fn push_entry(&mut self, entry: WalEntry) -> usize {
-        self.ensure_capacity();
         self.tx_ring_pusher.push(entry)
     }
 
-    // Make room for one push by re-granting freed space WITHOUT committing, so the
-    // in-flight tx stays uncommitted for verify/finalize; back off until space frees.
-    fn ensure_capacity(&mut self) {
-        while self.tx_ring_pusher.capacity() == 0 {
-            if self.tx_ring_pusher.grant() > 0 {
-                self.ring_retry_count = 0;
-                return;
+    // Make room by re-granting freed space WITHOUT committing, so the in-flight
+    // tx stays uncommitted for verify/finalize; back off until space frees.
+    // Returns false only on shutdown (ctx stopped while still waiting).
+    fn ensure_capacity(&mut self, ctx: &TransactorContext, capacity: usize) -> bool {
+        while self.tx_ring_pusher.capacity() < capacity {
+            if self.tx_ring_pusher.grant() >= capacity {
+                break;
+            }
+            if !ctx.is_running() {
+                return false;
             }
             self.ring_retry_count += 1;
             self.wait_strategy.retry(self.ring_retry_count);
         }
+        self.ring_retry_count = 0;
+        true
     }
 
     #[inline]
@@ -169,14 +173,15 @@ impl TransactorState {
         let mut sum_debits: u128 = 0;
 
         let end = self.tx_ring_pusher.cursor();
-        self.tx_ring_pusher.walk(self.last_ring_index + 1, end, |entry| {
-            if let WalEntry::Entry(e) = entry {
-                match e.kind {
-                    EntryKind::Credit => sum_credits += e.amount as u128,
-                    EntryKind::Debit => sum_debits += e.amount as u128,
+        self.tx_ring_pusher
+            .walk(self.last_ring_index + 1, end, |entry| {
+                if let WalEntry::Entry(e) = entry {
+                    match e.kind {
+                        EntryKind::Credit => sum_credits += e.amount as u128,
+                        EntryKind::Debit => sum_debits += e.amount as u128,
+                    }
                 }
-            }
-        });
+            });
         if sum_credits != sum_debits {
             self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
         }
@@ -185,20 +190,21 @@ impl TransactorState {
 
     pub fn rollback(&mut self) {
         let end = self.tx_ring_pusher.cursor();
-        self.tx_ring_pusher.walk(self.last_ring_index + 1, end, |entry| {
-            if let WalEntry::Entry(e) = entry
-                && let Some(balance) = self.balances.get_mut(e.account_id as usize)
-            {
-                match e.kind {
-                    EntryKind::Credit => {
-                        *balance = balance.saturating_add(e.amount as i64);
-                    }
-                    EntryKind::Debit => {
-                        *balance = balance.saturating_sub(e.amount as i64);
+        self.tx_ring_pusher
+            .walk(self.last_ring_index + 1, end, |entry| {
+                if let WalEntry::Entry(e) = entry
+                    && let Some(balance) = self.balances.get_mut(e.account_id as usize)
+                {
+                    match e.kind {
+                        EntryKind::Credit => {
+                            *balance = balance.saturating_add(e.amount as i64);
+                        }
+                        EntryKind::Debit => {
+                            *balance = balance.saturating_sub(e.amount as i64);
+                        }
                     }
                 }
-            }
-        });
+            });
         // Discard this tx's sub-items, keeping its metadata at `position`.
         self.tx_ring_pusher.rollback_to(self.last_ring_index + 1);
     }
@@ -486,7 +492,11 @@ impl TransactorRunner {
     }
 
     /// Process a batch of transactions directly, bypassing inbound/outbound queues.
-    pub fn process_direct_batch(&mut self, txs: impl IntoIterator<Item = Transaction>) {
+    pub fn process_direct_batch(
+        &mut self,
+        ctx: &TransactorContext,
+        txs: impl IntoIterator<Item = Transaction>,
+    ) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -494,18 +504,18 @@ impl TransactorRunner {
         for tx in txs {
             self.transaction_buffer.push(tx);
         }
-        self.process(timestamp);
+        self.process(ctx, timestamp);
         self.reset();
     }
 
     /// Process a single transaction directly, bypassing inbound/outbound queues.
-    pub fn process_direct(&mut self, tx: Transaction) {
+    pub fn process_direct(&mut self, ctx: &TransactorContext, tx: Transaction) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         self.transaction_buffer.push(tx);
-        self.process(timestamp);
+        self.process(ctx, timestamp);
         self.reset();
     }
 
@@ -602,7 +612,7 @@ impl TransactorRunner {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let max_tx_id = self.process(timestamp);
+        let max_tx_id = self.process(ctx, timestamp);
 
         // Publish the whole step's records to readers in one commit. The slots
         // were granted at the head of process().
@@ -719,7 +729,7 @@ impl TransactorRunner {
     /// Process the buffered transactions, producing wal entries in the
     /// shared `state.entries`. Returns the maximum transaction id observed
     /// in this batch (0 if none).
-    fn process(&mut self, timestamp: u64) -> u64 {
+    fn process(&mut self, ctx: &TransactorContext, timestamp: u64) -> u64 {
         let mut max_tx_id = 0;
         for idx in 0..self.transaction_buffer.len() {
             let tx_id = self.transaction_buffer[idx].id;
@@ -738,9 +748,11 @@ impl TransactorRunner {
             // --- Deduplication check ---
             match self.dedup.check(user_ref, tx_id) {
                 DedupResult::Duplicate(original_tx_id) => {
-                    self.state
-                        .borrow_mut()
-                        .emit_duplicate(user_ref, timestamp, original_tx_id);
+                    let mut s = self.state.borrow_mut();
+                    if !s.ensure_capacity(ctx, 2) {
+                        return max_tx_id;
+                    }
+                    s.emit_duplicate(user_ref, timestamp, original_tx_id);
                     self.rejected_transactions
                         .insert(tx_id, FailReason::DUPLICATE);
                     continue;
@@ -760,6 +772,9 @@ impl TransactorRunner {
                     ..
                 } => {
                     let mut s = self.state.borrow_mut();
+                    if !s.ensure_capacity(ctx, 3) {
+                        return max_tx_id;
+                    }
                     s.meta(*b"DEPOSIT\0", user_ref, timestamp);
                     s.debit(account, amount);
                     s.credit(SYSTEM_ACCOUNT_ID, amount);
@@ -771,6 +786,9 @@ impl TransactorRunner {
                     ..
                 } => {
                     let mut s = self.state.borrow_mut();
+                    if !s.ensure_capacity(ctx, 3) {
+                        return max_tx_id;
+                    }
                     s.meta(*b"WITHDRAW", user_ref, timestamp);
                     if s.get_balance(account) < amount as i64 {
                         s.fail(FailReason::INSUFFICIENT_FUNDS);
@@ -787,6 +805,9 @@ impl TransactorRunner {
                     ..
                 } => {
                     let mut s = self.state.borrow_mut();
+                    if !s.ensure_capacity(ctx, 3) {
+                        return max_tx_id;
+                    }
                     s.meta(*b"TRANSFER", user_ref, timestamp);
                     if from == to {
                         // no-op
@@ -803,6 +824,9 @@ impl TransactorRunner {
                     override_existing,
                     user_ref,
                 } => {
+                    if !self.state.borrow_mut().ensure_capacity(ctx, 2) {
+                        return max_tx_id;
+                    }
                     // 1. TxMetadata first (mirrors Operation::Function).
                     self.state
                         .borrow_mut()
@@ -852,6 +876,9 @@ impl TransactorRunner {
                     // CRCs the term record alongside the meta.
                     let record = wal_tx_term_entry(term, node_id, node_count, node_voted);
                     let mut s = self.state.borrow_mut();
+                    if !s.ensure_capacity(ctx, 2) {
+                        return max_tx_id;
+                    }
                     s.meta(*b"NEWTERM\0", 0, timestamp);
                     s.push_entry(WalEntry::Term(record));
                 }
@@ -870,6 +897,9 @@ impl TransactorRunner {
                             // verify/rollback bookkeeping below records
                             // the rejection and stamps the meta CRC.
                             let mut s = self.state.borrow_mut();
+                            if !s.ensure_capacity(ctx, 2) {
+                                return max_tx_id;
+                            }
                             s.meta(build_wasm_tag(0), user_ref, timestamp);
                             s.fail(FailReason::INVALID_OPERATION);
                         }
@@ -889,6 +919,9 @@ impl TransactorRunner {
                             // its tx_id) on every credit/debit.
                             let status = caller.execute(params);
                             let mut s = self.state.borrow_mut();
+                            if !s.ensure_capacity(ctx, 256) {
+                                return max_tx_id;
+                            }
                             if status != 0 {
                                 s.fail(FailReason::from_u8(status));
                             } else {
@@ -963,7 +996,10 @@ mod tests {
     fn fixture(max_accounts: usize, cap: usize) -> (Arc<TxRing>, TransactorState) {
         let (ring, mut writer, _releaser) = TxRing::new(cap);
         writer.reserve();
-        (ring, TransactorState::new(max_accounts, writer, WaitStrategy::LowLatency))
+        (
+            ring,
+            TransactorState::new(max_accounts, writer, WaitStrategy::LowLatency),
+        )
     }
 
     #[test]
@@ -1036,9 +1072,9 @@ mod tests {
     }
 
     #[test]
-    fn push_entry_reserves_when_grant_is_exhausted() {
-        // A 4-slot ring: fill the grant, then publish + release so the next
-        // push must reclaim space via the in-push reserve path.
+    fn ensure_capacity_reclaims_freed_slots() {
+        // A 4-slot ring: fill the grant, publish + release, then ensure_capacity
+        // must reclaim the freed slots so the next op can push again.
         let (_ring, mut writer, mut releaser) = TxRing::new(4);
         writer.reserve();
         let mut s = TransactorState::new(8, writer, WaitStrategy::LowLatency);
@@ -1052,8 +1088,11 @@ mod tests {
         s.tx_ring_pusher.commit();
         releaser.advance_to(4); // reader caught up; 4 slots are free again
 
-        // capacity() == 0 here, so push_entry reserves (commit + re-grant) then pushes.
-        s.debit(4, 7);
+        // capacity() == 0, so ensure_capacity must reclaim the freed slots.
+        let ctx = crate::test_support::mock_transactor_ctx();
+        assert!(s.ensure_capacity(&ctx, 1));
+        assert!(s.tx_ring_pusher.capacity() >= 1);
+        s.debit(4, 7); // ring_index 4 reuses slot 0
         assert_eq!(s.tx_ring_pusher.cursor(), 5);
         assert_eq!(s.get_balance(4), 7);
     }
