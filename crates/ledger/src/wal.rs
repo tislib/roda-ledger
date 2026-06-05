@@ -104,6 +104,11 @@ impl WalRunner {
                 entries_ingested += 1;
                 last_ring_index += 1;
 
+                // if the segment is full, do not push any more entries.
+                if self.is_rotation_needed() {
+                    return false;
+                }
+
                 true
             });
 
@@ -123,15 +128,25 @@ impl WalRunner {
             self.retry_count = 0;
 
             // Rotate the segment when the transaction count threshold is exceeded.
-            let tx_per_seg = self.storage.config().transaction_count_per_segment;
-            if self.last_received_tx_id > 0
-                && self.segment_start_tx_id > 0
-                && tx_per_seg > 0
-                && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg
-            {
+            let is_rotation_needed = self.is_rotation_needed();
+
+            if is_rotation_needed {
                 self.rotate(&ctx);
             }
         }
+    }
+
+    fn is_rotation_needed(&mut self) -> bool {
+        let tx_per_seg = self.storage.config().transaction_count_per_segment;
+        let is_rotation_needed = self.last_received_tx_id > 0
+            && self.segment_start_tx_id > 0
+            && tx_per_seg > 0
+            && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg;
+        is_rotation_needed
+    }
+
+    fn remaining_until_rotate(&mut self) -> u64 {
+        self.storage.config().transaction_count_per_segment - self.active_segment.record_count()
     }
 
     /// Append one entry to the active segment buffer and update tx_id bookkeeping.
