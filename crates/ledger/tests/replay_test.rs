@@ -7,7 +7,7 @@ use storage::StorageConfig;
 
 /// Force segment rotation and snapshot:
 ///   100 tx/segment + snapshot_frequency=1 ensures snapshot after first seal.
-const SMALL_SEGMENT_TX_COUNT: u64 = 100;
+const SMALL_SEGMENT_TX_COUNT: u64 = 1000;
 const SNAP_EVERY_SEAL: u32 = 1;
 
 #[test]

@@ -145,10 +145,6 @@ impl WalRunner {
         is_rotation_needed
     }
 
-    fn remaining_until_rotate(&mut self) -> u64 {
-        self.storage.config().transaction_count_per_segment - self.active_segment.record_count()
-    }
-
     /// Append one entry to the active segment buffer and update tx_id bookkeeping.
     fn ingest_entry(&mut self, entry: WalEntry) {
         self.active_segment.append_pending_entry(&entry);

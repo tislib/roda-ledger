@@ -708,6 +708,9 @@ impl TransactorRunner {
         {
             let mut s = self.state.borrow_mut();
             for entry in &entries {
+                if !s.ensure_capacity(ctx, 1) {
+                    return;
+                }
                 s.push_entry(*entry);
                 s.tx_ring_pusher.commit();
             }

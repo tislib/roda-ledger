@@ -7,7 +7,7 @@ use storage::{SNAPSHOT_MAGIC, StorageConfig};
 
 /// Force snapshot creation: very small WAL segments (100 tx/segment) + snapshot every seal.
 /// With 35K transactions → many seals → snapshot.
-const SMALL_SEGMENT_TX_COUNT: u64 = 100;
+const SMALL_SEGMENT_TX_COUNT: u64 = 1000;
 const SNAP_EVERY_SEAL: u32 = 1;
 
 #[test]

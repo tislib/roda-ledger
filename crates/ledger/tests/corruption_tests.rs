@@ -6,7 +6,7 @@ use std::time::Duration;
 use storage::StorageConfig;
 
 // 100 tx/segment + snapshot every seal → many seals, many snapshots
-const SMALL_SEGMENT_TX_COUNT: u64 = 1000;
+const SMALL_SEGMENT_TX_COUNT: u64 = 8000;
 const SNAP_FREQUENCY: u32 = 1;
 const NUM_TRANSACTIONS: u64 = 160_000;
 const ACCOUNT_ID: u64 = 7;

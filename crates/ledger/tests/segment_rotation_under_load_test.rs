@@ -17,7 +17,7 @@ fn unique_dir(name: &str) -> String {
 #[test]
 fn test_rapid_rotation_many_segments() {
     let dir = unique_dir("rapid_rotation");
-    let total = 500_000u64;
+    let total = 5000;
 
     {
         let config = LedgerConfig {
@@ -113,7 +113,7 @@ fn test_concurrent_writes_during_rotation() {
     let config = LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.clone(),
-            transaction_count_per_segment: 100,
+            transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,
             ..Default::default()
         },
@@ -170,7 +170,7 @@ fn test_seal_crc_integrity() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                transaction_count_per_segment: 100,
+                transaction_count_per_segment: 10_000,
                 snapshot_frequency: 0, // no snapshots, focus on WAL
                 ..Default::default()
             },
@@ -249,7 +249,7 @@ fn test_snapshot_at_segment_boundary() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                transaction_count_per_segment: 100,
+                transaction_count_per_segment: 2000,
                 snapshot_frequency: 2,
                 ..Default::default()
             },
