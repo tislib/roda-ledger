@@ -85,11 +85,6 @@ jobs:
           git clone --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" /root/roda-ledger
           cd /root/roda-ledger
 
-          # Build in release mode
-          echo "::group::Building"
-          /root/.cargo/bin/cargo build --package roda-ledger --release --bin load
-          echo "::endgroup::"
-
           # Run load test
           echo "::group::Load Test Output"
           /root/.cargo/bin/cargo run --package ledger --release --bin load 2>&1 | tee /root/load-test-output.txt
