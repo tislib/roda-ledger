@@ -14,6 +14,16 @@ path = "src/lib.rs"
 name = "roda-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables the `Fault` gRPC service on this node's node-port and the
+# `ClusterFaultInjector` it backs onto. Transitively enables
+# `ledger/fault-injection` and `storage/fault-injection` so the
+# disk-affecting buckets (DISK_ACCESS, WAL_ACCESS) reach the storage
+# layer's hooks. Production builds compile this surface out
+# entirely. See ADR-018.
+fault-injection = ["ledger/fault-injection"]
+
 [dependencies]
 proto.workspace = true
 storage.workspace = true
@@ -30,6 +40,7 @@ serde.workspace = true
 toml.workspace = true
 spdlog-rs.workspace = true
 arc-swap.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

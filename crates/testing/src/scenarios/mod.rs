@@ -13,6 +13,7 @@ use crate::scenario::Scenario;
 
 pub mod e2e;
 pub mod load;
+pub mod matrix_grid;
 
 /// All built-in scenarios in stable declared order. e2e scenarios first,
 /// then load scenarios.

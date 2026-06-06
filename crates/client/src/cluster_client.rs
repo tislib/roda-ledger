@@ -211,6 +211,9 @@ impl ClusterClient {
             match op(client).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    if !is_retryable(&e) {
+                        return Err(e); // deterministic rejection — retrying can't help
+                    }
                     if attempt == max {
                         warn!(
                             "cluster::{}: failed after {} retries (last node[{}]): {} (code={:?})",
@@ -541,6 +544,9 @@ impl ClusterLeaderClient {
             match op(client).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    if !is_retryable(&e) {
+                        return Err(e); // deterministic rejection — retrying can't help
+                    }
                     if attempt == max {
                         warn!(
                             "leader::{}: failed after {} retries (last node[{}]): {} (code={:?})",
@@ -864,6 +870,23 @@ fn should_rotate_leader(status: &tonic::Status) -> bool {
     )
 }
 
+/// True when another attempt may succeed: transient transport errors
+/// plus the "not a leader" rejection. `should_rotate_leader` ⊆ this.
+fn is_retryable(status: &tonic::Status) -> bool {
+    if is_not_leader_error(status) {
+        return true;
+    }
+    matches!(
+        status.code(),
+        Code::Unavailable
+            | Code::Cancelled
+            | Code::Unknown
+            | Code::Internal
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+    )
+}
+
 /// Parse the optional `leader-node-index` metadata hint into a node
 /// index. Returns `None` when the metadata is absent, malformed, or
 /// out of range for the current cluster size.
@@ -872,4 +895,41 @@ fn read_leader_hint(status: &tonic::Status, n_nodes: usize) -> Option<usize> {
     let s = meta.to_str().ok()?;
     let id: usize = s.parse().ok()?;
     if id < n_nodes { Some(id) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Status;
+
+    #[test]
+    fn deterministic_errors_are_not_retryable() {
+        assert!(!is_retryable(&Status::invalid_argument("bad wasm")));
+        assert!(!is_retryable(&Status::already_exists("dup")));
+        assert!(!is_retryable(&Status::not_found("missing")));
+        assert!(!is_retryable(&Status::permission_denied("nope")));
+        assert!(!is_retryable(&Status::unauthenticated("nope")));
+        assert!(!is_retryable(&Status::unimplemented("nope")));
+        // FailedPrecondition that is NOT a leadership rejection.
+        assert!(!is_retryable(&Status::failed_precondition("ledger sealed")));
+    }
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        assert!(is_retryable(&Status::unavailable("node down")));
+        assert!(is_retryable(&Status::cancelled("dropped")));
+        assert!(is_retryable(&Status::new(Code::Unknown, "opaque")));
+        assert!(is_retryable(&Status::internal("transient")));
+        assert!(is_retryable(&Status::deadline_exceeded("slow hop")));
+        assert!(is_retryable(&Status::resource_exhausted("busy")));
+    }
+
+    #[test]
+    fn not_a_leader_stays_retryable() {
+        // The exact message ensure_writable emits on a non-leader.
+        let s = Status::failed_precondition("node is not a leader; writes are not accepted");
+        assert!(is_not_leader_error(&s));
+        assert!(is_retryable(&s));
+        assert!(should_rotate_leader(&s));
+    }
 }

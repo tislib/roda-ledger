@@ -33,6 +33,10 @@ impl Segment {
 
         let wal_data = self.wal_data();
         let mut offset: usize = 0;
+        // tx_id is now carried only on TxMetadata. Track the most recent
+        // metadata's id and stamp it onto every follower record we see
+        // until the next TxMetadata appears.
+        let mut current_tx_id: u64 = 0;
         while offset < wal_data.len() {
             let entry = parse_wal_record(&wal_data[offset..]).map_err(|e| {
                 std::io::Error::new(
@@ -47,10 +51,11 @@ impl Segment {
             })?;
             match &entry {
                 WalEntry::Metadata(m) => {
+                    current_tx_id = m.tx_id;
                     tx_offsets.push((m.tx_id, offset as u64));
                 }
                 WalEntry::Entry(e) => {
-                    account_entries.push((e.account_id, e.tx_id));
+                    account_entries.push((e.account_id, current_tx_id));
                 }
                 WalEntry::Link(_) | WalEntry::FunctionRegistered(_) | WalEntry::Term(_) => {}
             }

@@ -173,7 +173,7 @@ impl TransactorState {
             entry_type: WalEntryKind::Link as u8,
             link_kind: TxLinkKind::Duplicate as u8,
             _pad: [0; 6],
-            tx_id: self.tx_id,
+            _pad1: [0; 8],
             to_tx_id: original_tx_id,
             _pad2: [0; 16],
         };
@@ -219,7 +219,7 @@ impl TransactorState {
             *balance = balance.saturating_sub(amount as i64);
             self.entries.push(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
-                tx_id: self.tx_id,
+                _pad1: [0; 8],
                 account_id,
                 amount,
                 kind: EntryKind::Credit,
@@ -240,7 +240,7 @@ impl TransactorState {
             *balance = balance.saturating_add(amount as i64);
             self.entries.push(WalEntry::Entry(TxEntry {
                 entry_type: WalEntryKind::TxEntry as u8,
-                tx_id: self.tx_id,
+                _pad1: [0; 8],
                 account_id,
                 amount,
                 kind: EntryKind::Debit,
@@ -546,7 +546,9 @@ impl TransactorRunner {
     fn apply_replicated_batch(&mut self, entries: Vec<WalEntry>, ctx: &TransactorContext) {
         let mut max_tx_id: u64 = 0;
 
-        // Apply balances under a single mut-borrow of state.
+        // Apply balances under a single mut-borrow of state. tx_id is
+        // now carried only on TxMetadata; follower records inherit it
+        // from the most recent metadata in the stream.
         {
             let mut state = self.state.borrow_mut();
             for entry in &entries {
@@ -555,9 +557,6 @@ impl TransactorRunner {
                         max_tx_id = m.tx_id;
                     }
                     WalEntry::Entry(e) => {
-                        if e.tx_id > max_tx_id {
-                            max_tx_id = e.tx_id;
-                        }
                         // The leader's authoritative post-update balance is
                         // recorded on the WAL record itself; just install
                         // it (idempotent and matches Recover's semantics).

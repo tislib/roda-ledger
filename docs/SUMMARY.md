@@ -26,3 +26,4 @@
     - [ADR-0009 Tx link dedup reversal](adr/0009-tx-link-dedup-reversal.md)
     - [ADR-0010 Sync submit](adr/0010-sync-submit.md)
     - [ADR-0014 WASM function registry](adr/0014-wasm-function-registry.md)
+    - [ADR-0018 Fault injection framework](adr/0018-fault-injection.md)

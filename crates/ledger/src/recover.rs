@@ -488,7 +488,7 @@ impl<'r> Recover<'r> {
                             return;
                         }
                         recover_balances.insert(entry.account_id, entry.computed_balance);
-                        snapshot.recover_index_tx_entry(entry);
+                        snapshot.recover_index_tx_entry(segment_recover_tx_id, entry);
                     }
                     WalEntry::Link(link) => {
                         if skipping_tx {
@@ -583,7 +583,7 @@ impl<'r> Recover<'r> {
                         return;
                     }
                     recover_balances.insert(entry.account_id, entry.computed_balance);
-                    snapshot.recover_index_tx_entry(entry);
+                    snapshot.recover_index_tx_entry(current_recover_tx_id, entry);
                 }
                 WalEntry::Link(link) => {
                     if skipping_tx {

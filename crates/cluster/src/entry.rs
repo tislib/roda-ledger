@@ -10,13 +10,26 @@ use spdlog::info;
 use std::path::Path;
 
 pub fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cfg = Config::from_file(config_path).map_err(|e| {
+    let mut cfg = Config::from_file(config_path).map_err(|e| {
         format!(
             "failed to load config from {}: {}",
             config_path.display(),
             e
         )
     })?;
+
+    // The TOML schema doesn't carry `log_level` (it's `#[serde(skip)]`
+    // on `LedgerConfig`); the e2e harness drives the default through
+    // `RODA_LOG_LEVEL` so spawned servers default to debug under
+    // `roda-scenario`. `Ledger::new` is what actually calls
+    // `set_level_filter`, so overriding the config field here is
+    // sufficient.
+    if let Some(level) = std::env::var("RODA_LOG_LEVEL")
+        .ok()
+        .and_then(|s| parse_log_level(&s))
+    {
+        cfg.ledger.log_level = level;
+    }
 
     info!(
         "starting roda-ledger (node_id={}, cluster_size={}) from {}",
@@ -45,6 +58,18 @@ fn install_shutdown_signals() -> std::io::Result<Signals> {
 #[cfg(not(unix))]
 fn install_shutdown_signals() -> std::io::Result<Signals> {
     Signals::new([SIGINT])
+}
+
+fn parse_log_level(s: &str) -> Option<spdlog::Level> {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => Some(spdlog::Level::Trace),
+        "debug" => Some(spdlog::Level::Debug),
+        "info" => Some(spdlog::Level::Info),
+        "warn" | "warning" => Some(spdlog::Level::Warn),
+        "error" => Some(spdlog::Level::Error),
+        "critical" | "crit" => Some(spdlog::Level::Critical),
+        _ => None,
+    }
 }
 
 fn wait_for_shutdown(signals: &mut Signals) {

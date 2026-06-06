@@ -49,8 +49,17 @@ pub struct ProcessProvisioner {
     /// stdout/stderr, which is what most tests want. The scenario
     /// CLI flips this to `true` so per-scenario output stays clean.
     quiet: bool,
+    /// Per-node deadline applied by `wait_one_ready`. Must cover the
+    /// worst-case cold-start WAL replay, since the gRPC port isn't
+    /// bound until `Ledger::start()` returns. Default 60s — comfortable
+    /// for the 1M-tx crash-recovery scenario on a CI worker.
+    readiness_timeout: Duration,
     state: Mutex<State>,
 }
+
+/// Default deadline `wait_one_ready` applies when none is overridden.
+/// See [`ProcessProvisioner::readiness_timeout`] for the rationale.
+pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct State {
@@ -89,8 +98,17 @@ impl ProcessProvisioner {
             server_bin,
             base_temp_dir: std::env::temp_dir(),
             quiet: false,
+            readiness_timeout: DEFAULT_READINESS_TIMEOUT,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Override the per-node readiness deadline. Useful for tests that
+    /// know recovery will be much shorter (tight timeout = faster fail)
+    /// or much longer (huge WAL replay) than the default.
+    pub fn with_readiness_timeout(mut self, timeout: Duration) -> Self {
+        self.readiness_timeout = timeout;
+        self
     }
 
     /// Override the parent directory used for per-cluster temp dirs.
@@ -201,7 +219,7 @@ impl Provisioner for ProcessProvisioner {
         }
 
         let urls = client_urls(&nodes);
-        wait_all_ready(&urls).await?;
+        wait_all_ready(&urls, self.readiness_timeout).await?;
 
         let mut state = self.state.lock();
         state.cluster_dir = Some(cluster_dir);
@@ -255,7 +273,7 @@ impl Provisioner for ProcessProvisioner {
         }
 
         let child = spawn_server(&self.server_bin, &config_path, self.quiet)?;
-        wait_one_ready(&url).await?;
+        wait_one_ready(&url, self.readiness_timeout).await?;
 
         let mut state = self.state.lock();
         if let Some(node) = state.nodes.get_mut(idx) {
@@ -338,18 +356,24 @@ fn spawn_server(bin: &Path, config_path: &Path, quiet: bool) -> Result<Child, Pr
     } else {
         (Stdio::inherit(), Stdio::inherit())
     };
-    Command::new(bin)
-        .arg(config_path)
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .map_err(|e| {
-            ProvisionerError::ProvisionFailed(format!(
-                "spawn `{} {}`: {e}",
-                bin.display(),
-                config_path.display()
-            ))
-        })
+    // `log_level` isn't part of the TOML schema (`#[serde(skip)]` on
+    // `LedgerConfig`); the e2e harness drives it via `RODA_LOG_LEVEL`
+    // so spawned servers default to info-level output during scenario
+    // runs. Callers that already set `RODA_LOG_LEVEL` upstream win —
+    // we only seed the default. Bump to `debug` ad-hoc with
+    // `RODA_LOG_LEVEL=debug cargo run -p control --bin scenario …`.
+    let mut cmd = Command::new(bin);
+    cmd.arg(config_path).stdout(stdout).stderr(stderr);
+    if std::env::var_os("RODA_LOG_LEVEL").is_none() {
+        cmd.env("RODA_LOG_LEVEL", "info");
+    }
+    cmd.spawn().map_err(|e| {
+        ProvisionerError::ProvisionFailed(format!(
+            "spawn `{} {}`: {e}",
+            bin.display(),
+            config_path.display()
+        ))
+    })
 }
 
 fn client_url(addr: SocketAddr) -> String {
@@ -374,8 +398,7 @@ fn teardown_existing(state: &mut State) {
     state.last_config = None;
 }
 
-async fn wait_one_ready(url: &str) -> Result<(), ProvisionerError> {
-    let timeout = Duration::from_secs(15);
+async fn wait_one_ready(url: &str, timeout: Duration) -> Result<(), ProvisionerError> {
     let start = Instant::now();
     loop {
         match client::NodeClient::connect_url(url).await {
@@ -393,9 +416,9 @@ async fn wait_one_ready(url: &str) -> Result<(), ProvisionerError> {
     }
 }
 
-async fn wait_all_ready(urls: &[String]) -> Result<(), ProvisionerError> {
+async fn wait_all_ready(urls: &[String], timeout: Duration) -> Result<(), ProvisionerError> {
     for url in urls {
-        wait_one_ready(url).await?;
+        wait_one_ready(url, timeout).await?;
     }
     Ok(())
 }

@@ -132,10 +132,10 @@ impl Snapshot {
         }
     }
 
-    pub(crate) fn recover_index_tx_entry(&mut self, entry: &TxEntry) {
+    pub(crate) fn recover_index_tx_entry(&mut self, tx_id: u64, entry: &TxEntry) {
         if let Some(indexer) = &mut self.indexer {
             indexer.insert_entry(
-                entry.tx_id,
+                tx_id,
                 entry.account_id,
                 entry.amount,
                 entry.kind,
@@ -167,8 +167,12 @@ impl SnapshotRunner {
                                 last_processed_tx_id = m.tx_id;
                             }
                             WalEntry::Entry(e) => {
+                                // tx_id is no longer on TxEntry — it
+                                // belongs to the preceding TxMetadata,
+                                // which we just stamped into
+                                // `last_processed_tx_id`.
                                 self.indexer.insert_entry(
-                                    e.tx_id,
+                                    last_processed_tx_id,
                                     e.account_id,
                                     e.amount,
                                     e.kind,

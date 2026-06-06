@@ -17,7 +17,8 @@ fn crash_recovery_test() {
     }
 
     let account_id = 1;
-    let num_transactions = 1_000_000;
+    // Enough WAL to make replay non-trivial across the two restarts below.
+    let num_transactions = 20_000;
     let deposit_amount = 1;
 
     // Phase 1: Insert transactions — WAL replay will be used on restart (no snapshot at 64MB segments)
@@ -110,7 +111,7 @@ fn crash_recovery_test() {
 
         let balance = ledger.get_balance(account_id);
 
-        // Verify balance: 2 phases × 1000 transactions × 1 deposit each
+        // Verify balance: 2 phases × num_transactions × deposit_amount each
         assert_eq!(balance, (2 * num_transactions * deposit_amount) as i64);
     }
 

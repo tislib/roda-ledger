@@ -37,6 +37,13 @@ pub struct Segment {
     wal_buffer: Vec<u8>,
     pub wal_position: usize,
     record_count: u64,
+
+    /// WAL-fault hook consulted at both write (`write_pending_entries`)
+    /// and sync (`Syncer::sync`) call sites. Always `None` in
+    /// production builds — kept unconditionally to avoid `#[cfg]`-fanning
+    /// every constructor.
+    #[cfg(feature = "fault-injection")]
+    fault: Option<crate::fault::WalFaultHook>,
 }
 
 impl Segment {
@@ -59,6 +66,8 @@ impl Segment {
             loaded: false,
             wal_position: 0,
             record_count: 0,
+            #[cfg(feature = "fault-injection")]
+            fault: None,
         })
     }
 
@@ -115,6 +124,8 @@ impl Segment {
             wal_position,
             record_count: 0,
             loaded: true,
+            #[cfg(feature = "fault-injection")]
+            fault: None,
         })
     }
 
@@ -202,6 +213,11 @@ impl Segment {
             "Segment is not active, cannot append"
         );
 
+        #[cfg(feature = "fault-injection")]
+        if let Some(hook) = self.fault.as_ref() {
+            hook.before_write(self.wal_buffer.len());
+        }
+
         let mut file = self.wal_file.as_ref().unwrap();
 
         loop {
@@ -239,10 +255,22 @@ impl Segment {
                 .try_clone()
                 .map_err(|e| Error::other(format!("Failed to clone WAL file: {}", e)))?;
 
-            Ok(Syncer::new(wal_file_clone))
+            let syncer = Syncer::new(wal_file_clone);
+            #[cfg(feature = "fault-injection")]
+            let syncer = syncer.with_fault(self.fault.clone());
+            Ok(syncer)
         } else {
             Err(Error::other("Segment is not loaded, cannot sync"))
         }
+    }
+
+    /// Attach a WAL-fault hook that every `Syncer` produced by this
+    /// segment will inherit AND that `write_pending_entries` will
+    /// consult before each `write_all`. Test-only seam — gated behind
+    /// `fault-injection`. See ADR-018.
+    #[cfg(feature = "fault-injection")]
+    pub fn set_fault(&mut self, hook: Option<crate::fault::WalFaultHook>) {
+        self.fault = hook;
     }
 
     pub fn record_count(&self) -> u64 {
@@ -384,9 +412,12 @@ impl Segment {
         let mut offset = 0usize;
         while offset + 40 <= self.wal_data.len() {
             let entry = parse_wal_record(&self.wal_data[offset..offset + 40])?;
-            let tx = entry.tx_id();
-            if tx > 0 {
-                return Ok(tx);
+            // tx_id lives only on TxMetadata now; follower records
+            // inherit it implicitly from the preceding metadata.
+            if let WalEntry::Metadata(m) = entry
+                && m.tx_id > 0
+            {
+                return Ok(m.tx_id);
             }
             offset += 40;
         }
@@ -415,9 +446,12 @@ impl Segment {
         while offset >= 40 {
             offset -= 40;
             let entry = parse_wal_record(&self.wal_data[offset..offset + 40])?;
-            let tx = entry.tx_id();
-            if tx > 0 {
-                return Ok(tx);
+            // tx_id is carried only by TxMetadata; scan back until we
+            // hit one (follower records have no tx_id of their own).
+            if let WalEntry::Metadata(m) = entry
+                && m.tx_id > 0
+            {
+                return Ok(m.tx_id);
             }
         }
         Ok(0)

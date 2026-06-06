@@ -1,6 +1,8 @@
 pub mod balance;
 pub mod config;
 pub mod dedup;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod index;
 pub mod ledger;
 pub mod pipeline;

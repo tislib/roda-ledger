@@ -9,6 +9,13 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enables `LedgerFaultInjector` (ledger::fault) and the
+# `Ledger::fault_injector()` accessor. Transitively enables
+# `storage/fault-injection`. See ADR-018.
+fault-injection = ["storage/fault-injection"]
+
 [dependencies]
 storage.workspace = true
 rand = "0.8"

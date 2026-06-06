@@ -13,6 +13,13 @@ pub const SNAPSHOT_MAGIC: u32 = 0x534E4150;
 pub struct Storage {
     config: StorageConfig,
     last_segment_id: AtomicU32,
+    /// WAL-fault hook propagated into every `Segment` returned by
+    /// `active_segment()`. `None` in production (the field is only
+    /// meaningful with `fault-injection`); read on every active-segment
+    /// open under `std::sync::Mutex` so tests can install/clear the
+    /// hook after `Storage::new`.
+    #[cfg(feature = "fault-injection")]
+    fault: std::sync::Mutex<Option<crate::fault::WalFaultHook>>,
 }
 
 impl Storage {
@@ -61,7 +68,18 @@ impl Storage {
         Ok(Self {
             config,
             last_segment_id,
+            #[cfg(feature = "fault-injection")]
+            fault: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install (or clear with `None`) a WAL-fault hook that every
+    /// future `active_segment()` will inherit. The same hook is
+    /// consulted at both `write_pending_entries` and `Syncer::sync`.
+    /// Test-only seam gated behind `fault-injection`. See ADR-018.
+    #[cfg(feature = "fault-injection")]
+    pub fn set_fault(&self, hook: Option<crate::fault::WalFaultHook>) {
+        *self.fault.lock().expect("fault mutex poisoned") = hook;
     }
 
     pub fn config(&self) -> &StorageConfig {
@@ -71,7 +89,14 @@ impl Storage {
     pub fn active_segment(&self) -> Result<Segment, std::io::Error> {
         let last_segment_id = self.last_segment_id();
 
-        Segment::open_active(self.config.data_dir.clone(), last_segment_id)
+        #[allow(unused_mut)]
+        let mut segment = Segment::open_active(self.config.data_dir.clone(), last_segment_id)?;
+        #[cfg(feature = "fault-injection")]
+        {
+            let hook = self.fault.lock().expect("fault mutex poisoned").clone();
+            segment.set_fault(hook);
+        }
+        Ok(segment)
     }
 
     pub fn segment(&self, segment_id: u32) -> Result<Segment, std::io::Error> {
@@ -108,10 +133,12 @@ impl Storage {
         self.last_segment_id.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Build a fresh [`WalTailer`] bound to this storage. Each call yields
-    /// an independent cursor.
-    pub fn wal_tailer(self: &Arc<Self>) -> WalTailer {
-        WalTailer::new(self.clone())
+    /// Build a fresh [`WalTailer`] bound to this storage, pre-positioned
+    /// at the first `TxMetadata` with `tx_id >= from_tx_id`. Each call
+    /// yields an independent cursor; subsequent `tail()` calls just
+    /// read forward from that cursor.
+    pub fn wal_tailer(self: &Arc<Self>, from_tx_id: u64) -> WalTailer {
+        WalTailer::new(self.clone(), from_tx_id)
     }
 
     /// DIAG-flake-replication: on-disk size of the active `wal.bin`,

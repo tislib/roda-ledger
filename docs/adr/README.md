@@ -17,3 +17,4 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-011](0011-wal-write-commit-separation.md)  | WAL Write/Commit Separation | Accepted |
 | [ADR-012](0012-e2e-testing.md)                  | E2E Testing Strategy | Proposed |
 | [ADR-013](0013-transaction-count-based-segments.md) | Transaction-Count-Based Segments and Deterministic Dedup | Proposed |
+| [ADR-018](0018-fault-injection.md)               | Fault Injection Framework | Proposed |

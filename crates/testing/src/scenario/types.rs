@@ -30,7 +30,10 @@ pub enum NodeSelector {
 }
 
 /// Pipeline level a submission should wait for before the step returns.
-/// `None` means fire-and-forget.
+/// `None` means fire-and-forget. `ClusterCommit` waits for majority
+/// replication on the cluster (proto `WAIT_LEVEL_CLUSTER_COMMIT`) and
+/// is what surfaces leader-failover as an observable RPC error so
+/// `cluster_client::with_leader_retry` can rotate and resubmit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WaitLevel {
     #[default]
@@ -38,6 +41,7 @@ pub enum WaitLevel {
     Computed,
     Committed,
     OnSnapshot,
+    ClusterCommit,
 }
 
 /// Pipeline level used by *waits* on already-submitted transactions.

@@ -153,10 +153,13 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                     if let Some(&prev) = account_balances.get(&e.account_id) {
                         let expected = prev + delta;
                         if e.computed_balance != expected {
+                            // tx_id no longer lives on TxEntry; the
+                            // currently-pending TxMetadata carries it.
+                            let tx_id = pending_meta.as_ref().map(|m| m.tx_id).unwrap_or(0);
                             errors.push(format!(
                                 "tx_id {}: account {} balance continuity violation \
                                  (prev={}, delta={}, expected={}, got={})",
-                                e.tx_id, e.account_id, prev, delta, expected, e.computed_balance
+                                tx_id, e.account_id, prev, delta, expected, e.computed_balance
                             ));
                             ok = false;
                         }

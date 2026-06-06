@@ -84,6 +84,17 @@ impl Simulator {
                 }
                 Ok(())
             }
+            Action::Concurrent(c) => {
+                // Op application is commutative for balance accounting,
+                // so we can walk branches sequentially regardless of
+                // the runtime's parallel execution.
+                for branch in &c.branches {
+                    for nested in branch {
+                        self.run_step(nested)?;
+                    }
+                }
+                Ok(())
+            }
             Action::AssertBalance(a) => {
                 let actual = self.balance(a.account);
                 if actual != a.expected {
@@ -170,11 +181,11 @@ impl Simulator {
             BatchKind::Dynamic {
                 base,
                 repeat,
-                batch_size,
+                batch_size: _,
             } => {
-                let inner = (*batch_size).max(1) as u64;
-                let outer = *repeat as u64;
-                for _ in 0..(outer * inner) {
+                // `batch_size` is the on-wire chunk size, not a
+                // multiplier — total ops = base.len() * repeat.
+                for _ in 0..*repeat as u64 {
                     for op in base {
                         self.apply_op(op);
                     }

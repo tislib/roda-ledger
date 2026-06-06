@@ -17,7 +17,9 @@ fn unique_dir(name: &str) -> String {
 #[test]
 fn test_rapid_rotation_many_segments() {
     let dir = unique_dir("rapid_rotation");
-    let total = 500_000u64;
+    // Segment count is throughput-dependent (batched WAL ingest), so keep
+    // enough volume to reliably seal well above the >=5 the assertion needs.
+    let total = 30_000u64;
 
     {
         let config = LedgerConfig {

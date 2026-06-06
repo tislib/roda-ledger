@@ -27,7 +27,7 @@ fn make_deposit_entries(tx_id: u64, account_id: u64, amount: u64) -> [WalEntry; 
         entry_type: WalEntryKind::TxEntry as u8,
         kind: EntryKind::Credit,
         _pad0: [0; 6],
-        tx_id,
+        _pad1: [0; 8],
         account_id,
         amount,
         computed_balance: amount as i64,

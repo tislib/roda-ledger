@@ -57,26 +57,30 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
                             return;
                         }
                         eprintln!("{}", msg);
-                        let mut j = wal_entry_to_json(entry);
+                        let mut j = wal_entry_to_json(entry, m.tx_id);
                         j["crc_error"] = serde_json::Value::Bool(true);
                         let _ = writeln!(writer, "{}", j);
                     } else {
-                        let _ = writeln!(writer, "{}", wal_entry_to_json(entry));
+                        let _ = writeln!(writer, "{}", wal_entry_to_json(entry, m.tx_id));
                     }
                 } else {
                     pending_meta = Some((*m, record_index));
-                    pending_json.push(wal_entry_to_json(entry));
+                    pending_json.push(wal_entry_to_json(entry, m.tx_id));
                 }
             }
             WalEntry::Entry(_)
             | WalEntry::Link(_)
             | WalEntry::FunctionRegistered(_)
             | WalEntry::Term(_) => {
+                // follower records inherit tx_id from the pending
+                // TxMetadata; orphan records (no preceding metadata)
+                // get 0 for display.
+                let current_tx = pending_meta.as_ref().map(|(m, _)| m.tx_id).unwrap_or(0);
                 if pending_meta.is_some() {
                     pending_sub_items.push(*entry);
-                    pending_json.push(wal_entry_to_json(entry));
+                    pending_json.push(wal_entry_to_json(entry, current_tx));
                 } else {
-                    let _ = writeln!(writer, "{}", wal_entry_to_json(entry));
+                    let _ = writeln!(writer, "{}", wal_entry_to_json(entry, current_tx));
                 }
             }
         }

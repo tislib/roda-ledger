@@ -334,7 +334,14 @@ enum HandshakeOutcome {
 }
 
 enum PushOutcome {
-    Sent,
+    /// A `WalUpdate` was sent. `drained` is true when the read filled
+    /// less than the full buffer — i.e. the WAL had nothing more to
+    /// hand us this round and the next iteration would almost
+    /// certainly come up empty. The sender backs off in that case so
+    /// the loop doesn't spin between trivial pushes when load is light.
+    Sent {
+        drained: bool,
+    },
     Idle,
     StreamClosed,
 }
@@ -572,8 +579,10 @@ async fn run_peer_sender(
         .expect("run_peer_sender requires a clustered config");
     let idle_sleep = Duration::from_millis(cluster.replication_poll_ms);
     let max_bytes = cluster.append_entries_max_bytes;
-    let mut tailer = consensus.ledger.current().wal_tailer();
-    let mut next_tx = start_tx_id + 1;
+    // Tailer is pre-positioned at `start_tx_id + 1`; subsequent
+    // `tail()` calls just stream forward from that cursor.
+    let next_tx = start_tx_id + 1;
+    let mut tailer = consensus.ledger.current().wal_tailer(next_tx);
     let mut buffer = vec![0u8; max_bytes];
     debug!(
         "replication_leader[{} peer={}]: sender started next_tx={}",
@@ -589,11 +598,19 @@ async fn run_peer_sender(
                 );
                 return;
             }
-            r = push_one(&consensus, pid, &out_tx, &mut tailer, &mut buffer, &mut next_tx) => r,
+            r = push_one(&consensus, pid, &out_tx, &mut tailer, &mut buffer) => r,
         };
         match outcome {
-            PushOutcome::Sent => yield_now().await,
-            PushOutcome::Idle => {
+            // Full buffer of WAL bytes — keep the loop tight so we
+            // don't artificially cap leader→follower throughput. A
+            // `yield_now` returns control to the runtime so other
+            // peer tasks (and the receiver) get a fair turn.
+            PushOutcome::Sent { drained: false } => yield_now().await,
+            // Either drained the WAL with a partial buffer, or sent
+            // a heartbeat on an empty WAL. Same backoff in both
+            // cases — no point re-asking immediately when we just
+            // learned there's nothing more.
+            PushOutcome::Sent { drained: true } | PushOutcome::Idle => {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -690,7 +707,6 @@ async fn push_one(
     out_tx: &mpsc::Sender<ReplicationLeaderMessage>,
     tailer: &mut WalTailer,
     buffer: &mut [u8],
-    next_tx: &mut u64,
 ) -> PushOutcome {
     let nid = c.node_id();
     c.self_advance();
@@ -700,7 +716,7 @@ async fn push_one(
         .expect("raft mutex poisoned")
         .cluster_commit_index();
 
-    let n = tailer.tail(*next_tx, buffer) as usize;
+    let n = tailer.tail(buffer) as usize;
     if n == 0 {
         return match out_tx.send(heartbeat_msg(cluster_commit_id)).await {
             Ok(()) => {
@@ -713,17 +729,9 @@ async fn push_one(
             Err(_) => PushOutcome::StreamClosed,
         };
     }
-    let records = decode_records(&buffer[..n]);
-    let max_tx = records.iter().map(|e| e.tx_id()).max().unwrap_or(*next_tx);
     debug!(
-        "replication_leader[{} peer={}]: WalUpdate next_tx={} bytes={} records={} max_tx={} cluster_commit={}",
-        nid,
-        peer_id,
-        *next_tx,
-        n,
-        records.len(),
-        max_tx,
-        cluster_commit_id
+        "replication_leader[{} peer={}]: WalUpdate bytes={} cluster_commit={}",
+        nid, peer_id, n, cluster_commit_id
     );
     if out_tx
         .send(wal_update_msg(&buffer[..n], cluster_commit_id))
@@ -732,8 +740,13 @@ async fn push_one(
     {
         return PushOutcome::StreamClosed;
     }
-    *next_tx = max_tx + 1;
-    PushOutcome::Sent
+    // If the WAL filled the whole buffer there's almost certainly
+    // more data behind it — keep the loop tight. If the WAL handed
+    // back less than the buffer, we've drained what was available
+    // and the caller should back off instead of spinning.
+    PushOutcome::Sent {
+        drained: n < buffer.len(),
+    }
 }
 
 fn heartbeat_msg(cluster_commit_id: u64) -> ReplicationLeaderMessage {

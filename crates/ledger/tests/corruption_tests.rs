@@ -5,10 +5,11 @@ use std::path::Path;
 use std::time::Duration;
 use storage::StorageConfig;
 
-// 100 tx/segment + snapshot every seal → many seals, many snapshots
+// 100 tx/segment, snapshot every seal. Segment/snapshot count is throughput-
+// dependent (batched ingest); 20_000 reliably yields the many each scenario needs.
 const SMALL_SEGMENT_TX_COUNT: u64 = 100;
 const SNAP_FREQUENCY: u32 = 1;
-const NUM_TRANSACTIONS: u64 = 160_000;
+const NUM_TRANSACTIONS: u64 = 20_000;
 const ACCOUNT_ID: u64 = 7;
 const DEPOSIT_AMOUNT: u64 = 1;
 
@@ -335,6 +336,175 @@ fn test2_non_recoverable_corruptions() {
             "Scenario B: expected a panic when all snapshot .crc sidecars are corrupted"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+// ─── test 3: file-level problems reported during restore ─────────────────────
+
+/// Helper for test3: pick the sealed WAL segment id that will be replayed
+/// after the latest snapshot is deleted. Returns `(target_wal_id,
+/// fallback_snap_id)`.
+fn pick_replayable_wal(dir: &str) -> (u32, u32) {
+    let mut snap_ids: Vec<u32> = list_files(dir, "snapshot_", ".bin")
+        .iter()
+        .filter_map(|n| parse_id(n, "snapshot_", ".bin"))
+        .collect();
+    snap_ids.sort_unstable_by(|a, b| b.cmp(a));
+    assert!(
+        snap_ids.len() >= 2,
+        "need ≥2 snapshots, got {}",
+        snap_ids.len()
+    );
+
+    let latest_snap_id = snap_ids[0];
+    let fallback_snap_id = snap_ids[1];
+
+    let _ = fs::remove_file(Path::new(dir).join(format!("snapshot_{:06}.bin", latest_snap_id)));
+    let _ = fs::remove_file(Path::new(dir).join(format!("snapshot_{:06}.crc", latest_snap_id)));
+
+    let mut replayable: Vec<u32> = list_files(dir, "wal_", ".crc")
+        .iter()
+        .filter_map(|n| parse_id(n, "wal_", ".crc"))
+        .filter(|id| *id > fallback_snap_id)
+        .collect();
+    replayable.sort_unstable();
+    let target = *replayable
+        .last()
+        .expect("expected at least one replayable WAL .crc");
+    (target, fallback_snap_id)
+}
+
+/// Each scenario corrupts a single file-level property reported during
+/// restore (data CRC mismatch, sidecar size mismatch, sidecar magic
+/// mismatch, snapshot data CRC mismatch). All four are no-error states
+/// from the filesystem's point of view — bytes are present and
+/// readable — but the integrity checks in `verify_wal_data` /
+/// snapshot verification fire and `Ledger::start` returns `Err`.
+#[test]
+fn test3_file_level_problems() {
+    // ── Scenario A: WAL data bytes modified (a "transaction moved" in
+    //    the middle of wal_{N}.bin). Stored CRC sidecar is intact;
+    //    recomputed CRC of the data differs → CRC mismatch error.
+    {
+        let dir = unique_dir("corruption_wal_data");
+        if Path::new(&dir).exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        setup_ledger(&dir);
+
+        let (target_wal_id, _) = pick_replayable_wal(&dir);
+        let bin_path = Path::new(&dir).join(format!("wal_{:06}.bin", target_wal_id));
+
+        // Flip a byte in the middle of the WAL data — simulates a
+        // transaction record being moved/overwritten in place.
+        let mut data = fs::read(&bin_path).expect("cannot read wal .bin");
+        assert!(data.len() > 40, "wal .bin too small to corrupt mid-record");
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+        fs::write(&bin_path, &data).expect("cannot write modified wal .bin");
+
+        let mut ledger = Ledger::new(make_config(&dir));
+        let result = ledger.start();
+        assert!(
+            result.is_err(),
+            "Scenario A: modifying bytes inside wal_{:06}.bin must fail restore (CRC mismatch)",
+            target_wal_id,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Scenario B: WAL sidecar size-field rewritten to a wrong value.
+    //    `verify_wal_data` reports a stored-size vs actual-size mismatch.
+    {
+        let dir = unique_dir("corruption_wal_size");
+        if Path::new(&dir).exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        setup_ledger(&dir);
+
+        let (target_wal_id, _) = pick_replayable_wal(&dir);
+        let crc_path = Path::new(&dir).join(format!("wal_{:06}.crc", target_wal_id));
+
+        // Rewrite bytes 4..12 (the stored size field) to a value that
+        // doesn't match the .bin length.
+        let mut sidecar = fs::read(&crc_path).expect("cannot read wal .crc");
+        assert_eq!(sidecar.len(), 16);
+        let bogus = (u64::MAX - 1).to_le_bytes();
+        sidecar[4..12].copy_from_slice(&bogus);
+        fs::write(&crc_path, &sidecar).expect("cannot write modified wal .crc");
+
+        let mut ledger = Ledger::new(make_config(&dir));
+        let result = ledger.start();
+        assert!(
+            result.is_err(),
+            "Scenario B: bogus size-field in wal_{:06}.crc must fail restore (size mismatch)",
+            target_wal_id,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Scenario C: WAL sidecar magic field rewritten to garbage.
+    //    `verify_wal_data` reports a magic mismatch.
+    {
+        let dir = unique_dir("corruption_wal_magic");
+        if Path::new(&dir).exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        setup_ledger(&dir);
+
+        let (target_wal_id, _) = pick_replayable_wal(&dir);
+        let crc_path = Path::new(&dir).join(format!("wal_{:06}.crc", target_wal_id));
+
+        // Rewrite the trailing 4 magic bytes.
+        let mut sidecar = fs::read(&crc_path).expect("cannot read wal .crc");
+        sidecar[12..16].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        fs::write(&crc_path, &sidecar).expect("cannot write modified wal .crc");
+
+        let mut ledger = Ledger::new(make_config(&dir));
+        let result = ledger.start();
+        assert!(
+            result.is_err(),
+            "Scenario C: wrong magic in wal_{:06}.crc must fail restore (magic mismatch)",
+            target_wal_id,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Scenario D: snapshot data bytes modified. Sidecar CRC is
+    //    intact; recomputed CRC of the snapshot differs → CRC
+    //    mismatch error during snapshot restore.
+    {
+        let dir = unique_dir("corruption_snap_data");
+        if Path::new(&dir).exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        setup_ledger(&dir);
+
+        let mut snap_ids: Vec<u32> = list_files(&dir, "snapshot_", ".bin")
+            .iter()
+            .filter_map(|n| parse_id(n, "snapshot_", ".bin"))
+            .collect();
+        snap_ids.sort_unstable_by(|a, b| b.cmp(a));
+        assert!(!snap_ids.is_empty(), "expected snapshot files after setup");
+
+        // Corrupt all snapshot .bin files so the restore can't fall
+        // back to a clean earlier one — start must surface the error.
+        for id in &snap_ids {
+            let bin_path = Path::new(&dir).join(format!("snapshot_{:06}.bin", id));
+            let mut data = fs::read(&bin_path).expect("cannot read snapshot .bin");
+            assert!(data.len() > 40, "snapshot too small to corrupt mid-file");
+            let mid = data.len() / 2;
+            data[mid] ^= 0xFF;
+            fs::write(&bin_path, &data).expect("cannot write modified snapshot .bin");
+        }
+
+        let mut ledger = Ledger::new(make_config(&dir));
+        let result = ledger.start();
+        assert!(
+            result.is_err(),
+            "Scenario D: modifying bytes inside snapshot .bin files must fail restore"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

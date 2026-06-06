@@ -2,7 +2,65 @@
 
 **Status:** Proposed
 **Date:** 2026-04-20
-**Last-Updated:** 2026-04-22
+**Last-Updated:** 2026-05-26
+
+## 2026-05-26 Decisions
+
+These decisions formalise changes since the 2026-04-22 update and
+supersede earlier ADR text where called out. Implementation lives in
+the code.
+
+1. **Quorum tracking is owned by the consensus library, not the
+   Cluster layer.** Supersedes the standalone-`Quorum` design in
+   §Quorum. The Cluster layer reads the cluster-wide watermark
+   through the consensus library; the per-peer slots and the
+   majority computation live inside that library. Leader-counts-
+   itself semantics and the `(n/2)+1` arithmetic are unchanged —
+   only ownership moved.
+
+2. **No per-role Leader / Follower bring-up types.** Supersedes
+   §"Role Separation: `Leader` / `Follower`". A single per-node
+   consensus value owns the long-lived consensus and
+   replication-driver loops, and these loops branch on the
+   consensus library's role internally. The tagged `ClusterHandles`
+   enum is not introduced; role transitions are observed via a
+   role-change subscription rather than through torn-down handle
+   structs.
+
+3. **Replication is a single bidirectional stream per peer, not one
+   RPC per AppendEntries.** Supersedes §"Lagged Replication
+   (replaces Two-Phase)" and §"Node gRPC Service"'s per-RPC
+   `AppendEntries` shape. Each stream begins with one handshake
+   (the sole raft-side validation point) and then carries WAL-update
+   and heartbeat messages without further per-message validation.
+   Any term or leader change closes the stream and re-handshakes.
+   Single-phase / lagged-commit semantics are unchanged.
+
+4. **The leader's commit progress feeds quorum by polling, not by
+   callback.** Supersedes §"2026-04-22 Decisions" item 4 ("Ledger
+   exposes a commit-advance hook"). The consensus loop reads the
+   Ledger's commit watermark and forwards it to the consensus
+   library's local-index advance method. Same effect — leader's
+   self-slot stays live — different mechanism.
+
+5. **Idle keepalive is a distinct message type, not an empty
+   AppendEntries.** Supersedes the wire shape called out in
+   §"Idle Heartbeats". Cadence and purpose (observational watermark
+   refresh, transport errors swallowed) are unchanged.
+
+6. **No leader-spawns-per-peer task supervision.** Supersedes
+   §"Task Topology" and the §"What Cluster Owns" row that claims
+   one task per peer owned by Leader. A single replication-driver
+   loop owns the per-peer streams whenever the node is leader; that
+   loop's lifecycle is independent of role transitions.
+
+7. **One shared lock serialises all Node-service handlers.** Not
+   strictly a new ADR-015 decision (ADR-016 §7 calls it out) but
+   restated here because no per-handler synchronisation exists at
+   the Cluster level — serialisation lives inside the consensus
+   library's wrapping value.
+
+---
 
 ## 2026-04-22 Decisions
 

@@ -304,3 +304,352 @@ async fn slow_follower_does_not_block_majority() {
     // Lagged follower must catch up via leader replication.
     ctl.require_pipeline_commit_at_least(follower_idx, 20).await;
 }
+
+// ── §8.3 Disk-level faults (ADR-018) ------------------------------------
+
+/// `WAL_ACCESS::Stuck` on the leader parks both `write_all` and
+/// `fdatasync` on the WAL — so the leader can't even append the
+/// bytes its tailer would ship to followers. With nothing on the
+/// wire, no follower can ack, the leader's own match_index stays
+/// put, and `cluster_commit` cannot advance for any tx submitted
+/// during the fault.
+///
+/// Released, the WAL committer wakes, the writer flushes, the
+/// tailer ships, peers ack, and `cluster_commit` catches up.
+///
+/// `DISK_ACCESS` (sync only) is intentionally *not* used here:
+/// with only the sync path parked the leader still completes
+/// `write_all`, its tailer reads page-cache bytes, and the two
+/// healthy followers can ack the entry on their own — the correct
+/// Raft behaviour but not what we want to assert against in this
+/// test.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_stuck_causes_submission_to_not_commit() {
+    use client::PipelineIndex;
+
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
+    let leader_idx = ctl
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("leader");
+
+    // RAII guard: even on a test-body panic, unstick before drop
+    // so the WAL committer can finish and the cluster can shut
+    // down cleanly. (A stuck sync leaves the committer parked on a
+    // condvar; without release, `ClusterNode::Drop` would deadlock
+    // waiting for the WAL stage to join.)
+    struct UnstickGuard<'a> {
+        ctl: &'a ClusterTestingControl,
+        idx: usize,
+    }
+    impl Drop for UnstickGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.ctl.unstick_wal_access(self.idx);
+        }
+    }
+
+    // ── Phase 1: park fdatasync on the leader, submit a deposit ──
+    ctl.stick_wal_access(leader_idx).expect("stick disk");
+    let _guard = UnstickGuard {
+        ctl: &ctl,
+        idx: leader_idx,
+    };
+
+    // Submit (no `_and_wait` — the wait would block forever on the
+    // parked sync). The sequencer assigns a tx_id immediately and
+    // the transactor can still compute; only the WAL committer is
+    // parked, so we get the tx_id back fast.
+    let tx_id = ctl.deposit(ACCOUNT, AMOUNT, 1).await.expect("submit");
+    assert!(tx_id > 0, "sequencer must have assigned a tx_id");
+
+    // Soak: long enough that any normal commit path would have
+    // closed (the WAL committer's cycle is sub-millisecond at
+    // idle).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ── Phase 2: assert cluster_commit_id stayed below tx_id ──
+    let pi: PipelineIndex = ctl
+        .raw_client_for_slot(leader_idx)
+        .expect("raw client")
+        .get_pipeline_index()
+        .await
+        .expect("pipeline index while stuck");
+    assert!(
+        pi.cluster_commit < tx_id,
+        "DISK_ACCESS stuck must hold back cluster_commit: \
+         tx_id={tx_id} cluster_commit={} commit={} snapshot={}",
+        pi.cluster_commit,
+        pi.commit,
+        pi.snapshot,
+    );
+
+    // ── Phase 3: release, then watch the deposit make it through ──
+    ctl.unstick_wal_access(leader_idx).expect("unstick");
+    // The guard's drop becomes a no-op second release; that's
+    // idempotent on the injector.
+
+    ctl.wait_for(
+        Duration::from_secs(5),
+        "cluster_commit catches up",
+        || async {
+            let pi = ctl
+                .raw_client_for_slot(leader_idx)
+                .expect("raw client")
+                .get_pipeline_index()
+                .await
+                .ok();
+            pi.is_some_and(|p| p.cluster_commit >= tx_id)
+        },
+    )
+    .await
+    .expect("cluster_commit advanced");
+}
+
+/// Counterpart to `disk_stuck_causes_submission_to_not_commit`:
+/// with only the sync axis parked on the leader, the WAL writer
+/// still appends, the tailer ships from the page cache, and the two
+/// healthy followers ack — so the leader's quorum view
+/// (`cluster_commit_index`) advances on a 2-of-3 quorum even though
+/// the leader's own `match_index` is stuck.
+///
+/// We can't use `deposit_and_wait(ClusterCommit)` here because that
+/// handler also requires the leader's *local* `commit` watermark to
+/// pass `tx_id` (i.e. local sync must complete) — which never
+/// happens under DISK_ACCESS Stuck. Instead we read
+/// `cluster_commit_index` directly from the pipeline view.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_stuck_on_leader_still_commits_via_quorum() {
+    use client::PipelineIndex;
+
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
+    let leader_idx = ctl
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("leader");
+
+    struct UnstickGuard<'a> {
+        ctl: &'a ClusterTestingControl,
+        idx: usize,
+    }
+    impl Drop for UnstickGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.ctl.unstick_disk_access(self.idx);
+        }
+    }
+
+    ctl.stick_disk_access(leader_idx).expect("stick disk");
+    let _guard = UnstickGuard {
+        ctl: &ctl,
+        idx: leader_idx,
+    };
+
+    let tx_id = ctl.deposit(ACCOUNT, AMOUNT, 1).await.expect("submit");
+    assert!(tx_id > 0);
+
+    // Followers ack via tailer reading page-cache bytes — the
+    // leader's quorum view must advance even though its own sync is
+    // parked. Read it straight off the leader.
+    ctl.wait_for(
+        Duration::from_secs(5),
+        "cluster_commit advances despite leader sync stuck",
+        || async {
+            let pi: Option<PipelineIndex> = ctl
+                .raw_client_for_slot(leader_idx)
+                .expect("raw client")
+                .get_pipeline_index()
+                .await
+                .ok();
+            pi.is_some_and(|p| p.cluster_commit >= tx_id)
+        },
+    )
+    .await
+    .expect("2-of-3 follower quorum must commit");
+
+    // The leader's *local* commit is the opposite: it CANNOT have
+    // advanced past tx_id, because the sync that gates
+    // last_commit_id is still parked.
+    let pi = ctl
+        .raw_client_for_slot(leader_idx)
+        .expect("raw client")
+        .get_pipeline_index()
+        .await
+        .expect("pi after");
+    assert!(
+        pi.commit < tx_id,
+        "leader's local commit must NOT have advanced (sync still stuck): \
+         tx_id={tx_id} local_commit={}",
+        pi.commit,
+    );
+}
+
+/// `WAL_ACCESS::Stuck` on a follower must not block `cluster_commit`.
+/// The leader + the OTHER follower form a 2-of-3 quorum so any new
+/// write commits cluster-wide; the stuck follower simply lags.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_stuck_on_follower_does_not_block_commit() {
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
+    let _ = ctl
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("leader");
+    let follower_idx = ctl.first_follower_index().await.expect("follower");
+
+    struct UnstickGuard<'a> {
+        ctl: &'a ClusterTestingControl,
+        idx: usize,
+    }
+    impl Drop for UnstickGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.ctl.unstick_wal_access(self.idx);
+        }
+    }
+
+    ctl.stick_wal_access(follower_idx).expect("stick follower");
+    let _guard = UnstickGuard {
+        ctl: &ctl,
+        idx: follower_idx,
+    };
+
+    // Leader + other follower = 2-of-3 quorum, so ClusterCommit
+    // succeeds even with the third node's WAL stuck.
+    let r = ctl
+        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .await
+        .expect("ClusterCommit must succeed with one follower's WAL stuck");
+    assert_eq!(r.fail_reason, 0);
+}
+
+/// `WAL_ACCESS::Slow` adds a per-call write delay rather than
+/// parking — so `cluster_commit` still advances, just with extra
+/// latency. Verifies the Slow code path is wired end-to-end and
+/// doesn't deadlock.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_slow_on_leader_still_commits() {
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
+    let leader_idx = ctl
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("leader");
+
+    struct ClearGuard<'a> {
+        ctl: &'a ClusterTestingControl,
+        idx: usize,
+    }
+    impl Drop for ClearGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.ctl.clear_all_faults(self.idx);
+        }
+    }
+
+    // 30 ms is enough to be observable in the test budget but
+    // nowhere near deposit_and_wait's default timeout — the commit
+    // path still closes.
+    ctl.slow_wal_access(leader_idx, 30).expect("slow wal");
+    let _guard = ClearGuard {
+        ctl: &ctl,
+        idx: leader_idx,
+    };
+
+    let r = ctl
+        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .await
+        .expect("ClusterCommit must still close under Slow");
+    assert_eq!(r.fail_reason, 0);
+}
+
+/// `ClearAllFaults` releases every parked op and clears every active
+/// rule in one call. Used as teardown but exercised here for its own
+/// behavior: stick WAL, observe the commit is blocked, call
+/// `clear_all_faults`, observe a fresh submit goes through.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_all_faults_releases_everything() {
+    use client::PipelineIndex;
+
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
+        .await
+        .expect("start");
+    let leader_idx = ctl
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("leader");
+
+    struct ClearGuard<'a> {
+        ctl: &'a ClusterTestingControl,
+        idx: usize,
+    }
+    impl Drop for ClearGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.ctl.clear_all_faults(self.idx);
+        }
+    }
+
+    ctl.stick_wal_access(leader_idx).expect("stick");
+    let _guard = ClearGuard {
+        ctl: &ctl,
+        idx: leader_idx,
+    };
+
+    // Submit while stuck — tx_id is assigned but won't commit.
+    let stuck_tx = ctl.deposit(ACCOUNT, AMOUNT, 1).await.expect("submit");
+    assert!(stuck_tx > 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pi_during: PipelineIndex = ctl
+        .raw_client_for_slot(leader_idx)
+        .expect("raw client")
+        .get_pipeline_index()
+        .await
+        .expect("pi during");
+    assert!(
+        pi_during.cluster_commit < stuck_tx,
+        "stuck WAL must hold back cluster_commit: \
+         tx_id={stuck_tx} cluster_commit={}",
+        pi_during.cluster_commit,
+    );
+
+    // ClearAllFaults must wake both write and sync axes.
+    let (cleared, released) = ctl.clear_all_faults(leader_idx).expect("clear_all");
+    assert!(
+        cleared >= 1,
+        "ClearAllFaults must report ≥1 cleared level (got {cleared})"
+    );
+    assert!(
+        released >= 1,
+        "ClearAllFaults must report ≥1 released stuck op (got {released})"
+    );
+
+    // The previously-stuck tx and a fresh submit must both commit.
+    ctl.wait_for(
+        Duration::from_secs(5),
+        "post-clear_all cluster_commit catches up",
+        || async {
+            let pi = ctl
+                .raw_client_for_slot(leader_idx)
+                .expect("raw client")
+                .get_pipeline_index()
+                .await
+                .ok();
+            pi.is_some_and(|p| p.cluster_commit >= stuck_tx)
+        },
+    )
+    .await
+    .expect("cluster_commit advanced");
+
+    let r = ctl
+        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .await
+        .expect("fresh submit must commit after clear_all");
+    assert_eq!(r.fail_reason, 0);
+}
