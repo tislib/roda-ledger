@@ -52,6 +52,7 @@ struct RunCtx {
     last_killed: Option<usize>,
     /// Pending branch tasks, awaited at end-of-scenario.
     branches: Vec<JoinHandle<Result<(), RunError>>>,
+    last_tx_id: u64,
 }
 
 impl RunCtx {
@@ -346,6 +347,7 @@ impl ScenarioRunner {
         let tx_id = self.do_submit(client, &s.op, s.wait, s.retry).await?;
         metrics.record_submit_latency(started.elapsed());
         ctx.bindings.insert(user_ref, tx_id);
+        ctx.last_tx_id = tx_id;
         Ok(())
     }
 
@@ -435,6 +437,7 @@ impl ScenarioRunner {
             }
             for (op, tx_id) in chunk.iter().zip(tx_ids.iter()) {
                 ctx.bindings.insert(user_ref_of(op), *tx_id);
+                ctx.last_tx_id = *tx_id;
             }
         }
         Ok(())
@@ -568,6 +571,7 @@ impl ScenarioRunner {
             for local in joined {
                 for (user_ref, tx_id) in local.bindings {
                     ctx.bindings.insert(user_ref, tx_id);
+                    ctx.last_tx_id = tx_id;
                 }
                 if let Some(idx) = local.last_killed {
                     ctx.last_killed = Some(idx);
@@ -959,6 +963,8 @@ fn resolve_tx(ctx: &RunCtx, tx: &TxRef) -> Result<u64, RunError> {
             .get(ur)
             .copied()
             .ok_or(RunError::UnknownUserRef(*ur)),
+        TxRef::TxId(tx_id) => Ok(*tx_id),
+        TxRef::LastTx => Ok(ctx.last_tx_id),
     }
 }
 

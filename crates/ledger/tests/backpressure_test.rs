@@ -38,7 +38,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use storage::StorageConfig;
 
-const QUEUE_SIZE: usize = 16;
+const RING_SIZE: usize = 16;
 const SUBMIT_TOTAL: u64 = 100_000;
 /// Tightest credible bound on `submitted - snapshot`. Pipeline slack
 /// is ~290 entries; `1_000` is a comfortable margin for VecDeque
@@ -90,7 +90,7 @@ fn make_config(dir: &str) -> LedgerConfig {
             transaction_count_per_segment: 1_000_000,
             snapshot_frequency: u32::MAX,
         },
-        queue_size: QUEUE_SIZE,
+        ring_size: RING_SIZE,
         seal_check_internal: Duration::from_millis(10),
         disable_seal: true,
         ..Default::default()

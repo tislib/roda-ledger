@@ -96,7 +96,7 @@ fn test_segment_exact_boundary_rotation() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                transaction_count_per_segment: 100,
+                transaction_count_per_segment: 1000,
                 snapshot_frequency: 2,
                 ..Default::default()
             },

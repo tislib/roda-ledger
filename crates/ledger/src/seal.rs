@@ -3,6 +3,7 @@ use crate::pipeline::SealContext;
 use spdlog::{debug, error, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 use storage::SegmentStaus::SEALED;
@@ -10,7 +11,8 @@ use storage::entities::WalEntry;
 use storage::{Segment, Storage};
 
 pub struct Seal {
-    runner: Option<SealRunner>, // will be taken out when start() is called
+    runner: Option<SealRunner>,   // will be taken out when start() is called
+    seal_step_id: Arc<AtomicU64>, // monotonic counter to indicate that the seal process has progressed
 }
 
 struct SealRunner {
@@ -22,18 +24,26 @@ struct SealRunner {
     /// (internal.md §11.4).
     function_map: HashMap<String, (u16, u32)>,
     seal_check_internal: Duration,
+    seal_step_id: Arc<AtomicU64>,
 }
 
 impl Seal {
     pub fn new(config: &LedgerConfig, storage: Arc<Storage>) -> Self {
+        let seal_step_id: Arc<AtomicU64> = Arc::new(Default::default());
         Self {
             runner: Some(SealRunner {
                 storage,
                 balances: vec![0; config.max_accounts],
                 function_map: HashMap::new(),
                 seal_check_internal: config.seal_check_internal,
+                seal_step_id: seal_step_id.clone(),
             }),
+            seal_step_id,
         }
+    }
+
+    pub fn seal_step_id(&self) -> u64 {
+        self.seal_step_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn start(&mut self, ctx: SealContext) -> std::io::Result<JoinHandle<()>> {
@@ -128,6 +138,8 @@ impl Seal {
 impl SealRunner {
     fn run(&mut self, ctx: SealContext) {
         while ctx.is_running() {
+            self.seal_step_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // A long time nothing happened.
             if let Err(e) = self.seal_pending_segments(&ctx) {
                 error!("Seal: failed to seal pending segments: {}", e);
@@ -145,9 +157,6 @@ impl SealRunner {
 
         let mut pending = self.storage.list_all_segments()?;
         for segment in pending.iter_mut() {
-            if !ctx.is_running() {
-                break;
-            }
             if segment.status() == SEALED {
                 continue;
             }

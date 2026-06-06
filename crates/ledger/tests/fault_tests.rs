@@ -27,7 +27,7 @@ impl Drop for FaultGuard {
     }
 }
 
-fn make_config(dir: &str, queue_size: usize) -> LedgerConfig {
+fn make_config(dir: &str, ring_size: usize) -> LedgerConfig {
     LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.to_string(),
@@ -35,7 +35,7 @@ fn make_config(dir: &str, queue_size: usize) -> LedgerConfig {
             transaction_count_per_segment: 100_000,
             snapshot_frequency: u32::MAX,
         },
-        queue_size,
+        ring_size,
         seal_check_internal: Duration::from_millis(10),
         disable_seal: true,
         ..Default::default()
@@ -193,16 +193,10 @@ fn stuck_write_blocks_commit_and_snapshot() {
 #[test]
 fn stuck_sync_creates_submit_backpressure() {
     let dir = unique_dir("stuck_backpressure");
-    // Small queues so the pipeline fills after a few hundred submits.
-    // Downstream slack the submitter accumulates before blocking is
-    // roughly: seq→trans (queue_size) + wal_input (queue_size) +
-    // WAL writer VecDeque (initial capacity = queue_size * 16).
-    // For queue_size = 16 that's ~288; pick `total` comfortably above
-    // so backpressure is unambiguous but cleanup stays cheap.
-    let queue_size = 16usize;
+    let ring_size = 1024usize;
     let total: u64 = 100_000;
 
-    let mut ledger = Ledger::new(make_config(&dir, queue_size));
+    let mut ledger = Ledger::new(make_config(&dir, ring_size));
     let fault = ledger.fault_injector();
     let _guard = FaultGuard(fault.clone());
     fault.stick_sync();
@@ -233,7 +227,7 @@ fn stuck_sync_creates_submit_backpressure() {
     assert!(
         stuck_at < total,
         "submit thread should be blocked on backpressure, but completed all \
-         {total} submits (queue_size={queue_size})"
+         {total} submits (queue_size={ring_size})"
     );
     assert!(!h.is_finished(), "submit thread must still be parked");
 

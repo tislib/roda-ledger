@@ -17,7 +17,7 @@ echo "Running clippy..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "Running tests..."
-cargo nextest run --workspace --cargo-profile ci
+cargo nextest run --workspace --cargo-profile ci --all-features
 
 echo "Running doctests..."
 cargo test --doc --profile ci

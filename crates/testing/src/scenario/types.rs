@@ -61,6 +61,8 @@ pub enum PipelineLevel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxRef {
     UserRef(u64),
+    TxId(u64),
+    LastTx,
 }
 
 /// One submittable operation. Mirrors the `roda.ledger.v1` operation
