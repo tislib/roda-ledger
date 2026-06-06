@@ -16,3 +16,5 @@ pub mod transactor;
 pub mod wait_strategy;
 pub mod wal;
 pub mod wasm_runtime;
+pub mod test_support;
+pub mod tx_ring;

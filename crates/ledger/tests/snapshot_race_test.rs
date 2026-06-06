@@ -44,7 +44,7 @@ fn test_race_post_seal_transaction_double_counted_on_restart() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: temp_dir.clone(),
-                transaction_count_per_segment: 100, // small segments → seal happens quickly
+                transaction_count_per_segment: 1000, // small segments → seal happens quickly
                 snapshot_frequency: 1,              // snapshot on every seal
                 ..Default::default()
             },

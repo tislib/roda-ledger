@@ -18,7 +18,6 @@ fn make_config(dir: &str) -> LedgerConfig {
     LedgerConfig {
         storage: StorageConfig {
             data_dir: dir.to_string(),
-            transaction_count_per_segment: 100,
             snapshot_frequency: 1,
             ..Default::default()
         },

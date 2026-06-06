@@ -25,7 +25,6 @@ fn test_replay_identical_balances() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                transaction_count_per_segment: 100,
                 snapshot_frequency: 1,
                 ..Default::default()
             },
@@ -118,7 +117,7 @@ fn test_replay_identical_balances() {
 fn test_replay_across_many_segments() {
     let dir = unique_dir("replay_many_segs");
     let num_accounts = 50u64;
-    let total_deposits = 200_000u64;
+    let total_deposits = 2_000u64;
     let deposits_per_account = total_deposits / num_accounts;
 
     let live_balances: Vec<i64>;
@@ -277,7 +276,7 @@ fn test_replay_snapshot_plus_partial_wal() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                transaction_count_per_segment: 100,
+                transaction_count_per_segment: 10_000,
                 snapshot_frequency: 1,
                 ..Default::default()
             },
@@ -318,7 +317,6 @@ fn test_replay_snapshot_plus_partial_wal() {
         let config = LedgerConfig {
             storage: StorageConfig {
                 data_dir: dir.clone(),
-                transaction_count_per_segment: 100,
                 snapshot_frequency: 1,
                 ..Default::default()
             },

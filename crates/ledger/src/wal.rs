@@ -1,15 +1,12 @@
 use crate::pipeline::WalContext;
-use crate::snapshot::SnapshotMessage;
 use crate::wait_strategy::WaitStrategy;
 use Ordering::Release;
 use arc_swap::ArcSwap;
-use std::collections::VecDeque;
-use std::hint::spin_loop;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::{JoinHandle, yield_now};
-use storage::entities::{WalEntry, WalInput};
+use std::thread::JoinHandle;
+use storage::entities::WalEntry;
 use storage::{Segment, Storage, Syncer};
 
 pub struct Wal {
@@ -59,14 +56,6 @@ pub struct WalRunner {
     active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
     retry_count: u64,
     active_segment: Segment,
-    buffer: VecDeque<WalEntry>,
-    /// Fixed upper bound on `buffer` occupancy, used to budget how many
-    /// entries we pull from `wal_input` per iteration. NOT read from
-    /// `buffer.capacity()`: a `VecDeque` grows on overflow, so a live
-    /// `capacity()` budget would expand every time the buffer
-    /// reallocated — letting a stuck/slow sync (which blocks the drain
-    /// loop) pull unboundedly from upstream and defeat backpressure.
-    buffer_limit: usize,
     /// `tx_id` of the most-recently-ingested `TxMetadata`. Used as the
     /// authoritative tx_id when the closing sub-item of a transaction
     /// is a structural record (`TxTerm`, `FunctionRegistered`) whose
@@ -89,8 +78,6 @@ impl WalRunner {
         let active_segment = storage.active_segment().unwrap();
         let syncer = active_segment.syncer().expect("Failed to get syncer");
         active_segment_sync.store(Arc::new(Some(syncer)));
-        let buffer_limit = ctx.input_capacity() * 16;
-        let buffer = VecDeque::with_capacity(buffer_limit);
         let wait_strategy = ctx.wait_strategy();
 
         Self {
@@ -100,8 +87,6 @@ impl WalRunner {
             active_segment_sync,
             retry_count: 0,
             active_segment,
-            buffer,
-            buffer_limit,
             current_tx_id: 0,
             last_received_tx_id: 0,
             segment_start_tx_id: 0,
@@ -110,39 +95,22 @@ impl WalRunner {
     }
 
     pub fn run(&mut self, ctx: WalContext) {
+        let mut last_ring_index = 0;
         while ctx.is_running() {
-            // Each slot is a WalInput::{Single,Multi}; Multi carries a follower batch.
-            let inbound = ctx.input();
-            // Budget against the FIXED limit, not `buffer.capacity()` —
-            // the VecDeque grows on overflow and a live-capacity budget
-            // would ratchet open under a stalled drain (see field docs).
-            // `saturating_sub` so a buffer already at/over the limit
-            // (it can overshoot by one in-flight tx group) yields 0.
-            let available = inbound
-                .len()
-                .min(self.buffer_limit.saturating_sub(self.buffer.len()));
+            let ring = ctx.tx_ring();
+            let mut entries_ingested = 0;
+            ring.walk_entries(last_ring_index, |entry| {
+                self.ingest_entry(entry);
+                entries_ingested += 1;
+                last_ring_index += 1;
 
-            let mut entries_ingested: u32 = 0;
-            let mut k = available;
-            while ctx.is_running() && (k > 0 || self.pending_records > 0) {
-                if let Some(input) = inbound.pop() {
-                    match input {
-                        WalInput::Single(entry) => {
-                            self.ingest_entry(entry);
-                            entries_ingested += 1;
-                        }
-                        WalInput::Multi(entries) => {
-                            for entry in entries {
-                                self.ingest_entry(entry);
-                                entries_ingested += 1;
-                            }
-                        }
-                    }
-                } else {
-                    spin_loop();
+                // if the segment is full, do not push any more entries.
+                if self.is_rotation_needed() {
+                    return false;
                 }
-                k = k.saturating_sub(1);
-            }
+
+                true
+            });
 
             // if new entries are available, write them to the segment.
             if entries_ingested > 0 {
@@ -152,7 +120,7 @@ impl WalRunner {
             }
 
             // if there are no movements, skip the rest of the loop.
-            if entries_ingested == 0 && self.buffer.is_empty() {
+            if entries_ingested == 0 {
                 self.retry_count += 1;
                 self.wait_strategy.retry(self.retry_count);
                 continue;
@@ -160,32 +128,21 @@ impl WalRunner {
             self.retry_count = 0;
 
             // Rotate the segment when the transaction count threshold is exceeded.
-            let tx_per_seg = self.storage.config().transaction_count_per_segment;
-            if self.last_received_tx_id > 0
-                && self.segment_start_tx_id > 0
-                && tx_per_seg > 0
-                && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg
-            {
+            let is_rotation_needed = self.is_rotation_needed();
+
+            if is_rotation_needed {
                 self.rotate(&ctx);
             }
-
-            // Push committed entries to the outbound queue. tx_id is
-            // carried only by `TxMetadata`; followers inherit it
-            // from the preceding metadata, which by FIFO order has
-            // already passed the commit-index gate by the time we
-            // see them.
-            while let Some(entry) = self.buffer.pop_front() {
-                if let WalEntry::Metadata(m) = &entry
-                    && m.tx_id > ctx.commit_index()
-                {
-                    self.buffer.push_front(entry);
-                    break;
-                }
-                if !self.push_outbound(&ctx, entry) {
-                    break;
-                }
-            }
         }
+    }
+
+    fn is_rotation_needed(&self) -> bool {
+        let tx_per_seg = self.storage.config().transaction_count_per_segment;
+        let is_rotation_needed = self.last_received_tx_id > 0
+            && self.segment_start_tx_id > 0
+            && tx_per_seg > 0
+            && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg - 1;
+        is_rotation_needed
     }
 
     /// Append one entry to the active segment buffer and update tx_id bookkeeping.
@@ -194,7 +151,6 @@ impl WalRunner {
         if let WalEntry::Metadata(m) = &entry {
             self.current_tx_id = m.tx_id;
         }
-        self.buffer.push_back(entry);
         if self.move_pending_entry(&entry) {
             // Use `current_tx_id` rather than `entry.tx_id()`: structural
             // sub-items (`TxTerm`, `FunctionRegistered`) carry no tx_id,
@@ -235,25 +191,6 @@ impl WalRunner {
             }
         }
         self.pending_records == 0
-    }
-
-    /// Push `entry` to the outbound queue, yielding until space is available.
-    /// Returns `false` if a shutdown was requested while waiting.
-    fn push_outbound(&self, ctx: &WalContext, entry: WalEntry) -> bool {
-        let outbound = ctx.output();
-        let mut msg = SnapshotMessage::Entry(entry);
-        loop {
-            match outbound.push(msg) {
-                Ok(_) => return true,
-                Err(returned) => {
-                    msg = returned;
-                    if !ctx.is_running() {
-                        return false;
-                    }
-                    yield_now();
-                }
-            }
-        }
     }
 
     pub fn commit_sync(&mut self, ctx: &WalContext) {
