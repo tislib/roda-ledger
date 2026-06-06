@@ -115,7 +115,6 @@ window.
 | `writer.cursor() -> usize` | — | the next `ring_index` this writer will write to (the head) |
 | `writer.push(entry: WalEntry) -> usize` | — | write at the head, return the `ring_index` written; **panics if `capacity() == 0`** |
 | `writer.walk(start, end, handler)` | — | visit `ring_index` range `[start, end)` (wrapping) lending each `&WalEntry` — no copy |
-| `writer.patch(ring_index, f)` | — | back-patch the uncommitted entry at absolute `ring_index` (e.g. a metadata CRC) |
 | `writer.commit()` | `Release` | publish the head so readers/releaser observe it |
 | `writer.rollback_to(ring_index)` | — | move the head back to `ring_index`, discarding the uncommitted tail |
 | `drop(writer)` | `Release` | auto-`commit()` of whatever was pushed |

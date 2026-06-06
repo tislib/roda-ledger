@@ -93,19 +93,23 @@ impl<'r> Recover<'r> {
         Ok(())
     }
 
-    /// Walks the raw WAL data transaction-by-transaction, verifying CRC for
-    /// each one.  Returns the byte offset of the last fully validated record.
+    /// Walks the raw WAL data transaction-by-transaction (trailer layout:
+    /// followers precede the closing `TxMetadata`), verifying each group's
+    /// declared count and CRC. Returns the byte offset of the last fully
+    /// validated record — the end of the last complete transaction.
     ///
-    /// A broken transaction at the tail is tolerated (the offset before it is
-    /// returned).  A broken transaction in the middle (with valid transactions
-    /// after it) is non-recoverable and returns an error.
+    /// A partial tail (followers with no closing metadata, or a torn record) is
+    /// truncated to that offset. A broken transaction in the middle (with valid
+    /// transactions after it) is non-recoverable and returns an error.
     fn validate_wal_transactions(data: &[u8]) -> Result<usize, std::io::Error> {
         let aligned_len = (data.len() / ENTRY_SIZE) * ENTRY_SIZE;
         let data = &data[..aligned_len];
 
-        // Reusable buffer — collect follower slices for CRC computation,
-        // reuse capacity across transactions.
+        // Reusable buffer — collect a transaction's follower slices until its
+        // closing metadata, which carries the count and the CRC over
+        // (followers ++ zeroed-crc metadata).
         let mut follower_slices: Vec<&[u8]> = Vec::with_capacity(256);
+        let mut group_start: usize = 0;
 
         let mut offset: usize = 0;
         let mut last_good: usize = 0;
@@ -113,89 +117,73 @@ impl<'r> Recover<'r> {
         while offset + ENTRY_SIZE <= data.len() {
             let kind = data[offset];
 
-            match kind {
-                // ── Transaction: TxMetadata + sub-items ─────────────────
-                k if k == WalEntryKind::TxMetadata as u8 => {
-                    let meta: TxMetadata =
-                        bytemuck::pod_read_unaligned(&data[offset..offset + ENTRY_SIZE]);
-                    let expected = meta.sub_item_count as usize;
-                    let tx_start = offset;
+            if kind == WalEntryKind::TxMetadata as u8 {
+                // ── Closing metadata: validate the buffered group ───────
+                let meta: TxMetadata =
+                    bytemuck::pod_read_unaligned(&data[offset..offset + ENTRY_SIZE]);
+                let broken_at = if follower_slices.is_empty() {
+                    offset
+                } else {
+                    group_start
+                };
 
-                    // Check whether enough records remain for this tx.
-                    let records_left = (data.len() - offset) / ENTRY_SIZE - 1;
-                    if records_left < expected {
-                        return Self::handle_broken_tx(
-                            data,
-                            tx_start,
-                            last_good,
-                            "not enough follower records",
-                        );
-                    }
-
-                    // Validate follower kinds and collect slices for CRC.
-                    follower_slices.clear();
-                    let mut foff = offset + ENTRY_SIZE;
-                    let mut followers_ok = true;
-                    for _ in 0..expected {
-                        let fk = data[foff];
-                        if fk != WalEntryKind::TxEntry as u8
-                            && fk != WalEntryKind::Link as u8
-                            && fk != WalEntryKind::TxTerm as u8
-                            && fk != WalEntryKind::FunctionRegistered as u8
-                        {
-                            followers_ok = false;
-                            break;
-                        }
-                        follower_slices.push(&data[foff..foff + ENTRY_SIZE]);
-                        foff += ENTRY_SIZE;
-                    }
-
-                    if !followers_ok {
-                        return Self::handle_broken_tx(
-                            data,
-                            tx_start,
-                            last_good,
-                            "unexpected follower record kind",
-                        );
-                    }
-
-                    // ── CRC verification ─────────────────────────────
-                    let mut meta_for_crc = meta;
-                    meta_for_crc.crc32c = 0;
-                    let mut digest = crc32c::crc32c(bytemuck::bytes_of(&meta_for_crc));
-                    for slice in &follower_slices {
-                        digest = crc32c::crc32c_append(digest, slice);
-                    }
-
-                    if digest != meta.crc32c {
-                        return Self::handle_broken_tx(
-                            data,
-                            tx_start,
-                            last_good,
-                            &format!(
-                                "CRC mismatch (stored={:#010x}, computed={:#010x})",
-                                meta.crc32c, digest
-                            ),
-                        );
-                    }
-
-                    // Transaction is valid.
-                    offset = foff;
-                    last_good = offset;
-                }
-
-                // ── Orphan entry/link or unknown kind ───────────────────
-                _ => {
+                if follower_slices.len() != meta.sub_item_count as usize {
                     return Self::handle_broken_tx(
                         data,
-                        offset,
+                        broken_at,
                         last_good,
-                        &format!("unexpected record kind {}", kind),
+                        "follower count mismatch",
                     );
                 }
+
+                // CRC over the followers (push order) then the zeroed-crc metadata.
+                let mut digest = 0u32;
+                for slice in &follower_slices {
+                    digest = crc32c::crc32c_append(digest, slice);
+                }
+                let mut meta_for_crc = meta;
+                meta_for_crc.crc32c = 0;
+                digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&meta_for_crc));
+
+                if digest != meta.crc32c {
+                    return Self::handle_broken_tx(
+                        data,
+                        broken_at,
+                        last_good,
+                        &format!(
+                            "CRC mismatch (stored={:#010x}, computed={:#010x})",
+                            meta.crc32c, digest
+                        ),
+                    );
+                }
+
+                // Group complete — it ends exactly at this metadata.
+                offset += ENTRY_SIZE;
+                last_good = offset;
+                follower_slices.clear();
+            } else if kind == WalEntryKind::TxEntry as u8
+                || kind == WalEntryKind::Link as u8
+                || kind == WalEntryKind::TxTerm as u8
+                || kind == WalEntryKind::FunctionRegistered as u8
+            {
+                // ── Follower: buffer it until the closing metadata ──────
+                if follower_slices.is_empty() {
+                    group_start = offset;
+                }
+                follower_slices.push(&data[offset..offset + ENTRY_SIZE]);
+                offset += ENTRY_SIZE;
+            } else {
+                return Self::handle_broken_tx(
+                    data,
+                    offset,
+                    last_good,
+                    &format!("unexpected record kind {}", kind),
+                );
             }
         }
 
+        // The valid region must end at a TxMetadata. Followers still buffered are a
+        // partial tail with no commit record — truncating to `last_good` drops them.
         Ok(last_good)
     }
 
@@ -232,68 +220,45 @@ impl<'r> Recover<'r> {
         Ok(last_good)
     }
 
-    /// Scans forward from `from_offset` to check if any complete, CRC-valid
-    /// transaction exists after this point.
+    /// Scans forward from `from_offset` to check whether any complete, CRC-valid
+    /// transaction exists after this point (trailer layout: a group is complete
+    /// when a `TxMetadata` validates the followers buffered before it).
     fn has_valid_tx_after(data: &[u8], from_offset: usize) -> bool {
         let mut off = from_offset;
+        let mut follower_slices: Vec<&[u8]> = Vec::with_capacity(256);
 
         while off + ENTRY_SIZE <= data.len() {
             let kind = data[off];
 
             if kind == WalEntryKind::TxMetadata as u8 {
-                if off + ENTRY_SIZE > data.len() {
-                    return false;
-                }
                 let meta: TxMetadata = bytemuck::pod_read_unaligned(&data[off..off + ENTRY_SIZE]);
-                let expected = meta.sub_item_count as usize;
-                let records_available = (data.len() - off) / ENTRY_SIZE - 1;
-
-                if records_available < expected {
-                    off += ENTRY_SIZE;
-                    continue;
-                }
-
-                // Check follower kinds.
-                let mut foff = off + ENTRY_SIZE;
-                let mut followers_ok = true;
-                let mut follower_slices: Vec<&[u8]> = Vec::with_capacity(expected);
-                for _ in 0..expected {
-                    let fk = data[foff];
-                    if fk != WalEntryKind::TxEntry as u8
-                        && fk != WalEntryKind::Link as u8
-                        && fk != WalEntryKind::TxTerm as u8
-                        && fk != WalEntryKind::FunctionRegistered as u8
-                    {
-                        followers_ok = false;
-                        break;
+                if follower_slices.len() == meta.sub_item_count as usize {
+                    let mut digest = 0u32;
+                    for slice in &follower_slices {
+                        digest = crc32c::crc32c_append(digest, slice);
                     }
-                    follower_slices.push(&data[foff..foff + ENTRY_SIZE]);
-                    foff += ENTRY_SIZE;
+                    let mut meta_for_crc = meta;
+                    meta_for_crc.crc32c = 0;
+                    digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&meta_for_crc));
+                    if digest == meta.crc32c {
+                        // A complete, CRC-valid transaction exists after the break.
+                        return true;
+                    }
                 }
-
-                if !followers_ok {
-                    off += ENTRY_SIZE;
-                    continue;
-                }
-
-                // CRC check.
-                let mut meta_for_crc = meta;
-                meta_for_crc.crc32c = 0;
-                let mut digest = crc32c::crc32c(bytemuck::bytes_of(&meta_for_crc));
-                for slice in &follower_slices {
-                    digest = crc32c::crc32c_append(digest, slice);
-                }
-
-                if digest == meta.crc32c {
-                    // Found a valid transaction after the broken one.
-                    return true;
-                }
-
+                // This metadata did not close a valid group — restart buffering.
+                follower_slices.clear();
                 off += ENTRY_SIZE;
-                continue;
+            } else if kind == WalEntryKind::TxEntry as u8
+                || kind == WalEntryKind::Link as u8
+                || kind == WalEntryKind::TxTerm as u8
+                || kind == WalEntryKind::FunctionRegistered as u8
+            {
+                follower_slices.push(&data[off..off + ENTRY_SIZE]);
+                off += ENTRY_SIZE;
+            } else {
+                follower_slices.clear();
+                off += ENTRY_SIZE;
             }
-
-            off += ENTRY_SIZE;
         }
 
         false
@@ -344,6 +309,11 @@ impl<'r> Recover<'r> {
             })?;
         let mut last_tx_id = 0;
         let mut recover_balances = HashMap::new();
+        // Trailer layout: a transaction's followers precede its `TxMetadata`, which
+        // supplies the tx_id, the watermark decision, and the index ordering. Hold
+        // the in-flight followers until the metadata; the buffer carries across
+        // segment seams since a transaction may span a rotation boundary.
+        let mut group: Vec<WalEntry> = Vec::new();
 
         // restore the latest snapshot
         for segment in self.segments.iter_mut() {
@@ -459,77 +429,64 @@ impl<'r> Recover<'r> {
                 )
             })?;
 
-            let mut segment_recover_tx_id = 0u64;
-            // `skipping_tx` becomes true once we observe a `Metadata`
-            // with `tx_id > watermark`. Subsequent `Entry`/`Link`
-            // records belong to that rejected transaction and must be
-            // dropped. `FunctionRegistered` records are also dropped
-            // once we are past the last accepted transaction — they
-            // occurred temporally after a rejected tx (ADR-0016 §9).
-            let mut skipping_tx = false;
             let snapshot = &mut self.snapshot;
             let transactor = &*self.transactor;
             let seal = &mut *self.seal;
             let mut function_apply_err: Option<std::io::Error> = None;
             segment
                 .visit_wal_records(|record| match record {
+                    // Trailer layout: the metadata closes the transaction. Decide
+                    // skip/apply here with the authoritative tx_id, then flush the
+                    // followers buffered before it.
                     WalEntry::Metadata(metadata) => {
                         if metadata.tx_id > watermark {
-                            skipping_tx = true;
+                            group.clear();
                             return;
                         }
-                        skipping_tx = false;
                         last_tx_id = metadata.tx_id;
-                        segment_recover_tx_id = metadata.tx_id;
                         snapshot.recover_index_tx_metadata(metadata);
-                    }
-                    WalEntry::Entry(entry) => {
-                        if skipping_tx {
-                            return;
-                        }
-                        recover_balances.insert(entry.account_id, entry.computed_balance);
-                        snapshot.recover_index_tx_entry(segment_recover_tx_id, entry);
-                    }
-                    WalEntry::Link(link) => {
-                        if skipping_tx {
-                            return;
-                        }
-                        snapshot.recover_index_tx_link(segment_recover_tx_id, link);
-                    }
-                    WalEntry::FunctionRegistered(f) => {
-                        if skipping_tx {
-                            return;
-                        }
-                        if function_apply_err.is_none()
-                            && let Err(e) = transactor.recover_function_registered(f)
-                        {
-                            function_apply_err = Some(std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "recover: replay FunctionRegistered({} v{}) failed: {}",
-                                    f.name_str(),
-                                    f.version,
-                                    e
-                                ),
-                            ));
-                            return;
-                        }
-                        if function_apply_err.is_none()
-                            && let Err(e) =
-                                seal.recover_function_record(f.name_str(), f.version, f.crc32c)
-                        {
-                            function_apply_err = Some(std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "recover: seal map update for {} v{} failed: {}",
-                                    f.name_str(),
-                                    f.version,
-                                    e
-                                ),
-                            ));
+                        for follower in group.drain(..) {
+                            match follower {
+                                WalEntry::Entry(entry) => {
+                                    recover_balances
+                                        .insert(entry.account_id, entry.computed_balance);
+                                    snapshot.recover_index_tx_entry(metadata.tx_id, &entry);
+                                }
+                                WalEntry::Link(link) => {
+                                    snapshot.recover_index_tx_link(metadata.tx_id, &link);
+                                }
+                                WalEntry::FunctionRegistered(f) if function_apply_err.is_none() => {
+                                    if let Err(e) = transactor.recover_function_registered(&f) {
+                                        function_apply_err = Some(std::io::Error::new(
+                                            e.kind(),
+                                            format!(
+                                                "recover: replay FunctionRegistered({} v{}) failed: {}",
+                                                f.name_str(),
+                                                f.version,
+                                                e
+                                            ),
+                                        ));
+                                    } else if let Err(e) = seal.recover_function_record(
+                                        f.name_str(),
+                                        f.version,
+                                        f.crc32c,
+                                    ) {
+                                        function_apply_err = Some(std::io::Error::new(
+                                            e.kind(),
+                                            format!(
+                                                "recover: seal map update for {} v{} failed: {}",
+                                                f.name_str(),
+                                                f.version,
+                                                e
+                                            ),
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
-                    _ => {}
+                    other => group.push(*other),
                 })
                 .map_err(|e| {
                     std::io::Error::new(
@@ -550,9 +507,6 @@ impl<'r> Recover<'r> {
         let active_segment = self.storage.active_segment().map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
         })?;
-        let mut current_recover_tx_id = 0u64;
-        // Same skipping discipline as the sealed-segment loop above.
-        let mut skipping_tx = false;
         let snapshot = &mut self.snapshot;
         let transactor = &mut self.transactor;
         let seal = &mut *self.seal;
@@ -561,15 +515,13 @@ impl<'r> Recover<'r> {
             .visit_wal_records(|record| match record {
                 WalEntry::Metadata(metadata) => {
                     if metadata.tx_id > watermark {
-                        skipping_tx = true;
+                        group.clear();
                         return;
                     }
-                    skipping_tx = false;
                     last_tx_id = metadata.tx_id;
-                    current_recover_tx_id = metadata.tx_id;
                     snapshot.recover_index_tx_metadata(metadata);
 
-                    // Only non-duplicate committed transactions should be in the dedup cache
+                    // Only non-duplicate committed transactions belong in the dedup cache.
                     if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
                         transactor.dedup_cache_mut().recover_entry(
                             metadata.user_ref,
@@ -577,54 +529,45 @@ impl<'r> Recover<'r> {
                             last_tx_id,
                         );
                     }
-                }
-                WalEntry::Entry(entry) => {
-                    if skipping_tx {
-                        return;
-                    }
-                    recover_balances.insert(entry.account_id, entry.computed_balance);
-                    snapshot.recover_index_tx_entry(current_recover_tx_id, entry);
-                }
-                WalEntry::Link(link) => {
-                    if skipping_tx {
-                        return;
-                    }
-                    snapshot.recover_index_tx_link(current_recover_tx_id, link);
-                }
-                WalEntry::FunctionRegistered(f) => {
-                    if skipping_tx {
-                        return;
-                    }
-                    if function_apply_err.is_none()
-                        && let Err(e) = transactor.recover_function_registered(f)
-                    {
-                        function_apply_err = Some(std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "recover: replay FunctionRegistered({} v{}) failed: {}",
-                                f.name_str(),
-                                f.version,
-                                e
-                            ),
-                        ));
-                        return;
-                    }
-                    if function_apply_err.is_none()
-                        && let Err(e) =
-                            seal.recover_function_record(f.name_str(), f.version, f.crc32c)
-                    {
-                        function_apply_err = Some(std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "recover: seal map update for {} v{} failed: {}",
-                                f.name_str(),
-                                f.version,
-                                e
-                            ),
-                        ));
+                    for follower in group.drain(..) {
+                        match follower {
+                            WalEntry::Entry(entry) => {
+                                recover_balances.insert(entry.account_id, entry.computed_balance);
+                                snapshot.recover_index_tx_entry(metadata.tx_id, &entry);
+                            }
+                            WalEntry::Link(link) => {
+                                snapshot.recover_index_tx_link(metadata.tx_id, &link);
+                            }
+                            WalEntry::FunctionRegistered(f) if function_apply_err.is_none() => {
+                                if let Err(e) = transactor.recover_function_registered(&f) {
+                                    function_apply_err = Some(std::io::Error::new(
+                                        e.kind(),
+                                        format!(
+                                            "recover: replay FunctionRegistered({} v{}) failed: {}",
+                                            f.name_str(),
+                                            f.version,
+                                            e
+                                        ),
+                                    ));
+                                } else if let Err(e) =
+                                    seal.recover_function_record(f.name_str(), f.version, f.crc32c)
+                                {
+                                    function_apply_err = Some(std::io::Error::new(
+                                        e.kind(),
+                                        format!(
+                                            "recover: seal map update for {} v{} failed: {}",
+                                            f.name_str(),
+                                            f.version,
+                                            e
+                                        ),
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                _ => {}
+                other => group.push(*other),
             })
             .map_err(|e| {
                 std::io::Error::new(
