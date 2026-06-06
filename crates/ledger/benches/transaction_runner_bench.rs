@@ -1,4 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use ledger::ledger::WaitStrategy;
+use ledger::test_support::mock_pipeline;
 use ledger::transaction::{Operation, Transaction};
 use ledger::transactor::TransactorRunner;
 use ledger::wasm_runtime::WasmRuntime;
@@ -24,7 +26,11 @@ fn transaction_runner_bench(c: &mut Criterion) {
         .expect("storage"),
     );
     let runtime = Arc::new(WasmRuntime::new(storage));
-    let mut runner = TransactorRunner::new(10_000_000, runtime);
+
+    // Ring writer + context + background drain so process_direct never blocks.
+    let (pipeline, writer, _drain) = mock_pipeline(1024, 1 << 16, WaitStrategy::Balanced);
+    let ctx = pipeline.transactor_context();
+    let mut runner = TransactorRunner::new(10_000_000, runtime, writer);
     let mut current_id = 0u64;
 
     group.throughput(Throughput::Elements(1));
@@ -38,7 +44,7 @@ fn transaction_runner_bench(c: &mut Criterion) {
                 user_ref: 0,
             });
             tx.id = current_id;
-            runner.process_direct(tx);
+            runner.process_direct(&ctx, tx);
         });
     });
 
@@ -58,7 +64,7 @@ fn transaction_runner_bench(c: &mut Criterion) {
                     tx
                 })
                 .collect();
-            runner.process_direct_batch(batch);
+            runner.process_direct_batch(&ctx, batch);
         });
     });
 

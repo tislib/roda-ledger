@@ -7,7 +7,7 @@ use storage::StorageConfig;
 
 // 100 tx/segment, snapshot every seal. Segment/snapshot count is throughput-
 // dependent (batched ingest); 20_000 reliably yields the many each scenario needs.
-const SMALL_SEGMENT_TX_COUNT: u64 = 100;
+const SMALL_SEGMENT_TX_COUNT: u64 = 1000;
 const SNAP_FREQUENCY: u32 = 1;
 const NUM_TRANSACTIONS: u64 = 20_000;
 const ACCOUNT_ID: u64 = 7;

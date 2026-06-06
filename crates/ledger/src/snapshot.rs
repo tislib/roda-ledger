@@ -2,24 +2,13 @@ use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
+use crate::tx_ring::releaser::TxRingReleaser;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::JoinHandle;
 use storage::Storage;
 use storage::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
-// ── Message types for the Snapshot stage queue (ADR-008) ─────────────────────
-
-/// Single message type for the WAL→Snapshot queue.
-///
-/// Both `WalEntry` records and query requests flow through a single FIFO queue,
-/// which gives **read-your-own-writes consistency** for free: a query submitted
-/// after a transaction is enqueued after its entries and always sees the committed
-/// state.
-pub enum SnapshotMessage {
-    Entry(WalEntry),
-    Query(QueryRequest),
-}
 
 /// A query to be executed by the Snapshot stage against the `TransactionIndexer`.
 ///
@@ -61,6 +50,7 @@ pub struct Snapshot {
     indexer: Option<TransactionIndexer>,
     #[allow(dead_code)]
     storage: Arc<Storage>,
+    ring_releaser: Option<TxRingReleaser>,
 }
 
 struct SnapshotRunner {
@@ -68,10 +58,15 @@ struct SnapshotRunner {
     /// Total remaining records (entries + links) for the current transaction.
     pending_records: u16,
     indexer: TransactionIndexer,
+    ring_releaser: TxRingReleaser,
 }
 
 impl Snapshot {
-    pub fn new(config: &LedgerConfig, storage: Arc<Storage>) -> Self {
+    pub fn new(
+        config: &LedgerConfig,
+        storage: Arc<Storage>,
+        ring_releaser: TxRingReleaser,
+    ) -> Self {
         let account_count = config.max_accounts;
         let balances: Arc<Vec<AtomicI64>> =
             Arc::new((0..account_count).map(|_| AtomicI64::new(0)).collect());
@@ -86,6 +81,7 @@ impl Snapshot {
                 account_heads_size,
             )),
             storage,
+            ring_releaser: Some(ring_releaser),
         }
     }
 
@@ -105,6 +101,7 @@ impl Snapshot {
             balances: self.balances.clone(),
             pending_records: 0,
             indexer: self.indexer.take().unwrap(),
+            ring_releaser: self.ring_releaser.take().unwrap(),
         };
         std::thread::Builder::new()
             .name("snapshot".to_string())
@@ -152,88 +149,92 @@ impl Snapshot {
 impl SnapshotRunner {
     pub fn run(&mut self, ctx: SnapshotContext) {
         let mut retry_count = 0;
+        let inbound = ctx.query();
+        let mut last_ring_index = 0;
         let mut last_processed_tx_id = 0;
-        let inbound = ctx.input();
         while ctx.is_running() {
-            if let Some(message) = inbound.pop() {
-                retry_count = 0;
+            ctx.ring().walk_entries(last_ring_index, |wal_entry| {
+                match wal_entry {
+                    WalEntry::Metadata(m) => {
+                        if m.tx_id > ctx.commit_index() {
+                            // process only committed txns
+                            return false;
+                        }
 
-                match message {
-                    SnapshotMessage::Entry(wal_entry) => {
-                        match wal_entry {
-                            WalEntry::Metadata(m) => {
-                                self.indexer.insert_tx(m.tx_id);
-                                self.pending_records = m.sub_item_count;
-                                last_processed_tx_id = m.tx_id;
-                            }
-                            WalEntry::Entry(e) => {
-                                // tx_id is no longer on TxEntry — it
-                                // belongs to the preceding TxMetadata,
-                                // which we just stamped into
-                                // `last_processed_tx_id`.
-                                self.indexer.insert_entry(
-                                    last_processed_tx_id,
-                                    e.account_id,
-                                    e.amount,
-                                    e.kind,
-                                    e.computed_balance,
-                                );
-                                self.balances[e.account_id as usize]
-                                    .store(e.computed_balance, Ordering::Release);
-                                self.pending_records = self.pending_records.saturating_sub(1);
-                            }
-                            WalEntry::Link(l) => {
-                                self.indexer.insert_link(
-                                    last_processed_tx_id,
-                                    l.kind(),
-                                    l.to_tx_id,
-                                );
-                                self.pending_records = self.pending_records.saturating_sub(1);
-                            }
-                            WalEntry::FunctionRegistered(_) => {
-                                // The Transactor owns WasmRuntime
-                                // mutations — registration and
-                                // unregistration are applied during the
-                                // FunctionRegistration dispatcher arm.
-                                // The Snapshot stage only sees this
-                                // record as a sub-item of its parent
-                                // TxMetadata; decrement the counter so
-                                // the meta+follower group completes.
-                                self.pending_records = self.pending_records.saturating_sub(1);
-                            }
-                            WalEntry::Term(_) => {
-                                // TxTerm is a sub-item of its parent
-                                // TxMetadata; decrement to complete the
-                                // meta+follower group.
-                                self.pending_records = self.pending_records.saturating_sub(1);
-                            }
-                        }
-                        if last_processed_tx_id > 0 && self.pending_records == 0 {
-                            ctx.set_processed_index(last_processed_tx_id);
-                        }
+                        self.indexer.insert_tx(m.tx_id);
+                        self.pending_records = m.sub_item_count;
+                        last_processed_tx_id = m.tx_id;
                     }
-                    SnapshotMessage::Query(q) => {
-                        let response = match q.kind {
-                            QueryKind::GetTransaction { tx_id } => {
-                                let result = self.indexer.get_transaction(tx_id).map(|entries| {
-                                    let links =
-                                        self.indexer.get_links(tx_id).cloned().unwrap_or_default();
-                                    TransactionResult { entries, links }
-                                });
-                                QueryResponse::Transaction(result)
-                            }
-                            QueryKind::GetAccountHistory {
-                                account_id,
-                                from_tx_id,
-                                limit,
-                            } => QueryResponse::AccountHistory(
-                                self.indexer
-                                    .get_account_history(account_id, from_tx_id, limit),
-                            ),
-                        };
-                        (q.respond)(response);
+                    WalEntry::Entry(e) => {
+                        // tx_id is no longer on TxEntry — it
+                        // belongs to the preceding TxMetadata,
+                        // which we just stamped into
+                        // `last_processed_tx_id`.self.indexer.insert_entry(
+                        self.indexer.insert_entry(
+                            last_processed_tx_id,
+                            e.account_id,
+                            e.amount,
+                            e.kind,
+                            e.computed_balance,
+                        );
+                        self.balances[e.account_id as usize]
+                            .store(e.computed_balance, Ordering::Release);
+                        self.pending_records = self.pending_records.saturating_sub(1);
+                    }
+                    WalEntry::Link(l) => {
+                        self.indexer
+                            .insert_link(last_processed_tx_id, l.kind(), l.to_tx_id);
+                        self.pending_records = self.pending_records.saturating_sub(1);
+                    }
+                    WalEntry::FunctionRegistered(_) => {
+                        // The Transactor owns WasmRuntime
+                        // mutations — registration and
+                        // unregistration are applied during the
+                        // FunctionRegistration dispatcher arm.
+                        // The Snapshot stage only sees this
+                        // record as a sub-item of its parent
+                        // TxMetadata; decrement the counter so
+                        // the meta+follower group completes.
+                        self.pending_records = self.pending_records.saturating_sub(1);
+                    }
+                    WalEntry::Term(_) => {
+                        // TxTerm is a sub-item of its parent
+                        // TxMetadata; decrement to complete the
+                        // meta+follower group.
+                        self.pending_records = self.pending_records.saturating_sub(1);
                     }
                 }
+                if last_processed_tx_id > 0 && self.pending_records == 0 {
+                    ctx.set_processed_index(last_processed_tx_id);
+                }
+
+                last_ring_index += 1;
+
+                true
+            });
+            self.ring_releaser.advance_to(last_ring_index);
+
+            if let Some(q) = inbound.pop() {
+                retry_count = 0;
+
+                let response = match q.kind {
+                    QueryKind::GetTransaction { tx_id } => {
+                        let result = self.indexer.get_transaction(tx_id).map(|entries| {
+                            let links = self.indexer.get_links(tx_id).cloned().unwrap_or_default();
+                            TransactionResult { entries, links }
+                        });
+                        QueryResponse::Transaction(result)
+                    }
+                    QueryKind::GetAccountHistory {
+                        account_id,
+                        from_tx_id,
+                        limit,
+                    } => QueryResponse::AccountHistory(
+                        self.indexer
+                            .get_account_history(account_id, from_tx_id, limit),
+                    ),
+                };
+                (q.respond)(response);
             } else {
                 ctx.wait_strategy().retry(retry_count);
                 retry_count += 1;

@@ -10,14 +10,15 @@
 //! one stage do not cause false sharing with adjacent indexes.
 
 use crate::config::LedgerConfig;
-use crate::snapshot::SnapshotMessage;
+use crate::snapshot::QueryRequest;
 use crate::transaction::TransactionInput;
+use crate::tx_ring::ring::TxRing;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use storage::entities::{WalEntry, WalInput};
+use storage::entities::WalEntry;
 
 /// Callback fired by the WAL stage whenever `commit_index` advances.
 pub type CommitHandler = Arc<dyn Fn(u64) + Send + Sync + 'static>;
@@ -30,8 +31,7 @@ pub type CommitHandler = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 pub struct Pipeline {
     // ---- inter-stage queues ----
     sequencer_to_transactor: ArrayQueue<TransactionInput>,
-    wal_input: ArrayQueue<WalInput>,
-    wal_to_snapshot: ArrayQueue<SnapshotMessage>,
+    snapshot_query: ArrayQueue<QueryRequest>,
 
     // ---- global progress indexes (cache-padded to avoid false sharing) ----
     /// Next transaction id to be handed out by the sequencer (initialized to 1).
@@ -65,25 +65,25 @@ pub struct Pipeline {
 
     /// Shared wait strategy used by every stage's idle/backpressure loops.
     wait_strategy: WaitStrategy,
+    pub tx_ring: Arc<TxRing>,
 }
 
 impl Pipeline {
     /// Construct a pipeline with empty queues sized from the ledger config.
-    pub fn new(config: &LedgerConfig) -> Arc<Self> {
-        Self::with_sizes(config.queue_size, config.queue_size, config.wait_strategy)
+    pub fn new(config: &LedgerConfig, tx_ring: Arc<TxRing>) -> Arc<Self> {
+        Self::with_sizes(config.ring_size, config.wait_strategy, tx_ring)
     }
 
     /// Low-level constructor exposed for benches/tests that need to control
     /// the individual queue sizes without building a full `LedgerConfig`.
     pub fn with_sizes(
         small_queue_size: usize,
-        wal_queue_size: usize,
         wait_strategy: WaitStrategy,
+        tx_ring: Arc<TxRing>,
     ) -> Arc<Self> {
         Arc::new(Self {
             sequencer_to_transactor: ArrayQueue::new(small_queue_size),
-            wal_input: ArrayQueue::new(wal_queue_size),
-            wal_to_snapshot: ArrayQueue::new(small_queue_size),
+            snapshot_query: ArrayQueue::new(small_queue_size),
 
             sequencer_index: CachePadded::new(AtomicU64::new(1)),
             compute_index: CachePadded::new(AtomicU64::new(0)),
@@ -91,7 +91,7 @@ impl Pipeline {
             snapshot_index: CachePadded::new(AtomicU64::new(0)),
             seal_index: CachePadded::new(AtomicU32::new(0)),
             seal_watermark: CachePadded::new(AtomicU64::new(u64::MAX)),
-
+            tx_ring,
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
         })
@@ -175,8 +175,8 @@ impl Pipeline {
 
     /// Try to push a query onto the WAL→Snapshot queue without blocking.
     /// Used by `Ledger::query` which manages its own backpressure.
-    pub fn try_push_query(&self, msg: SnapshotMessage) -> Result<(), SnapshotMessage> {
-        self.wal_to_snapshot.push(msg)
+    pub fn try_push_query(&self, msg: QueryRequest) -> Result<(), QueryRequest> {
+        self.snapshot_query.push(msg)
     }
 
     // ─── recovery setters (crate-internal) ──────────────────────────────────
@@ -284,11 +284,6 @@ impl TransactorContext {
     }
 
     #[inline(always)]
-    pub fn output(&self) -> &ArrayQueue<WalInput> {
-        &self.pipeline.wal_input
-    }
-
-    #[inline(always)]
     pub fn input_capacity(&self) -> usize {
         self.pipeline.sequencer_to_transactor.capacity()
     }
@@ -337,23 +332,8 @@ pub struct WalContext {
 
 impl WalContext {
     #[inline(always)]
-    pub fn input(&self) -> &ArrayQueue<WalInput> {
-        &self.pipeline.wal_input
-    }
-
-    #[inline(always)]
-    pub fn output(&self) -> &ArrayQueue<SnapshotMessage> {
-        &self.pipeline.wal_to_snapshot
-    }
-
-    #[inline(always)]
-    pub fn input_capacity(&self) -> usize {
-        self.pipeline.wal_input.capacity()
-    }
-
-    #[inline(always)]
-    pub fn get_processed_index(&self) -> u64 {
-        self.pipeline.commit_index.load(Ordering::Acquire)
+    pub fn tx_ring(&self) -> Arc<TxRing> {
+        self.pipeline.tx_ring.clone()
     }
 
     /// Publish a new commit-index and fire the registered `on_commit`
@@ -387,8 +367,18 @@ pub struct SnapshotContext {
 
 impl SnapshotContext {
     #[inline(always)]
-    pub fn input(&self) -> &ArrayQueue<SnapshotMessage> {
-        &self.pipeline.wal_to_snapshot
+    pub fn query(&self) -> &ArrayQueue<QueryRequest> {
+        &self.pipeline.snapshot_query
+    }
+
+    #[inline(always)]
+    pub fn ring(&self) -> &TxRing {
+        &self.pipeline.tx_ring
+    }
+
+    #[inline]
+    pub fn commit_index(&self) -> u64 {
+        self.pipeline.commit_index.load(Ordering::Acquire)
     }
 
     #[inline(always)]
@@ -454,15 +444,6 @@ pub struct LedgerContext {
 }
 
 impl LedgerContext {
-    /// Non-blocking single-entry push; returns the entry back on a full queue.
-    #[inline]
-    pub fn push_wal_entry(&self, entry: WalEntry) -> Result<(), WalEntry> {
-        self.pipeline
-            .wal_input
-            .push(WalInput::Single(entry))
-            .map_err(|wi| wi.single())
-    }
-
     /// Non-blocking push of follower-replicated WAL entries through the
     /// Transactor (NOT directly to the WAL stage). The Transactor mirrors
     /// the entries' effects onto its `balances` and `dedup` state, then

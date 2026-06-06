@@ -82,6 +82,12 @@ impl Storage {
         *self.fault.lock().expect("fault mutex poisoned") = hook;
     }
 
+    pub fn segment_count(&self) -> usize {
+        // last_segment_id starts from 1
+        // last_segment_id - 1(for starting from one) + 1 (for the active segment)
+        self.last_segment_id.load(Ordering::Acquire) as usize
+    }
+
     pub fn config(&self) -> &StorageConfig {
         &self.config
     }
