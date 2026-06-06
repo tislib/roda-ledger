@@ -69,18 +69,6 @@ impl TxRingWriter {
         }
     }
 
-    /// Mutate the uncommitted entry at absolute `ring_index` (e.g. back-patch a
-    /// metadata CRC after its sub-items are known). No copy.
-    pub(crate) fn patch<F: FnOnce(&mut WalEntry)>(&mut self, ring_index: usize, f: F) {
-        debug_assert!(
-            self.ring.write.load(Ordering::Relaxed) <= ring_index && ring_index < self.cursor,
-            "TxRingWriter::patch: ring_index outside the uncommitted window"
-        );
-        // SAFETY: `[commit, cursor)` is the writer's exclusive, unpublished window.
-        let entry = unsafe { &mut *self.ring.slots[ring_index & (self.ring.capacity - 1)].get() };
-        f(entry);
-    }
-
     // Publish the head so readers and the releaser observe it.
     pub fn commit(&mut self) {
         self.ring.write.store(self.cursor, Ordering::Release);

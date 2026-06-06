@@ -59,22 +59,26 @@ fn deposit_entries(tx_id: u64, account: u64, amount: u64) -> Vec<WalEntry> {
         amount,
         computed_balance: amount as i64,
     };
-    vec![WalEntry::Metadata(meta), WalEntry::Entry(entry)]
+    // Trailer (commit-record) layout: the follower entry precedes its metadata.
+    vec![WalEntry::Entry(entry), WalEntry::Metadata(meta)]
 }
 
-/// Read or inherit the tx_id of a 40-byte record.
+/// Per-record tx_ids for a tailer buffer in trailer (commit-record) layout.
 ///
-/// Storage only stores `tx_id` on `TxMetadata` now; follower records
-/// (`TxEntry`, `TxLink`) and structural records (`TxTerm`,
-/// `FunctionRegistered`) inherit it from the most recently seen
-/// metadata. `running` is the caller's `last_meta_tx_id` accumulator —
-/// updated when a new metadata is encountered and returned for every
-/// record in the stream.
-fn record_tx_id(record: &[u8], running: &mut u64) -> u64 {
-    if record[0] == WalEntryKind::TxMetadata as u8 {
-        *running = u64::from_le_bytes(record[TX_ID_OFFSET..TX_ID_OFFSET + 8].try_into().unwrap());
+/// A transaction's records are `[followers…, TxMetadata]` and only the closing
+/// `TxMetadata` stores the `tx_id`; the followers inherit it. Scanning backward,
+/// the most recently seen metadata supplies the id for the followers before it.
+fn record_tx_ids(buf: &[u8], n_records: usize) -> Vec<u64> {
+    let mut ids = vec![0u64; n_records];
+    let mut owner = 0u64;
+    for i in (0..n_records).rev() {
+        let rec = &buf[i * WAL_RECORD_SIZE..];
+        if rec[0] == WalEntryKind::TxMetadata as u8 {
+            owner = u64::from_le_bytes(rec[TX_ID_OFFSET..TX_ID_OFFSET + 8].try_into().unwrap());
+        }
+        ids[i] = owner;
     }
-    *running
+    ids
 }
 
 /// Drive a deposit through the normal client path and block until committed.
@@ -117,12 +121,10 @@ fn append_wal_entries_writes_records_visible_via_tailer() {
     let mut buf = vec![0u8; 4096];
     let n = tailer.tail(&mut buf) as usize;
     assert_eq!(n, WAL_RECORD_SIZE * 2);
-    assert_eq!(buf[0], WalEntryKind::TxMetadata as u8);
-    assert_eq!(buf[WAL_RECORD_SIZE], WalEntryKind::TxEntry as u8);
-    let mut running = 0u64;
-    for rec in 0..2 {
-        assert_eq!(record_tx_id(&buf[rec * WAL_RECORD_SIZE..], &mut running), 1);
-    }
+    // Trailer layout: the entry comes first, the closing metadata last.
+    assert_eq!(buf[0], WalEntryKind::TxEntry as u8);
+    assert_eq!(buf[WAL_RECORD_SIZE], WalEntryKind::TxMetadata as u8);
+    assert_eq!(record_tx_ids(&buf, 2), vec![1, 1]);
 }
 
 #[test]
@@ -139,10 +141,7 @@ fn append_wal_entries_multi_slot_batches_multiple_tx() {
     let mut buf = vec![0u8; 4096];
     let n = tailer.tail(&mut buf) as usize;
     assert_eq!(n, WAL_RECORD_SIZE * 6);
-    let mut running = 0u64;
-    for (i, tx) in [1u64, 1, 2, 2, 3, 3].iter().enumerate() {
-        assert_eq!(record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running), *tx);
-    }
+    assert_eq!(record_tx_ids(&buf, 6), vec![1, 1, 2, 2, 3, 3]);
 }
 
 #[test]
@@ -173,9 +172,10 @@ fn tailer_from_tx_id_returns_only_transactional_records() {
     let n = tailer.tail(&mut buf) as usize;
     // Deposit → 1 metadata + 2 entries (debit + credit).
     assert_eq!(n, WAL_RECORD_SIZE * 3);
-    assert_eq!(buf[0], WalEntryKind::TxMetadata as u8);
+    // Trailer layout: two debit/credit entries, then the closing metadata.
+    assert_eq!(buf[0], WalEntryKind::TxEntry as u8);
     assert_eq!(buf[WAL_RECORD_SIZE], WalEntryKind::TxEntry as u8);
-    assert_eq!(buf[WAL_RECORD_SIZE * 2], WalEntryKind::TxEntry as u8);
+    assert_eq!(buf[WAL_RECORD_SIZE * 2], WalEntryKind::TxMetadata as u8);
 }
 
 /// Buffer-size rounding: the tailer drops the trailing `len % 40`
@@ -235,15 +235,12 @@ fn tailer_passive_resumes_across_calls_without_duplicates() {
     // One deposit group per call → 5 resume steps.
     let mut buf = vec![0u8; WAL_RECORD_SIZE * 3];
     let mut collected: Vec<u64> = Vec::new();
-    let mut running = 0u64;
     loop {
         let n = tailer.tail(&mut buf) as usize;
         if n == 0 {
             break;
         }
-        for i in 0..(n / WAL_RECORD_SIZE) {
-            collected.push(record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running));
-        }
+        collected.extend(record_tx_ids(&buf, n / WAL_RECORD_SIZE));
     }
 
     // 5 deposits × 3 records (meta + debit + credit) = 15.
@@ -283,9 +280,8 @@ fn tailer_actively_sees_new_records_on_each_call() {
     // The new bytes must only contain records with tx_id > first batch.
     // The first record in the buffer is guaranteed to be a TxMetadata
     // (the tailer aligns to whole-tx boundaries on resume).
-    let mut running = 0u64;
-    for i in 0..(second / WAL_RECORD_SIZE) {
-        assert!(record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running) >= 2);
+    for tx in record_tx_ids(&buf, second / WAL_RECORD_SIZE) {
+        assert!(tx >= 2);
     }
 }
 
@@ -303,11 +299,7 @@ fn tailer_from_lag_streams_full_history() {
     let n = tailer.tail(&mut buf) as usize;
     assert_eq!(n, WAL_RECORD_SIZE * 3 * 20);
 
-    let mut tx_ids: Vec<u64> = Vec::new();
-    let mut running = 0u64;
-    for i in 0..(n / WAL_RECORD_SIZE) {
-        tx_ids.push(record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running));
-    }
+    let tx_ids = record_tx_ids(&buf, n / WAL_RECORD_SIZE);
     for expected in 1..=20 {
         assert!(tx_ids.contains(&expected), "missing tx_id {}", expected);
     }
@@ -331,9 +323,7 @@ fn tailer_crosses_segment_rotation() {
     assert_eq!(n, WAL_RECORD_SIZE * 3 * 10);
 
     let mut last_tx = 0u64;
-    let mut running = 0u64;
-    for i in 0..(n / WAL_RECORD_SIZE) {
-        let tx = record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running);
+    for tx in record_tx_ids(&buf, n / WAL_RECORD_SIZE) {
         assert!((1..=10).contains(&tx));
         assert!(tx >= last_tx);
         last_tx = tx;
@@ -349,7 +339,6 @@ fn tailer_actively_tails_while_rotating() {
 
     let mut collected: Vec<u64> = Vec::new();
     let mut buf = vec![0u8; WAL_RECORD_SIZE * 4];
-    let mut running = 0u64;
 
     for _ in 0..6 {
         deposit_client(&ledger, 1, 10);
@@ -358,9 +347,7 @@ fn tailer_actively_tails_while_rotating() {
             if n == 0 {
                 break;
             }
-            for i in 0..(n / WAL_RECORD_SIZE) {
-                collected.push(record_tx_id(&buf[i * WAL_RECORD_SIZE..], &mut running));
-            }
+            collected.extend(record_tx_ids(&buf, n / WAL_RECORD_SIZE));
         }
     }
 

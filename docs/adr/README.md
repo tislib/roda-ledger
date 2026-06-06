@@ -17,4 +17,10 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-011](0011-wal-write-commit-separation.md)  | WAL Write/Commit Separation | Accepted |
 | [ADR-012](0012-e2e-testing.md)                  | E2E Testing Strategy | Proposed |
 | [ADR-013](0013-transaction-count-based-segments.md) | Transaction-Count-Based Segments and Deterministic Dedup | Proposed |
+| [ADR-014](0014-wasm-function-registry.md)        | WASM Function Registry and Function Operation Execution | Proposed |
+| [ADR-015](0015-cluster-mode.md)                  | Cluster Mode | Proposed |
+| [ADR-016](0016-leader-election.md)               | Leader Election and Log Divergence | Proposed |
+| [ADR-017](0017-roda-raft.md)                     | roda-raft Design | — |
 | [ADR-018](0018-fault-injection.md)               | Fault Injection Framework | Proposed |
+| [ADR-019](0019-transaction-ring.md)              | Transaction Ring | Accepted |
+| [ADR-020](0020-wal-trailer-metadata.md)          | Trailer Metadata — Commit-Record WAL Layout | Accepted |

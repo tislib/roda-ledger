@@ -51,18 +51,10 @@ impl Wal {
 
 pub struct WalRunner {
     storage: Arc<Storage>,
-    pending_records: u16,
     last_written_tx_id: Arc<AtomicU64>,
     active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
     retry_count: u64,
     active_segment: Segment,
-    /// `tx_id` of the most-recently-ingested `TxMetadata`. Used as the
-    /// authoritative tx_id when the closing sub-item of a transaction
-    /// is a structural record (`TxTerm`, `FunctionRegistered`) whose
-    /// `WalEntry::tx_id()` returns 0 — without this, `last_received_tx_id`
-    /// would regress to 0 and `commit_index` would never advance past
-    /// such a transaction.
-    current_tx_id: u64,
     last_received_tx_id: u64,
     segment_start_tx_id: u64,
     wait_strategy: WaitStrategy,
@@ -82,12 +74,10 @@ impl WalRunner {
 
         Self {
             storage,
-            pending_records: 0,
             last_written_tx_id,
             active_segment_sync,
             retry_count: 0,
             active_segment,
-            current_tx_id: 0,
             last_received_tx_id: 0,
             segment_start_tx_id: 0,
             wait_strategy,
@@ -144,19 +134,14 @@ impl WalRunner {
             && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg - 1
     }
 
-    /// Append one entry to the active segment buffer and update tx_id bookkeeping.
+    /// Append one entry to the active segment and advance tx bookkeeping. Trailer
+    /// layout: a `TxMetadata` closes its tx, so tracking advances only there.
     fn ingest_entry(&mut self, entry: WalEntry) {
         self.active_segment.append_pending_entry(&entry);
         if let WalEntry::Metadata(m) = &entry {
-            self.current_tx_id = m.tx_id;
-        }
-        if self.move_pending_entry(&entry) {
-            // Use `current_tx_id` rather than `entry.tx_id()`: structural
-            // sub-items (`TxTerm`, `FunctionRegistered`) carry no tx_id,
-            // so reading from the closing record would regress this to 0.
-            self.last_received_tx_id = self.current_tx_id;
+            self.last_received_tx_id = m.tx_id;
             if self.segment_start_tx_id == 0 {
-                self.segment_start_tx_id = self.current_tx_id;
+                self.segment_start_tx_id = m.tx_id;
             }
         }
     }
@@ -173,23 +158,6 @@ impl WalRunner {
         let syncer = self.active_segment.syncer().expect("Failed to get syncer");
         self.active_segment_sync.store(Arc::new(Some(syncer)));
         self.segment_start_tx_id = 0; // will be set on next tx arrival
-    }
-
-    // Update `pending_records` based on the given entry. 0 means the entry is
-    // complete.
-    fn move_pending_entry(&mut self, entry: &WalEntry) -> bool {
-        match entry {
-            WalEntry::Metadata(m) => {
-                self.pending_records = m.sub_item_count;
-            }
-            WalEntry::Entry(_)
-            | WalEntry::Link(_)
-            | WalEntry::Term(_)
-            | WalEntry::FunctionRegistered(_) => {
-                self.pending_records = self.pending_records.saturating_sub(1);
-            }
-        }
-        self.pending_records == 0
     }
 
     pub fn commit_sync(&mut self, ctx: &WalContext) {

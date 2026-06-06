@@ -526,11 +526,8 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         // Index past the last whole-tx boundary; truncate here on overflow.
         let mut last_whole_tx_end: usize = 0;
 
-        // tx_id is carried only by `TxMetadata`. Track the running
-        // tx_id (the most recent metadata's tx_id) and stamp it onto
-        // every follower record in the iteration's range / limit
-        // logic — pre-refactor the `WalEntry::tx_id()` helper did this
-        // implicitly via a per-record field; now the loop is explicit.
+        // tx_id lives only on `TxMetadata`; track the most recent one for the bound
+        // checks below (a bound hit at a metadata truncates the incomplete tx).
         let mut running_tx: u64 = 0;
         'outer: loop {
             let n = tailer.tail(&mut buf) as usize;
@@ -555,12 +552,13 @@ impl proto::ledger_server::Ledger for LedgerHandler {
                     break 'outer;
                 }
 
-                // TxMetadata marks the start of a whole transaction.
-                if matches!(e, storage::entities::WalEntry::Metadata(_)) {
+                let is_meta = matches!(e, storage::entities::WalEntry::Metadata(_));
+                emitted.push(e);
+                // Trailer layout: a TxMetadata closes its transaction, so the
+                // whole-tx boundary is just past it.
+                if is_meta {
                     last_whole_tx_end = emitted.len();
                 }
-
-                emitted.push(e);
                 if emitted.len() >= limit as usize {
                     break 'outer;
                 }
@@ -591,18 +589,21 @@ impl proto::ledger_server::Ledger for LedgerHandler {
             .map(|tx| tx + 1)
             .unwrap_or(0);
 
-        // The proto encoding for `WalTxEntry` / `WalTxLink` still
-        // carries `tx_id`, so we have to stamp it onto each emitted
-        // record from the most recent metadata before mapping.
-        let mut current_tx: u64 = 0;
+        // The proto encoding for `WalTxEntry` / `WalTxLink` still carries `tx_id`.
+        // Trailer layout: a record's tx_id is on the metadata that closes its group
+        // (which follows it), so resolve each id by scanning backward.
+        let mut owner = 0u64;
+        let mut tx_ids = vec![0u64; emitted.len()];
+        for i in (0..emitted.len()).rev() {
+            if let storage::entities::WalEntry::Metadata(m) = &emitted[i] {
+                owner = m.tx_id;
+            }
+            tx_ids[i] = owner;
+        }
         let records = emitted
             .into_iter()
-            .map(|e| {
-                if let storage::entities::WalEntry::Metadata(m) = &e {
-                    current_tx = m.tx_id;
-                }
-                crate::mapping::wal_entry_to_proto(e, current_tx)
-            })
+            .zip(tx_ids)
+            .map(|(e, tx)| crate::mapping::wal_entry_to_proto(e, tx))
             .collect();
 
         Ok(Response::new(proto::GetLogResponse {

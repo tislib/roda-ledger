@@ -55,8 +55,6 @@ pub struct Snapshot {
 
 struct SnapshotRunner {
     balances: Arc<Vec<AtomicI64>>,
-    /// Total remaining records (entries + links) for the current transaction.
-    pending_records: u16,
     indexer: TransactionIndexer,
     ring_releaser: TxRingReleaser,
 }
@@ -99,7 +97,6 @@ impl Snapshot {
     pub fn start(&mut self, ctx: SnapshotContext) -> std::io::Result<JoinHandle<()>> {
         let runner = SnapshotRunner {
             balances: self.balances.clone(),
-            pending_records: 0,
             indexer: self.indexer.take().unwrap(),
             ring_releaser: self.ring_releaser.take().unwrap(),
         };
@@ -151,65 +148,45 @@ impl SnapshotRunner {
         let mut retry_count = 0;
         let inbound = ctx.query();
         let mut last_ring_index = 0;
-        let mut last_processed_tx_id = 0;
+        // Trailer layout: buffer a transaction's followers until its TxMetadata clears
+        // the commit gate, then apply index + balances together (invisible until durable).
+        let mut entries: Vec<TxEntry> = Vec::new();
+        let mut links: Vec<TxLink> = Vec::new();
         while ctx.is_running() {
+            entries.clear();
+            links.clear();
+            let mut cursor = last_ring_index;
             ctx.ring().walk_entries(last_ring_index, |wal_entry| {
                 match wal_entry {
+                    // Not durable yet: index + release wait for the next pass.
+                    WalEntry::Metadata(m) if m.tx_id > ctx.commit_index() => return false,
                     WalEntry::Metadata(m) => {
-                        if m.tx_id > ctx.commit_index() {
-                            // process only committed txns
-                            return false;
-                        }
-
                         self.indexer.insert_tx(m.tx_id);
-                        self.pending_records = m.sub_item_count;
-                        last_processed_tx_id = m.tx_id;
+                        for e in entries.drain(..) {
+                            self.indexer.insert_entry(
+                                m.tx_id,
+                                e.account_id,
+                                e.amount,
+                                e.kind,
+                                e.computed_balance,
+                            );
+                            self.balances[e.account_id as usize]
+                                .store(e.computed_balance, Ordering::Release);
+                        }
+                        for l in links.drain(..) {
+                            self.indexer.insert_link(m.tx_id, l.kind(), l.to_tx_id);
+                        }
+                        last_ring_index = cursor + 1;
+                        ctx.set_processed_index(m.tx_id);
                     }
                     WalEntry::Entry(e) => {
-                        // tx_id is no longer on TxEntry — it
-                        // belongs to the preceding TxMetadata,
-                        // which we just stamped into
-                        // `last_processed_tx_id`.self.indexer.insert_entry(
-                        self.indexer.insert_entry(
-                            last_processed_tx_id,
-                            e.account_id,
-                            e.amount,
-                            e.kind,
-                            e.computed_balance,
-                        );
-                        self.balances[e.account_id as usize]
-                            .store(e.computed_balance, Ordering::Release);
-                        self.pending_records = self.pending_records.saturating_sub(1);
+                        entries.push(e);
                     }
-                    WalEntry::Link(l) => {
-                        self.indexer
-                            .insert_link(last_processed_tx_id, l.kind(), l.to_tx_id);
-                        self.pending_records = self.pending_records.saturating_sub(1);
-                    }
-                    WalEntry::FunctionRegistered(_) => {
-                        // The Transactor owns WasmRuntime
-                        // mutations — registration and
-                        // unregistration are applied during the
-                        // FunctionRegistration dispatcher arm.
-                        // The Snapshot stage only sees this
-                        // record as a sub-item of its parent
-                        // TxMetadata; decrement the counter so
-                        // the meta+follower group completes.
-                        self.pending_records = self.pending_records.saturating_sub(1);
-                    }
-                    WalEntry::Term(_) => {
-                        // TxTerm is a sub-item of its parent
-                        // TxMetadata; decrement to complete the
-                        // meta+follower group.
-                        self.pending_records = self.pending_records.saturating_sub(1);
-                    }
+                    WalEntry::Link(l) => links.push(l),
+                    // TxTerm / FunctionRegistered carry no query index.
+                    _ => {}
                 }
-                if last_processed_tx_id > 0 && self.pending_records == 0 {
-                    ctx.set_processed_index(last_processed_tx_id);
-                }
-
-                last_ring_index += 1;
-
+                cursor += 1;
                 true
             });
             self.ring_releaser.advance_to(last_ring_index);
