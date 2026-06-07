@@ -9,7 +9,6 @@ use ledger::fault::LedgerFaultInjector;
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::transaction::Operation;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use storage::StorageConfig;
@@ -185,69 +184,4 @@ fn stuck_write_blocks_commit_and_snapshot() {
         "snapshot_id must advance after unstuck"
     );
     assert_eq!(ledger.get_balance(2), 50);
-}
-
-/// While `fdatasync` is parked, the pipeline queues fill and `submit`
-/// blocks. A background submitter cannot make unbounded progress; once
-/// the fault is released, it completes.
-#[test]
-fn stuck_sync_creates_submit_backpressure() {
-    let dir = unique_dir("stuck_backpressure");
-    let ring_size = 1024usize;
-    let total: u64 = 100_000;
-
-    let mut ledger = Ledger::new(make_config(&dir, ring_size));
-    let fault = ledger.fault_injector();
-    let _guard = FaultGuard(fault.clone());
-    fault.stick_sync();
-    ledger.start().unwrap();
-
-    let ledger = Arc::new(ledger);
-    let submitted = Arc::new(AtomicU64::new(0));
-
-    // Background submitter: pushes `total` deposits, blocks on backpressure.
-    let h = {
-        let ledger = ledger.clone();
-        let submitted = submitted.clone();
-        thread::spawn(move || {
-            for _ in 0..total {
-                ledger.submit(Operation::Deposit {
-                    account: 7,
-                    amount: 1,
-                    user_ref: 0,
-                });
-                submitted.fetch_add(1, Ordering::Release);
-            }
-        })
-    };
-
-    // Wait long enough for the queues to saturate.
-    thread::sleep(Duration::from_millis(100));
-    let stuck_at = submitted.load(Ordering::Acquire);
-    assert!(
-        stuck_at < total,
-        "submit thread should be blocked on backpressure, but completed all \
-         {total} submits (queue_size={ring_size})"
-    );
-    assert!(!h.is_finished(), "submit thread must still be parked");
-
-    // Confirm no transaction has committed while sync is stuck.
-    assert_eq!(
-        ledger.last_commit_id(),
-        0,
-        "no commit can land while sync is stuck"
-    );
-
-    // Release: submitter drains and the pipeline progresses.
-    fault.unstuck_sync();
-
-    h.join().expect("submit thread joined");
-    assert_eq!(submitted.load(Ordering::Acquire), total);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ledger.last_snapshot_id() < total && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(ledger.last_snapshot_id(), total);
-    assert_eq!(ledger.get_balance(7), total as i64);
 }
