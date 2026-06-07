@@ -93,7 +93,7 @@ The updated balances are written to the snapshot, making them visible to readers
 
 The gap between Stage 3 and Stage 4 is typically tens to hundreds of nanoseconds — the Snapshotter runs continuously as part of the pipeline and is not a slow checkpoint process.
 
-The significant gap is between Stage 2 and Stage 3. WAL writes are batched dynamically: the WAL Writer drains everything available from its input queue, writes it, and only then yields to `fdatasync` (driven by an independent WAL Committer thread). Throughput and latency of this stage are bounded by sequential disk write speed.
+The significant gap is between Stage 2 and Stage 3. WAL writes are batched dynamically: the WAL Writer drains everything currently available, writes it, and only then yields to `fdatasync` (driven by an independent WAL Committer thread). Throughput and latency of this stage are bounded by sequential disk write speed.
 
 ---
 

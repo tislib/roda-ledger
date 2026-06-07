@@ -14,7 +14,7 @@ roda-ledger is built around two problems that pull in opposite directions: **cor
 
 Correctness requires strict ordering and a single source of truth — concurrent writers create races, conflicts, and partial states that are catastrophic in a financial system. Throughput requires parallelism — sequential processing leaves hardware idle.
 
-The solution is a **staged pipeline**. Each stage does one job on its own thread, communicating with adjacent stages through lock-free queues. There is no shared mutable state between stages.
+The solution is a **staged pipeline**. Each stage does one job on its own thread. The Transactor's record stream flows to the read stages through a single lock-free **transaction ring**; the submit and query paths use lock-free SPSC queues. There is no shared mutable state between stages.
 
 The key insight: **parallelism around execution, not within it.** The Transactor executes one transaction at a time — this is the source of all correctness guarantees. But while the Transactor executes transaction N, the WAL is persisting N-1, and the Snapshotter is making N-2 visible to readers. All stages run concurrently without ever coordinating.
 
@@ -72,7 +72,7 @@ The Transactor is a single-threaded, deterministic execution engine. It processe
 
 <img src="./resources/transactor-flow.png" style="width: 100%;"/>
 
-For each transaction the Transactor: checks deduplication by `user_ref`, executes the operation (producing credit/debit entries and updating the balance cache live), verifies invariants (zero-sum), computes a CRC over the full transaction, then advances its processed index and sends to the WAL queue. Failed transactions — duplicates, execution errors, invariant violations — follow the same path to the WAL for audit purposes.
+For each transaction the Transactor: checks deduplication by `user_ref`, executes the operation (producing credit/debit entries and updating the balance cache live), and writes those entries directly into the transaction ring's uncommitted region — slots it owns exclusively that no reader can see yet. It verifies the zero-sum invariant by walking its own uncommitted slots, folds a running CRC over the entries as they are written, then assembles the transaction's metadata — its commit record — and **publishes the whole transaction atomically** by advancing the ring's write frontier. Failed transactions — duplicates, execution errors, invariant violations — discard the uncommitted entries and publish a lone trailing metadata record, so the audit trail stays complete and readers only ever observe whole, validated transactions.
 
 The balance cache always reflects the latest state. This is why the write path is always linearizable — the Transactor never makes a decision based on stale data.
 
@@ -115,7 +115,7 @@ For an `Operation::Function { name, params, user_ref }` the Transactor:
 6. On a `0` return: verifies `sum(credits) == sum(debits)`. Failure here yields `ZERO_SUM_VIOLATION` and the same rollback. Success commits the captured entries to the live balance cache and emits them as ordinary `TxEntry` records.
 7. Tags the resulting `TxMetadata` with `b"fnw\n" ++ crc32c[0..4]` so every committed transaction permanently identifies the exact binary that produced it.
 
-Stages 5–7 are the atomicity boundary. Nothing reaches the WAL queue until the function has either fully succeeded *and* balanced, or been fully rolled back. The WAL stage and the Snapshotter that follow it are unchanged — they cannot tell a function-produced entry stream from a native one.
+Stages 5–7 are the atomicity boundary. Nothing is published to the transaction ring until the function has either fully succeeded *and* balanced, or been fully rolled back. The WAL stage and the Snapshotter that follow it are unchanged — they cannot tell a function-produced entry stream from a native one.
 
 ### Why this fits the pipeline
 
@@ -155,10 +155,10 @@ The WAL stage makes transactions durable. A transaction executed by the Transact
 
 The WAL runs as **two concurrent threads** communicating through shared atomics:
 
-- **WAL Writer** — drains the input queue into a buffer, writes to the active segment file, advances `last_written_tx_id`, rotates segments when full, and pushes committed entries to the Snapshotter queue.
-- **WAL Committer** — runs independently, calls `fdatasync` whenever `last_written_tx_id > last_committed_tx_id`, then advances `last_committed_tx_id`.
+- **WAL Writer** — reads published records from the transaction ring, writes them to the active segment file, advances `last_written_tx_id`, and rotates segments when full.
+- **WAL Committer** — runs independently, calls `fdatasync` whenever `last_written_tx_id > last_committed_tx_id`, then advances `last_committed_tx_id` (which the pipeline exposes as `commit_index`).
 
-The Writer never blocks waiting for `fdatasync` — it continues writing while the Committer syncs. Entries only flow to the Snapshotter after the Committer confirms durability. This decoupling is why the WAL sustains high write throughput despite the inherent latency of `fdatasync` (~100s µs, disk-bound).
+The Writer never blocks waiting for `fdatasync` — it continues writing while the Committer syncs. The WAL forwards nothing: the Snapshotter reads the same ring independently and gates itself on `commit_index`, so a transaction becomes visible to readers only after it is durable. This decoupling is why the WAL sustains high write throughput despite the inherent latency of `fdatasync` (~100s µs, disk-bound).
 
 The WAL is **segmented** — divided into files based on transaction count (`transaction_count_per_segment`). When the transaction count in the active segment reaches the configured limit, the Writer rotates to a new one. Segment files are dynamically sized on disk — a segment with many complex (multi-entry) transactions will be larger than one with simple deposits — but the transaction count per segment is always fixed and predictable. Sealed segments are complete, consistent units used for recovery.
 
@@ -182,7 +182,7 @@ A segment moves through three states:
 
 <img src="./resources/segment-anatomy.png" style="width: 60%;" />
 
-Every WAL record is exactly **40 bytes** — fixed size, no variable-length scanning. This makes recovery fast and deterministic.
+Every WAL record is exactly **40 bytes** — fixed size, no variable-length scanning. This makes recovery fast and deterministic. A transaction is a contiguous group of records: its entries followed by a single trailing `TxMetadata` that acts as the **commit record** — a transaction exists exactly when its metadata has been written. Segments are a pure physical partition of one logical stream, so a transaction may span a segment boundary (its entries in one segment, the trailing metadata in the next). See [ADR-020](./adr/0020-wal-trailer-metadata.md).
 
 ### Seal process
 
@@ -222,22 +222,34 @@ The Snapshotter applies committed entries to the readable state — the balance 
 
 **Why a separate stage?** The Transactor's balance cache is write-side truth, private and optimized for writes. The Snapshotter maintains read-side truth. Separating them means readers never block writers.
 
-The Snapshotter processes a single input queue carrying two message types:
+The Snapshotter draws from two independent sources:
 
 <img src="./resources/snapshotter-flow.png" style="width: 100%;" />
 
-- **WalEntry** — updates the appropriate index or balance cache based on entry type. Once a full transaction is processed, `last_processed_tx_id` advances and `get_balance` reflects it.
-- **QueryRequest** — executes inline against current state (`GetTransaction`, `GetAccountHistory`) and calls the response callback.
+- **The transaction ring** — it reads published records, buffering a transaction's entries until the trailing metadata arrives and its `tx_id` is at or below `commit_index` (the durability gate). Only then does it apply the entries to the indexes and balance cache together, advance `snapshot_index`, and — as the ring's sole releaser — reclaim the consumed slots. Readers therefore never see a partially-applied or not-yet-durable transaction.
+- **A query-only queue** — `GetTransaction` / `GetAccountHistory` requests execute inline against current state and call the response callback.
 
 The Snapshotter does no computation — balances are pre-computed by the Transactor and stored in entries. The gap between `COMMITTED` and `ON_SNAPSHOT` is typically nanoseconds.
 
 ---
 
+## The transaction ring
+
+The Transactor, WAL, and Snapshotter share a single lock-free **transaction ring** — the one transport for the record stream, replacing the former transactor→WAL and WAL→snapshot queues ([ADR-019](./adr/0019-transaction-ring.md)).
+
+- **One producer.** The Transactor appends records into ring slots and publishes them. It also builds each transaction *in place* in the uncommitted region, so the ring doubles as its per-transaction scratch space — no separate staging buffer.
+- **Independent copy-out readers.** The WAL and Snapshotter each track their own absolute cursor and copy records out at their own pace. A slot may be reused once released, so readers copy rather than borrow.
+- **One releaser, durability-gated.** The Snapshotter is the only party that advances the reclamation point, and only up to the durability watermark. A slot is reused only after the record it held is durable on disk *and* consumed by every reader — making "never overwrite an undurable record" a structural property of the transport.
+
+Positions are absolute, monotonically increasing indices (mapped to physical slots on access), so progress and ordering stay unambiguous across wraps. Because a transaction is published atomically, the ring capacity (`ring_size`) must be at least the largest possible single transaction.
+
+---
+
 ## Inter-stage communication
 
-Stages communicate exclusively through **SPSC lock-free queues** — one producer, one consumer, no locks, no CAS contention. Each stage owns its data completely.
+The record stream rides the transaction ring described above; the **submit and query paths** use lock-free **SPSC queues** (`sequencer → transactor`, and the Snapshotter's query queue) — one producer, one consumer, no locks. Each stage owns its data completely.
 
-**Backpressure** propagates naturally: WAL pressure fills the Transactor-to-WAL queue, stalling the Transactor, which fills the Sequencer-to-Transactor queue, which eventually stalls `submit()`. No explicit flow control needed.
+**Backpressure** propagates naturally. The Snapshotter releases ring slots only up to the durability watermark, so if durability or indexing stalls, the ring fills and the Transactor stops finding free slots; that stalls the Transactor, which fills the `sequencer → transactor` queue, which eventually stalls `submit()`. No explicit flow control is needed, and the producer never blocks inside the ring — it retries under the shared wait strategy.
 
 The wait strategy under backpressure is controlled by the `wait_strategy` config field (see [API → Setup](./02-api.md#grpc-server)): `low_latency` (spin forever), `balanced` (spin → yield → park), `low_cpu` (park quickly).
 
@@ -252,7 +264,7 @@ On startup, roda-ledger restores state automatically before accepting transactio
 3. Replay WAL segments that postdate the snapshot
 4. Resume from the exact point where the ledger left off
 
-Because every committed transaction is in the WAL, and the WAL is always replayed on recovery, **a committed transaction is never lost**. Recovery time is bounded by snapshot frequency — more frequent snapshots mean less WAL to replay.
+Because every committed transaction is in the WAL, and the WAL is always replayed on recovery, **a committed transaction is never lost**. Replay buffers a transaction's entries until its trailing metadata closes and validates the group — carrying the buffer across segment seams for a transaction that spans a boundary — while a torn tail of the active segment is truncated back to its last metadata boundary. Recovery time is bounded by snapshot frequency — more frequent snapshots mean less WAL to replay.
 
 ---
 
