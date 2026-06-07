@@ -1,3 +1,5 @@
+use crate::WAL_RECORD_SIZE;
+use crate::wal_serializer::{parse_wal_record, serialize_wal_records};
 use bytemuck::{Pod, Zeroable};
 
 // Discriminants 2 and 3 are retired (formerly SegmentHeader / SegmentSealed);
@@ -244,6 +246,38 @@ impl WalEntry {
             WalEntry::FunctionRegistered(_) => WalEntryKind::FunctionRegistered,
             WalEntry::Term(_) => WalEntryKind::TxTerm,
         }
+    }
+}
+
+pub struct WalBinaryRecord([u8; WAL_RECORD_SIZE]);
+
+impl WalBinaryRecord {
+    pub fn from_wal_entry(entry: WalEntry) -> Self {
+        match entry {
+            WalEntry::Metadata(m) => {
+                WalBinaryRecord(<[u8; 40]>::try_from(bytemuck::bytes_of(&m)).unwrap())
+            }
+            WalEntry::Entry(m) => {
+                WalBinaryRecord(<[u8; 40]>::try_from(bytemuck::bytes_of(&m)).unwrap())
+            }
+            WalEntry::Link(m) => {
+                WalBinaryRecord(<[u8; 40]>::try_from(bytemuck::bytes_of(&m)).unwrap())
+            }
+            WalEntry::FunctionRegistered(m) => {
+                WalBinaryRecord(<[u8; 40]>::try_from(bytemuck::bytes_of(&m)).unwrap())
+            }
+            WalEntry::Term(m) => {
+                WalBinaryRecord(<[u8; 40]>::try_from(bytemuck::bytes_of(&m)).unwrap())
+            }
+        }
+    }
+
+    pub fn to_wal_entry(&self) -> WalEntry {
+        parse_wal_record(&self.0).expect("invalid WAL record")
+    }
+
+    pub fn empty() -> Self {
+        WalBinaryRecord([0; WAL_RECORD_SIZE])
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::tx_ring::ring::TxRing;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use storage::entities::WalEntry;
+use storage::entities::{WalBinaryRecord, WalEntry};
 
 /// The single producer for a [`TxRing`]. Owns its `Arc<TxRing>`, so it is
 /// `'static` and storable (e.g. in the transactor's `Rc<RefCell<…>>`).
@@ -46,7 +46,7 @@ impl TxRingWriter {
         let ring_index = self.cursor;
         // SAFETY: the writer is the sole producer and owns this slot until commit.
         unsafe {
-            *self.ring.slots[ring_index & (self.ring.capacity - 1)].get() = val;
+            *self.ring.slots[ring_index & (self.ring.capacity - 1)].get() = WalBinaryRecord::from_wal_entry(val);
         }
         self.cursor = ring_index.wrapping_add(1);
         ring_index
@@ -64,8 +64,8 @@ impl TxRingWriter {
         let mut idx = start;
         while idx != end {
             // SAFETY: `[start, end)` is the writer's exclusive, unpublished window.
-            let entry = unsafe { &*self.ring.slots[idx & mask].get() };
-            handler(entry);
+            let entry = unsafe { (&*self.ring.slots[idx & mask].get()).to_wal_entry() };
+            handler(&entry);
             idx = idx.wrapping_add(1);
         }
     }

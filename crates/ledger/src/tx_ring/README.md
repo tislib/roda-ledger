@@ -1,7 +1,7 @@
 # `tx_ring` — single-writer, single-reader (SPSC) lock-free ring buffer
 
 `TxRing` is the inter-stage transport between the transactor (producer) and the WAL
-(consumer). One writer fills a fixed, power-of-two array of `WalEntry` slots; one reader
+(consumer). One writer fills a fixed, power-of-two array of `WalRecord` slots; one reader
 consumes them **in place** and advances a release index that bounds the writer so it can
 never overwrite data the reader hasn't released yet.
 
@@ -21,9 +21,12 @@ no longer touches the ring — it tails the durable WAL (`WalTailer::tail_entrie
 
 Invariant chain (always true): `release_index ≤ write_index ≤ release_index + capacity`.
 
-The element type is fixed to [`WalEntry`](../../../storage/src/entities.rs) — a
-`#[derive(Copy)]` 40-byte POD enum — so reads copy out by value and never hand out a
-reference into a live slot.
+The slot element is a [`WalRecord`](../../../storage/src/wal_serializer.rs) — a `Copy`,
+`Pod`, 40-byte **byte record** (the on-disk WAL format; byte 0 is the kind discriminator).
+The handles convert at the boundary: `push` serializes a `WalEntry` into the slot, `walk`/
+`get` decode a slot back to a `WalEntry`. Because the slots are raw records, a published
+range is a contiguous `&[u8]` — `read_batch` hands it to the WAL to write to disk with **no
+serialization and no intermediate buffer copy** (zero-copy bulk write).
 
 ---
 
@@ -87,10 +90,10 @@ unsynchronized slot write, and a cursor bump.
   readers, the application is responsible for advancing the release index only once *every*
   reader is done with those slots (typically the slowest/last stage drives it).
 
-**Element type:** the ring stores `WalEntry`. It is `Copy`, so `get()` returns a value and
-no reference into a slot ever escapes (hence no `Sync` requirement on the element). Slots
-are pre-filled with a zeroed placeholder (`WalEntry::Entry(TxEntry::zeroed())`) until the
-writer overwrites them; the placeholder is never observed by a caller that respects the
+**Element type:** the ring stores `WalRecord` (40-byte `Pod` byte records). `get()`/`walk`
+decode to an owned `WalEntry`; `read_batch` hands the raw bytes to a callback that never lets
+them escape. Slots are pre-filled with a zeroed placeholder until the writer overwrites
+them; the placeholder is never observed by a caller that respects the
 window.
 
 ---

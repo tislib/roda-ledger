@@ -37,7 +37,7 @@ impl TxRingReader {
         while idx != write {
             // SAFETY: idx is in `[released, write)`, which the gated writer never
             // overwrites; we copy out by value, never lending a slot reference.
-            let entry = unsafe { *self.ring.slots[idx & mask].get() };
+            let entry = unsafe { (*self.ring.slots[idx & mask].get()).to_wal_entry() };
             if !handler(entry) {
                 break;
             }
@@ -67,7 +67,7 @@ impl TxRingReader {
     /// must keep `idx` inside `[released, write_index)`.
     pub fn get(&self, idx: usize) -> WalEntry {
         // SAFETY: in-window slots are never overwritten by the gated writer.
-        unsafe { *self.ring.slots[idx & (self.ring.capacity - 1)].get() }
+        unsafe { (*self.ring.slots[idx & (self.ring.capacity - 1)].get()).to_wal_entry() }
     }
 
     pub fn write_index(&self) -> usize {

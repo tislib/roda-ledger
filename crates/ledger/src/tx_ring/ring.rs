@@ -5,14 +5,14 @@ use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use storage::entities::{TxEntry, WalEntry};
+use storage::entities::{TxEntry, WalBinaryRecord, WalEntry};
 
 /// Lock-free SPSC slot buffer. Lives behind an `Arc` held by exactly two handles
 /// — the [`TxRingWriter`] and the [`TxRingReader`] — and is dropped when both are
 /// dropped. The element type is fixed to a `Copy` 40-byte `WalEntry`, so reads
 /// copy out by value and never lend a reference into a live slot.
 pub struct TxRing {
-    pub(super) slots: Box<[UnsafeCell<WalEntry>]>,
+    pub(super) slots: Box<[UnsafeCell<WalBinaryRecord>]>,
     pub(super) write: CachePadded<AtomicUsize>, // write frontier; only the writer advances it
     pub(super) release: CachePadded<AtomicUsize>, // consumed high-water; only the reader advances it
     pub(super) capacity: usize,                   // power of two
@@ -36,7 +36,7 @@ impl TxRing {
         );
         let ring = Arc::new(Self {
             slots: (0..capacity)
-                .map(|_| UnsafeCell::new(empty_entry()))
+                .map(|_| UnsafeCell::new(WalBinaryRecord::empty()))
                 .collect(),
             write: CachePadded::new(AtomicUsize::new(0)),
             release: CachePadded::new(AtomicUsize::new(0)),
