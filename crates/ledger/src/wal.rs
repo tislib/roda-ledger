@@ -1,4 +1,5 @@
 use crate::pipeline::WalContext;
+use crate::tx_ring::reader::TxRingReader;
 use crate::wait_strategy::WaitStrategy;
 use Ordering::Release;
 use arc_swap::ArcSwap;
@@ -11,14 +12,24 @@ use storage::{Segment, Storage, Syncer};
 
 pub struct Wal {
     storage: Arc<Storage>,
+    /// Ring reader, moved into the WalRunner on `start`. The WAL is the sole ring
+    /// consumer: it reads each entry and frees its slot (on write) via this reader.
+    reader: Option<TxRingReader>,
 }
 
 impl Wal {
-    pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<Storage>, reader: TxRingReader) -> Self {
+        Self {
+            storage,
+            reader: Some(reader),
+        }
     }
 
-    pub fn start(&self, ctx: WalContext) -> std::io::Result<[JoinHandle<()>; 2]> {
+    pub fn start(&mut self, ctx: WalContext) -> std::io::Result<[JoinHandle<()>; 2]> {
+        let reader = self
+            .reader
+            .take()
+            .expect("Wal::start called twice (reader already taken)");
         let last_written_tx_id = Arc::new(AtomicU64::new(0));
         let active_segment_sync: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
 
@@ -26,6 +37,7 @@ impl Wal {
             self.storage.clone(),
             last_written_tx_id.clone(),
             active_segment_sync.clone(),
+            reader,
             &ctx,
         );
         let wal_ctx_clone = ctx.clone();
@@ -58,6 +70,9 @@ pub struct WalRunner {
     last_received_tx_id: u64,
     segment_start_tx_id: u64,
     wait_strategy: WaitStrategy,
+    /// Reads the ring and frees slots (on write). Wrapped in `Option` so `run`
+    /// can move it to a local — the walk closure borrows the rest of `self`.
+    reader: Option<TxRingReader>,
 }
 
 impl WalRunner {
@@ -65,6 +80,7 @@ impl WalRunner {
         storage: Arc<Storage>,
         last_written_tx_id: Arc<AtomicU64>,
         active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
+        reader: TxRingReader,
         ctx: &WalContext,
     ) -> Self {
         let active_segment = storage.active_segment().unwrap();
@@ -81,15 +97,17 @@ impl WalRunner {
             last_received_tx_id: 0,
             segment_start_tx_id: 0,
             wait_strategy,
+            reader: Some(reader),
         }
     }
 
     pub fn run(&mut self, ctx: WalContext) {
+        // Move the reader to a local so the walk closure can borrow the rest of self.
+        let mut reader = self.reader.take().expect("WalRunner::run called twice");
         let mut last_ring_index = 0;
         while ctx.is_running() {
-            let ring = ctx.tx_ring();
             let mut entries_ingested = 0;
-            ring.walk_entries(last_ring_index, |entry| {
+            reader.walk(last_ring_index, |entry| {
                 self.ingest_entry(entry);
                 entries_ingested += 1;
                 last_ring_index += 1;
@@ -107,6 +125,9 @@ impl WalRunner {
                 self.active_segment.write_pending_entries();
                 self.last_written_tx_id
                     .store(self.last_received_tx_id, Release);
+                // Release after the disk write (not the in-memory copy) so a stalled
+                // writer back-pressures the transactor; fdatasync/commit stays decoupled.
+                reader.release_to(last_ring_index);
             }
 
             // if there are no movements, skip the rest of the loop.

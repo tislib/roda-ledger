@@ -29,6 +29,17 @@ fn fmt_ns(ns: u64) -> String {
     }
 }
 
+/// Compact count for the stage-backlog column (e.g. 1048576 -> "1.0M").
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 fn main() {
     let args = Args::parse();
     let account_count = args.account_count;
@@ -54,14 +65,22 @@ fn main() {
     let mut last_committed = 0u64;
     let mut second = 0u32;
 
-    // Table header
+    // Table header. The backlog column is the per-stage pressure: txs that
+    // have cleared one stage but not the next (seq>cmp transactor input,
+    // cmp>cmt WAL/ring, cmt>snp snapshot). The widest gap is the bottleneck.
     println!();
-    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!("  backlog seq>cmp/cmp>cmt/cmt>snp = txs waiting before transactor / WAL / snapshot");
+    println!();
     println!(
-        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} |",
-        "#", "time", "TPS", "TPC", "P50", "P99", "in-flight"
+        "  +-----+--------+------------+------------+----------+----------+------------+--------------------------+"
     );
-    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!(
+        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>24} |",
+        "#", "time", "TPS", "TPC", "P50", "P99", "in-flight", "seq>cmp/cmp>cmt/cmt>snp"
+    );
+    println!(
+        "  +-----+--------+------------+------------+----------+----------+------------+--------------------------+"
+    );
 
     loop {
         let account = 1 + rand::random::<u64>() % account_count;
@@ -98,11 +117,26 @@ fn main() {
             if now.duration_since(last_tick) >= Duration::from_secs(1) {
                 second += 1;
                 let wall = start_time.elapsed();
+
+                // Read indexes downstream-first so each upstream value is taken
+                // last; keeps the gaps non-negative under racy concurrent reads.
+                let snapshotted = ledger.last_snapshot_id();
                 let committed = ledger.last_commit_id();
+                let computed = ledger.last_compute_id();
+                let sequenced = ledger.last_sequenced_id();
+
                 let delta = committed - last_committed;
                 let interval = now.duration_since(last_tick).as_secs_f64();
                 let tps = delta as f64 / interval;
                 let in_flight = i.saturating_sub(committed);
+
+                // Per-stage pressure: txs cleared by one stage, awaiting the next.
+                let backlog = format!(
+                    "{}/{}/{}",
+                    fmt_count(sequenced.saturating_sub(computed)),
+                    fmt_count(computed.saturating_sub(committed)),
+                    fmt_count(committed.saturating_sub(snapshotted)),
+                );
 
                 let bucket = (second as usize).saturating_sub(1);
                 let stats = if bucket < per_second.len() {
@@ -112,7 +146,7 @@ fn main() {
                 };
 
                 println!(
-                    "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} |",
+                    "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} | {:>24} |",
                     second,
                     wall.as_secs(),
                     format!("{:.0}", tps),
@@ -120,6 +154,7 @@ fn main() {
                     fmt_ns(stats.p50),
                     fmt_ns(stats.p99),
                     in_flight,
+                    backlog,
                 );
 
                 last_tick = now;
@@ -132,7 +167,9 @@ fn main() {
         }
     }
 
-    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!(
+        "  +-----+--------+------------+------------+----------+----------+------------+--------------------------+"
+    );
 
     // Final summary
     let elapsed = start_time.elapsed();

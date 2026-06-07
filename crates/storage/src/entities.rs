@@ -51,12 +51,14 @@ impl FailReason {
     }
 }
 
+/// Transaction commit record — written last, after its followers (trailer layout).
+/// CRC32C covers the followers in push order, then this record with `crc32c` zeroed.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxMetadata {
     pub entry_type: u8,          // 1 @ 0  — WalEntryKind::TxMetadata
     pub fail_reason: FailReason, // 1 @ 1
-    pub sub_item_count: u16, // 2 @ 2  — TxEntry + TxLink + TxTerm + FunctionRegistered following
+    pub sub_item_count: u16, // 2 @ 2  — count of preceding TxEntry/TxLink/TxTerm/FunctionRegistered followers
     pub crc32c: u32,         // 4 @ 4  — CRC32C; zero this field when computing
     pub tx_id: u64,          // 8 @ 8
     pub timestamp: u64,      // 8 @ 16
@@ -123,7 +125,7 @@ pub struct TxEntry {
     pub entry_type: u8,        // 1 @ 0  — WalEntryKind::TxEntry
     pub kind: EntryKind,       // 1 @ 1  — Credit or Debit
     pub _pad0: [u8; 6],        // 6 @ 2
-    pub _pad1: [u8; 8],        // 8 @ 8  — reserved (tx_id is on the preceding TxMetadata)
+    pub _pad1: [u8; 8],        // 8 @ 8  — reserved (tx_id is on the trailing TxMetadata)
     pub account_id: u64,       // 8 @ 16
     pub amount: u64,           // 8 @ 24 — integer minor units, no floats, no decimals
     pub computed_balance: i64, // 8 @ 32 — running balance after this entry, set by Transactor
@@ -142,7 +144,7 @@ pub struct TxLink {
     pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Link (4)
     pub link_kind: u8,   // 1 @ 1  — TxLinkKind as u8
     pub _pad: [u8; 6],   // 6 @ 2
-    pub _pad1: [u8; 8],  // 8 @ 8  — reserved (tx_id is on the preceding TxMetadata)
+    pub _pad1: [u8; 8],  // 8 @ 8  — reserved (tx_id is on the trailing TxMetadata)
     pub to_tx_id: u64,   // 8 @ 16  — referenced transaction
     pub _pad2: [u8; 16], // 16 @ 24
 } // total: 40 bytes

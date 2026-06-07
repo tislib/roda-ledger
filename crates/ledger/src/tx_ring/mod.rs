@@ -1,7 +1,7 @@
-// Lock-free SPSC-gated ring: single writer, single releaser, copy-out readers.
+// Lock-free SPSC ring with no Arc: one writer, one reader (which also releases).
 #![allow(dead_code)]
 
-pub mod releaser;
+pub mod reader;
 pub mod ring;
 pub mod writer;
 

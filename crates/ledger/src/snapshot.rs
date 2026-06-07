@@ -2,7 +2,6 @@ use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
-use crate::tx_ring::releaser::TxRingReleaser;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -48,23 +47,19 @@ pub enum QueryResponse {
 pub struct Snapshot {
     balances: Arc<Vec<AtomicI64>>,
     indexer: Option<TransactionIndexer>,
-    #[allow(dead_code)]
     storage: Arc<Storage>,
-    ring_releaser: Option<TxRingReleaser>,
 }
 
 struct SnapshotRunner {
     balances: Arc<Vec<AtomicI64>>,
     indexer: TransactionIndexer,
-    ring_releaser: TxRingReleaser,
+    storage: Arc<Storage>,
+    /// First tx id to tail (recovered `snapshot_index` + 1).
+    from_tx_id: u64,
 }
 
 impl Snapshot {
-    pub fn new(
-        config: &LedgerConfig,
-        storage: Arc<Storage>,
-        ring_releaser: TxRingReleaser,
-    ) -> Self {
+    pub fn new(config: &LedgerConfig, storage: Arc<Storage>) -> Self {
         let account_count = config.max_accounts;
         let balances: Arc<Vec<AtomicI64>> =
             Arc::new((0..account_count).map(|_| AtomicI64::new(0)).collect());
@@ -79,7 +74,6 @@ impl Snapshot {
                 account_heads_size,
             )),
             storage,
-            ring_releaser: Some(ring_releaser),
         }
     }
 
@@ -95,10 +89,13 @@ impl Snapshot {
     }
 
     pub fn start(&mut self, ctx: SnapshotContext) -> std::io::Result<JoinHandle<()>> {
+        // Resume tailing the durable WAL right after the last tx recovery applied.
+        let from_tx_id = ctx.get_processed_index() + 1;
         let runner = SnapshotRunner {
             balances: self.balances.clone(),
             indexer: self.indexer.take().unwrap(),
-            ring_releaser: self.ring_releaser.take().unwrap(),
+            storage: self.storage.clone(),
+            from_tx_id,
         };
         std::thread::Builder::new()
             .name("snapshot".to_string())
@@ -147,7 +144,8 @@ impl SnapshotRunner {
     pub fn run(&mut self, ctx: SnapshotContext) {
         let mut retry_count = 0;
         let inbound = ctx.query();
-        let mut last_ring_index = 0;
+        // Tail the durable WAL instead of the ring; the WAL owns ring release now.
+        let mut tailer = self.storage.wal_tailer(self.from_tx_id);
         // Trailer layout: buffer a transaction's followers until its TxMetadata clears
         // the commit gate, then apply index + balances together (invisible until durable).
         let mut entries: Vec<TxEntry> = Vec::new();
@@ -155,10 +153,9 @@ impl SnapshotRunner {
         while ctx.is_running() {
             entries.clear();
             links.clear();
-            let mut cursor = last_ring_index;
-            ctx.ring().walk_entries(last_ring_index, |wal_entry| {
+            let progressed = tailer.tail_entries(|wal_entry| {
                 match wal_entry {
-                    // Not durable yet: index + release wait for the next pass.
+                    // Not durable yet: tail_entries retains this group; re-read once committed.
                     WalEntry::Metadata(m) if m.tx_id > ctx.commit_index() => return false,
                     WalEntry::Metadata(m) => {
                         self.indexer.insert_tx(m.tx_id);
@@ -176,7 +173,6 @@ impl SnapshotRunner {
                         for l in links.drain(..) {
                             self.indexer.insert_link(m.tx_id, l.kind(), l.to_tx_id);
                         }
-                        last_ring_index = cursor + 1;
                         ctx.set_processed_index(m.tx_id);
                     }
                     WalEntry::Entry(e) => {
@@ -186,10 +182,8 @@ impl SnapshotRunner {
                     // TxTerm / FunctionRegistered carry no query index.
                     _ => {}
                 }
-                cursor += 1;
                 true
             });
-            self.ring_releaser.advance_to(last_ring_index);
 
             if let Some(q) = inbound.pop() {
                 retry_count = 0;
@@ -212,9 +206,11 @@ impl SnapshotRunner {
                     ),
                 };
                 (q.respond)(response);
-            } else {
+            } else if !progressed {
                 ctx.wait_strategy().retry(retry_count);
                 retry_count += 1;
+            } else {
+                retry_count = 0;
             }
         }
     }

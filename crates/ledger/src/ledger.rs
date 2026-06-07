@@ -57,18 +57,21 @@ impl Ledger {
             injector
         };
 
-        let (ring, ring_writer, ring_releaser) = TxRing::new(config.ring_size);
+        // SPSC tx ring: writer → transactor, reader → WAL. No Arc, not held by
+        // the pipeline; the WAL reads and frees slots (on ingest) via the reader.
+        let (ring_writer, ring_reader) = TxRing::new(config.ring_size);
 
-        let pipeline = Pipeline::new(&config, ring);
+        let pipeline = Pipeline::new(&config);
         let wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
-        let snapshot = Snapshot::new(&config, storage.clone(), ring_releaser);
+        let snapshot = Snapshot::new(&config, storage.clone());
         let seal = Seal::new(&config, storage.clone());
         let transactor = Transactor::new(&config, wasm_runtime.clone(), ring_writer);
+        let wal = Wal::new(storage.clone(), ring_reader);
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
             transactor,
-            wal: Wal::new(storage.clone()),
+            wal,
             snapshot,
             seal,
             storage,
@@ -202,6 +205,10 @@ impl Ledger {
         } else {
             TransactionStatus::OnSnapshot
         }
+    }
+
+    pub fn last_sequenced_id(&self) -> u64 {
+        self.pipeline.last_sequenced_id()
     }
 
     pub fn last_compute_id(&self) -> u64 {

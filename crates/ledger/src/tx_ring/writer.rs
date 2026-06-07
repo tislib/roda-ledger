@@ -44,6 +44,7 @@ impl TxRingWriter {
             "TxRingWriter: push beyond granted capacity"
         );
         let ring_index = self.cursor;
+        // SAFETY: the writer is the sole producer and owns this slot until commit.
         unsafe {
             *self.ring.slots[ring_index & (self.ring.capacity - 1)].get() = val;
         }
@@ -69,7 +70,7 @@ impl TxRingWriter {
         }
     }
 
-    // Publish the head so readers and the releaser observe it.
+    // Publish the head so the reader observes it.
     pub fn commit(&mut self) {
         self.ring.write.store(self.cursor, Ordering::Release);
     }
@@ -85,7 +86,7 @@ impl TxRingWriter {
     }
 
     /// Grant all currently-free slots from the head **without** publishing — picks
-    /// up space the releaser has freed, leaving the uncommitted tail in place.
+    /// up space the reader has freed, leaving the uncommitted tail in place.
     /// Returns the new `capacity()`.
     pub fn grant(&mut self) -> usize {
         let granted = self.ring.free_from(self.cursor);
