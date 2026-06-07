@@ -6,7 +6,7 @@
 
 [![roda-ledger demo](docs/resources/demo.png)](http://roda-ledger.tislib.net)
 
-roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic by uploading sandboxed WebAssembly functions that execute atomically inside the ledger as first-class operations. Get 5.8 million transactions per second out of the box.
+roda-ledger is built around a single idea: the ledger should adapt to you. Choose your consistency level per call. Define your own transaction logic by uploading sandboxed WebAssembly functions that execute atomically inside the ledger as first-class operations. Get 5.22 million transactions per second out of the box.
 
 ---
 
@@ -26,7 +26,9 @@ roda-ledger pursues all three. It does this through a staged pipeline where each
 
 Benchmarks on bare metal, WAL persistence enabled:
 
-> Load test (50s, 1M accounts): **5.8M tx/s** avg · P50 50ns · P99 100ns · P999 210ns — [full report](docs/load.md)
+> **Throughput** (50s, 1M accounts): **5.22M tx/s** avg · submit-latency P50 60ns · P99 90ns · P999 210ns — [full report](docs/load.md)
+>
+> **Latency under load** (end-to-end: submit → durable & readable): idle P50 547µs · at 1M tx/s P50 2.2ms / P99 2.9ms / P999 3.3ms · saturated 4.41M tx/s P999 8.0ms — [latency report](docs/load.md#latency-under-load)
 
 ---
 
