@@ -53,6 +53,10 @@ pub struct WalTailer {
     /// having to pass it again.
     from_tx_id: u64,
     cursor: Option<Cursor>,
+    /// Reusable read scratch for [`tail_entries`](Self::tail_entries); allocated lazily.
+    read_buf: Vec<u8>,
+    /// Whole records read but not yet consumed by the handler (re-delivered next call).
+    pending: Vec<u8>,
 }
 
 struct Cursor {
@@ -95,6 +99,8 @@ impl WalTailer {
             storage,
             from_tx_id,
             cursor: None,
+            read_buf: Vec::new(),
+            pending: Vec::new(),
         };
         let _ = t.locate();
         t
@@ -104,6 +110,7 @@ impl WalTailer {
     /// tailer back to its construction-time position without rebuilding it.
     pub fn reset(&mut self) {
         self.cursor = None;
+        self.pending.clear();
         let _ = self.locate();
     }
 
@@ -202,6 +209,39 @@ impl WalTailer {
         }
 
         written as u32
+    }
+
+    /// Stream committed WAL records through `handler`, the durable-WAL twin of
+    /// `TxRing::walk_entries`. Each `WalEntry` is delivered in stream order; the
+    /// tailer owns the read position. Returns `true` if any whole tx group was
+    /// accepted (made progress), `false` on idle/EOF (drives caller backoff).
+    ///
+    /// Returning `false` from `handler` stops the sweep and **retains the current
+    /// (incomplete) tx group** so it is re-delivered whole on the next call — e.g.
+    /// the snapshot stops at a metadata whose `tx_id > commit_index` and re-reads
+    /// it once committed. Position only advances past fully-accepted groups.
+    pub fn tail_entries(&mut self, mut handler: impl FnMut(WalEntry) -> bool) -> bool {
+        // Only read new bytes once the retained group(s) drain — we can't apply
+        // past a stopped (uncommitted) group anyway, so don't read ahead.
+        if self.pending.is_empty() {
+            let mut buf = std::mem::take(&mut self.read_buf);
+            if buf.len() < TAIL_ENTRIES_BUF_BYTES {
+                buf.resize(TAIL_ENTRIES_BUF_BYTES, 0);
+            }
+            let n = self.tail(&mut buf) as usize;
+            let consumed = walk_groups(&buf[..n], &mut handler);
+            if consumed < n {
+                self.pending.extend_from_slice(&buf[consumed..n]);
+            }
+            self.read_buf = buf;
+            consumed > 0
+        } else {
+            let consumed = walk_groups(&self.pending, &mut handler);
+            if consumed > 0 {
+                self.pending.drain(..consumed);
+            }
+            consumed > 0
+        }
     }
 
     /// Open the segment that holds `self.from_tx_id` (walking back
@@ -371,6 +411,39 @@ impl WalTailer {
             false
         }
     }
+}
+
+/// Read-buffer size for [`WalTailer::tail_entries`]: 4 MiB dwarfs any tx group so
+/// one syscall amortizes ~100k records and the partial-group trim never starves.
+const TAIL_ENTRIES_BUF_BYTES: usize = 1 << 22;
+
+/// Deliver whole tx groups from `bytes` to `handler` and return the byte length of
+/// the groups fully accepted (handler returned `true` through their closing
+/// `TxMetadata`). A `false` return stops the walk with the in-progress group left
+/// un-consumed, so the caller can retain and re-deliver it. Malformed records are
+/// skipped (folded into the current group). Trailer layout: followers precede their
+/// metadata, which closes the group.
+fn walk_groups(bytes: &[u8], handler: &mut impl FnMut(WalEntry) -> bool) -> usize {
+    let mut consumed = 0usize;
+    let mut group_len = 0usize;
+    let mut off = 0usize;
+    while off + WAL_RECORD_SIZE <= bytes.len() {
+        let slice = &bytes[off..off + WAL_RECORD_SIZE];
+        off += WAL_RECORD_SIZE;
+        group_len += WAL_RECORD_SIZE;
+        let Ok(rec) = parse_wal_record(slice) else {
+            continue;
+        };
+        let is_meta = matches!(rec, WalEntry::Metadata(_));
+        if !handler(rec) {
+            break;
+        }
+        if is_meta {
+            consumed += group_len;
+            group_len = 0;
+        }
+    }
+    consumed
 }
 
 /// Walks `bytes` as a sequence of 40-byte WAL records and returns the byte
@@ -632,5 +705,57 @@ mod tests {
         // partial group's followers, ready to re-read once it's complete.
         let again = tailer.tail(&mut buf) as usize;
         assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn tail_entries_stops_and_redelivers_uncommitted_group() {
+        // tx1..tx3, each = entry + meta. A handler that rejects tx_id > limit
+        // (the snapshot's commit gate) must deliver the committed prefix, retain
+        // the rejected group, and re-deliver it whole once the limit rises.
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[
+                entry(1),
+                meta(1, 1),
+                entry(2),
+                meta(2, 1),
+                entry(3),
+                meta(3, 1),
+            ],
+        );
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer(1);
+
+        // Gate at 2: tx1, tx2 apply; tx3's metadata returns false (its group is retained).
+        let mut applied = Vec::new();
+        let progressed = tailer.tail_entries(|e| {
+            if let WalEntry::Metadata(m) = &e {
+                if m.tx_id > 2 {
+                    return false;
+                }
+                applied.push(m.tx_id);
+            }
+            true
+        });
+        assert!(progressed);
+        assert_eq!(applied, vec![1, 2]);
+
+        // Gate at 3: the retained tx3 group (entry + meta) is re-delivered whole.
+        let mut applied2 = Vec::new();
+        let progressed2 = tailer.tail_entries(|e| {
+            if let WalEntry::Metadata(m) = &e {
+                if m.tx_id > 3 {
+                    return false;
+                }
+                applied2.push(m.tx_id);
+            }
+            true
+        });
+        assert!(progressed2);
+        assert_eq!(applied2, vec![3]);
+
+        // Nothing new appended → no progress.
+        assert!(!tailer.tail_entries(|_| true));
     }
 }

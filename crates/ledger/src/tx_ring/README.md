@@ -1,19 +1,22 @@
-# `tx_ring` — single-writer, multi-reader lock-free ring buffer
+# `tx_ring` — single-writer, single-reader (SPSC) lock-free ring buffer
 
-`TxRing` is the inter-stage transport for the roda-ledger pipeline. One writer fills a
-fixed, power-of-two array of `WalEntry` slots; many readers consume the same slots **in
-place** at their own pace; and a single *release mover* advances a consume index that
-bounds the writer so it can never overwrite data that hasn't been released yet.
+`TxRing` is the inter-stage transport between the transactor (producer) and the WAL
+(consumer). One writer fills a fixed, power-of-two array of `WalEntry` slots; one reader
+consumes them **in place** and advances a release index that bounds the writer so it can
+never overwrite data the reader hasn't released yet.
 
-It behaves like an **SPSC** queue for flow control — one producer, one consume-index mover
-— but allows an arbitrary number of **passive readers** between them.
+`TxRing::new(capacity)` hands out exactly two handles — a [`TxRingWriter`] and a
+[`TxRingReader`] (which both reads *and* releases). The ring itself lives behind an `Arc`
+shared by the two handles and is **dropped when both handles are dropped**; it is never
+exposed. Pipeline wiring (ADR-021): writer → transactor, reader → WAL; the snapshot stage
+no longer touches the ring — it tails the durable WAL (`WalTailer::tail_entries`).
 
 ```
             release_index            write_index           release_index + capacity
                  │                         │                          │
    ── overwritable ──┤■■■■■■■■■■■■■■■■■■■■■■│── writer may fill ──────┤
                      └ readable window ────┘
-                     [release_index, write_index)   ← every reader's cursor lives here
+                     [release_index, write_index)   ← the reader's cursor lives here
 ```
 
 Invariant chain (always true): `release_index ≤ write_index ≤ release_index + capacity`.
@@ -26,23 +29,22 @@ reference into a live slot.
 
 ## Components
 
-Construction hands out exactly three things, so the single-writer / single-mover rules are
+Construction hands out exactly two handles, so the single-writer / single-reader rules are
 enforced *by the type system*, not by convention:
 
 ```rust
-let (ring, writer, releaser) = TxRing::new(capacity);
-//   Arc<TxRing>     TxRingWriter   TxRingReleaser
+let (writer, reader) = TxRing::new(capacity);
+//   TxRingWriter   TxRingReader
 ```
 
 | Handle | Count | Role |
 |---|---|---|
-| `Arc<TxRing>` | many (clone freely) | shared by **all readers**; exposes the read API and cursors |
-| `TxRingWriter` | exactly one | the **only** producer; owns an `Arc<TxRing>` and drives `reserve` / `push` / `commit` / `rollback` |
-| `TxRingReleaser` | exactly one | the **only** mover of the consume (release) index |
+| `TxRingWriter` | exactly one | the **only** producer; drives `reserve` / `push` / `commit` / `rollback` |
+| `TxRingReader` | exactly one | the **only** consumer; reads (`walk` / `get`) **and** moves the release index (`release_to`) |
 
-- `TxRingWriter` / `TxRingReleaser` are **not `Clone`** and are yielded once from `new()`.
-- Readers are anonymous: each just holds an `Arc<TxRing>` and its own local `usize`
-  cursor. There is no `Consumer` type — a reader can sit at any index inside the readable
+- Both handles hold an `Arc<TxRing>`; the ring drops when both do.
+- `TxRingWriter` / `TxRingReader` are **not `Clone`** and are yielded once from `new()`.
+- The reader holds its own local release cursor and reads any index inside the readable
   window and read any element or sub-range.
 
 ---

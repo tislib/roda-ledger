@@ -77,7 +77,9 @@ Every WAL record is exactly 40 bytes — a hard invariant for every record
 type. The first byte of every record is its `entry_type` discriminant, which
 makes the WAL stream `[record][record][record]…` self-describing without a
 separate length-prefix or framing layer. Records are laid out for zero-copy
-serialization: the bytes on the wire are the bytes in memory.
+serialization: the bytes on the wire are the bytes in memory. A transaction is
+a group of follower records (`TxEntry`/`TxLink`) terminated by a trailing
+`TxMetadata` — its commit record (§18.3, [ADR-0020]).
 
 ---
 
@@ -110,24 +112,30 @@ machine on disk and makes status a pure function of the pipeline.
 
 ### §2.3 Pipeline ownership and context slicing
 
-The Pipeline is the sole owner of every inter-stage queue, every progress
-index, the shutdown flag, and the shared wait strategy. Stages never own
-this state directly — each receives a typed context that exposes only the
-slice it may legally read or publish. The wrapping is purely for type-level
-encapsulation; there is no runtime cost.
+The Pipeline is the sole owner of the transaction ring (§13.4), both
+inter-stage queues, every progress index, the shutdown flag, and the shared
+wait strategy. Stages never own this state directly — each receives a typed
+context that exposes only the slice it may legally read or publish. The
+wrapping is purely for type-level encapsulation; there is no runtime cost.
 
-### §2.4 Inter-stage queues
+### §2.4 Inter-stage transport
 
-The three inter-stage channels are lock-free, fixed-capacity,
-single-producer / single-consumer queues:
+The record stream rides a single lock-free **transaction ring** (§13.4): the
+Transactor is the sole producer; the WAL and Snapshotter are independent
+copy-out readers; the Snapshotter is the sole releaser. The former
+`transactor → wal` and `wal → snapshot` queues are gone — both stages now read
+the same ring ([ADR-0019]).
 
-- `sequencer → transactor`
-- `transactor → wal`
-- `wal → snapshot`
+Two lock-free, fixed-capacity, single-producer / single-consumer queues
+remain, for the paths that are not the record stream:
 
-Capacity is fixed at construction from `queue_size` (§15.2). A full queue
-is the only backpressure signal; producers spin/yield until space exists.
-There is no other flow-control mechanism.
+- `sequencer → transactor` — submitted operations awaiting execution.
+- `snapshot query` — `GetTransaction` / `GetAccountHistory` requests (§8.4).
+
+Queue capacity is fixed at construction from `queue_size` (§15.2); ring
+capacity from `ring_size` (§15.10). A full queue or a full ring is the only
+backpressure signal; producers spin/yield until space exists. There is no
+other flow-control mechanism.
 
 ### §2.5 Global progress indexes
 
@@ -149,11 +157,12 @@ threshold check on a single counter resolves any wait.
 
 ### §2.6 Backpressure and shutdown
 
-Backpressure is implicit and propagates through queue saturation alone: a
-slow Snapshotter fills the wal→snapshot queue, which stalls the WAL, which
-fills the transactor→wal queue, which stalls the Transactor, which fills the
-sequencer→transactor queue, which stalls `submit()`. There is no rate
-limiter, leaky bucket, or admission control. Shutdown is the inverse signal:
+Backpressure is implicit and propagates through ring and queue saturation: a
+slow Snapshotter stops releasing ring slots (it releases only up to the
+durability watermark, §13.5), so the ring fills and the Transactor stops
+finding free slots; the stalled Transactor fills the sequencer→transactor
+queue, which stalls `submit()`. There is no rate limiter, leaky bucket, or
+admission control. Shutdown is the inverse signal:
 `Pipeline::shutdown()` clears `running`; every stage's idle loop checks the
 flag and exits. The shutdown signal does not need to be observed
 immediately — the queues drain to a safe state regardless of the precise
@@ -245,21 +254,26 @@ transaction. The write path is therefore linearizable by construction;
 the read path requires an explicit `submit_wait(snapshot)` (§14.4) for the
 same guarantee.
 
-### §4.6 Per-step entries buffer
+### §4.6 In-place assembly in the ring
 
-The Transactor accumulates every WAL record it produces during a step (a
-step may execute many transactions in sequence) into a buffer, then flushes
-the buffer as a single batch onto the transactor→wal queue. Batching
-amortises the cost of queue handoff and gives the WAL stage a contiguous
-slice to write.
+The Transactor writes the records it produces directly into the transaction
+ring's uncommitted region — the slots above the write frontier that it owns
+exclusively and no reader can see (§13.4). There is no separate staging buffer:
+the ring *is* the per-transaction scratch space. As it pushes followers it
+accumulates the two derived metadata fields — a running CRC digest (§4.10) and
+a follower count (`pending_items`) — so finalize needs no second pass. On
+finalize it assembles the trailing `TxMetadata` once with those values and
+publishes the whole transaction atomically by advancing the write frontier; on
+failure it discards the uncommitted tail (§4.12).
 
-### §4.7 The `position` marker
+### §4.7 The `tx_start_index` marker
 
-While accumulating entries, the Transactor tracks the start of the
-*current* transaction's records in the buffer. Verify (§4.11), rollback
-(§4.12), and CRC computation (§4.10) all scope their work to that
-transaction's records only — they never re-walk earlier transactions in
-the same batch.
+The Transactor records the ring index where the *current* transaction's first
+follower lands (`tx_start_index`). Verify (§4.11) and rollback (§4.12) scope
+their work to the slots from `tx_start_index` to the write head — the in-flight
+transaction's records — and never touch already-published ones. The CRC is
+folded incrementally as those records are pushed (§4.10), not re-walked from
+the marker.
 
 ### §4.8 Built-in operation semantics
 
@@ -288,15 +302,16 @@ the built-in check.
 
 ### §4.10 Per-transaction CRC32C
 
-After verify and any rollback are complete, the Transactor computes a
-CRC32C over `TxMetadata` (with its own `crc32c` field zeroed) followed by
-all `TxEntry` records of this transaction followed by all `TxLink` records,
-and writes the result into `TxMetadata.crc32c`. The CRC therefore covers
-exactly one transaction's full record stream and uses CRC32C
+The Transactor folds a running CRC32C over each follower record as it is
+pushed, in push order, then — when the transaction finalizes — appends the
+trailing `TxMetadata` (with its own `crc32c` field zeroed) into the digest and
+stores the result into that field. The CRC therefore covers the followers (in
+order) followed by the zeroed-crc metadata, and is computed incrementally
+rather than by re-walking the transaction after the fact. It uses CRC32C
 (Castagnoli) — hardware-accelerated on modern CPUs. Because the field
-participates in the digest while being part of the record, it must be
-zeroed during computation; consumers that want to verify the CRC must
-zero it before recomputing.
+participates in the digest while being part of the record, it is zeroed during
+computation; a consumer verifies by recomputing in the same order — the
+followers, then the zeroed metadata (§18.3, [ADR-0020]).
 
 ### §4.11 Zero-sum invariant
 
@@ -311,12 +326,14 @@ not a configuration option.
 
 ### §4.12 Rollback
 
-When verify fails or a WASM execution rejects, the Transactor reverses
-every credit/debit produced in `entries[position..]` against the live
-balance cache, truncates the buffer to keep only the leading `TxMetadata`,
-sets `fail_reason`, and recomputes the CRC. The cost is O(entry_count) and
-is acceptable because typical entry counts are small. The metadata is
-preserved deliberately — see §4.13.
+When verify fails or a WASM execution rejects, the Transactor reverses every
+credit/debit it produced for this transaction against the live balance cache
+and discards the uncommitted tail in the ring (rolling the write head back to
+`tx_start_index`, §4.7). It then sets `fail_reason` and finalizes the
+transaction as a lone trailing `TxMetadata` (`sub_item_count = 0`) — see §4.13.
+There is no leading metadata to preserve: the metadata is materialized only at
+finalize. The cost is O(entry_count) and is acceptable because typical entry
+counts are small.
 
 ### §4.13 Failed transactions are journaled
 
@@ -516,8 +533,8 @@ live balance cache until *all* of the following hold: `execute` returned
 `0`, the captured credits and debits balance (§4.11), and no
 wasmtime-layer error occurred. If any of those fail, the entire batch
 of host calls is discarded — the same rollback machinery as a built-in
-operation (§4.12). The WAL queue therefore never sees a partial function
-execution.
+operation (§4.12). Nothing is published to the transaction ring, so no reader
+ever sees a partial function execution.
 
 ### §6.11 Wasmtime-layer failure mapping
 
@@ -543,11 +560,11 @@ ledger never reinterprets them. [ADR-0014]
 
 ### §6.13 Entry-limit enforcement
 
-If a function emits more than 255 `credit`/`debit` calls in a single
-execution, the `u8` `entry_count` field of `TxMetadata` cannot
+If a function emits more than 65535 `credit`/`debit` calls in a single
+execution, the `u16` `sub_item_count` field of `TxMetadata` cannot
 encode the count. The Transactor fails the transaction with
 `ENTRY_LIMIT_EXCEEDED` and rolls it back. Function authors who
-need more than 255 entries must split the work across multiple
+need more than 65535 entries must split the work across multiple
 transactions.
 
 ### §6.14 Audit tag
@@ -627,34 +644,33 @@ There is no other coordination — no condvars, no channels.
 
 ### §7.3 Writer buffer
 
-The Writer holds a bounded queue of WAL records that have been written
-to the segment file but not yet forwarded to the Snapshotter. The
-buffer is sized so the Writer can stay ahead of the Committer while it
-syncs, and is sized in advance — never resized — so the WAL stage's
-memory footprint is fixed.
+The Writer copies records out of the ring into a bounded pending-write buffer,
+batched so a whole iteration's worth of records reaches disk in one `write`
+syscall. The buffer is sized in advance — never resized — so the WAL stage's
+memory footprint is fixed. It forwards records nowhere: the Snapshotter reads
+the ring independently (§8.4).
 
 ### §7.4 Writer per-iteration loop
 
-Each iteration the Writer batches incoming records into the active
-segment's pending-write buffer, performs a single buffered `write`
-syscall (one per iteration, not per record), rotates the segment if
-the transaction-count threshold is met (§7.6), and drains records to
-the Snapshotter — but only those whose `tx_id ≤ last-committed`.
-Entries still awaiting `fdatasync` stay in the local buffer for the
-next iteration. The drain is the gate that enforces the durability
-rule (§7.5); as entries flow, `commit_index` (§2.5) advances.
+Each iteration the Writer copies the newly published ring records into the
+active segment's pending-write buffer, performs a single buffered `write`
+syscall (one per iteration, not per record), advances *last-written*, and
+rotates the segment if the transaction-count threshold is met (§7.6). It does
+not gate or forward anything to the Snapshotter — durability visibility is the
+Snapshotter's own concern (§7.5). As records are written and the Committer
+syncs them, `commit_index` (§2.5) advances.
 
-### §7.5 Forwarding rule and per-record bookkeeping
+### §7.5 Durability rule, enforced reader-side
 
-Entries flow from the WAL to the Snapshotter only *after* they are
-durable. This is the **durability rule**: the Snapshotter — and
-therefore `get_balance`, queries, and the snapshot wait level — never
-sees a transaction that is not yet on disk. Step 4 of §7.4 enforces
-this by gating the drain on *last-committed*. The Writer also tracks
-how many records of the current transaction it still expects (from
-`TxMetadata.entry_count + link_count`) and keeps consuming the inbound
-queue until that count reaches zero, even if buffer space is tight —
-a partial transaction must never leak across a segment boundary.
+The durability rule still holds: the Snapshotter — and therefore `get_balance`,
+queries, and the snapshot wait level — never sees a transaction that is not yet
+on disk. But the WAL no longer enforces it by forwarding only durable records.
+Instead the Snapshotter reads the ring and gates *itself*: it applies a
+transaction only once the trailing `TxMetadata`'s `tx_id ≤ commit_index`
+(§8.4). The Writer therefore keeps no per-transaction "expected record count"
+bookkeeping; it writes whatever the ring publishes, and a transaction is
+recognised as complete at its trailing metadata. A transaction may span a
+segment boundary (§18.3, [ADR-0020]).
 
 ### §7.6 Segment rotation
 
@@ -680,13 +696,13 @@ Writer's buffer, and never inspects any queue — its single
 responsibility is moving *last-committed* forward as fast as storage
 allows.
 
-### §7.8 Backpressure on the outbound queue
+### §7.8 Backpressure from a slow reader
 
-A persistently slow Snapshotter fills the wal→snapshot queue, which
-slows the Writer's drain (§7.4), which fills the Writer's local
-buffer, which throttles intake from the inbound queue, which
-back-pressures the Transactor (§2.6). The same mechanism that gives the
-WAL its throughput is the one that protects it from a slow reader.
+There is no outbound queue to fill. A persistently slow Snapshotter stops
+releasing ring slots (it releases only up to the durability watermark, §13.5),
+so the ring eventually fills and the Transactor — the sole producer — stalls
+for want of free slots (§2.6). The WAL Writer, an independent reader, is never
+itself blocked by the Snapshotter; the two consume the ring at their own pace.
 
 ### §7.9 Failure handling
 
@@ -725,29 +741,37 @@ The read-side cache is a flat array of atomic balances, sized to
 concurrently without locks. The array is pre-allocated at startup and
 never resized. [ADR-0002]
 
-### §8.4 SnapshotMessage and the single FIFO
+### §8.4 Ring entries and the query queue
 
-The Snapshotter consumes a single SPSC FIFO of `SnapshotMessage` carrying
-two variants interleaved:
+The Snapshotter draws from two independent sources, in a fixed order each
+iteration:
 
-- `Entry(WalEntry)` — a record forwarded by the WAL Writer (§7.4).
-- `Query(QueryRequest)` — a query enqueued by a caller (§10).
+- **The transaction ring** — the published record stream (§13.4), buffering a
+  transaction's followers until the trailing `TxMetadata` (§8.5).
+- **A query-only SPSC queue** — `GetTransaction` / `GetAccountHistory` requests
+  enqueued by callers (§10).
 
-A single FIFO for both is what gives read-your-own-writes for free: a
-query enqueued after a write is enqueued *after* the write's entries
-and is therefore guaranteed to see them applied. There is no second
-queue, no priority lane, no out-of-band query path.
+A query is no longer interleaved with entries in one FIFO, so read-your-own-
+writes is not automatic from enqueue ordering; it rests on the wait levels
+(§14). A caller that waits for `snapshot` before querying is guaranteed
+`snapshot_index ≥ tx_id`, and because the loop applies a transaction's entries
+before advancing `snapshot_index`, the subsequent query observes them. A query
+issued without that wait races the apply loop — the same trade-off a
+`none`-level submit makes.
 
 ### §8.5 Apply algorithm
 
-The Snapshotter dispatches each WAL entry by record kind, updating
-the hot index (§9.4) and, for `TxEntry`, publishing the carried
-`computed_balance` to the read-side balance cache. `FunctionRegistered`
-takes the registry path of §8.7. Once every record of a transaction
-has been applied, the Snapshotter publishes that `tx_id` as the new
-`snapshot_index` (§2.5). This is the *only* point at which the
-pipeline's read-side index advances — readers therefore never observe
-a partially-applied transaction.
+The Snapshotter walks the ring from its cursor, buffering a transaction's
+`TxEntry` / `TxLink` followers. When the trailing `TxMetadata` arrives it checks
+the durability gate: if `tx_id > commit_index` the transaction is not yet
+durable, so the walk stops and resumes next iteration. Otherwise it applies the
+buffered followers together — updating the hot index (§9.4) and publishing each
+`TxEntry`'s `computed_balance` to the read-side balance cache — then advances
+`snapshot_index` (§2.5) to this `tx_id` and, as the ring's sole releaser,
+reclaims the consumed slots (§13.5). Applying at the trailer is the *only* point
+the read-side index advances, so readers never observe a partially-applied or
+not-yet-durable transaction. `FunctionRegistered` takes the registry path of
+§8.7.
 
 ### §8.6 `last_tx_id` as the freshness signal
 
@@ -878,7 +902,7 @@ active window.
 
 ### §10.1 Query types
 
-Two query types reach the Snapshotter through the FIFO (§8.4):
+Two query types reach the Snapshotter through its query queue (§8.4):
 
 - `GetTransaction { tx_id }` — return the entries (and links) of one
   transaction.
@@ -940,7 +964,7 @@ partial results, no async runtime.
 
 ### §10.6 Status and balance queries
 
-Two non-FIFO query paths exist:
+Two query paths bypass the query queue entirely:
 
 - `get_balance(account_id)` — a direct atomic load on the read-side
   balance cache. Does not block, does not touch the Snapshotter,
@@ -949,7 +973,7 @@ Two non-FIFO query paths exist:
 - `get_transaction_status(tx_id)` — derived (§2.2) from the pipeline
   indexes plus the rejection registry (§4.17). Does not block.
 
-Neither of these traverses the Snapshotter FIFO; both serve very high
+Neither of these traverses the Snapshotter's query queue; both serve very high
 read volumes without contention.
 
 ---
@@ -1083,10 +1107,12 @@ Recovery loads the latest balance and function snapshots — seeding the
 Transactor's balance cache (§4.3), Seal's balance vector (§11.4), the
 read-side balance cache (§8.3), and the live WASM runtime — then
 replays sealed segments newer than the snapshot's segment id, then
-replays the active segment with per-record CRC validation governing
-how far the tail can be trusted (Stage 2). Finally `sequencer_index`
-is restored to `last_tx_id + 1` (§16.2). The fixed ordering is the
-load-bearing constraint (§12.4).
+replays the active segment — buffering each transaction's followers until its
+trailing `TxMetadata` validates the group, and trusting the tail only as far as
+the last complete metadata boundary (Stage 2). The follower buffer carries
+across segment seams, so a transaction split over a boundary reassembles.
+Finally `sequencer_index` is restored to `last_tx_id + 1` (§16.2). The fixed
+ordering is the load-bearing constraint (§12.4).
 
 ### §12.4 Order requirement
 
@@ -1129,14 +1155,15 @@ a known-good state.
 
 ---
 
-## §13 Inter-stage queues, backpressure, wait strategies
+## §13 Inter-stage transport, backpressure, wait strategies
 
-### §13.1 Lock-free SPSC queues
+### §13.1 Lock-free transport
 
-Every inter-stage queue is single-producer, single-consumer, lock-free,
-fixed-capacity. Each stage owns its data completely; no shared mutable
-state crosses stage boundaries. The fixed capacity is sized at
-construction from `queue_size` (§15.2).
+The record stream uses a single lock-free **transaction ring** (§13.4); the
+submit and query paths use lock-free, fixed-capacity, single-producer /
+single-consumer queues (§2.4). Each stage owns its data completely; no shared
+mutable state crosses stage boundaries. Queue capacity is sized at construction
+from `queue_size` (§15.2), the ring from `ring_size` (§15.10).
 
 ### §13.2 Wait strategies
 
@@ -1155,13 +1182,51 @@ strategy. Four variants exist:
 A single wait strategy is shared by every stage of one Pipeline; there
 is no per-stage override.
 
-### §13.3 Backpressure as queue saturation
+### §13.3 Backpressure as ring and queue saturation
 
-There is no rate limiter, leaky bucket, or admission control. Slowness
-in any stage propagates upstream as queue fullness, eventually stalling
-`submit()` (§2.6). This is intentional: the queues are the only place
-where stages observe each other's progress, and turning them into the
-backpressure mechanism keeps the design free of explicit coordination.
+There is no rate limiter, leaky bucket, or admission control. Slowness anywhere
+propagates upstream: a stalled Snapshotter stops releasing ring slots (§13.5),
+filling the ring and stalling the Transactor, which fills the
+sequencer→transactor queue and eventually stalls `submit()` (§2.6). This is
+intentional — the ring and queues are the only place stages observe each other's
+progress, and using them as the backpressure mechanism keeps the design free of
+explicit coordination.
+
+### §13.4 Transaction ring transport
+
+The transaction ring is a fixed-capacity, lock-free buffer that is the sole
+transport for the record stream between the Transactor and the read stages
+([ADR-0019]). It is single-producer, multi-reader:
+
+- The **Transactor** is the only writer. It writes records into the ring's
+  uncommitted region (slots above the *write frontier*), builds each transaction
+  in place there (§4.6), and publishes by advancing the write frontier — so
+  readers only ever observe whole, committed transactions.
+- The **WAL** and **Snapshotter** are independent copy-out readers, each
+  tracking its own absolute cursor. They copy records out (a slot may be reused
+  once released, so they cannot hold borrows across reclamation).
+- The **Snapshotter** is the sole releaser (§13.5).
+
+Positions are absolute, monotonically increasing indices mapped to physical
+slots on access; the capacity (`ring_size`, §15.10) is a power of two and must
+be at least the largest possible single transaction, since a transaction is
+published atomically and must fit in the uncommitted region. The producer never
+blocks inside the ring: when no free slots exist it backs off under the shared
+wait strategy (§13.2) and retries — backpressure is caller-driven, not hidden in
+the transport.
+
+### §13.5 Durability-gated reclamation
+
+A ring slot may be reused only after the record it held is durable on disk *and*
+consumed by every reader. The Snapshotter, as sole releaser, advances the
+reclamation point (the *release frontier*) only up to what it has applied, and
+it applies a transaction only once its trailing `TxMetadata.tx_id ≤
+commit_index` (§8.5). The frontiers therefore stay ordered
+`write ≥ persisted ≥ durable ≥ applied = released`. This makes "never overwrite
+a record that is not yet durable" a single structural property of the transport,
+rather than something each stage enforces separately. If durability stalls,
+reclamation stalls and the producer eventually blocks once the ring fills — the
+explicit, durability-coupled form of bounded-transport backpressure.
 
 ---
 
@@ -1219,10 +1284,10 @@ in L2/L3 even with read-side and seal-side duplicates.
 
 ### §15.2 `queue_size`
 
-Capacity of every inter-stage queue. Not exposed via `config.toml`;
-an internal tuning knob. The Sequencer→Transactor, Transactor→WAL,
-and WAL→Snapshot queues are all sized from this single value to keep
-backpressure symmetric across the pipeline.
+Capacity of the inter-stage queues. Not exposed via `config.toml`; an internal
+tuning knob. The two remaining queues — sequencer→transactor and the
+Snapshotter's query queue (§2.4) — are both sized from this single value. The
+record-stream ring is sized separately (`ring_size`, §15.10).
 
 ### §15.3 `wait_strategy`
 
@@ -1271,6 +1336,15 @@ Hot-index sizes (§9.6) are derived from `transaction_count_per_segment`
 changing the active window changes both the hot indexes and the dedup
 window in lockstep.
 
+### §15.10 `ring_size`
+
+Capacity of the transaction ring (§13.4). A power of two; not exposed via
+`config.toml`, an internal tuning knob like `queue_size`. Because a transaction
+is published atomically and assembled in place, the ring must be at least as
+large as the biggest possible single transaction (`sub_item_count ≤ u16::MAX`
+followers plus the trailing metadata); otherwise the Transactor cannot make
+progress.
+
 ---
 
 ## §16 Transaction ID space and recovery posture
@@ -1304,11 +1378,11 @@ committed log. The committed log, by §16.4, has no gaps.
 Every committed transaction is in the WAL, and the WAL is always
 replayed on recovery. A committed transaction therefore survives any
 crash — including a crash mid-`fdatasync` — provided the underlying
-storage honours its durability contract. The forwarding rule (§7.5)
-is what makes this true on the read side as well: the Snapshotter
-never sees a transaction that is not yet on disk, so a transaction that
-was visible to a reader before the crash is by definition committed
-and is replayed on restart.
+storage honours its durability contract. The Snapshotter's durability gate
+(§7.5, §8.5) makes this true on the read side as well: it never applies a
+transaction whose trailing `TxMetadata.tx_id` exceeds `commit_index`, so a
+transaction that was visible to a reader before the crash is by definition
+committed and is replayed on restart.
 
 ---
 
@@ -1419,15 +1493,16 @@ appropriate struct once the discriminant has been examined.
 
 ### §18.3 CRC envelope and torn-write detection
 
-`TxMetadata.crc32c` covers the metadata record (with that field zeroed
-for the digest) plus every following `TxEntry` and `TxLink`. The CRC
-field sitting inside its own coverage forces the zero-while-computing
-convention. A torn write that lands somewhere inside a multi-record
-transaction is detected by the metadata CRC failing — there is no
-per-record CRC, and none is needed. `FunctionRegistered` carries no
-`tx_id` and is outside any transaction's CRC envelope; the
-`crc32c == 0` value is the unregister signal (§6.17). [ADR-0001,
-ADR-0014]
+A transaction's CRC lives in its trailing `TxMetadata.crc32c` (§18.1) and covers
+the followers (`TxEntry` / `TxLink`) in stream order followed by the metadata
+record with that field zeroed for the digest. The CRC field sitting inside its
+own coverage forces the zero-while-computing convention. Because the metadata is
+the commit record, a transaction is complete only when its trailing metadata is
+present and its CRC matches; a torn write inside a transaction is caught when the
+metadata is missing or its CRC fails — there is no per-record CRC, and none is
+needed. `FunctionRegistered` carries no `tx_id` and is outside any transaction's
+CRC envelope; the `crc32c == 0` value is the unregister signal (§6.17).
+[ADR-0001, ADR-0014, ADR-0020]
 
 ---
 
@@ -1648,14 +1723,15 @@ EOF — and avoids any coordination with the writer.
 
 ### §23.4 Tail-trim on cold-boot recovery
 
-On startup, recovery (§12) inspects the active segment for a torn
-tail. The procedure: walk the segment record by record, validating
-each metadata's CRC against its dependent entries and links; on the
-first metadata whose CRC fails or that runs off the end of the file,
-truncate the file to the byte position just before that metadata.
-This is the *one* tolerated case of corruption (§12.7); a torn middle
-is fatal. The torn-tail trim is performed via `set_len` followed by an
-`fsync_data`, so the post-recovery file matches what is on disk.
+On startup, recovery (§12) inspects the active segment for a torn tail. The
+procedure: forward-scan the segment, buffering each transaction's followers
+until a `TxMetadata` closes and validates the group (buffered follower count
+equals `sub_item_count`, CRC matches). The valid region must end exactly on a
+metadata boundary; if the scan ends with buffered followers and no closing
+metadata, or on a torn sub-40-byte record, the file is truncated back to the
+last metadata boundary. This is the *one* tolerated case of corruption (§12.7);
+a torn middle is fatal. The trim is performed via `set_len` followed by an
+`fsync_data`, so the post-recovery file matches what is on disk. [ADR-0020]
 
 ### §23.5 Runtime truncation classifies segments by watermark
 
@@ -1666,10 +1742,12 @@ segment whose first `tx_id` is strictly above the watermark is removed
 entirely — `wal_NNNNNN.bin`, the `.crc` and `.seal` sidecars, the
 transaction and account indexes, the balance snapshot and its sidecar,
 the function snapshot and its sidecar — every artifact for that
-segment id. A segment that straddles the watermark is byte-truncated
-at the first `TxMetadata` whose `tx_id` exceeds the watermark; the
-surviving prefix is treated as Closed-but-not-yet-Sealed and resealed
-on the next start.
+segment id. A segment that straddles the watermark is byte-truncated immediately after the
+trailing `TxMetadata` of the highest transaction whose `tx_id ≤ watermark` — so
+the followers of the first over-watermark transaction are dropped along with its
+metadata, leaving the surviving prefix ending exactly on a metadata boundary.
+The surviving prefix is treated as Closed-but-not-yet-Sealed and resealed on the
+next start.
 
 ### §23.6 Sealed segments are immutable
 
@@ -1764,9 +1842,9 @@ answered by piping its output to `jq`.
 `roda_ctl pack INPUT [--out FILE] [--no_validate]` is the inverse of
 `unpack`: it parses NDJSON from `INPUT` (or stdin) and writes a
 binary segment to `--out` (or stdout). It re-encodes each record
-using the zero-copy serialization (§18.2) and recomputes the CRC32C
-of every `TxMetadata` from its dependent entries and links. By
-default it validates that `tx_id` values are monotonically increasing.
+using the zero-copy serialization (§18.2) and recomputes each transaction's
+CRC32C over its followers (in order) then the zeroed-crc trailing `TxMetadata`
+(§18.3). By default it validates that `tx_id` values are monotonically increasing.
 `--no_validate` disables the check for cases where a deliberately
 partial or malformed segment is needed (typically for testing
 recovery).
@@ -1777,8 +1855,8 @@ recovery).
 integrity audit over a data directory or a subset of its segments.
 Per segment it checks: the file-level CRC against the `.crc` sidecar;
 the per-transaction CRC; the cumulative `computed_balance` chain (no
-unexplained jumps); declared `entry_count` and `link_count` match the
-actual record counts. Across segments it checks that sealed segments
+unexplained jumps); the declared `sub_item_count` matches the actual follower
+count. Across segments it checks that sealed segments
 form a contiguous `tx_id` chain with no gaps and no overlaps. The
 output is a structured report; a non-zero exit code signals at least
 one failure.
@@ -2383,8 +2461,8 @@ and block until the threshold is crossed.
 `GetTransaction`, `GetTransactionStatus`, `GetTransactionStatuses`,
 `GetAccountHistory`, `GetBalance`, `GetBalances`. `GetBalance` and
 `GetBalances` are direct atomic reads against the read-side balance
-cache and never touch the snapshot FIFO (§10.6); the rest enqueue
-queries on the Snapshotter FIFO (§8.4). Reads are served on every
+cache and never touch the snapshot query queue (§10.6); the rest enqueue
+queries on the Snapshotter's query queue (§8.4). Reads are served on every
 role including `Initializing` and `Follower`; only the freshness
 signal (`last_tx_id`) tells the caller how stale the answer is.
 

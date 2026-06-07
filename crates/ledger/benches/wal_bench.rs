@@ -1,7 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::config::LedgerConfig;
 use ledger::ledger::WaitStrategy;
-use ledger::snapshot::Snapshot;
 use ledger::test_support::{ring_pipeline, ring_push};
 use ledger::wal::Wal;
 use std::sync::Arc;
@@ -33,9 +32,9 @@ fn make_deposit_entries(tx_id: u64, account_id: u64, amount: u64) -> [WalEntry; 
 }
 
 /// Drives the WAL persistence path: the bench feeds meta+entry pairs into the ring,
-/// the WAL stage reads them, writes segments and advances `commit_index`, and the
-/// snapshot stage (the releaser) reads behind it and frees ring slots — the same
-/// wiring as the production pipeline, minus the transactor.
+/// the WAL stage reads them, writes segments, advances `commit_index`, and frees ring
+/// slots on ingest (it is now the sole ring reader+releaser) — the production wiring
+/// minus the transactor and snapshot.
 fn wal_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal");
     group.throughput(Throughput::Elements(1));
@@ -47,15 +46,12 @@ fn wal_bench(c: &mut Criterion) {
     };
     let storage = Arc::new(Storage::new(config.storage.clone()).unwrap());
 
-    let (pipeline, mut writer, releaser) = ring_pipeline(1 << 20, 1 << 16, WaitStrategy::Balanced);
+    let (pipeline, mut writer, reader) = ring_pipeline(1 << 20, 1 << 16, WaitStrategy::Balanced);
 
-    let wal = Wal::new(storage.clone());
+    // The WAL owns the reader: it reads each entry and frees its ring slot (on
+    // write), so the feeder never blocks forever.
+    let mut wal = Wal::new(storage.clone(), reader);
     let wal_handles = wal.start(pipeline.wal_context()).unwrap();
-
-    // Snapshot stage acts as the releaser: it reads behind `commit_index` (set by
-    // the WAL) and advances the ring releaser, so the feeder never blocks forever.
-    let mut snapshot = Snapshot::new(&config, storage.clone(), releaser);
-    let snap_handle = snapshot.start(pipeline.snapshot_context()).unwrap();
 
     let mut current_id = 0u64;
     group.bench_function("write", |b| {
@@ -74,7 +70,6 @@ fn wal_bench(c: &mut Criterion) {
     for h in wal_handles {
         let _ = h.join();
     }
-    let _ = snap_handle.join();
 }
 
 criterion_group!(benches, wal_bench);

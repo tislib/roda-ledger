@@ -12,7 +12,6 @@
 use crate::config::LedgerConfig;
 use crate::snapshot::QueryRequest;
 use crate::transaction::TransactionInput;
-use crate::tx_ring::ring::TxRing;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
@@ -65,22 +64,19 @@ pub struct Pipeline {
 
     /// Shared wait strategy used by every stage's idle/backpressure loops.
     wait_strategy: WaitStrategy,
-    pub tx_ring: Arc<TxRing>,
 }
 
 impl Pipeline {
     /// Construct a pipeline with empty queues sized from the ledger config.
-    pub fn new(config: &LedgerConfig, tx_ring: Arc<TxRing>) -> Arc<Self> {
-        Self::with_sizes(config.ring_size, config.wait_strategy, tx_ring)
+    /// The tx ring is no longer owned here — it is a standalone SPSC pair
+    /// (writer → transactor, reader → WAL) created in `Ledger::new`.
+    pub fn new(config: &LedgerConfig) -> Arc<Self> {
+        Self::with_sizes(1024, config.wait_strategy)
     }
 
     /// Low-level constructor exposed for benches/tests that need to control
     /// the individual queue sizes without building a full `LedgerConfig`.
-    pub fn with_sizes(
-        small_queue_size: usize,
-        wait_strategy: WaitStrategy,
-        tx_ring: Arc<TxRing>,
-    ) -> Arc<Self> {
+    pub fn with_sizes(small_queue_size: usize, wait_strategy: WaitStrategy) -> Arc<Self> {
         Arc::new(Self {
             sequencer_to_transactor: ArrayQueue::new(small_queue_size),
             snapshot_query: ArrayQueue::new(small_queue_size),
@@ -91,7 +87,6 @@ impl Pipeline {
             snapshot_index: CachePadded::new(AtomicU64::new(0)),
             seal_index: CachePadded::new(AtomicU32::new(0)),
             seal_watermark: CachePadded::new(AtomicU64::new(u64::MAX)),
-            tx_ring,
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
         })
@@ -331,11 +326,6 @@ pub struct WalContext {
 }
 
 impl WalContext {
-    #[inline(always)]
-    pub fn tx_ring(&self) -> Arc<TxRing> {
-        self.pipeline.tx_ring.clone()
-    }
-
     /// Publish a new commit-index and fire the registered `on_commit`
     /// handler (if any). The handler runs synchronously on the WAL
     /// commit thread — keep it fast and non-blocking.
@@ -369,11 +359,6 @@ impl SnapshotContext {
     #[inline(always)]
     pub fn query(&self) -> &ArrayQueue<QueryRequest> {
         &self.pipeline.snapshot_query
-    }
-
-    #[inline(always)]
-    pub fn ring(&self) -> &TxRing {
-        &self.pipeline.tx_ring
     }
 
     #[inline]

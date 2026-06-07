@@ -1,8 +1,12 @@
-# ADR-018: Transaction Ring — Single-Writer Inter-Stage Transport
+# ADR-019: Transaction Ring — Single-Writer Inter-Stage Transport
 
 **Status:** Accepted  
 **Date:** 2026-06-05  
 **Author:** Taleh Ibrahimli  
+
+**Amended by:**
+- ADR-020 — removes the in-ring metadata back-fill (`patch`) step described below; the metadata is now assembled complete and published with a single push as the transaction's trailing commit record.
+- ADR-021 — moves the ring releaser from the snapshot to the WAL (release-on-ingest) and has the snapshot tail the durable WAL instead of reading the ring; the ring becomes single-reader (SPSC) and reclamation is gated on ingest, not durability. The "Durability-gated reclamation" and "snapshot is the sole releaser" sections below are superseded.
 
 **Amends:**
 - ADR-006 — replaces the queue-based hand-off between the transactor, WAL, and snapshot stages, and ties ring-slot reclamation to the durability watermark.

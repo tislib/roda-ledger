@@ -1,29 +1,26 @@
 //! Backpressure tests using the `LedgerFaultInjector`. See ADR-018.
 //!
-//! Each test parks one disk operation (write/sync, stalled or slowed),
-//! drives a high-rate submitter at the ledger, and asserts two things:
+//! Backpressure comes from the **disk writer** (ADR-021): the WAL frees a ring slot
+//! only after it has *written* the batch to the segment, so a stalled/slow writer
+//! holds the ring and back-pressures the transactor. `fdatasync` is deliberately
+//! NOT a flow-control point — release happens before commit, so a stalled fsync
+//! does not directly cap submission (the page cache + OS write-back absorb the
+//! write-vs-sync gap). These tests therefore exercise only the write path.
 //!
-//! 1. **In-flight cap** — `submitted - last_snapshot_id` stays under
-//!    `MAX_INFLIGHT`. This is the *submitter*'s view of how far ahead
-//!    of durable state it ever gets. Without backpressure the
-//!    submitter would race to `SUBMIT_TOTAL` while the snapshot stage
-//!    is wedged at 0 and the gap would blow past the pipeline's
-//!    natural slack.
+//! Each test parks the WAL write (stalled or slowed), drives a high-rate submitter,
+//! and asserts two things:
 //!
-//! 2. **Submitter does not move** — over a second observation window
-//!    (`OBSERVE`) we sample `submitted` twice and require the delta
-//!    to stay under `MAX_PROGRESS_IN_OBSERVE`. For stall faults this
-//!    is essentially zero (the queues are full and `submit()` parks
-//!    in its spin/yield retry); for slow faults it is the small
-//!    steady-state throughput admitted by the throttled write/sync.
-//!    Either way it is dramatically below the unthrottled submitter's
-//!    rate of millions of ops/sec, so a passing test directly proves
-//!    `submit()` is being held back by the WAL stage.
+//! 1. **In-flight cap** — `submitted - last_snapshot_id` stays under `MAX_INFLIGHT`.
+//!    Without backpressure the submitter would race to `SUBMIT_TOTAL` while the
+//!    snapshot stage is wedged at 0.
 //!
-//! Pipeline slack (queue_size = 16) totals ~290 entries:
-//!   - seq→trans:           queue_size (16)
-//!   - wal_input:           queue_size (16)
-//!   - WAL writer VecDeque: queue_size * 16 = 256
+//! 2. **Submitter does not move** — over a second window (`OBSERVE`) the delta in
+//!    `submitted` stays under `MAX_PROGRESS_IN_OBSERVE` — far below the unthrottled
+//!    submitter's millions of ops/sec, proving `submit()` is held back by the writer.
+//!
+//! Pipeline slack is dominated by the inter-stage buffers: the sequencer→transactor
+//! queue (`1024`, pipeline.rs) plus the transactor's batch buffer (same capacity),
+//! ~`2k` entries, well under the runaway an un-back-pressured pipeline would reach.
 //!
 //! Run with `--features fault-injection`.
 
@@ -40,11 +37,11 @@ use storage::StorageConfig;
 
 const RING_SIZE: usize = 16;
 const SUBMIT_TOTAL: u64 = 100_000;
-/// Tightest credible bound on `submitted - snapshot`. Pipeline slack
-/// is ~290 entries; `1_000` is a comfortable margin for VecDeque
-/// growth and scheduling jitter while still rejecting an OOM-class
-/// runaway buffer.
-const MAX_INFLIGHT: u64 = 1_000;
+/// Bound on `submitted - snapshot`. Slack is the seq→transactor queue (1024) plus
+/// the transactor's batch buffer (same capacity) ≈ 2k entries; `3_000` is a
+/// comfortable margin for scheduling jitter while still rejecting an OOM-class
+/// runaway (which would race toward `SUBMIT_TOTAL`).
+const MAX_INFLIGHT: u64 = 3_000;
 /// First wait: let the fault soak so the pipeline settles into its
 /// steady-state. Picked long enough that an unthrottled pipeline
 /// would have buffered ≫ `MAX_INFLIGHT` by now.
@@ -187,32 +184,9 @@ fn run_backpressure_scenario(
     h.join().expect("submit thread joined");
 }
 
-/// `before_sync` parks on a condvar — `fdatasync` never completes
-/// until `unstuck_sync`. Once the WAL writer's buffer fills and the
-/// upstream queues saturate, `submit()` parks in its spin/yield
-/// retry. Both in-flight and submitter progress assertions pin this.
-#[test]
-fn sync_stall_caps_submission() {
-    run_backpressure_scenario("sync_stall", |f| f.stick_sync(), |f| f.unstuck_sync());
-}
-
-/// `before_sync` sleeps for `SLOW` per call — the committer makes
-/// forward progress but at a throttled rate. The pipeline reaches a
-/// steady-state in-flight cap and submitter throughput stays a tiny
-/// fraction of an unblocked submitter's.
-#[test]
-fn sync_slow_caps_submission() {
-    run_backpressure_scenario(
-        "sync_slow",
-        |f| f.set_sync_delay(Some(SLOW)),
-        |f| f.set_sync_delay(None),
-    );
-}
-
-/// `before_write` parks on a condvar — `write_all` on the WAL file
-/// never completes. Same backpressure shape as `sync_stall` but the
-/// stall originates one stage earlier; the WAL writer's VecDeque
-/// never even gets to absorb its first batch.
+/// `before_write` parks on a condvar — `write_all` on the WAL file never completes.
+/// The WAL holds the ring (release happens only after the write), the upstream
+/// queues saturate, and `submit()` parks in its spin/yield retry.
 #[test]
 fn write_stall_caps_submission() {
     run_backpressure_scenario("write_stall", |f| f.stick_write(), |f| f.unstuck_write());

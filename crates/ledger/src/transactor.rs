@@ -61,6 +61,7 @@ pub struct TransactorState {
     pub tx_ring_pusher: TxRingWriter,
     wait_strategy: WaitStrategy,
     ring_retry_count: u64,
+    sum: i128,
 }
 
 impl TransactorState {
@@ -84,6 +85,7 @@ impl TransactorState {
             tx_ring_pusher,
             wait_strategy,
             ring_retry_count: 0,
+            sum: 0,
         }
     }
 
@@ -106,6 +108,7 @@ impl TransactorState {
             tx_ring_pusher,
             wait_strategy,
             ring_retry_count: 0,
+            sum: 0,
         }
     }
 
@@ -135,6 +138,7 @@ impl TransactorState {
         self.tx_start_index = self.tx_ring_pusher.cursor();
         self.running_crc = 0;
         self.pending_items = 0;
+        self.sum = 0;
     }
 
     pub fn push_entry(&mut self, entry: WalEntry) -> usize {
@@ -192,19 +196,7 @@ impl TransactorState {
             return self.fail_reason;
         }
 
-        let mut sum_credits: u128 = 0;
-        let mut sum_debits: u128 = 0;
-
-        let end = self.tx_ring_pusher.cursor();
-        self.tx_ring_pusher.walk(self.tx_start_index, end, |entry| {
-            if let WalEntry::Entry(e) = entry {
-                match e.kind {
-                    EntryKind::Credit => sum_credits += e.amount as u128,
-                    EntryKind::Debit => sum_debits += e.amount as u128,
-                }
-            }
-        });
-        if sum_credits != sum_debits {
+        if self.sum != 0 {
             self.fail_reason = FailReason::ZERO_SUM_VIOLATION;
         }
         self.fail_reason
@@ -331,6 +323,7 @@ impl TransactorState {
                 _pad0: [0; 6],
                 computed_balance,
             }));
+            self.sum -= amount as i128;
         } else {
             self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
         }
@@ -353,6 +346,7 @@ impl TransactorState {
                 _pad0: [0; 6],
                 computed_balance,
             }));
+            self.sum += amount as i128;
         } else {
             self.fail_reason = FailReason::ACCOUNT_LIMIT_EXCEEDED;
         }
@@ -993,15 +987,17 @@ pub fn build_wasm_tag(crc32c: u32) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_ring::reader::TxRingReader;
     use crate::tx_ring::ring::TxRing;
 
     // A TransactorState wired to a fresh ring with `cap` slots already granted,
-    // so the per-step ops can push straight into the ring's pending window.
-    fn fixture(max_accounts: usize, cap: usize) -> (Arc<TxRing>, TransactorState) {
-        let (ring, mut writer, _releaser) = TxRing::new(cap);
+    // so the per-step ops can push straight into the ring's pending window. The
+    // returned reader inspects what the writer (inside the state) published.
+    fn fixture(max_accounts: usize, cap: usize) -> (TxRingReader, TransactorState) {
+        let (mut writer, reader) = TxRing::new(cap);
         writer.reserve();
         (
-            ring,
+            reader,
             TransactorState::new(max_accounts, writer, WaitStrategy::LowLatency),
         )
     }
@@ -1059,16 +1055,16 @@ mod tests {
 
     #[test]
     fn commit_publishes_records_to_a_reader() {
-        let (ring, mut s) = fixture(16, 64);
+        let (reader, mut s) = fixture(16, 64);
         s.init(1);
         s.begin(*b"TEST\0\0\0\0", 7, 0);
         s.debit(3, 100);
         s.credit(5, 100);
         s.tx_ring_pusher.commit();
 
-        assert_eq!(ring.write_index(), 2);
+        assert_eq!(reader.write_index(), 2);
         // trailer layout: the debit entry is the first record, at slot 0
-        match ring.get(0) {
+        match reader.get(0) {
             WalEntry::Entry(e) => {
                 assert_eq!(e.amount, 100);
                 assert!(matches!(e.kind, EntryKind::Debit));
@@ -1081,7 +1077,7 @@ mod tests {
     fn ensure_capacity_reclaims_freed_slots() {
         // A 4-slot ring: fill the grant, publish + release, then ensure_capacity
         // must reclaim the freed slots so the next op can push again.
-        let (_ring, mut writer, mut releaser) = TxRing::new(4);
+        let (mut writer, mut reader) = TxRing::new(4);
         writer.reserve();
         let mut s = TransactorState::new(8, writer, WaitStrategy::LowLatency);
         s.init(1);
@@ -1093,7 +1089,7 @@ mod tests {
         assert_eq!(s.tx_ring_pusher.capacity(), 0);
 
         s.tx_ring_pusher.commit();
-        releaser.advance_to(4); // reader caught up; 4 slots are free again
+        reader.release_to(4); // reader caught up; 4 slots are free again
 
         // capacity() == 0, so ensure_capacity must reclaim the freed slots.
         let ctx = crate::test_support::mock_transactor_ctx();
@@ -1109,7 +1105,7 @@ mod tests {
         // begin() records the transaction's start in `tx_start_index`; a
         // reserve() between transactions publishes the prior one. The trailing
         // metadata is materialized last by finalize_committed().
-        let (ring, mut writer, _releaser) = TxRing::new(64);
+        let (mut writer, reader) = TxRing::new(64);
         writer.reserve();
         let mut s = TransactorState::new(16, writer, WaitStrategy::LowLatency);
 
@@ -1131,10 +1127,10 @@ mod tests {
         assert_eq!(s.finalize_committed(), 2);
         s.tx_ring_pusher.commit();
 
-        assert_eq!(ring.write_index(), 6);
+        assert_eq!(reader.write_index(), 6);
         // the trailing metadata of each tx sits at the end of its group
         for meta_idx in [2usize, 5usize] {
-            match ring.get(meta_idx) {
+            match reader.get(meta_idx) {
                 WalEntry::Metadata(m) => assert_eq!(m.sub_item_count, 2),
                 _ => panic!("expected metadata at ring_index {meta_idx}"),
             }

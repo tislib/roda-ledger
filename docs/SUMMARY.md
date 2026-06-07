@@ -27,3 +27,5 @@
     - [ADR-0010 Sync submit](adr/0010-sync-submit.md)
     - [ADR-0014 WASM function registry](adr/0014-wasm-function-registry.md)
     - [ADR-0018 Fault injection framework](adr/0018-fault-injection.md)
+    - [ADR-0019 Transaction ring](adr/0019-transaction-ring.md)
+    - [ADR-0020 Trailer metadata — commit-record WAL layout](adr/0020-wal-trailer-metadata.md)
