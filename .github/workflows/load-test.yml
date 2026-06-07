@@ -89,6 +89,11 @@ jobs:
           echo "::group::Load Test Output"
           /root/.cargo/bin/cargo run --package ledger --release --bin load 2>&1 | tee /root/load-test-output.txt
           echo "::endgroup::"
+
+          # Run latency test (after the load test, on the same server)
+          echo "::group::Latency Test Output"
+          /root/.cargo/bin/cargo run --package ledger --release --bin load_latency 2>&1 | tee /root/load-latency-output.txt
+          echo "::endgroup::"
           SETUP_EOF
         env:
           BRANCH: ${{ github.ref_name }}
@@ -102,6 +107,9 @@ jobs:
           scp -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key \
             root@$SERVER_IP:/root/load-test-output.txt results/load-test-output.txt 2>/dev/null || \
             echo "No output file to retrieve" > results/load-test-output.txt
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/load_test_key \
+            root@$SERVER_IP:/root/load-latency-output.txt results/load-latency-output.txt 2>/dev/null || \
+            echo "No latency output file to retrieve" > results/load-latency-output.txt
       - name: Upload results artifact
         if: always()
         uses: actions/upload-artifact@v4
