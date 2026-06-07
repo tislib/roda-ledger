@@ -715,7 +715,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_segment(
             &active_wal_path(dir.path()),
-            &[entry(1), meta(1, 1), entry(2), meta(2, 1), entry(3), meta(3, 1)],
+            &[
+                entry(1),
+                meta(1, 1),
+                entry(2),
+                meta(2, 1),
+                entry(3),
+                meta(3, 1),
+            ],
         );
         let storage = open_storage(&dir);
         let mut tailer = storage.wal_tailer(1);
