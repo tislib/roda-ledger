@@ -1,11 +1,10 @@
 use crate::tx_ring::reader::TxRingReader;
 use crate::tx_ring::writer::TxRingWriter;
-use bytemuck::Zeroable;
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use storage::entities::{TxEntry, WalBinaryRecord, WalEntry};
+use storage::entities::WalBinaryRecord;
 
 /// Lock-free SPSC slot buffer. Lives behind an `Arc` held by exactly two handles
 /// — the [`TxRingWriter`] and the [`TxRingReader`] — and is dropped when both are
@@ -52,10 +51,4 @@ impl TxRing {
         let occupied = frontier.wrapping_sub(self.release.load(Ordering::Acquire));
         self.capacity.saturating_sub(occupied)
     }
-}
-
-// Placeholder filling every slot until the writer overwrites it; never observed by a
-// caller that respects the [release, write) window.
-fn empty_entry() -> WalEntry {
-    WalEntry::Entry(TxEntry::zeroed())
 }

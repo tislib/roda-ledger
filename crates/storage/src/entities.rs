@@ -1,5 +1,5 @@
-use crate::WAL_RECORD_SIZE;
-use crate::wal_serializer::{parse_wal_record, serialize_wal_records};
+use crate::wal_serializer::parse_wal_record;
+use crate::{TX_ID_OFFSET, WAL_RECORD_SIZE};
 use bytemuck::{Pod, Zeroable};
 
 // Discriminants 2 and 3 are retired (formerly SegmentHeader / SegmentSealed);
@@ -249,6 +249,9 @@ impl WalEntry {
     }
 }
 
+/// `#[repr(transparent)]` so a contiguous `[WalBinaryRecord]` is byte-identical to a
+/// `[u8]` — lets the WAL hand a published ring range straight to `write_all`, no copy.
+#[repr(transparent)]
 pub struct WalBinaryRecord([u8; WAL_RECORD_SIZE]);
 
 impl WalBinaryRecord {
@@ -278,6 +281,21 @@ impl WalBinaryRecord {
 
     pub fn empty() -> Self {
         WalBinaryRecord([0; WAL_RECORD_SIZE])
+    }
+
+    /// `tx_id` if this record is a `TxMetadata`, else `None`. Byte 0 is the kind
+    /// discriminator; lets the WAL find the last committed tx in a range by scanning
+    /// right-to-left without decoding every record.
+    pub fn metadata_tx_id(&self) -> Option<u64> {
+        if self.0[0] == WalEntryKind::TxMetadata as u8 {
+            Some(u64::from_le_bytes(
+                self.0[TX_ID_OFFSET..TX_ID_OFFSET + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            ))
+        } else {
+            None
+        }
     }
 }
 

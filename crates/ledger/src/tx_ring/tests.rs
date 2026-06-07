@@ -2,11 +2,14 @@ use super::reader::TxRingReader;
 use super::ring::TxRing;
 use super::writer::TxRingWriter;
 use bytemuck::Zeroable;
-use storage::entities::{TxEntry, WalEntry};
+use storage::entities::{TxEntry, WalEntry, WalEntryKind};
 
 // A distinct entry whose `account_id` doubles as its logical position, so reads are checkable.
+// `entry_type` must be stamped: the ring stores raw bytes and re-parses on read, so a
+// zeroed discriminator (byte 0) would parse back as `TxMetadata`.
 fn entry(id: u64) -> WalEntry {
     WalEntry::Entry(TxEntry {
+        entry_type: WalEntryKind::TxEntry as u8,
         account_id: id,
         ..TxEntry::zeroed()
     })

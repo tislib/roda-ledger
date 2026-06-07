@@ -1,3 +1,4 @@
+use crate::WAL_RECORD_SIZE;
 use crate::entities::WalEntry;
 use crate::layout::{
     active_wal_path, segment_crc_path, segment_seal_path, segment_wal_path, wal_stop_path,
@@ -231,6 +232,43 @@ impl Segment {
 
         self.wal_position += self.wal_buffer.len();
         self.wal_buffer.clear();
+    }
+
+    /// Write a pre-serialized record buffer straight to the WAL file — no per-entry
+    /// copy through `wal_buffer`. `bytes` must be a whole number of 40-byte records
+    /// (e.g. a contiguous `&[WalBinaryRecord]` range from the tx ring, reinterpreted).
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        assert_eq!(
+            self.status,
+            SegmentStaus::ACTIVE,
+            "Segment is not active, cannot append"
+        );
+        debug_assert_eq!(
+            bytes.len() % WAL_RECORD_SIZE,
+            0,
+            "write_bytes: not a whole number of records"
+        );
+        if bytes.is_empty() {
+            return;
+        }
+
+        #[cfg(feature = "fault-injection")]
+        if let Some(hook) = self.fault.as_ref() {
+            hook.before_write(bytes.len());
+        }
+
+        let mut file = self.wal_file.as_ref().unwrap();
+        loop {
+            if let Err(e) = file.write_all(bytes) {
+                warn!("Failed to write to WAL: {}", e);
+                sleep(Duration::from_secs(1));
+                continue;
+            }
+            break;
+        }
+
+        self.wal_position += bytes.len();
+        self.record_count += (bytes.len() / WAL_RECORD_SIZE) as u64;
     }
 
     pub fn write_entries(&mut self, entries: &[WalEntry]) {

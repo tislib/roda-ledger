@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use storage::entities::WalEntry;
 use storage::{Segment, Storage, Syncer};
 
 pub struct Wal {
@@ -102,68 +101,54 @@ impl WalRunner {
     }
 
     pub fn run(&mut self, ctx: WalContext) {
-        // Move the reader to a local so the walk closure can borrow the rest of self.
+        // Move the reader to a local; the write closure borrows the rest of self.
         let mut reader = self.reader.take().expect("WalRunner::run called twice");
-        let mut last_ring_index = 0;
+        let tx_per_seg = self.storage.config().transaction_count_per_segment;
         while ctx.is_running() {
-            let mut entries_ingested = 0;
-            reader.walk(last_ring_index, |entry| {
-                self.ingest_entry(entry);
-                entries_ingested += 1;
-                last_ring_index += 1;
+            // Cap the batch at the active segment's remaining tx room so a segment holds
+            // exactly `tx_per_seg` txs; the ring cuts on a tx boundary (never splits one).
+            let max_tx_count = if tx_per_seg == 0 {
+                usize::MAX // unlimited — never rotate
+            } else {
+                (tx_per_seg - self.segment_tx_count()) as usize
+            };
 
-                // if the segment is full, do not push any more entries.
-                if self.is_rotation_needed() {
-                    return false;
-                }
-
-                true
+            // The ring hands us the next whole-tx byte run and which txs it covers; we
+            // just write it to the segment, then release happens inside `read_next_batch`.
+            let batch = reader.read_next_batch(max_tx_count, |bytes| {
+                self.active_segment.write_bytes(bytes)
             });
 
-            // if new entries are available, write them to the segment.
-            if entries_ingested > 0 {
-                self.active_segment.write_pending_entries();
-                self.last_written_tx_id
-                    .store(self.last_received_tx_id, Release);
-                // Release after the disk write (not the in-memory copy) so a stalled
-                // writer back-pressures the transactor; fdatasync/commit stays decoupled.
-                reader.release_to(last_ring_index);
-            }
-
-            // if there are no movements, skip the rest of the loop.
-            if entries_ingested == 0 {
+            // No complete tx ready yet — back off and retry.
+            let Some(last_tx) = batch.last_tx else {
                 self.retry_count += 1;
                 self.wait_strategy.retry(self.retry_count);
                 continue;
-            }
+            };
             self.retry_count = 0;
 
-            // Rotate the segment when the transaction count threshold is exceeded.
-            let is_rotation_needed = self.is_rotation_needed();
+            if self.segment_start_tx_id == 0 {
+                self.segment_start_tx_id =
+                    batch.first_tx.expect("first_tx is set whenever last_tx is");
+            }
+            self.last_received_tx_id = last_tx;
+            // Release happens on the disk write (inside read_next_batch), so a stalled
+            // writer back-pressures the transactor; fdatasync/commit stays decoupled.
+            self.last_written_tx_id.store(last_tx, Release);
 
-            if is_rotation_needed {
+            // The segment is full once it holds `tx_per_seg` txs.
+            if tx_per_seg > 0 && self.segment_tx_count() >= tx_per_seg {
                 self.rotate(&ctx);
             }
         }
     }
 
-    fn is_rotation_needed(&self) -> bool {
-        let tx_per_seg = self.storage.config().transaction_count_per_segment;
-        self.last_received_tx_id > 0
-            && self.segment_start_tx_id > 0
-            && tx_per_seg > 0
-            && self.last_received_tx_id - self.segment_start_tx_id >= tx_per_seg - 1
-    }
-
-    /// Append one entry to the active segment and advance tx bookkeeping. Trailer
-    /// layout: a `TxMetadata` closes its tx, so tracking advances only there.
-    fn ingest_entry(&mut self, entry: WalEntry) {
-        self.active_segment.append_pending_entry(&entry);
-        if let WalEntry::Metadata(m) = &entry {
-            self.last_received_tx_id = m.tx_id;
-            if self.segment_start_tx_id == 0 {
-                self.segment_start_tx_id = m.tx_id;
-            }
+    // Txs already written to the active segment (0 before its first tx lands).
+    fn segment_tx_count(&self) -> u64 {
+        if self.segment_start_tx_id == 0 {
+            0
+        } else {
+            self.last_received_tx_id - self.segment_start_tx_id + 1
         }
     }
 
