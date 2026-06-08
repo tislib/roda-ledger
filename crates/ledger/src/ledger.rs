@@ -215,6 +215,11 @@ impl Ledger {
         self.pipeline.last_compute_id()
     }
 
+    /// Last tx id written to the WAL's page cache (buffered, pre-fsync).
+    pub fn last_write_id(&self) -> u64 {
+        self.pipeline.last_write_id()
+    }
+
     pub fn last_commit_id(&self) -> u64 {
         self.pipeline.last_commit_id()
     }

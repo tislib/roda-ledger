@@ -37,6 +37,10 @@ pub struct Pipeline {
     sequencer_index: CachePadded<AtomicU64>,
     /// Last transaction id executed by the transactor (compute index).
     compute_index: CachePadded<AtomicU64>,
+    /// Last transaction id written to the active segment's page cache by the
+    /// WAL writer — buffered only, NOT yet fdatasync'd (that gate is
+    /// `commit_index`). Lets callers observe pipeline transit minus the fsync.
+    write_index: CachePadded<AtomicU64>,
     /// Last transaction id durably written by the WAL (commit index).
     commit_index: CachePadded<AtomicU64>,
     /// Last transaction id reflected in the snapshot/indexer.
@@ -83,6 +87,7 @@ impl Pipeline {
 
             sequencer_index: CachePadded::new(AtomicU64::new(1)),
             compute_index: CachePadded::new(AtomicU64::new(0)),
+            write_index: CachePadded::new(AtomicU64::new(0)),
             commit_index: CachePadded::new(AtomicU64::new(0)),
             snapshot_index: CachePadded::new(AtomicU64::new(0)),
             seal_index: CachePadded::new(AtomicU32::new(0)),
@@ -154,6 +159,10 @@ impl Pipeline {
 
     pub fn last_compute_id(&self) -> u64 {
         self.compute_index.load(Ordering::Acquire)
+    }
+
+    pub fn last_write_id(&self) -> u64 {
+        self.write_index.load(Ordering::Acquire)
     }
 
     pub fn last_commit_id(&self) -> u64 {
@@ -337,6 +346,19 @@ impl WalContext {
     #[inline]
     pub fn commit_index(&self) -> u64 {
         self.pipeline.commit_index.load(Ordering::Acquire)
+    }
+
+    /// Publish the buffered-write high-water mark after the WAL writer has
+    /// `write()`-ed entries to the page cache (Release: pairs with the
+    /// committer's Acquire read so it only fsyncs already-written bytes).
+    #[inline]
+    pub fn set_write_index(&self, id: u64) {
+        self.pipeline.write_index.store(id, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn write_index(&self) -> u64 {
+        self.pipeline.write_index.load(Ordering::Acquire)
     }
 
     #[inline(always)]
