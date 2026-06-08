@@ -1,9 +1,10 @@
-//! End-to-end latency under load. A probe submits a deposit, then spins on
-//! `last_snapshot_id` until that tx clears the final pipeline stage, timing the
-//! round-trip. Repeated `--samples` times per scenario to get P50/P99/P999,
-//! while a background thread sustains a target throughput (or runs flat-out).
+//! Latency under load. A probe submits a deposit, then spins on the chosen
+//! pipeline index (`--wait-level`: compute / write / commit / snapshot) until
+//! that tx arrives, timing the round-trip. Repeated `--samples` times per
+//! scenario for P50/P99/P999, while a background thread sustains a target
+//! throughput (or runs flat-out).
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ledger::config::LedgerConfig;
 use ledger::ledger::Ledger;
 use ledger::transaction::Operation;
@@ -28,19 +29,58 @@ struct Args {
     #[arg(short, long, default_value_t = 1_000_000)]
     account_count: u64,
 
-    /// Probe samples per scenario (each is one deposit → snapshot round-trip).
+    /// Probe samples per scenario (each is one deposit → wait-level round-trip).
     #[arg(short, long, default_value_t = 1000)]
     samples: u64,
 
     /// Settle time after starting background load before sampling, in ms.
     #[arg(short, long, default_value_t = 500)]
     warmup_ms: u64,
+
+    /// Pipeline stage the probe waits for before stopping the timer.
+    #[arg(short = 'l', long, value_enum, default_value_t = Stage::Commit)]
+    wait_level: Stage,
 }
 
 /// A load scenario: `None` = no background load, `Some(u64::MAX)` = flat-out.
 struct Scenario {
     name: &'static str,
     load: Option<u64>,
+}
+
+/// The pipeline index a probe waits for — the "wait level".
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Stage {
+    /// Executed by the transactor (in-memory).
+    Compute,
+    /// Written to the WAL page cache (buffered, pre-fsync).
+    Write,
+    /// fdatasync'd to disk — durable.
+    Commit,
+    /// Applied to the snapshot / indexer — readable.
+    Snapshot,
+}
+
+impl Stage {
+    /// Current high-water mark of this stage's pipeline index.
+    #[inline]
+    fn index(self, ledger: &Ledger) -> u64 {
+        match self {
+            Stage::Compute => ledger.last_compute_id(),
+            Stage::Write => ledger.last_write_id(),
+            Stage::Commit => ledger.last_commit_id(),
+            Stage::Snapshot => ledger.last_snapshot_id(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Stage::Compute => "compute (executed)",
+            Stage::Write => "write (page cache, pre-fsync)",
+            Stage::Commit => "commit (durable, fsync)",
+            Stage::Snapshot => "snapshot (readable)",
+        }
+    }
 }
 
 fn fmt_ns(ns: u64) -> String {
@@ -88,9 +128,9 @@ fn generate_load(ledger: &Ledger, target_tps: u64, account_count: u64, stop: &At
     }
 }
 
-/// Submit one deposit and spin until it reaches the snapshot stage; return the
-/// end-to-end latency (admission + full pipeline transit).
-fn probe_once(ledger: &Ledger, account_count: u64) -> Duration {
+/// Submit one deposit and spin until it reaches `stage`; return the round-trip
+/// latency (admission + pipeline transit up to that stage).
+fn probe_once(ledger: &Ledger, account_count: u64, stage: Stage) -> Duration {
     let account = 1 + rand::random::<u64>() % account_count;
     let start = Instant::now();
     let tx_id = ledger.submit(Operation::Deposit {
@@ -99,7 +139,7 @@ fn probe_once(ledger: &Ledger, account_count: u64) -> Duration {
         user_ref: 0,
     });
     let mut spins = 0u64;
-    while ledger.last_snapshot_id() < tx_id {
+    while stage.index(ledger) < tx_id {
         spins += 1;
         if spins.is_multiple_of(512) {
             thread::yield_now();
@@ -110,13 +150,13 @@ fn probe_once(ledger: &Ledger, account_count: u64) -> Duration {
     start.elapsed()
 }
 
-/// Wait until the snapshot stage has caught up with everything sequenced. The
-/// caller must have already stopped + joined any load thread so the sequenced
-/// high-water mark is stable.
-fn drain(ledger: &Ledger) {
+/// Wait until `stage` has caught up with everything sequenced. The caller must
+/// have already stopped + joined any load thread so the sequenced high-water
+/// mark is stable.
+fn drain(ledger: &Ledger, stage: Stage) {
     loop {
         let sequenced = ledger.last_sequenced_id();
-        if ledger.last_snapshot_id() >= sequenced {
+        if stage.index(ledger) >= sequenced {
             return;
         }
         spin_loop();
@@ -127,6 +167,7 @@ fn main() {
     let args = Args::parse();
     let account_count = args.account_count.max(1);
     let samples = args.samples.max(1);
+    let wait_level = args.wait_level;
 
     let mut ledger = Ledger::new(LedgerConfig {
         // +1 so SYSTEM_ACCOUNT_ID (0) and accounts 1..=account_count all fit.
@@ -162,8 +203,10 @@ fn main() {
 
     println!();
     println!(
-        "  latency under load | accounts={} samples={} probe=deposit→snapshot",
-        account_count, samples,
+        "  latency under load | accounts={} samples={} probe=deposit→{}",
+        account_count,
+        samples,
+        wait_level.label(),
     );
     println!();
     let border =
@@ -174,8 +217,6 @@ fn main() {
         "Scenario", "Target", "Achieved TPS", "P50", "P99", "P999", "Max",
     );
     println!("{border}");
-
-    let progress_step = (samples / 20).max(1);
 
     for sc in &scenarios {
         // Spawn the background load (if any) and let it reach steady state.
@@ -190,29 +231,25 @@ fn main() {
         }
 
         for _ in 0..WARMUP_PROBES {
-            probe_once(&ledger, account_count);
+            probe_once(&ledger, account_count, wait_level);
         }
 
-        // Sampled run. Snapshot-id delta over the window gives achieved TPS.
+        // Sampled run. wait-level index delta over the window gives achieved TPS.
         let mut measurer = LatencyMeasurer::new(1);
-        let snap_start = ledger.last_snapshot_id();
+        let snap_start = wait_level.index(&ledger);
         let t_start = Instant::now();
-        for i in 0..samples {
-            measurer.measure(probe_once(&ledger, account_count));
-            if (i + 1).is_multiple_of(progress_step) {
-                eprint!("\r  {} … {}/{}", sc.name, i + 1, samples);
-            }
+        for _ in 0..samples {
+            measurer.measure(probe_once(&ledger, account_count, wait_level));
         }
         let elapsed = t_start.elapsed();
-        let snap_end = ledger.last_snapshot_id();
-        eprint!("\r{:60}\r", "");
+        let snap_end = wait_level.index(&ledger);
 
         // Stop + drain so the next scenario starts from an empty pipeline.
         if let Some(handle) = load_handle {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
-        drain(&ledger);
+        drain(&ledger, wait_level);
 
         let achieved = (snap_end - snap_start) as f64 / elapsed.as_secs_f64();
         let target = match sc.load {

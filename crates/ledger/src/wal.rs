@@ -1,11 +1,8 @@
 use crate::pipeline::WalContext;
 use crate::tx_ring::reader::TxRingReader;
 use crate::wait_strategy::WaitStrategy;
-use Ordering::Release;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Acquire;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use storage::entities::WalEntry;
 use storage::{Segment, Storage, Syncer};
@@ -30,12 +27,10 @@ impl Wal {
             .reader
             .take()
             .expect("Wal::start called twice (reader already taken)");
-        let last_written_tx_id = Arc::new(AtomicU64::new(0));
         let active_segment_sync: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
 
         let mut wal_runner = WalRunner::new(
             self.storage.clone(),
-            last_written_tx_id.clone(),
             active_segment_sync.clone(),
             reader,
             &ctx,
@@ -49,7 +44,6 @@ impl Wal {
 
         let mut wal_committer = WalCommitter {
             active_segment: active_segment_sync,
-            last_written_tx_id,
         };
         let wal_commit_th = std::thread::Builder::new()
             .name("wal_commit".to_string())
@@ -63,7 +57,6 @@ impl Wal {
 
 pub struct WalRunner {
     storage: Arc<Storage>,
-    last_written_tx_id: Arc<AtomicU64>,
     active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
     retry_count: u64,
     active_segment: Segment,
@@ -78,7 +71,6 @@ pub struct WalRunner {
 impl WalRunner {
     pub fn new(
         storage: Arc<Storage>,
-        last_written_tx_id: Arc<AtomicU64>,
         active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
         reader: TxRingReader,
         ctx: &WalContext,
@@ -90,7 +82,6 @@ impl WalRunner {
 
         Self {
             storage,
-            last_written_tx_id,
             active_segment_sync,
             retry_count: 0,
             active_segment,
@@ -123,10 +114,9 @@ impl WalRunner {
             // if new entries are available, write them to the segment.
             if entries_ingested > 0 {
                 self.active_segment.write_pending_entries();
-                self.last_written_tx_id
-                    .store(self.last_received_tx_id, Release);
-                // Release after the disk write (not the in-memory copy) so a stalled
-                // writer back-pressures the transactor; fdatasync/commit stays decoupled.
+                // Publish after the page-cache write (not the in-memory copy) so a
+                // stalled writer back-pressures the transactor; fdatasync/commit stays decoupled.
+                ctx.set_write_index(self.last_received_tx_id);
                 reader.release_to(last_ring_index);
             }
 
@@ -184,12 +174,11 @@ impl WalRunner {
     pub fn commit_sync(&mut self, ctx: &WalContext) {
         let mut syncer = self.active_segment.syncer().expect("Failed to get syncer");
         syncer.sync().expect("Failed to sync segment");
-        ctx.set_commit_index(self.last_written_tx_id.load(Acquire));
+        ctx.set_commit_index(ctx.write_index());
     }
 }
 
 struct WalCommitter {
-    last_written_tx_id: Arc<AtomicU64>,
     active_segment: Arc<ArcSwap<Option<Syncer>>>,
 }
 
@@ -200,7 +189,7 @@ impl WalCommitter {
         let mut sync: Option<Syncer> = None;
         let mut sync_id = 0;
         while ctx.is_running() {
-            if self.last_written_tx_id.load(Acquire) <= ctx.commit_index() {
+            if ctx.write_index() <= ctx.commit_index() {
                 retry_count += 1;
                 wait_strategy.retry(retry_count);
                 continue;
@@ -223,7 +212,7 @@ impl WalCommitter {
     }
 
     pub fn commit_sync(&mut self, ctx: &WalContext, syncer: &mut Syncer) {
-        let commit_tx_id = self.last_written_tx_id.load(Acquire);
+        let commit_tx_id = ctx.write_index();
 
         syncer.sync().expect("Failed to sync segment");
 

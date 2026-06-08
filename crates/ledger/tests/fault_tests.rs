@@ -141,7 +141,7 @@ fn stuck_write_blocks_commit_and_snapshot() {
 
     // With the write stalled, compute can still complete (transactor
     // doesn't write) but the WAL writer's `write_all` never returns,
-    // so `last_written_tx_id` stays at zero and commit can't follow.
+    // so the pipeline write index stays at zero and commit can't follow.
     let deadline = Instant::now() + Duration::from_millis(500);
     while ledger.last_compute_id() < last_id && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));

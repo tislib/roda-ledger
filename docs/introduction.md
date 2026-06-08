@@ -6,7 +6,7 @@ It is built for engineers who need a ledger they can trust. Not a general-purpos
 
 It is also designed to get out of your way. Common operations — deposits, withdrawals, transfers — work out of the box. Custom multi-account logic is expressed through registered WASM functions without touching the engine. How much durability you need is your call, per submission: fire and forget for maximum throughput, or wait for disk confirmation when it matters. Run it as a Docker service in minutes, or embed it as a library. The ledger adapts to your use case, not the other way around.
 
-**5.22 million transactions per second. Sub-microsecond latency. WAL-backed durability. Zero torn writes.**
+**5.7 million transactions per second. Sub-microsecond latency. WAL-backed durability. Zero torn writes.**
 
 ---
 
