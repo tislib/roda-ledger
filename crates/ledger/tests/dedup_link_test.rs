@@ -1,10 +1,10 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse, TransactionResult};
+use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
 use std::fs;
 use std::time::Duration;
 use storage::StorageConfig;
-use storage::entities::{FailReason, TxLinkKind};
+use storage::entities::{FailReason, TxLinkKind, WalEntry};
 
 fn unique_dir(name: &str) -> String {
     let nanos = std::time::SystemTime::now()
@@ -33,7 +33,19 @@ fn temp_ledger() -> Ledger {
     })
 }
 
-fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<TransactionResult> {
+/// A duplicate-detected link, flattened so the assertions below read unchanged.
+struct LinkRow {
+    kind: TxLinkKind,
+    to_tx_id: u64,
+}
+
+/// Split view of a queried transaction: balance entries (counted) and links.
+struct TxView {
+    entries: Vec<()>,
+    links: Vec<LinkRow>,
+}
+
+fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<TxView> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     ledger.query(QueryRequest {
         kind: QueryKind::GetTransaction { tx_id },
@@ -42,7 +54,23 @@ fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<TransactionResult> {
         }),
     });
     match rx.recv().unwrap() {
-        QueryResponse::Transaction(result) => result,
+        QueryResponse::Transaction(result) => result.map(|r| {
+            let mut view = TxView {
+                entries: Vec::new(),
+                links: Vec::new(),
+            };
+            for e in &r.entries {
+                match e {
+                    WalEntry::Entry(_) => view.entries.push(()),
+                    WalEntry::Link(l) => view.links.push(LinkRow {
+                        kind: l.kind(),
+                        to_tx_id: l.to_tx_id,
+                    }),
+                    _ => {}
+                }
+            }
+            view
+        }),
         _ => panic!("unexpected response type"),
     }
 }
@@ -54,6 +82,7 @@ fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<TransactionResult> {
 fn test_dedup_rejects_duplicate_deposit() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let _id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -87,6 +116,7 @@ fn test_dedup_rejects_duplicate_deposit() {
 fn test_dedup_creates_duplicate_link() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -116,6 +146,7 @@ fn test_dedup_creates_duplicate_link() {
 fn test_different_user_refs_not_deduped() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -139,6 +170,7 @@ fn test_different_user_refs_not_deduped() {
 fn test_dedup_multiple_retries() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -171,6 +203,7 @@ fn test_dedup_multiple_retries() {
 fn test_dedup_transfer() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     // Fund account 1
     let fund = ledger.submit(Operation::Deposit {
@@ -211,6 +244,7 @@ fn test_dedup_transfer() {
 fn test_dedup_withdrawal() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let fund = ledger.submit(Operation::Deposit {
         account: 1,
@@ -249,6 +283,7 @@ fn test_dedup_survives_restart() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
 
         id1 = ledger.submit(Operation::Deposit {
             account: 1,
@@ -262,6 +297,7 @@ fn test_dedup_survives_restart() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
 
         // Same user_ref should be rejected after restart
         let id2 = ledger.submit(Operation::Deposit {
@@ -296,6 +332,7 @@ fn test_dedup_survives_restart_with_seal() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
 
         // Submit some filler transactions (all fit in one segment with count=100)
         for i in 0..50 {
@@ -318,6 +355,7 @@ fn test_dedup_survives_restart_with_seal() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
 
         let id2 = ledger.submit(Operation::Deposit {
             account: 1,
@@ -346,6 +384,7 @@ fn test_dedup_survives_restart_with_seal() {
 fn test_dedup_cross_operation_types() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     // First: deposit with user_ref=50
     let fund = ledger.submit(Operation::Deposit {
@@ -385,6 +424,7 @@ fn test_dedup_cross_operation_types() {
 fn test_original_tx_has_no_links() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -407,6 +447,7 @@ fn test_original_tx_has_no_links() {
 fn test_duplicate_tx_queryable_with_link() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -443,6 +484,7 @@ fn test_dedup_multiple_restarts() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
         let id = ledger.submit(Operation::Deposit {
             account: 1,
             amount: 100,
@@ -455,6 +497,7 @@ fn test_dedup_multiple_restarts() {
     for restart in 0..3 {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
 
         let dup_id = ledger.submit(Operation::Deposit {
             account: 1,
@@ -482,6 +525,7 @@ fn test_new_user_ref_after_restart() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
         let id = ledger.submit(Operation::Deposit {
             account: 1,
             amount: 100,
@@ -493,6 +537,7 @@ fn test_new_user_ref_after_restart() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100);
 
         // Different user_ref should succeed
         let id2 = ledger.submit(Operation::Deposit {

@@ -165,6 +165,7 @@ fn tailer_passive_empty_ledger_from_nonzero_returns_zero() {
 #[test]
 fn tailer_from_tx_id_returns_only_transactional_records() {
     let ledger = started_ledger();
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
     let tx = deposit_client(&ledger, 1, 100);
 
     let mut tailer = ledger.wal_tailer(tx);
@@ -187,8 +188,9 @@ fn tailer_from_tx_id_returns_only_transactional_records() {
 #[test]
 fn tailer_rounds_buffer_down_to_record_boundary() {
     let ledger = started_ledger();
-    deposit_client(&ledger, 1, 10);
-    let mut tailer = ledger.wal_tailer(1);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
+    let tx = deposit_client(&ledger, 1, 10);
+    let mut tailer = ledger.wal_tailer(tx);
 
     // 199 rounds down to 4 records (160 B) — plenty for one 3-record
     // deposit group. Expect exactly the group's bytes back.
@@ -227,10 +229,16 @@ fn tailer_rounds_buffer_down_to_record_boundary() {
 #[test]
 fn tailer_passive_resumes_across_calls_without_duplicates() {
     let ledger = started_ledger();
-    for _ in 0..5 {
-        deposit_client(&ledger, 1, 10);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
+    let mut first_deposit = 0u64;
+    for i in 0..5 {
+        let id = deposit_client(&ledger, 1, 10);
+        if i == 0 {
+            first_deposit = id;
+        }
     }
-    let mut tailer = ledger.wal_tailer(1);
+    // Tail from the first deposit so the open's records (tx 1) are excluded.
+    let mut tailer = ledger.wal_tailer(first_deposit);
 
     // One deposit group per call → 5 resume steps.
     let mut buf = vec![0u8; WAL_RECORD_SIZE * 3];
@@ -251,8 +259,9 @@ fn tailer_passive_resumes_across_calls_without_duplicates() {
         assert!(*tx >= last);
         last = *tx;
     }
-    assert_eq!(collected.first().copied(), Some(1));
-    assert_eq!(collected.last().copied(), Some(5));
+    // Deposits are tx 2..=6 (the open took tx 1).
+    assert_eq!(collected.first().copied(), Some(2));
+    assert_eq!(collected.last().copied(), Some(6));
 }
 
 /// Active tail: writer keeps appending while tailer streams. Each call
@@ -261,8 +270,9 @@ fn tailer_passive_resumes_across_calls_without_duplicates() {
 #[test]
 fn tailer_actively_sees_new_records_on_each_call() {
     let ledger = started_ledger();
-    deposit_client(&ledger, 1, 10);
-    let mut tailer = ledger.wal_tailer(1);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
+    let tx = deposit_client(&ledger, 1, 10);
+    let mut tailer = ledger.wal_tailer(tx);
 
     let mut buf = vec![0u8; 4096];
     let first = tailer.tail(&mut buf) as usize;
@@ -277,11 +287,11 @@ fn tailer_actively_sees_new_records_on_each_call() {
     deposit_client(&ledger, 1, 30);
     let second = tailer.tail(&mut buf) as usize;
     assert!(second > 0);
-    // The new bytes must only contain records with tx_id > first batch.
-    // The first record in the buffer is guaranteed to be a TxMetadata
-    // (the tailer aligns to whole-tx boundaries on resume).
+    // The new bytes must only contain records past the first deposit (tx 2);
+    // i.e. tx_id >= 3. The first record in the buffer is guaranteed to be a
+    // TxMetadata (the tailer aligns to whole-tx boundaries on resume).
     for tx in record_tx_ids(&buf, second / WAL_RECORD_SIZE) {
-        assert!(tx >= 2);
+        assert!(tx >= 3);
     }
 }
 
@@ -290,17 +300,24 @@ fn tailer_actively_sees_new_records_on_each_call() {
 #[test]
 fn tailer_from_lag_streams_full_history() {
     let ledger = started_ledger();
-    for _ in 0..20 {
-        deposit_client(&ledger, 1, 10);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
+    let mut first_deposit = 0u64;
+    for i in 0..20 {
+        let id = deposit_client(&ledger, 1, 10);
+        if i == 0 {
+            first_deposit = id;
+        }
     }
-    let mut tailer = ledger.wal_tailer(1);
+    // Tail from the first deposit so the open's records (tx 1) are excluded.
+    let mut tailer = ledger.wal_tailer(first_deposit);
 
     let mut buf = vec![0u8; 40 * 200];
     let n = tailer.tail(&mut buf) as usize;
     assert_eq!(n, WAL_RECORD_SIZE * 3 * 20);
 
+    // Deposits are tx 2..=21 (the open took tx 1).
     let tx_ids = record_tx_ids(&buf, n / WAL_RECORD_SIZE);
-    for expected in 1..=20 {
+    for expected in 2..=21 {
         assert!(tx_ids.contains(&expected), "missing tx_id {}", expected);
     }
 }
@@ -311,20 +328,27 @@ fn tailer_from_lag_streams_full_history() {
 #[test]
 fn tailer_crosses_segment_rotation() {
     let ledger = started_ledger_with_rotation(3);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
     // 10 deposits → ~3 rotations at 3 tx per segment.
-    for _ in 0..10 {
-        deposit_client(&ledger, 1, 10);
+    let mut first_deposit = 0u64;
+    for i in 0..10 {
+        let id = deposit_client(&ledger, 1, 10);
+        if i == 0 {
+            first_deposit = id;
+        }
     }
-    wait_until("commit >= 10", || ledger.last_commit_id() >= 10);
+    wait_until("commit >= 11", || ledger.last_commit_id() >= 11);
 
-    let mut tailer = ledger.wal_tailer(1);
+    // Tail from the first deposit so the open's records (tx 1) are excluded.
+    let mut tailer = ledger.wal_tailer(first_deposit);
     let mut buf = vec![0u8; 40 * 200];
     let n = tailer.tail(&mut buf) as usize;
     assert_eq!(n, WAL_RECORD_SIZE * 3 * 10);
 
+    // Deposits are tx 2..=11 (the open took tx 1).
     let mut last_tx = 0u64;
     for tx in record_tx_ids(&buf, n / WAL_RECORD_SIZE) {
-        assert!((1..=10).contains(&tx));
+        assert!((2..=11).contains(&tx));
         assert!(tx >= last_tx);
         last_tx = tx;
     }
@@ -335,7 +359,9 @@ fn tailer_crosses_segment_rotation() {
 #[test]
 fn tailer_actively_tails_while_rotating() {
     let ledger = started_ledger_with_rotation(2);
-    let mut tailer = ledger.wal_tailer(1);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
+    // Deposits start at tx 2; tail from there so the open's records are excluded.
+    let mut tailer = ledger.wal_tailer(2);
 
     let mut collected: Vec<u64> = Vec::new();
     let mut buf = vec![0u8; WAL_RECORD_SIZE * 4];
@@ -362,7 +388,8 @@ fn tailer_actively_tails_while_rotating() {
         assert!(chunk[0] > last);
         last = chunk[0];
     }
-    assert_eq!(last, 6);
+    // Deposits are tx 2..=7 (the open took tx 1).
+    assert_eq!(last, 7);
 }
 
 /// `from_tx_id` is bound at construction. Different starting points
@@ -370,20 +397,22 @@ fn tailer_actively_tails_while_rotating() {
 #[test]
 fn tailer_distinct_from_tx_ids_locate_independently() {
     let ledger = started_ledger();
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
     for _ in 0..3 {
         deposit_client(&ledger, 1, 10);
     }
+    // Deposits are tx 2, 3, 4 (the open took tx 1).
 
     let mut buf = vec![0u8; 4096];
 
-    // Skip tx_id=1: one submit = 3 records; tx_ids 2 and 3 → 6 records.
-    let mut t_from_2 = ledger.wal_tailer(2);
-    let n1 = t_from_2.tail(&mut buf) as usize;
+    // Skip the first deposit (tx 2): tx 3 and 4 → 6 records.
+    let mut t_from_3 = ledger.wal_tailer(3);
+    let n1 = t_from_3.tail(&mut buf) as usize;
     assert_eq!(n1, WAL_RECORD_SIZE * 6);
 
-    // Fresh tailer from tx_id=1: 3 tx × 3 records = 9 records.
-    let mut t_from_1 = ledger.wal_tailer(1);
-    let n2 = t_from_1.tail(&mut buf) as usize;
+    // Fresh tailer from the first deposit (tx 2): 3 tx × 3 records = 9 records.
+    let mut t_from_2 = ledger.wal_tailer(2);
+    let n2 = t_from_2.tail(&mut buf) as usize;
     assert_eq!(n2, WAL_RECORD_SIZE * 9);
 }
 
@@ -392,8 +421,9 @@ fn tailer_distinct_from_tx_ids_locate_independently() {
 #[test]
 fn tailer_reset_rewinds_to_locate_position() {
     let ledger = started_ledger();
-    deposit_client(&ledger, 1, 10);
-    let mut tailer = ledger.wal_tailer(1);
+    ledger.open_accounts(10); // enforce existence for account 1 (open is tx 1)
+    let tx = deposit_client(&ledger, 1, 10);
+    let mut tailer = ledger.wal_tailer(tx);
 
     let mut buf = vec![0u8; 4096];
     let first = tailer.tail(&mut buf) as usize;

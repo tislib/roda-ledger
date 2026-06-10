@@ -247,6 +247,12 @@ impl ScenarioRunner {
         scenario: &Scenario,
         metrics: &Arc<MetricsCollector>,
     ) -> Result<(), RunError> {
+        // Pre-open a block of accounts so scenario deposits pass existence
+        // enforcement (ADR-022); scenarios address small, dense account ids.
+        client
+            .open_account_and_wait(100_000, 0, proto_ledger::WaitLevel::ClusterCommit)
+            .await
+            .map_err(|e| RunError::Client(e.to_string()))?;
         let mut ctx = RunCtx::default();
         for step in &scenario.steps {
             self.dispatch(client, metrics, &mut ctx, step).await?;

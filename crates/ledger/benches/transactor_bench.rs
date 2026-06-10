@@ -19,7 +19,7 @@ fn transactor_bench(c: &mut Criterion) {
     let (pipeline, writer, _drain) = mock_pipeline(1 << 20, 1 << 16, WaitStrategy::Balanced);
 
     let config = LedgerConfig {
-        max_accounts: 10_000_000,
+        initial_account_size: 10_000_000,
         ..LedgerConfig::default()
     };
     let tmp = tempfile::tempdir().expect("tempdir");

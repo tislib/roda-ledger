@@ -205,7 +205,6 @@ async fn cluster_client_writes_survive_leader_failover() {
 /// `transfer_and_wait` exercises the same leader-routed retry path
 /// across a kill+restart cycle of the leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[ignore]
 async fn cluster_client_transfer_after_leader_restart() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig::cluster(3))
         .await
@@ -240,10 +239,21 @@ async fn cluster_client_transfer_after_leader_restart() {
         .expect("transfer");
     assert_eq!(r.fail_reason, 0);
 
-    let a = cluster.get_balance(ACCOUNT_A).await.expect("A").balance;
-    let b = cluster.get_balance(ACCOUNT_B).await.expect("B").balance;
+    // Reads are round-robined across nodes and served from each node's
+    // snapshot, which trails ClusterCommit; pin every read to the
+    // transfer's tx_id so it waits for the chosen node to apply it.
+    let a = cluster
+        .get_balance_at(ACCOUNT_A, r.tx_id)
+        .await
+        .expect("A")
+        .balance;
+    let b = cluster
+        .get_balance_at(ACCOUNT_B, r.tx_id)
+        .await
+        .expect("B")
+        .balance;
     let s = cluster
-        .get_balance(SYSTEM_ACCOUNT_ID)
+        .get_balance_at(SYSTEM_ACCOUNT_ID, r.tx_id)
         .await
         .expect("sys")
         .balance;

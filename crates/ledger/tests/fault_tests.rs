@@ -59,9 +59,14 @@ fn stuck_sync_blocks_commit_and_snapshot() {
     let fault = ledger.fault_injector();
     let _guard = FaultGuard(fault.clone());
 
-    // Stick BEFORE start so the first sync the committer attempts parks.
-    fault.stick_sync();
+    // Open account 1 first (must flow through a non-stuck pipeline). This
+    // commits + snapshots as tx_id 1, so the stuck-state indices below are 1,
+    // not 0, and the deposit under test becomes tx_id 2.
     ledger.start().unwrap();
+    ledger.open_accounts(10);
+
+    // Now stick the sync so the next sync the committer attempts parks.
+    fault.stick_sync();
 
     let last_id = ledger.submit(Operation::Deposit {
         account: 1,
@@ -85,13 +90,13 @@ fn stuck_sync_blocks_commit_and_snapshot() {
 
     assert_eq!(
         ledger.last_commit_id(),
-        0,
-        "commit_id must not advance while fdatasync is parked"
+        1,
+        "commit_id must not advance past the open (tx 1) while fdatasync is parked"
     );
     assert_eq!(
         ledger.last_snapshot_id(),
-        0,
-        "snapshot_id must not advance while commit is stuck"
+        1,
+        "snapshot_id must not advance past the open (tx 1) while commit is stuck"
     );
     assert_eq!(
         ledger.get_balance(1),
@@ -127,11 +132,15 @@ fn stuck_write_blocks_commit_and_snapshot() {
     let fault = ledger.fault_injector();
     let _guard = FaultGuard(fault.clone());
 
-    // Stick BEFORE start so the first `write_all` the WAL writer
-    // attempts parks instead of returning. No error surfaces — the
-    // call never returns at all.
-    fault.stick_write();
+    // Open account 2 first (must flow through a non-stuck pipeline). This
+    // commits + snapshots as tx_id 1, so the stuck-state indices below are 1,
+    // not 0, and the deposit under test becomes tx_id 2.
     ledger.start().unwrap();
+    ledger.open_accounts(10);
+
+    // Now stick `write_all` so the next write the WAL writer attempts parks
+    // instead of returning. No error surfaces — the call never returns at all.
+    fault.stick_write();
 
     let last_id = ledger.submit(Operation::Deposit {
         account: 2,
@@ -157,13 +166,13 @@ fn stuck_write_blocks_commit_and_snapshot() {
 
     assert_eq!(
         ledger.last_commit_id(),
-        0,
-        "commit_id must not advance while write_all is parked"
+        1,
+        "commit_id must not advance past the open (tx 1) while write_all is parked"
     );
     assert_eq!(
         ledger.last_snapshot_id(),
-        0,
-        "snapshot_id must not advance while commit is frozen"
+        1,
+        "snapshot_id must not advance past the open (tx 1) while commit is frozen"
     );
     assert_eq!(
         ledger.get_balance(2),

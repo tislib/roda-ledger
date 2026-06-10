@@ -1,5 +1,6 @@
 use crate::entities::{
-    FunctionRegistered, TxEntry, TxLink, TxMetadata, TxTerm, WalEntry, WalEntryKind,
+    AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, TxEntry, TxLink,
+    TxMetadata, TxTerm, WalEntry, WalEntryKind,
 };
 
 pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
@@ -9,6 +10,9 @@ pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
         WalEntry::Link(l) => bytemuck::bytes_of(l),
         WalEntry::FunctionRegistered(f) => bytemuck::bytes_of(f),
         WalEntry::Term(t) => bytemuck::bytes_of(t),
+        WalEntry::AccountOpened(a) => bytemuck::bytes_of(a),
+        WalEntry::AccountLinked(a) => bytemuck::bytes_of(a),
+        WalEntry::AccountFlagsUpdated(a) => bytemuck::bytes_of(a),
     }
 }
 
@@ -43,6 +47,18 @@ pub fn parse_wal_record(data: &[u8]) -> Result<WalEntry, std::io::Error> {
         k if k == WalEntryKind::TxTerm as u8 => {
             let term: TxTerm = bytemuck::pod_read_unaligned(record_data);
             Ok(WalEntry::Term(term))
+        }
+        k if k == WalEntryKind::AccountOpened as u8 => {
+            let a: AccountOpened = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::AccountOpened(a))
+        }
+        k if k == WalEntryKind::AccountLinked as u8 => {
+            let a: AccountLinked = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::AccountLinked(a))
+        }
+        k if k == WalEntryKind::AccountFlagsUpdated as u8 => {
+            let a: AccountFlagsUpdated = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::AccountFlagsUpdated(a))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -221,6 +237,23 @@ mod tests {
         let parsed = parse_wal_record(buf).expect("parse");
         if let WalEntry::FunctionRegistered(f) = parsed {
             assert!(f.is_unregister());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn parse_account_linked_round_trip() {
+        let original = WalEntry::AccountLinked(crate::entities::AccountLinked::new(7, 3, 1024));
+        let buf = serialize_wal_records(&original);
+        assert_eq!(buf.len(), 40);
+        assert_eq!(buf[0], WalEntryKind::AccountLinked as u8);
+        let parsed = parse_wal_record(buf).expect("parse");
+        assert_eq!(parsed, original);
+        if let WalEntry::AccountLinked(a) = parsed {
+            assert_eq!(a.parent_id, 7);
+            assert_eq!(a.type_id, 3);
+            assert_eq!(a.child_id, 1024);
         } else {
             panic!("wrong variant");
         }

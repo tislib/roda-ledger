@@ -158,7 +158,7 @@ pub struct FunctionInfo {
 /// One page of raw WAL records returned by [`NodeClient::get_log`].
 #[derive(Debug, Clone)]
 pub struct LogPage {
-    pub records: Vec<proto::WalLogRecord>,
+    pub records: Vec<proto::WalEntry>,
     pub next_tx_id: u64,
     pub last_commit_tx_id: u64,
 }
@@ -421,6 +421,32 @@ impl NodeClient {
         .await
     }
 
+    /// Open `count` (>= 1) sequential accounts and wait (ADR-022).
+    pub async fn open_account_and_wait(
+        &self,
+        count: u32,
+        user_ref: u64,
+        wait_level: proto::WaitLevel,
+    ) -> Result<SubmitResult> {
+        self.with_retry("open_account_and_wait", || async {
+            let mut client = self.inner.clone();
+            let resp = client
+                .submit_and_wait(proto::SubmitAndWaitRequest {
+                    operation: Some(proto::submit_and_wait_request::Operation::OpenAccount(
+                        proto::OpenAccount { count, user_ref },
+                    )),
+                    wait_level: wait_level as i32,
+                })
+                .await?
+                .into_inner();
+            Ok(SubmitResult {
+                tx_id: resp.transaction_id,
+                fail_reason: resp.fail_reason,
+            })
+        })
+        .await
+    }
+
     /// Submit a withdrawal and wait.
     pub async fn withdraw_and_wait(
         &self,
@@ -632,7 +658,10 @@ impl NodeClient {
                 account_id, self.url
             );
             let resp = client
-                .get_balance(proto::GetBalanceRequest { account_id })
+                .get_balance(proto::GetBalanceRequest {
+                    account_id,
+                    include_linked: false,
+                })
                 .await?
                 .into_inner();
             Ok(Balance {
@@ -747,26 +776,34 @@ impl NodeClient {
                 .get_transaction(proto::GetTransactionRequest { tx_id })
                 .await?
                 .into_inner();
-            Ok(Transaction {
-                tx_id: resp.tx_id,
-                entries: resp
-                    .entries
-                    .iter()
-                    .map(|e| TxEntry {
+            // The wire shape is now `Transaction { meta, items }`; tx_id lives
+            // on the metadata, entries/links are interleaved in `items`.
+            let txn = resp.transaction.unwrap_or_default();
+            let tx_id = match txn.meta.as_ref().and_then(|w| w.entry.as_ref()) {
+                Some(proto::wal_entry::Entry::Metadata(m)) => m.tx_id,
+                _ => tx_id,
+            };
+            let mut entries = Vec::new();
+            let mut links = Vec::new();
+            for item in txn.items {
+                match item.entry {
+                    Some(proto::wal_entry::Entry::TxEntry(e)) => entries.push(TxEntry {
                         account_id: e.account_id,
                         amount: e.amount,
                         kind: e.kind,
                         computed_balance: e.computed_balance,
-                    })
-                    .collect(),
-                links: resp
-                    .links
-                    .iter()
-                    .map(|l| TxLink {
+                    }),
+                    Some(proto::wal_entry::Entry::Link(l)) => links.push(TxLink {
                         to_tx_id: l.to_tx_id,
                         kind: l.kind,
-                    })
-                    .collect(),
+                    }),
+                    _ => {}
+                }
+            }
+            Ok(Transaction {
+                tx_id,
+                entries,
+                links,
             })
         })
         .await
@@ -777,31 +814,40 @@ impl NodeClient {
         &self,
         account_id: u64,
         from_tx_id: u64,
-        limit: u32,
+        to_tx_id: u64,
     ) -> Result<AccountHistory> {
         self.with_retry("get_account_history", || async {
             let mut client = self.inner.clone();
-            trace!("get_account_history: account_id = {:?}, from_tx_id = {:?}, limit = {:?} at node_url: {:?}", account_id, from_tx_id, limit, self.url);
+            trace!("get_account_history: account_id = {:?}, from_tx_id = {:?}, to_tx_id = {:?} at node_url: {:?}", account_id, from_tx_id, to_tx_id, self.url);
             let resp = client
                 .get_account_history(proto::GetAccountHistoryRequest {
                     account_id,
                     from_tx_id,
-                    limit,
+                    to_tx_id,
                 })
                 .await?
                 .into_inner();
-            Ok(AccountHistory {
-                entries: resp
-                    .entries
-                    .iter()
-                    .map(|e| TxEntry {
+            // Flatten the returned transactions' balance entries. `next_tx_id`
+            // carries the scan's floor (scan_last_tx_id) — feed it back as
+            // `from_tx_id` to page further into the past.
+            let next_tx_id = resp.scan_last_tx_id;
+            let entries = resp
+                .transactions
+                .into_iter()
+                .flat_map(|t| t.items)
+                .filter_map(|w| match w.entry {
+                    Some(proto::wal_entry::Entry::TxEntry(e)) => Some(TxEntry {
                         account_id: e.account_id,
                         amount: e.amount,
                         kind: e.kind,
                         computed_balance: e.computed_balance,
-                    })
-                    .collect(),
-                next_tx_id: resp.next_tx_id,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            Ok(AccountHistory {
+                entries,
+                next_tx_id,
             })
         })
         .await

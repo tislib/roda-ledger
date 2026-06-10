@@ -41,7 +41,7 @@ fn wal_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     let config = LedgerConfig {
-        max_accounts: 1_000_000,
+        initial_account_size: 1_000_000,
         ..LedgerConfig::bench()
     };
     let storage = Arc::new(Storage::new(config.storage.clone()).unwrap());

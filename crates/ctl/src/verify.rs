@@ -183,6 +183,21 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                     pending_sub_items.push(WalEntry::Term(*t));
                 }
             }
+            WalEntry::AccountOpened(a) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::AccountOpened(*a));
+                }
+            }
+            WalEntry::AccountLinked(a) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::AccountLinked(*a));
+                }
+            }
+            WalEntry::AccountFlagsUpdated(a) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::AccountFlagsUpdated(*a));
+                }
+            }
         }
     });
 
@@ -199,7 +214,7 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
         match segment.load_snapshot() {
             Ok(Some(data)) => Some(SnapshotReport {
                 filename: snap_file,
-                account_count: data.balances.len() as u64,
+                account_count: data.accounts.len() as u64,
                 ok: true,
                 errors: vec![],
             }),

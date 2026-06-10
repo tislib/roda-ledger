@@ -36,6 +36,7 @@ fn test_crash_after_wal_before_snapshot() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before deposits
 
         let mut last_id = 0u64;
         for _ in 0..total {
@@ -86,6 +87,9 @@ fn test_five_sequential_crash_cycles() {
     for cycle in 0..cycles {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        if cycle == 0 {
+            ledger.open_accounts(100); // first cycle opens; existence survives later cycles
+        }
 
         // Verify running total at the beginning of each cycle
         let expected = (cycle * deposits_per_cycle) as i64;
@@ -141,6 +145,7 @@ fn test_crash_preserves_tx_id_monotonicity() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before deposits
 
         let mut last_id = 0u64;
         for _ in 0..1_000 {
@@ -190,6 +195,7 @@ fn test_crash_recovery_uses_snapshot_as_base() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before deposits
 
         for _ in 0..50_000 {
             ledger.submit(Operation::Deposit {
@@ -238,6 +244,7 @@ fn test_crash_with_partial_active_wal() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before deposits
 
         let mut last_id = 0u64;
         for _ in 0..initial_deposits {

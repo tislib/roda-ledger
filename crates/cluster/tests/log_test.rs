@@ -1,5 +1,5 @@
 use ::proto::ledger::WaitLevel;
-use ::proto::ledger::wal_log_record::Entry as LogEntry;
+use ::proto::ledger::wal_entry::Entry as LogEntry;
 use client::NodeClient;
 use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 
@@ -11,14 +11,14 @@ async fn setup() -> (ClusterTestingControl, NodeClient) {
     (ctl, client)
 }
 
-fn count_metadata(records: &[::proto::ledger::WalLogRecord]) -> usize {
+fn count_metadata(records: &[::proto::ledger::WalEntry]) -> usize {
     records
         .iter()
         .filter(|r| matches!(r.entry, Some(LogEntry::Metadata(_))))
         .count()
 }
 
-fn metadata_tx_ids(records: &[::proto::ledger::WalLogRecord]) -> Vec<u64> {
+fn metadata_tx_ids(records: &[::proto::ledger::WalEntry]) -> Vec<u64> {
     records
         .iter()
         .filter_map(|r| match &r.entry {
@@ -114,7 +114,8 @@ async fn get_log_paginates_without_duplicates() {
         from = page.next_tx_id;
     }
 
-    let expected: Vec<u64> = (1..=n).collect();
+    // tx 1 is the harness auto-open; the n deposits are tx 2..=n+1.
+    let expected: Vec<u64> = (1..=n + 1).collect();
     assert_eq!(
         seen, expected,
         "all tx ids retrieved exactly once, in order"
@@ -140,7 +141,8 @@ async fn get_log_caps_oversized_limit() {
     }
 
     let page = client.get_log(1, 0, 50_000).await.unwrap();
-    assert_eq!(count_metadata(&page.records), 3);
+    // 3 deposits + the harness auto-open (tx 1).
+    assert_eq!(count_metadata(&page.records), 4);
     assert!(
         page.records.len() <= 10_000,
         "server hard cap of 10,000 records"

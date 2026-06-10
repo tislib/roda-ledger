@@ -53,6 +53,9 @@ fn test_race_post_seal_transaction_double_counted_on_restart() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        // Open the filler + witness accounts (ids 1..=2) before any deposit;
+        // existence is now enforced. Reconstructed from the WAL on restart.
+        ledger.open_accounts(2);
 
         // Fill segment 1: enough transactions to trigger at least one seal.
         // 35 000 × 2 records × 33 bytes ≈ 2.3 MB → more than 1 MB → at least one rotation.

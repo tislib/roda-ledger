@@ -13,6 +13,7 @@ fn test_concurrent_deposits_final_balance() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(1); // id 1
     let ledger = Arc::new(ledger);
 
     let num_threads = 8;
@@ -57,6 +58,7 @@ fn test_concurrent_transfers_conserve_total() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // ids 1..=10
     let ledger = Arc::new(ledger);
 
     let num_accounts = 10u64;
@@ -126,6 +128,7 @@ fn test_concurrent_mixed_operations() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(5); // ids 1..=5
     let ledger = Arc::new(ledger);
 
     // Pre-fund accounts 1..=5
@@ -230,6 +233,8 @@ fn test_concurrent_monotonic_tx_ids() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    // Opening consumes tx_id 1; submitter ids start right after it.
+    let open_tx_id = ledger.open_accounts(1).tx_id; // id 1
     let ledger = Arc::new(ledger);
 
     let num_threads = 4;
@@ -262,9 +267,10 @@ fn test_concurrent_monotonic_tx_ids() {
     // No duplicates
     all_ids.dedup();
     assert_eq!(all_ids.len(), total, "duplicate tx IDs found");
-    // Contiguous from 1..=total
-    assert_eq!(all_ids[0], 1);
-    assert_eq!(*all_ids.last().unwrap(), total as u64);
+    // Contiguous from the id right after the open tx.
+    let first_submit_id = open_tx_id + 1;
+    assert_eq!(all_ids[0], first_submit_id);
+    assert_eq!(*all_ids.last().unwrap(), first_submit_id + total as u64 - 1);
 }
 
 /// Tiny queue_size=8 with 4 threads x 10K deposits. Backpressure must not lose transactions.
@@ -277,6 +283,7 @@ fn test_concurrent_small_queue_backpressure() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(1); // id 1
     let ledger = Arc::new(ledger);
 
     let num_threads = 4;

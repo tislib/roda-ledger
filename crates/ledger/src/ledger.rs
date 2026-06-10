@@ -5,8 +5,10 @@ use crate::pipeline::Pipeline;
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
-use crate::snapshot::{QueryRequest, QueryResponse, Snapshot};
-use crate::transaction::{Operation, SubmitResult, TransactionStatus, WaitLevel};
+use crate::snapshot::{QueryKind, QueryRequest, QueryResponse, Snapshot};
+use crate::transaction::{
+    AccountHistory, OpenAccountsResult, Operation, SubmitResult, TransactionStatus, WaitLevel,
+};
 use crate::transactor::Transactor;
 use crate::tx_ring::ring::TxRing;
 pub use crate::wait_strategy::WaitStrategy;
@@ -19,7 +21,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use storage::WalTailer;
-use storage::entities::WalEntry;
+use storage::entities::{FailReason, WalEntry};
 use storage::{Segment, Storage};
 
 pub struct Ledger {
@@ -184,6 +186,72 @@ impl Ledger {
         self.snapshot.get_balance(account_id)
     }
 
+    /// Raw 8-lane flags word for `account_id` (lane 0 = status). Used by the
+    /// read-side guard (ADR-022 §8) to reject internal accounts.
+    pub fn get_flags(&self, account_id: u64) -> u64 {
+        self.snapshot.get_flags(account_id)
+    }
+
+    /// Per-type linked-bucket balances for `account_id` (ADR-022 §8 breakdown):
+    /// `(type_id, balance)` for every bucket linked under this parent.
+    pub fn linked_balances(&self, account_id: u64) -> Vec<(u16, Balance)> {
+        self.snapshot.linked_balances(account_id)
+    }
+
+    /// Committed transactions that reference `account_id`, newest→oldest,
+    /// scanned backward from `from_tx_id` (`0` = latest) down to `to_tx_id` (the
+    /// oldest tx_id to include — the scan stops below it). Reads the durable WAL
+    /// via `WalScanner`, independent of the in-memory index. The returned
+    /// `scan_last_tx_id` is the oldest tx the scan reached; re-query with
+    /// `from_tx_id = scan_last_tx_id` to page further into the past.
+    pub fn get_account_history(
+        &self,
+        account_id: u64,
+        from_tx_id: u64,
+        to_tx_id: u64,
+    ) -> AccountHistory {
+        let mut transactions = Vec::new();
+        // Surface every transaction so the `to_tx_id` floor is exact (a tx's id
+        // lives on its metadata, which the matcher's any-entry rule can't see);
+        // filter by account and stop at the floor in the handler.
+        let scan_last_tx_id = self.storage.wal_scanner().scan(
+            from_tx_id,
+            0,
+            |_| true,
+            |tx| {
+                if tx.meta.tx_id < to_tx_id {
+                    return false;
+                }
+                if tx
+                    .entries
+                    .iter()
+                    .any(|e| Self::entry_references_account(e, account_id))
+                {
+                    transactions.push(tx);
+                }
+                true
+            },
+        );
+        AccountHistory {
+            transactions,
+            scan_last_tx_id,
+        }
+    }
+
+    /// Whether a WAL follower references `account_id` — the account-history
+    /// filter: balance entries, opens covering it, links naming it, flag updates.
+    fn entry_references_account(e: &WalEntry, account_id: u64) -> bool {
+        match e {
+            WalEntry::Entry(te) => te.account_id == account_id,
+            WalEntry::AccountOpened(a) => {
+                account_id >= a.begin_account_id && account_id < a.begin_account_id + a.count as u64
+            }
+            WalEntry::AccountLinked(a) => a.parent_id == account_id || a.child_id == account_id,
+            WalEntry::AccountFlagsUpdated(a) => a.account_id == account_id,
+            _ => false,
+        }
+    }
+
     pub fn last_sealed_segment_id(&self) -> u32 {
         self.pipeline.last_sealed_id()
     }
@@ -270,6 +338,47 @@ impl Ledger {
         let tx_id = self.submit(operation);
         self.wait_for_transaction_level(tx_id, level);
         self.build_submit_result(tx_id)
+    }
+
+    /// Open `count` accounts; wait until the snapshot reflects the tx, then read
+    /// back the `AccountOpened` record to return the allocated id range. Account
+    /// ids are allocated sequentially from 1.
+    pub fn open_accounts(&self, count: u32) -> OpenAccountsResult {
+        let tx_id = self.submit(Operation::OpenAccount { count, user_ref: 0 });
+        self.wait_for_transaction_level(tx_id, WaitLevel::OnSnapshot);
+
+        let status = self.get_transaction_status(tx_id);
+        if status.is_err() {
+            return OpenAccountsResult {
+                tx_id,
+                fail_reason: status.error_reason(),
+                begin_account_id: 0,
+                count: 0,
+            };
+        }
+
+        // Read the AccountOpened record back from the committed transaction.
+        let (begin_account_id, opened) = match self.query_block(QueryRequest {
+            kind: QueryKind::GetTransaction { tx_id },
+            respond: Box::new(|_| {}),
+        }) {
+            QueryResponse::Transaction(Some(result)) => result
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    WalEntry::AccountOpened(a) => Some((a.begin_account_id, a.count)),
+                    _ => None,
+                })
+                .unwrap_or((0, 0)),
+            _ => (0, 0),
+        };
+
+        OpenAccountsResult {
+            tx_id,
+            fail_reason: FailReason::NONE,
+            begin_account_id,
+            count: opened,
+        }
     }
 
     pub fn submit_batch_and_wait(

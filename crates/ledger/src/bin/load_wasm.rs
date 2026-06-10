@@ -72,11 +72,12 @@ fn main() {
     let account_count = args.account_count;
     let wait_mode = args.wait;
     let mut ledger = Ledger::new(LedgerConfig {
-        max_accounts: account_count as usize,
         log_level: Info,
         ..LedgerConfig::bench()
     });
     ledger.start().unwrap();
+    // Existence enforcement (ADR-022): open the accounts the load hits (1..=N).
+    ledger.open_accounts(account_count.max(1) as u32);
 
     // Register the deposit function once, before driving load.
     let binary = wat::parse_str(DEPOSIT_WAT).expect("parse deposit wat");

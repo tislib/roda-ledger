@@ -124,27 +124,24 @@ service Ledger {
 // Used by the fire-and-forget SubmitOperation RPC.
 message SubmitOperationRequest {
   oneof operation {
-    Deposit    deposit = 1;
-    Withdrawal withdrawal = 2;
-    Transfer   transfer = 3;
-    // 4 reserved (previously Composite; removed in favour of WASM
-    // Function operations — see ADR-014).
-    Function   function = 5;
+    Deposit     deposit = 1;
+    Withdrawal  withdrawal = 2;
+    Transfer    transfer = 3;
+    OpenAccount open_account = 4; // ADR-022: open a block of accounts
+    Function    function = 5;
   }
-  reserved 4;
 }
 
 // SubmitAndWaitRequest wraps an operation with a WaitLevel.
 // Used by the blocking SubmitAndWait RPC.
 message SubmitAndWaitRequest {
   oneof operation {
-    Deposit    deposit = 1;
-    Withdrawal withdrawal = 2;
-    Transfer   transfer = 3;
-    // 4 reserved (previously Composite).
-    Function   function = 5;
+    Deposit     deposit = 1;
+    Withdrawal  withdrawal = 2;
+    Transfer    transfer = 3;
+    OpenAccount open_account = 4; // ADR-022: open a block of accounts
+    Function    function = 5;
   }
-  reserved 4;
   WaitLevel wait_level = 6;
 }
 
@@ -164,6 +161,14 @@ message Deposit {
   uint64 user_ref = 3; // Opaque external reference. Stored in WAL, not interpreted
   // by the ledger. Use this to link to your own database record
   // (e.g. an order ID, payment ID).
+}
+
+// OpenAccount opens `count` (>= 1) sequential accounts (ADR-022). The opened
+// ids are allocated from the current high-water; the first id is returned via
+// the transaction's AccountOpened record (query GetTransaction to read it).
+message OpenAccount {
+  uint32 count = 1; // Number of accounts to open. 0 is treated as 1.
+  uint64 user_ref = 2; // Opaque external reference, stored in the WAL.
 }
 
 // Withdrawal debits an account to the system sink.
@@ -246,6 +251,7 @@ message SubmitBatchAndWaitResponse {
 
 message GetBalanceRequest {
   uint64 account_id = 1; // Account to query. Returns 0 if never touched.
+  bool include_linked = 2; // ADR-022 §8: also return per-type linked-bucket balances.
 }
 
 message GetBalanceResponse {
@@ -255,6 +261,14 @@ message GetBalanceResponse {
   uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
   // this ID are reflected in the balance. The actual
   // last snapshot ID might be slightly higher.
+  repeated LinkedBalance linked = 3; // ADR-022 §8: per-type linked-bucket balances (if requested).
+  uint64 flags = 4; // ADR-022: the account's 8-lane flags word (lane 0 = status).
+}
+
+// A single linked bucket's balance, keyed by its program-defined type_id.
+message LinkedBalance {
+  uint32 type_id = 1;
+  int64 balance = 2;
 }
 
 message GetBalancesRequest {
@@ -389,28 +403,17 @@ message GetTransactionRequest {
 }
 
 message GetTransactionResponse {
-  uint64               tx_id = 1;
-  repeated TxEntryRecord entries = 2;
-  repeated TxLinkRecord  links = 3;
+  Transaction transaction = 1;
 }
 
-// TxEntryRecord represents a single debit or credit within a transaction.
-message TxEntryRecord {
-  uint64    account_id = 1;
-  uint64    amount = 2;
-  EntryKind kind = 3;
-  int64     computed_balance = 4;
+message Transaction {
+  WalEntry meta = 1;
+  repeated WalEntry items = 2;
 }
 
 enum EntryKind {
   CREDIT = 0;
   DEBIT = 1;
-}
-
-// TxLinkRecord represents a link between transactions (ADR-009).
-message TxLinkRecord {
-  uint64   to_tx_id = 1;  // Referenced transaction ID.
-  LinkKind kind = 2;  // Type of link relationship.
 }
 
 enum LinkKind {
@@ -442,13 +445,15 @@ enum WaitOutcome {
 
 message GetAccountHistoryRequest {
   uint64 account_id = 1;
-  uint64 from_tx_id = 2;  // 0 = latest
-  uint32 limit = 3;  // default 20, max 1000
+  uint64 from_tx_id = 2;  // 0 = latest; the backward scan starts here (newest→oldest).
+  uint64 to_tx_id = 3;  // oldest tx_id to include; the scan stops below it (0 = to the WAL start).
 }
 
 message GetAccountHistoryResponse {
-  repeated TxEntryRecord entries = 1;
-  uint64                 next_tx_id = 2;  // 0 = no more entries
+  repeated Transaction transactions = 1;
+  // Oldest tx_id the scan reached. To page further into the past, send this
+  // value back as `from_tx_id` in the next request.
+  uint64 scan_last_tx_id = 2;
 }
 
 // ---- ADR-014: Function Registry ----
@@ -493,20 +498,23 @@ message GetLogRequest {
 }
 
 message GetLogResponse {
-  repeated WalLogRecord records = 1;
+  repeated WalEntry records = 1;
   uint64 next_tx_id = 2;        // 0 = no more records in [from..to] on this node.
   uint64 last_commit_tx_id = 3; // node's last_commit_id at read time.
 }
 
 // WalLogRecord mirrors the in-memory WalEntry enum (storage::entities::WalEntry).
 // Field numbers 6 and 7 are retired (formerly WalSegmentHeader / WalSegmentSealed).
-message WalLogRecord {
+message WalEntry {
   oneof entry {
-    WalTxMetadata         metadata             = 1;
-    WalTxEntry            tx_entry             = 2;
-    WalTxLink             link                 = 3;
-    WalTxTerm             term                 = 4;
-    WalFunctionRegistered function_registered  = 5;
+    WalTxMetadata         metadata = 1;
+    WalTxEntry            tx_entry = 2;
+    WalTxLink             link = 3;
+    WalTxTerm             term = 4;
+    WalFunctionRegistered function_registered = 5;
+    WalAccountOpened      account_opened = 8;
+    WalAccountLinked      account_linked = 9;
+    WalAccountFlagsUpdated account_flags_updated = 10;
   }
 }
 
@@ -548,23 +556,42 @@ message WalFunctionRegistered {
   uint32 crc32c = 3; // 0 = unregister record
 }
 
+message WalAccountOpened {
+  uint64 begin_account_id = 1;
+  uint32 count = 2;
+  uint64 flags = 3;
+  uint64 user_ref = 4;
+}
+
+message WalAccountLinked {
+  uint64 parent_id = 1;
+  uint32 type_id = 2;
+  uint64 child_id = 3;
+}
+
+message WalAccountFlagsUpdated {
+  uint64 account_id = 1;
+  uint64 prev_flags = 2;
+  uint64 new_flags = 3;
+}
+
 // ---- Terms / election history query ----
 
 message GetTermsRequest {
   uint64 from_term = 1; // 0 = include from earliest term.
-  uint32 limit     = 2; // default 1000, server hard-cap 10000.
+  uint32 limit = 2; // default 1000, server hard-cap 10000.
 }
 
 message GetTermsResponse {
   repeated TermInfo terms = 1;       // ascending by term.
-  uint64   current_term  = 2;        // mirror.current_term() at read time.
-  uint64   next_term     = 3;        // 0 = no more; else first term not returned.
+  uint64   current_term = 2;        // mirror.current_term() at read time.
+  uint64   next_term = 3;        // 0 = no more; else first term not returned.
 }
 
 message TermInfo {
-  uint64 term             = 1;
-  uint64 start_tx_id      = 2; // 0 if no boundary committed (vote-only term).
-  uint64 voted_for        = 3; // this node's vote in this term; 0 = none granted.
-  bool   has_term_record  = 4; // true if term.log has a boundary for this term.
-  bool   has_vote_record  = 5; // true if vote.log has an entry for this term.
+  uint64 term = 1;
+  uint64 start_tx_id = 2; // 0 if no boundary committed (vote-only term).
+  uint64 voted_for = 3; // this node's vote in this term; 0 = none granted.
+  bool   has_term_record = 4; // true if term.log has a boundary for this term.
+  bool   has_vote_record = 5; // true if vote.log has an entry for this term.
 }

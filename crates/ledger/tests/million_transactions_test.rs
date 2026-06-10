@@ -10,6 +10,10 @@ fn million_deposits_final_balance() {
         ..LedgerConfig::temp()
     });
     ledger.start().unwrap();
+    // Account 1 must exist before deposits. open_accounts commits one extra tx
+    // (an AccountOpened record only — it touches no balance), so the account-1
+    // and SYSTEM (account 0) balance totals below are unchanged.
+    ledger.open_accounts(100);
 
     // Generate 1,000,000 deposit transactions of amount 1 into account 1
     let mut last_id = 0;

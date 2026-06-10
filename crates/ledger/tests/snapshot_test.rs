@@ -33,6 +33,7 @@ fn test_snapshot_creation() {
 
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(100); // accounts 1 and 2 must exist before deposits
 
     // Submit enough transactions to trigger at least one WAL segment seal
     for _ in 0..35_000 {
@@ -76,10 +77,10 @@ fn test_snapshot_creation() {
 
     let bin_data = fs::read(&snap_path).expect("snapshot file should be readable");
 
-    // Header: 36 bytes
+    // Header: 50 bytes (v3 — adds per-account flags + link table)
     assert!(
-        bin_data.len() >= 36,
-        "Snapshot must have at least 36-byte header"
+        bin_data.len() >= 50,
+        "Snapshot must have at least 50-byte v3 header"
     );
 
     // Validate magic
@@ -91,18 +92,30 @@ fn test_snapshot_creation() {
 
     // Validate version
     let version = bin_data[4];
-    assert_eq!(version, 1, "Snapshot version should be 1");
+    assert_eq!(version, 3, "Snapshot version should be 3 (flags + links)");
 
     // Validate segment_id > 0
     let segment_id = u32::from_le_bytes(bin_data[5..9].try_into().unwrap());
     assert!(segment_id > 0, "Snapshot segment_id should be > 0");
 
-    // account_count at offset 17 (after magic4+version1+segment_id4+last_tx_id8)
-    let account_count = u64::from_le_bytes(bin_data[17..25].try_into().unwrap());
+    // next_account_id at offset 17 (after magic4+version1+segment_id4+last_tx_id8).
+    // open_accounts(100) allocated ids 1..=100, so the high-water is 101.
+    let next_account_id = u64::from_le_bytes(bin_data[17..25].try_into().unwrap());
+    assert_eq!(
+        next_account_id, 101,
+        "Snapshot should persist the account allocator high-water"
+    );
+
+    // account_count at offset 25 (after next_account_id8)
+    let account_count = u64::from_le_bytes(bin_data[25..33].try_into().unwrap());
     assert!(
         account_count > 0,
         "Snapshot should have non-zero account count"
     );
+
+    // link_count at offset 33 (after account_count8) — none created here.
+    let link_count = u64::from_le_bytes(bin_data[33..41].try_into().unwrap());
+    assert_eq!(link_count, 0, "no links created in this test");
 
     // Verify .crc sidecar exists and has correct format
     let crc_name = snap_name.replace(".bin", ".crc");
@@ -172,6 +185,7 @@ fn test_snapshot_restore_correct_balances() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // account_id (42) must exist before deposits
 
         let mut last_id = 0u64;
         // Enough txs to trigger at least one seal → snapshot

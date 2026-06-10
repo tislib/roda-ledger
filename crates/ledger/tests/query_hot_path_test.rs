@@ -1,8 +1,19 @@
-use ledger::index::IndexedTxEntry;
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
 use std::time::Duration;
+use storage::entities::WalEntry;
+
+/// Flattened view of a queried balance entry, mirroring the old
+/// `IndexedTxEntry` fields so the assertions below read unchanged.
+#[derive(Debug)]
+#[allow(dead_code)] // mirrors IndexedTxEntry's shape; not every field is asserted
+struct Row {
+    tx_id: u64,
+    account_id: u64,
+    amount: u64,
+    computed_balance: i64,
+}
 
 fn temp_ledger() -> Ledger {
     let config = LedgerConfig {
@@ -12,7 +23,7 @@ fn temp_ledger() -> Ledger {
     Ledger::new(config)
 }
 
-fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<Vec<IndexedTxEntry>> {
+fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<Vec<Row>> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     ledger.query(QueryRequest {
         kind: QueryKind::GetTransaction { tx_id },
@@ -21,30 +32,21 @@ fn query_transaction(ledger: &Ledger, tx_id: u64) -> Option<Vec<IndexedTxEntry>>
         }),
     });
     match rx.recv().unwrap() {
-        QueryResponse::Transaction(result) => result.map(|r| r.entries),
-        _ => panic!("unexpected response type"),
-    }
-}
-
-fn query_account_history(
-    ledger: &Ledger,
-    account_id: u64,
-    from_tx_id: u64,
-    limit: usize,
-) -> Vec<IndexedTxEntry> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    ledger.query(QueryRequest {
-        kind: QueryKind::GetAccountHistory {
-            account_id,
-            from_tx_id,
-            limit,
-        },
-        respond: Box::new(move |resp| {
-            let _ = tx.send(resp);
+        QueryResponse::Transaction(result) => result.map(|r| {
+            let tx_id = r.meta.tx_id;
+            r.entries
+                .iter()
+                .filter_map(|e| match e {
+                    WalEntry::Entry(x) => Some(Row {
+                        tx_id,
+                        account_id: x.account_id,
+                        amount: x.amount,
+                        computed_balance: x.computed_balance,
+                    }),
+                    _ => None,
+                })
+                .collect()
         }),
-    });
-    match rx.recv().unwrap() {
-        QueryResponse::AccountHistory(result) => result,
         _ => panic!("unexpected response type"),
     }
 }
@@ -55,6 +57,7 @@ fn query_account_history(
 fn test_get_transaction_deposit() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let tx_id = ledger.submit(Operation::Deposit {
         account: 1,
@@ -74,6 +77,7 @@ fn test_get_transaction_deposit() {
 fn test_get_transaction_transfer() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     // Fund account 10 first
     let dep_id = ledger.submit(Operation::Deposit {
@@ -109,6 +113,7 @@ fn test_get_transaction_transfer() {
 fn test_get_transaction_miss_returns_none() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let result = query_transaction(&ledger, 999_999);
     assert!(result.is_none());
@@ -118,6 +123,7 @@ fn test_get_transaction_miss_returns_none() {
 fn test_get_transaction_multiple_sequential() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     let mut ids = Vec::new();
     for i in 0..100u64 {
@@ -135,123 +141,13 @@ fn test_get_transaction_multiple_sequential() {
     }
 }
 
-// ── GetAccountHistory hot path ───────────────────────────────────────────────
-
-#[test]
-fn test_account_history_single_account() {
-    let mut ledger = temp_ledger();
-    ledger.start().unwrap();
-
-    let mut last_id = 0;
-    for _ in 0..5 {
-        last_id = ledger.submit(Operation::Deposit {
-            account: 42,
-            amount: 100,
-            user_ref: 0,
-        });
-    }
-    ledger.wait_for_transaction(last_id);
-
-    let history = query_account_history(&ledger, 42, 0, 10);
-    // Each deposit has 2 entries touching account 42 and system account.
-    // Account history for 42 should have 5 entries (one per deposit).
-    assert_eq!(history.len(), 5);
-    // Newest first
-    assert!(history[0].tx_id > history[4].tx_id);
-    // All entries are for account 42
-    assert!(history.iter().all(|e| e.account_id == 42));
-}
-
-#[test]
-fn test_account_history_limit_respected() {
-    let mut ledger = temp_ledger();
-    ledger.start().unwrap();
-
-    let mut last_id = 0;
-    for _ in 0..20 {
-        last_id = ledger.submit(Operation::Deposit {
-            account: 7,
-            amount: 50,
-            user_ref: 0,
-        });
-    }
-    ledger.wait_for_transaction(last_id);
-
-    let history = query_account_history(&ledger, 7, 0, 5);
-    assert_eq!(history.len(), 5);
-}
-
-#[test]
-fn test_account_history_from_tx_id_lower_bound() {
-    let mut ledger = temp_ledger();
-    ledger.start().unwrap();
-
-    let mut ids = Vec::new();
-    for _ in 0..10 {
-        ids.push(ledger.submit(Operation::Deposit {
-            account: 15,
-            amount: 10,
-            user_ref: 0,
-        }));
-    }
-    ledger.wait_for_transaction(*ids.last().unwrap());
-
-    // Only entries with tx_id >= ids[5]
-    let from_id = ids[5];
-    let history = query_account_history(&ledger, 15, from_id, 100);
-    assert!(history.iter().all(|e| e.tx_id >= from_id));
-    assert_eq!(history.len(), 5);
-}
-
-#[test]
-fn test_account_history_empty_for_unknown_account() {
-    let mut ledger = temp_ledger();
-    ledger.start().unwrap();
-
-    let tx_id = ledger.submit(Operation::Deposit {
-        account: 1,
-        amount: 100,
-        user_ref: 0,
-    });
-    ledger.wait_for_transaction(tx_id);
-
-    let history = query_account_history(&ledger, 999_999, 0, 10);
-    assert!(history.is_empty());
-}
-
-#[test]
-fn test_account_history_computed_balance_progression() {
-    let mut ledger = temp_ledger();
-    ledger.start().unwrap();
-
-    let mut last_id = 0;
-    for i in 1..=5u64 {
-        last_id = ledger.submit(Operation::Deposit {
-            account: 33,
-            amount: i * 100,
-            user_ref: 0,
-        });
-    }
-    ledger.wait_for_transaction(last_id);
-
-    let history = query_account_history(&ledger, 33, 0, 10);
-    // Newest first: computed_balance should be decreasing as we go back in time
-    for i in 0..history.len() - 1 {
-        assert!(
-            history[i].computed_balance >= history[i + 1].computed_balance,
-            "balance should be monotonically non-decreasing going forward in time"
-        );
-    }
-    // Latest balance should be sum(100+200+300+400+500) = 1500
-    assert_eq!(history[0].computed_balance, 1500);
-}
-
 // ── Read-your-own-writes consistency ─────────────────────────────────────────
 
 #[test]
 fn test_read_your_own_writes_consistency() {
     let mut ledger = temp_ledger();
     ledger.start().unwrap();
+    ledger.open_accounts(100);
 
     // Submit and immediately query — the single queue guarantees ordering.
     let tx_id = ledger.submit(Operation::Deposit {

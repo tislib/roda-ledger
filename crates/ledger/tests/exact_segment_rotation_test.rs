@@ -35,6 +35,11 @@ fn test_transaction_count_per_segment_respected() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        // Open account 1 before depositing. This commits tx 1, becoming the first
+        // tx of segment 1; rotation is span-based (last_tx - segment_start), so each
+        // sealed segment still holds exactly tx_per_segment transactions and the
+        // segment count is unchanged.
+        ledger.open_accounts(100);
 
         let mut last_id = 0u64;
         for i in 0..total_txs {

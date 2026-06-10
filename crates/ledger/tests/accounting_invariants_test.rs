@@ -8,12 +8,12 @@ use storage::entities::FailReason;
 fn test_global_zero_sum() {
     let max_accounts = 100usize;
     let config = LedgerConfig {
-        max_accounts,
         seal_check_internal: Duration::from_millis(10),
         ..LedgerConfig::temp()
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(50); // ids 1..=50 (test uses 1..20); N < max_accounts (100)
 
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -66,6 +66,7 @@ fn test_insufficient_funds_rejected() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test uses account 5
 
     let dep_id = ledger.submit(Operation::Deposit {
         account: 5,
@@ -101,6 +102,7 @@ fn test_transfer_conserves_balances() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test funds/transfers among 1..=5
 
     // Fund accounts 1..=5
     let mut last_id = 0u64;
@@ -157,6 +159,7 @@ fn test_deposit_creates_matching_debit_credit() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test uses account 7
 
     let id = ledger.submit(Operation::Deposit {
         account: 7,

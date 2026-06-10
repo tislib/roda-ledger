@@ -11,7 +11,16 @@ use std::path::Path;
 pub struct SnapshotData {
     pub segment_id: u32,
     pub last_tx_id: u64,
-    pub balances: Vec<(u64, i64)>,
+    /// Account allocator high-water at the snapshot boundary (ADR-022): the
+    /// next id to allocate. Reconstructs OPEN status for opened-but-unfunded
+    /// accounts that the balance set alone can't (zero-balance accounts are
+    /// not persisted). Version-1 snapshots default this to 1.
+    pub next_account_id: u64,
+    /// Existent accounts at the boundary: `(id, balance, flags)` (ADR-022 §5).
+    /// Persisting flags keeps PROGRAMMED buckets from recovering as OPEN.
+    pub accounts: Vec<(u64, i64, u64)>,
+    /// Parent→bucket links: `(parent_id, type_id, child_id)` (ADR-022 §3).
+    pub links: Vec<(u64, u16, u64)>,
 }
 
 /// In-memory representation of a function snapshot (internal.md §20.6).
@@ -24,8 +33,8 @@ pub struct FunctionSnapshotData {
 }
 
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
-const SNAPSHOT_VERSION: u8 = 1;
-const SNAPSHOT_HEADER_SIZE: usize = 36;
+const SNAPSHOT_VERSION: u8 = 3; // v3 adds per-account flags + the link table (ADR-022)
+const SNAPSHOT_HEADER_SIZE: usize = 50; // v2 was 44; +8 link_count, pad 6→4
 
 const FUNCTION_SNAPSHOT_MAGIC: u32 = 0x46554E43; // "FUNC"
 const FUNCTION_SNAPSHOT_VERSION: u8 = 1;
@@ -34,12 +43,18 @@ const FUNCTION_RECORD_NAME_LEN: usize = 32;
 const FUNCTION_RECORD_SIZE: usize = FUNCTION_RECORD_NAME_LEN + 2 + 4; // 38 bytes
 
 impl Segment {
-    /// Writes a compressed snapshot for this segment to disk.
-    /// Uses temp files + atomic rename for crash safety.
-    /// Format (ADR-006): magic(4) + version(1) + segment_id(4) + checkpoint_id(8)
-    ///                   + account_count(8) + compressed(1) + pad(6) + data_crc32c(4)
-    ///                   + lz4_body
-    pub fn save_snapshot(&self, records: &[(u64, i64)]) -> std::io::Result<()> {
+    /// Writes a compressed snapshot for this segment to disk (temp files plus
+    /// atomic rename for crash safety). Format (ADR-006/ADR-022 v3): a header of
+    /// magic(4), version(1), segment_id(4), checkpoint_id(8), next_account_id(8),
+    /// account_count(8), link_count(8), compressed(1), pad(4), data_crc32c(4),
+    /// then an lz4 body of account_count×(id:8, balance:8, flags:8) followed by
+    /// link_count×(parent:8, type_id:2, child:8).
+    pub fn save_snapshot(
+        &self,
+        next_account_id: u64,
+        accounts: &[(u64, i64, u64)],
+        links: &[(u64, u16, u64)],
+    ) -> std::io::Result<()> {
         let segment_id = self.id();
         let data_dir = Path::new(self.data_dir());
         let bin_tmp = snapshot_bin_tmp_path(data_dir, segment_id);
@@ -47,14 +62,22 @@ impl Segment {
         let bin_final = snapshot_bin_path(data_dir, segment_id);
         let crc_final = snapshot_crc_path(data_dir, segment_id);
 
-        let account_count = records.len() as u64;
+        let account_count = accounts.len() as u64;
+        let link_count = links.len() as u64;
         let checkpoint_id = segment_id as u64;
 
-        // 1. Serialize records to raw bytes (account_id: u64 LE + balance: i64 LE)
-        let mut raw_data: Vec<u8> = Vec::with_capacity(records.len() * 16);
-        for (account_id, balance) in records {
+        // 1. Serialize: accounts (id:u64 LE, balance:i64 LE, flags:u64 LE) then
+        //    links (parent:u64 LE, type_id:u16 LE, child:u64 LE).
+        let mut raw_data: Vec<u8> = Vec::with_capacity(accounts.len() * 24 + links.len() * 18);
+        for (account_id, balance, flags) in accounts {
             raw_data.extend_from_slice(&account_id.to_le_bytes());
             raw_data.extend_from_slice(&balance.to_le_bytes());
+            raw_data.extend_from_slice(&flags.to_le_bytes());
+        }
+        for (parent_id, type_id, child_id) in links {
+            raw_data.extend_from_slice(&parent_id.to_le_bytes());
+            raw_data.extend_from_slice(&type_id.to_le_bytes());
+            raw_data.extend_from_slice(&child_id.to_le_bytes());
         }
 
         // 2. Compute data CRC over raw (uncompressed) data
@@ -63,15 +86,17 @@ impl Segment {
         // 3. LZ4 compress (always mandatory)
         let body_data = lz4_flex::compress_prepend_size(&raw_data);
 
-        // 4. Build 36-byte header
+        // 4. Build header
         let mut header = Vec::with_capacity(SNAPSHOT_HEADER_SIZE);
         header.extend_from_slice(&SNAPSHOT_MAGIC.to_le_bytes()); // 4
         header.push(SNAPSHOT_VERSION); // 1
         header.extend_from_slice(&segment_id.to_le_bytes()); // 4
         header.extend_from_slice(&checkpoint_id.to_le_bytes()); // 8
+        header.extend_from_slice(&next_account_id.to_le_bytes()); // 8
         header.extend_from_slice(&account_count.to_le_bytes()); // 8
+        header.extend_from_slice(&link_count.to_le_bytes()); // 8
         header.push(1u8); // 1  compressed=true
-        header.extend_from_slice(&[0u8; 6]); // 6  pad
+        header.extend_from_slice(&[0u8; 4]); // 4  pad
         header.extend_from_slice(&data_crc32c.to_le_bytes()); // 4
         debug_assert_eq!(header.len(), SNAPSHOT_HEADER_SIZE);
 
@@ -294,14 +319,20 @@ fn load_snapshot_for_segment(
     let last_tx_id = u64::from_le_bytes(bin_data[offset..offset + 8].try_into().unwrap());
     offset += 8;
 
+    let next_account_id = u64::from_le_bytes(bin_data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
     let account_count = u64::from_le_bytes(bin_data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    let link_count = u64::from_le_bytes(bin_data[offset..offset + 8].try_into().unwrap());
     offset += 8;
 
     // compressed flag — always 1 for newly written snapshots; handle 0 for backward compat
     let compressed = bin_data[offset] != 0;
     offset += 1;
 
-    offset += 6; // skip pad
+    offset += 4; // skip pad
 
     let data_crc32c = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
     offset += 4;
@@ -326,7 +357,7 @@ fn load_snapshot_for_segment(
         return Ok(None);
     }
 
-    let expected_data_len = account_count as usize * 16;
+    let expected_data_len = account_count as usize * 24 + link_count as usize * 18;
     if record_data.len() != expected_data_len {
         warn!(
             "{}: data length mismatch (expected={}, got={})",
@@ -337,22 +368,49 @@ fn load_snapshot_for_segment(
         return Ok(None);
     }
 
-    let mut balances = Vec::with_capacity(account_count as usize);
     let mut rec_offset = 0;
+    let mut accounts = Vec::with_capacity(account_count as usize);
     for _ in 0..account_count {
         let account_id =
             u64::from_le_bytes(record_data[rec_offset..rec_offset + 8].try_into().unwrap());
-        rec_offset += 8;
-        let balance =
-            i64::from_le_bytes(record_data[rec_offset..rec_offset + 8].try_into().unwrap());
-        rec_offset += 8;
-        balances.push((account_id, balance));
+        let balance = i64::from_le_bytes(
+            record_data[rec_offset + 8..rec_offset + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let flags = u64::from_le_bytes(
+            record_data[rec_offset + 16..rec_offset + 24]
+                .try_into()
+                .unwrap(),
+        );
+        rec_offset += 24;
+        accounts.push((account_id, balance, flags));
+    }
+
+    let mut links = Vec::with_capacity(link_count as usize);
+    for _ in 0..link_count {
+        let parent_id =
+            u64::from_le_bytes(record_data[rec_offset..rec_offset + 8].try_into().unwrap());
+        let type_id = u16::from_le_bytes(
+            record_data[rec_offset + 8..rec_offset + 10]
+                .try_into()
+                .unwrap(),
+        );
+        let child_id = u64::from_le_bytes(
+            record_data[rec_offset + 10..rec_offset + 18]
+                .try_into()
+                .unwrap(),
+        );
+        rec_offset += 18;
+        links.push((parent_id, type_id, child_id));
     }
 
     Ok(Some(SnapshotData {
         segment_id,
         last_tx_id,
-        balances,
+        next_account_id,
+        accounts,
+        links,
     }))
 }
 
@@ -567,5 +625,24 @@ mod tests {
             .save_function_snapshot(&[(bad_name, 1, 1)])
             .expect_err("should reject long name");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_accounts_flags_and_links() {
+        let (seg, _td) = temp_segment();
+        // (id, balance, flags) — flags lane 0: 1 = OPEN, 2 = PROGRAMMED.
+        let accounts = vec![(1u64, 100i64, 1u64), (3u64, -50i64, 2u64)];
+        let links = vec![(1u64, 7u16, 3u64)];
+        seg.save_snapshot(777, &accounts, &links).expect("save");
+        assert!(seg.has_snapshot());
+
+        let loaded = seg.load_snapshot().expect("load").expect("data present");
+        assert_eq!(loaded.segment_id, seg.id());
+        assert_eq!(
+            loaded.next_account_id, 777,
+            "v3 round-trips next_account_id"
+        );
+        assert_eq!(loaded.accounts, accounts, "balances + flags round-trip");
+        assert_eq!(loaded.links, links, "links round-trip");
     }
 }

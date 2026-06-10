@@ -10,7 +10,10 @@
 //! shape so callers can treat the two parsers interchangeably.
 
 use crate::constants::WAL_RECORD_SIZE;
-use crate::entities::{FunctionRegistered, TxEntry, TxLink, TxMetadata, TxTerm, WalEntryKind};
+use crate::entities::{
+    AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, TxEntry, TxLink,
+    TxMetadata, TxTerm, WalEntryKind,
+};
 
 /// Borrowed view of a single WAL record. Lifetime is tied to the
 /// backing byte slice; nothing here owns its data.
@@ -21,6 +24,9 @@ pub enum WalEntryRef<'a> {
     Link(&'a TxLink),
     FunctionRegistered(&'a FunctionRegistered),
     Term(&'a TxTerm),
+    AccountOpened(&'a AccountOpened),
+    AccountLinked(&'a AccountLinked),
+    AccountFlagsUpdated(&'a AccountFlagsUpdated),
 }
 
 /// Decode a single 40-byte WAL record without copying. The returned
@@ -52,6 +58,15 @@ pub fn read_entry(data: &[u8]) -> Result<WalEntryRef<'_>, std::io::Error> {
             Ok(WalEntryRef::FunctionRegistered(bytemuck::from_bytes(rec)))
         }
         k if k == WalEntryKind::TxTerm as u8 => Ok(WalEntryRef::Term(bytemuck::from_bytes(rec))),
+        k if k == WalEntryKind::AccountOpened as u8 => {
+            Ok(WalEntryRef::AccountOpened(bytemuck::from_bytes(rec)))
+        }
+        k if k == WalEntryKind::AccountLinked as u8 => {
+            Ok(WalEntryRef::AccountLinked(bytemuck::from_bytes(rec)))
+        }
+        k if k == WalEntryKind::AccountFlagsUpdated as u8 => {
+            Ok(WalEntryRef::AccountFlagsUpdated(bytemuck::from_bytes(rec)))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown WAL record kind={}", kind),
@@ -286,6 +301,9 @@ mod tests {
                 WalEntryRef::Link(_) => WalEntryKind::Link as u8,
                 WalEntryRef::FunctionRegistered(_) => WalEntryKind::FunctionRegistered as u8,
                 WalEntryRef::Term(_) => WalEntryKind::TxTerm as u8,
+                WalEntryRef::AccountOpened(_) => WalEntryKind::AccountOpened as u8,
+                WalEntryRef::AccountLinked(_) => WalEntryKind::AccountLinked as u8,
+                WalEntryRef::AccountFlagsUpdated(_) => WalEntryKind::AccountFlagsUpdated as u8,
             })
             .collect();
         assert_eq!(

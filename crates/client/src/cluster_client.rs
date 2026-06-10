@@ -282,6 +282,17 @@ impl ClusterClient {
             .await
     }
 
+    pub async fn open_account_and_wait(
+        &self,
+        count: u32,
+        user_ref: u64,
+        wait_level: proto::WaitLevel,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .open_account_and_wait(count, user_ref, wait_level)
+            .await
+    }
+
     pub async fn withdraw_and_wait(
         &self,
         account: u64,
@@ -451,10 +462,11 @@ impl ClusterClient {
         &self,
         account_id: u64,
         from_tx_id: u64,
-        limit: u32,
+        to_tx_id: u64,
     ) -> Result<AccountHistory> {
         self.with_read_retry("get_account_history", move |c| async move {
-            c.get_account_history(account_id, from_tx_id, limit).await
+            c.get_account_history(account_id, from_tx_id, to_tx_id)
+                .await
         })
         .await
     }
@@ -661,6 +673,18 @@ impl ClusterLeaderClient {
             .await
     }
 
+    pub async fn open_account_and_wait(
+        &self,
+        count: u32,
+        user_ref: u64,
+        wait_level: proto::WaitLevel,
+    ) -> Result<SubmitResult> {
+        self.with_leader_retry("open_account_and_wait", move |c| async move {
+            c.open_account_and_wait(count, user_ref, wait_level).await
+        })
+        .await
+    }
+
     pub async fn withdraw_and_wait(
         &self,
         account: u64,
@@ -824,10 +848,11 @@ impl ClusterLeaderClient {
         &self,
         account_id: u64,
         from_tx_id: u64,
-        limit: u32,
+        to_tx_id: u64,
     ) -> Result<AccountHistory> {
         self.with_leader_retry("get_account_history", move |c| async move {
-            c.get_account_history(account_id, from_tx_id, limit).await
+            c.get_account_history(account_id, from_tx_id, to_tx_id)
+                .await
         })
         .await
     }

@@ -12,7 +12,7 @@
 //!   dispatcher arm — never on the hot transaction path.
 //!
 //! - [`WasmRuntimeEngine`] — per-Transactor execution layer. Owns:
-//!   - a long-lived `Store<Rc<RefCell<TransactorState>>>` — **not**
+//!   - a long-lived `Store<Rc<RefCell<TransactorComputer>>>` — **not**
 //!     re-created per call and not per registration change;
 //!   - a lazy per-name [`FunctionCaller`] cache tagged with the global
 //!     `update_seq` at which it was last verified. On every
@@ -21,13 +21,13 @@
 //!     global wipe, unrelated cache entries are untouched.
 //!   - host functions read the transactor state via
 //!     `caller.data().borrow_mut()` — no tx_id is carried through the
-//!     wasmtime boundary; the transactor calls [`TransactorState::init`]
+//!     wasmtime boundary; the transactor calls [`TransactorComputer::init`]
 //!     once per transaction and state methods pick the current id up
 //!     from the field.
 //!
 //! No `unsafe`, no raw pointers, no generics.
 
-use crate::transactor::TransactorState;
+use crate::transactor::TransactorComputer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -57,10 +57,10 @@ type ExecTypedFunc = TypedFunc<(i64, i64, i64, i64, i64, i64, i64, i64), i32>;
 
 /// Store data threaded through wasmtime host calls: the shared mutable
 /// transactor state. The transactor writes its per-transaction id into
-/// the state via [`TransactorState::init`] before calling
+/// the state via [`TransactorComputer::init`] before calling
 /// [`FunctionCaller::execute`], so no `tx_id` ever crosses the wasmtime
 /// boundary.
-pub type WasmStoreData = Rc<RefCell<TransactorState>>;
+pub type WasmStoreData = Rc<RefCell<TransactorComputer>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmRuntime — shared compiled-module registry
@@ -379,6 +379,57 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             },
         )
         .expect("register ledger.get_balance");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "linked_account",
+            |caller: Caller<'_, WasmStoreData>, account_id: u64, type_id: u32| -> u64 {
+                // Get-or-create the bucket linked to `account_id` under
+                // `type_id` (ADR-022 §6); returns the child account id.
+                caller
+                    .data()
+                    .borrow_mut()
+                    .linked_account(account_id, type_id as u16)
+            },
+        )
+        .expect("register ledger.linked_account");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "get_flag",
+            |caller: Caller<'_, WasmStoreData>, account_id: u64, lane: u32| -> u32 {
+                caller
+                    .data()
+                    .borrow()
+                    .get_account_flag(account_id, lane as u8) as u32
+            },
+        )
+        .expect("register ledger.get_flag");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "has_flag",
+            |caller: Caller<'_, WasmStoreData>, account_id: u64, lane: u32, value: u32| -> u32 {
+                caller
+                    .data()
+                    .borrow()
+                    .has_account_flag(account_id, lane as u8, value as u8) as u32
+            },
+        )
+        .expect("register ledger.has_flag");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "set_flag",
+            |caller: Caller<'_, WasmStoreData>, account_id: u64, lane: u32, value: u32| {
+                // ADR-022 §6: WASM may set any lane, including the status lane (0).
+                caller
+                    .data()
+                    .borrow_mut()
+                    .set_account_flag(account_id, lane as u8, value as u8);
+            },
+        )
+        .expect("register ledger.set_flag");
 
     linker
 }
@@ -453,7 +504,7 @@ impl FunctionCaller {
 /// registrations.
 pub struct WasmRuntimeEngine {
     runtime: Arc<WasmRuntime>,
-    state: Rc<RefCell<TransactorState>>,
+    state: Rc<RefCell<TransactorComputer>>,
     /// Wrapped in `Rc<RefCell<>>` so every produced [`FunctionCaller`]
     /// can carry an `Rc::clone` and `execute(params)` without the
     /// caller threading the store through the call site.
@@ -465,7 +516,7 @@ impl WasmRuntimeEngine {
     /// Build a new per-Transactor engine. Creates the long-lived `Store`
     /// holding an `Rc::clone(&state)` so every host call sees the same
     /// mutable transactor state.
-    pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<TransactorState>>) -> Self {
+    pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<TransactorComputer>>) -> Self {
         let store = Rc::new(RefCell::new(Store::new(
             runtime.engine(),
             Rc::clone(&state),
@@ -554,10 +605,10 @@ impl WasmRuntimeEngine {
         self.caller(name).is_some()
     }
 
-    /// Shared reference to the `TransactorState` handle held by the
+    /// Shared reference to the `TransactorComputer` handle held by the
     /// engine's Store. Useful for tests.
     #[inline]
-    pub fn state(&self) -> &Rc<RefCell<TransactorState>> {
+    pub fn state(&self) -> &Rc<RefCell<TransactorComputer>> {
         &self.state
     }
 

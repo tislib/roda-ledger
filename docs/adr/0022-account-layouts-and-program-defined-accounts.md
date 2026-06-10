@@ -162,22 +162,12 @@ GetBalance { account_id, include_linked: bool = false }
 ### Negative
 - Breaking on-disk and wire format (acceptable: pre-production, no users). Every account now requires a creation record; benchmarks/tests must `OpenAccount` first.
 - Per-account memory roughly doubles (8 B → 16 B) — touches ADR-002's memory claims.
-- The transactor's `rollback()` must be extended to reverse account-layout mutations (allocator, cell flags, link map), not just balances.
-- `linked_account` lets a program grow the account space implicitly; bounded by `max_accounts` (fails gracefully) but, absent WASM fuel metering, a per-account link cap is advisable.
-- Account ids are `u64`; the id space is effectively inexhaustible.
+- `linked_account` lets a program grow the account space implicitly;
 
 ### Neutral
 - Two distinct creation paths (user `OpenAccount` vs. program `linked_account`).
 - Transactor links use a `HashMap`, the snapshot uses an ordered `SkipMap` — intentional asymmetry (point-resolve vs. enumerate).
 - Eventual consistency for live reads becomes an explicit, relied-upon property.
-
-## Open Questions
-- **Status-lane guard:** flags are WASM-only (no user op; users write a WASM function to manipulate flags). Remaining question: whether the status lane (0) is guarded from WASM self-modification (e.g. a program flipping a bucket's own `PROGRAMMED`/frozen state), or WASM has full control.
-- **Auto-created bucket flags:** bare `PROGRAMMED`, or inherit the parent's currency/type lanes.
-- **Resolve-only variant:** a non-creating `linked_account_opt` (returns 0 if absent) for conditional logic / read paths.
-- **Runaway guard:** a per-account link cap (ties to the absent WASM fuel metering).
-- **Partial flag updates:** an optional `mask: u64` on `AccountFlagsUpdated` for lane-preserving updates.
-- **Naming:** final names for records, statuses (`PROGRAMMED` vs `INTERNAL`), and host functions.
 
 ## Implementation status / deviations
 - **Account ids stay `u64` (not `u32`).** The §1/§2 draft narrowed ids to `u32` for memory; we kept `u64` — the per-account saving wasn't worth the churn across the storage records, transactor, snapshot, seal, gRPC wire, and every test. No `< 2^32` wire validation.

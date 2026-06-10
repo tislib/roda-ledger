@@ -40,6 +40,7 @@ fn setup_ledger(dir: &str) -> i64 {
     let config = make_config(dir);
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test deposits into ACCOUNT_ID (7)
 
     let mut last_id = 0u64;
     for _ in 0..NUM_TRANSACTIONS {

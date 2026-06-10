@@ -3,6 +3,7 @@ use crate::ledger_slot::LedgerSlot;
 use ::proto::ledger as proto;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transaction::Operation;
+use ledger::transactor_computer::STATUS_PROGRAMMED;
 use spdlog::{trace, warn};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -227,12 +228,35 @@ impl proto::ledger_server::Ledger for LedgerHandler {
     ) -> Result<Response<proto::GetBalanceResponse>, Status> {
         let req = request.into_inner();
         let ledger = self.ledger.current();
+        // Read guard (ADR-022 §8): PROGRAMMED buckets hold program-internal
+        // money and are not directly client-queryable. SYSTEM (id 0) stays
+        // observable — it's the well-known zero-sum counterparty.
+        let flags = ledger.get_flags(req.account_id);
+        if (flags & 0xFF) as u8 == STATUS_PROGRAMMED {
+            return Err(Status::failed_precondition(
+                "account is a PROGRAMMED bucket and not directly queryable",
+            ));
+        }
         let balance = ledger.get_balance(req.account_id);
         let last_snapshot_tx_id = ledger.last_snapshot_id();
+        let linked = if req.include_linked {
+            ledger
+                .linked_balances(req.account_id)
+                .into_iter()
+                .map(|(type_id, balance)| proto::LinkedBalance {
+                    type_id: type_id as u32,
+                    balance,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(Response::new(proto::GetBalanceResponse {
             balance,
             last_snapshot_tx_id,
+            linked,
+            flags,
         }))
     }
 
@@ -361,28 +385,8 @@ impl proto::ledger_server::Ledger for LedgerHandler {
 
         match rx.recv() {
             Ok(QueryResponse::Transaction(Some(result))) => {
-                let entry_records: Vec<proto::TxEntryRecord> = result
-                    .entries
-                    .iter()
-                    .map(|e| proto::TxEntryRecord {
-                        account_id: e.account_id,
-                        amount: e.amount,
-                        kind: e.kind as i32,
-                        computed_balance: e.computed_balance,
-                    })
-                    .collect();
-                let link_records: Vec<proto::TxLinkRecord> = result
-                    .links
-                    .iter()
-                    .map(|l| proto::TxLinkRecord {
-                        to_tx_id: l.to_tx_id,
-                        kind: l.kind as i32,
-                    })
-                    .collect();
                 Ok(Response::new(proto::GetTransactionResponse {
-                    tx_id,
-                    entries: entry_records,
-                    links: link_records,
+                    transaction: Some(crate::mapping::transaction_to_proto(result)),
                 }))
             }
             Ok(QueryResponse::Transaction(None)) => Err(Status::not_found("transaction not found")),
@@ -394,50 +398,23 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         &self,
         request: Request<proto::GetAccountHistoryRequest>,
     ) -> Result<Response<proto::GetAccountHistoryResponse>, Status> {
+        // WalScanner does a backward disk scan — run it on a blocking thread.
         let req = request.into_inner();
-        let limit = if req.limit == 0 {
-            20
-        } else {
-            req.limit.min(1000)
-        } as usize;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-
-        self.ledger.current().query(QueryRequest {
-            kind: QueryKind::GetAccountHistory {
-                account_id: req.account_id,
-                from_tx_id: req.from_tx_id,
-                limit,
-            },
-            respond: Box::new(move |resp| {
-                let _ = tx.send(resp);
-            }),
-        });
-
-        match rx.recv() {
-            Ok(QueryResponse::AccountHistory(entries)) => {
-                let next_tx_id = entries.last().map_or(0, |e| {
-                    if e.prev_link == 0 {
-                        0
-                    } else {
-                        e.tx_id.saturating_sub(1)
-                    }
-                });
-                let entry_records: Vec<proto::TxEntryRecord> = entries
-                    .iter()
-                    .map(|e| proto::TxEntryRecord {
-                        account_id: e.account_id,
-                        amount: e.amount,
-                        kind: e.kind as i32,
-                        computed_balance: e.computed_balance,
-                    })
-                    .collect();
-                Ok(Response::new(proto::GetAccountHistoryResponse {
-                    entries: entry_records,
-                    next_tx_id,
-                }))
-            }
-            _ => Err(Status::internal("query failed")),
-        }
+        let ledger = self.ledger.current();
+        let history = tokio::task::spawn_blocking(move || {
+            ledger.get_account_history(req.account_id, req.from_tx_id, req.to_tx_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("account history scan failed: {e}")))?;
+        let transactions = history
+            .transactions
+            .into_iter()
+            .map(crate::mapping::transaction_to_proto)
+            .collect();
+        Ok(Response::new(proto::GetAccountHistoryResponse {
+            transactions,
+            scan_last_tx_id: history.scan_last_tx_id,
+        }))
     }
 
     // ------- WASM function registry ---------------------------------------

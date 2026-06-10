@@ -10,6 +10,9 @@ pub enum WalEntryKind {
     Link = 4,
     FunctionRegistered = 5,
     TxTerm = 6,
+    AccountOpened = 7,
+    AccountLinked = 8,
+    AccountFlagsUpdated = 9,
 }
 
 #[repr(u8)]
@@ -32,7 +35,8 @@ impl FailReason {
     pub const ZERO_SUM_VIOLATION: Self = Self(3);
     pub const ENTRY_LIMIT_EXCEEDED: Self = Self(4);
     pub const INVALID_OPERATION: Self = Self(5);
-    pub const ACCOUNT_LIMIT_EXCEEDED: Self = Self(6);
+    // 6 retired: ACCOUNT_LIMIT_EXCEEDED removed — u32-id-space exhaustion is
+    // unreachable in practice (>50GB), so the allocator panics instead.
     pub const DUPLICATE: Self = Self(7);
     // 8–127 reserved for future standard reasons
     // 128–255 user-defined custom reasons
@@ -226,6 +230,93 @@ pub struct TxTerm {
     pub _pad1: [u8; 12], // 12 @ 28 — pad to 40
 } // total: 40 bytes
 
+/// Account-layout WAL record: brings a contiguous range of accounts into
+/// existence with an initial `flags` word (status lane = OPEN). Written as a
+/// follower in the trailer layout, like `TxEntry`. Carries `user_ref` so the
+/// originating request is identifiable from the record alone.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct AccountOpened {
+    pub entry_type: u8,        // 1 @ 0  — WalEntryKind::AccountOpened (7)
+    pub _pad: [u8; 3],         // 3 @ 1
+    pub count: u32,            // 4 @ 4  — number of accounts opened (>= 1)
+    pub begin_account_id: u64, // 8 @ 8  — first id in the contiguous range
+    pub flags: u64,            // 8 @ 16 — initial flags applied to every account in the range
+    pub user_ref: u64,         // 8 @ 24 — client request reference
+    pub _pad2: [u8; 8],        // 8 @ 32 — pad to 40
+} // total: 40 bytes
+
+impl AccountOpened {
+    pub fn new(begin_account_id: u64, count: u32, flags: u64, user_ref: u64) -> Self {
+        Self {
+            entry_type: WalEntryKind::AccountOpened as u8,
+            _pad: [0; 3],
+            count,
+            begin_account_id,
+            flags,
+            user_ref,
+            _pad2: [0; 8],
+        }
+    }
+}
+
+/// Account-layout WAL record: links a bucket (`child_id`) to a `parent_id`
+/// under a program-defined `type_id` (ADR-022 §3). Written as a follower in
+/// the trailer layout, emitted by `linked_account`'s get-or-create path
+/// alongside the bucket's `AccountOpened`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct AccountLinked {
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::AccountLinked (8)
+    pub _pad: [u8; 1],   // 1 @ 1
+    pub type_id: u16,    // 2 @ 2  — program-defined bucket type (HOLD, BONUS, …)
+    pub _pad2: [u8; 4],  // 4 @ 4  — align to 8
+    pub parent_id: u64,  // 8 @ 8
+    pub child_id: u64,   // 8 @ 16 — the linked bucket account
+    pub _pad3: [u8; 16], // 16 @ 24 — pad to 40
+} // total: 40 bytes
+
+impl AccountLinked {
+    pub fn new(parent_id: u64, type_id: u16, child_id: u64) -> Self {
+        Self {
+            entry_type: WalEntryKind::AccountLinked as u8,
+            _pad: [0; 1],
+            type_id,
+            _pad2: [0; 4],
+            parent_id,
+            child_id,
+            _pad3: [0; 16],
+        }
+    }
+}
+
+/// Account-layout WAL record: an in-place flags mutation (ADR-022 §4), emitted
+/// by the WASM `set_flag` host fn. Carries the prior and resulting 8-lane flags
+/// word — replay applies `new_flags`; transactor rollback restores `prev_flags`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct AccountFlagsUpdated {
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::AccountFlagsUpdated (9)
+    pub _pad: [u8; 7],   // 7 @ 1  — align to 8
+    pub account_id: u64, // 8 @ 8
+    pub prev_flags: u64, // 8 @ 16
+    pub new_flags: u64,  // 8 @ 24
+    pub _pad2: [u8; 8],  // 8 @ 32 — pad to 40
+} // total: 40 bytes
+
+impl AccountFlagsUpdated {
+    pub fn new(account_id: u64, prev_flags: u64, new_flags: u64) -> Self {
+        Self {
+            entry_type: WalEntryKind::AccountFlagsUpdated as u8,
+            _pad: [0; 7],
+            account_id,
+            prev_flags,
+            new_flags,
+            _pad2: [0; 8],
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalEntry {
     Metadata(TxMetadata),
@@ -233,6 +324,9 @@ pub enum WalEntry {
     Link(TxLink),
     FunctionRegistered(FunctionRegistered),
     Term(TxTerm),
+    AccountOpened(AccountOpened),
+    AccountLinked(AccountLinked),
+    AccountFlagsUpdated(AccountFlagsUpdated),
 }
 
 impl WalEntry {
@@ -243,8 +337,20 @@ impl WalEntry {
             WalEntry::Link(_) => WalEntryKind::Link,
             WalEntry::FunctionRegistered(_) => WalEntryKind::FunctionRegistered,
             WalEntry::Term(_) => WalEntryKind::TxTerm,
+            WalEntry::AccountOpened(_) => WalEntryKind::AccountOpened,
+            WalEntry::AccountLinked(_) => WalEntryKind::AccountLinked,
+            WalEntry::AccountFlagsUpdated(_) => WalEntryKind::AccountFlagsUpdated,
         }
     }
+}
+
+/// A committed transaction reconstructed from the WAL: its closing `TxMetadata`
+/// plus the follower entries that precede it (in forward / file order). Produced
+/// by `WalScanner` and the query-index path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedTransaction {
+    pub meta: TxMetadata,
+    pub entries: Vec<WalEntry>,
 }
 
 // Safety checks for bytemuck
@@ -261,3 +367,6 @@ const _: () = assert!(std::mem::size_of::<TxEntry>() == 40);
 const _: () = assert!(std::mem::size_of::<TxLink>() == 40);
 const _: () = assert!(std::mem::size_of::<FunctionRegistered>() == 40);
 const _: () = assert!(std::mem::size_of::<TxTerm>() == 40);
+const _: () = assert!(std::mem::size_of::<AccountOpened>() == 40);
+const _: () = assert!(std::mem::size_of::<AccountLinked>() == 40);
+const _: () = assert!(std::mem::size_of::<AccountFlagsUpdated>() == 40);

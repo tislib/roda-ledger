@@ -32,6 +32,7 @@ fn test_rapid_rotation_many_segments() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // account 1 must exist before deposits
 
         let mut last_id = 0u64;
         for _ in 0..total {
@@ -122,6 +123,7 @@ fn test_concurrent_writes_during_rotation() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(100); // account 1 must exist before deposits
     let ledger = Arc::new(ledger);
 
     let num_threads = 4;
@@ -179,6 +181,7 @@ fn test_seal_crc_integrity() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // account 1 must exist before deposits
 
         let mut last_id = 0u64;
         for _ in 0..100_000 {
@@ -258,6 +261,7 @@ fn test_snapshot_at_segment_boundary() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // account 1 must exist before deposits
 
         // Generate enough data for 6+ segments (~120K deposits at 1MB segments)
         let mut last_id = 0u64;

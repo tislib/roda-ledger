@@ -250,6 +250,7 @@ fn multiple_functions_listed_independently() {
 #[test]
 fn named_succeeds_after_registration() {
     let ledger = start_ledger();
+    ledger.open_accounts(20); // ids 1..=20 (uses 10, 20)
     let binary = compile(TRANSFER_WAT);
     ledger
         .register_function("transfer", &binary, false)
@@ -279,6 +280,7 @@ fn named_succeeds_after_registration() {
 #[test]
 fn named_rolls_back_on_nonzero_status() {
     let ledger = start_ledger();
+    ledger.open_accounts(2); // ids 1..=2 — credit/debit run before the 47 status
     ledger
         .register_function("reject", &compile(REJECT_WAT), false)
         .unwrap();
@@ -307,6 +309,7 @@ fn named_exceeding_entry_limit_rejects_and_rolls_back() {
     // standard rollback path so neither account retains any of the
     // interim balance changes.
     let ledger = start_ledger();
+    ledger.open_accounts(2); // ids 1..=2 — loop credits/debits before the limit trips
     ledger
         .register_function("loop_transfer", &compile(LOOP_TRANSFER_WAT), false)
         .expect("register");
@@ -373,6 +376,7 @@ fn named_fails_for_unknown_function() {
 #[test]
 fn named_fails_after_unregister() {
     let ledger = start_ledger();
+    ledger.open_accounts(20); // ids 1..=20 (uses 10, 20)
     ledger
         .register_function("transfer", &compile(TRANSFER_WAT), false)
         .unwrap();
@@ -406,6 +410,7 @@ fn named_fails_after_unregister() {
 #[test]
 fn named_uses_latest_version_after_override() {
     let ledger = start_ledger();
+    ledger.open_accounts(2); // ids 1..=2 — v2 credits/debits before status 47
     // v1: returns 0 (success, does nothing).
     ledger
         .register_function("f", &compile(NOOP_WAT), false)
@@ -432,6 +437,7 @@ fn register_is_observable_before_and_during_concurrent_txs() {
     // Register a function, then submit a batch of transfers, and
     // confirm all balances agree with the zero-sum invariant.
     let ledger = start_ledger();
+    ledger.open_accounts(108); // ids 1..=108 (src 1..=8, dst 101..=108)
     ledger
         .register_function("transfer", &compile(TRANSFER_WAT), false)
         .unwrap();
@@ -485,6 +491,7 @@ fn register_and_call_in_same_batch() {
     // the next op runs. So a batch of [Register foo, Function foo]
     // should both succeed without any external snapshot wait.
     let ledger = start_ledger();
+    ledger.open_accounts(20); // ids 1..=20 (uses 10, 20)
     let binary = compile(TRANSFER_WAT);
 
     let results = ledger.submit_batch_and_wait(
@@ -581,7 +588,6 @@ fn persistent_config(dir: &std::path::Path) -> LedgerConfig {
     // snapshot_frequency = 1 makes every sealed segment emit a snapshot —
     // both balance and function.
     LedgerConfig {
-        max_accounts: 16,
         storage: StorageConfig {
             data_dir: dir.to_string_lossy().into_owned(),
             temporary: false,
@@ -616,6 +622,7 @@ fn handler_loads_after_restart() {
     {
         let mut ledger = Ledger::new(persistent_config(&guard.0));
         ledger.start().expect("first start");
+        ledger.open_accounts(2); // ids 1..=2 (funded here; survive snapshot restore)
         ledger
             .register_function("transfer", &compile(TRANSFER_WAT), false)
             .expect("register");
@@ -681,11 +688,14 @@ fn handler_loads_after_restart() {
     assert_eq!(list[0].name, "transfer");
     assert_eq!(list[0].version, 1);
 
-    // Named execution still works against the restored handler.
+    // Named execution still works against the restored handler. Uses the
+    // funded accounts 1/2 (whose existence is restored via the recovered
+    // balances). Phase 1 left balance(1) = -120, balance(2) = +120; this
+    // transfer adds another credit(1,20)/debit(2,20).
     let r = ledger.submit_and_wait(
         Operation::Function {
             name: "transfer".into(),
-            params: [3, 20, 4, 0, 0, 0, 0, 0],
+            params: [1, 20, 2, 0, 0, 0, 0, 0],
             user_ref: 999,
         },
         WaitLevel::OnSnapshot,
@@ -695,8 +705,8 @@ fn handler_loads_after_restart() {
         "Named after snapshot-restore failed: {:?}",
         r.fail_reason
     );
-    assert_eq!(ledger.get_balance(3), -20);
-    assert_eq!(ledger.get_balance(4), 20);
+    assert_eq!(ledger.get_balance(1), -140);
+    assert_eq!(ledger.get_balance(2), 140);
 }
 
 #[test]
@@ -709,6 +719,18 @@ fn latest_version_preserved_after_restart() {
     {
         let mut ledger = Ledger::new(persistent_config(&guard.0));
         ledger.start().unwrap();
+        ledger.open_accounts(2); // ids 1..=2 — v2 fee credits/debits before status 47
+        // Fund the highest used id so existence survives a snapshot-based
+        // restore (the OpenAccount record is snapshotted away; recovery
+        // reconstructs the OPEN range from the recovered balance high-water).
+        ledger.submit_and_wait(
+            Operation::Deposit {
+                account: 2,
+                amount: 1,
+                user_ref: 7,
+            },
+            WaitLevel::OnSnapshot,
+        );
 
         ledger
             .register_function("fee", &compile(NOOP_WAT), false)
@@ -773,6 +795,7 @@ fn unregister_persists_across_restart() {
     {
         let mut ledger = Ledger::new(persistent_config(&guard.0));
         ledger.start().unwrap();
+        ledger.open_accounts(5); // ids 1..=5 (fn "a" uses 1,2; deposit uses 5)
         ledger
             .register_function("a", &compile(TRANSFER_WAT), false)
             .unwrap();
@@ -830,6 +853,7 @@ fn function_snapshot_emitted_even_when_empty() {
     {
         let mut ledger = Ledger::new(persistent_config(&guard.0));
         ledger.start().expect("first start");
+        ledger.open_accounts(1); // id 1
         for i in 0..12 {
             ledger.submit_and_wait(
                 Operation::Deposit {
@@ -874,6 +898,7 @@ fn recovery_without_older_function_binaries_still_works() {
     {
         let mut ledger = Ledger::new(persistent_config(&guard.0));
         ledger.start().expect("first start");
+        ledger.open_accounts(2); // ids 1..=2
         ledger
             .register_function("foo", &compile(NOOP_WAT), false)
             .unwrap();
@@ -929,6 +954,7 @@ fn function_snapshot_load_skips_segments_below_snapshot_id() {
     {
         let mut ledger = Ledger::new(persistent_config(&guard.0));
         ledger.start().expect("first start");
+        ledger.open_accounts(2); // ids 1..=2
         ledger
             .register_function("alpha", &compile(NOOP_WAT), false)
             .unwrap();

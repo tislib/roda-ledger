@@ -36,6 +36,7 @@ fn test_replay_functionality() {
 
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before deposits; survives restart
 
         // Submit enough transactions to trigger a WAL seal and snapshot
         for _ in 0..35_000 {
