@@ -32,6 +32,7 @@ fn test_sealing_at_rotation_boundary() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // ids 1..=100 must exist before deposits
 
         for i in 0..record_count {
             ledger.submit(Operation::Deposit {
@@ -76,8 +77,10 @@ fn test_sealing_below_rotation_boundary() {
     let dir = unique_dir("sealing_below_boundary");
     let tx_count_per_segment: u64 = 100;
 
-    // Test 2: submit fewer transactions than the segment limit
-    let record_count = tx_count_per_segment - 1;
+    // Test 2: submit fewer transactions than the segment limit.
+    // open_accounts commits one extra tx (tx 1), so deposit one fewer to keep
+    // the total (open + deposits) below the rotation boundary.
+    let record_count = tx_count_per_segment - 2;
 
     {
         let config = LedgerConfig {
@@ -91,6 +94,7 @@ fn test_sealing_below_rotation_boundary() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // ids 1..=100 must exist before deposits
 
         for i in 0..record_count {
             ledger.submit(Operation::Deposit {

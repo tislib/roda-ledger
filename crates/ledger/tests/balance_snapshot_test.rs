@@ -5,6 +5,7 @@ use ledger::transaction::{Operation, WaitLevel};
 fn test_balance_always_guaranteed_when_wait_level_is_snapshotted() {
     let mut ledger = Ledger::new(LedgerConfig::temp());
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test uses account 1
 
     let account_id = 1;
     let mut expected_balance = 0;

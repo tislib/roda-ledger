@@ -12,6 +12,7 @@ use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 async fn standalone_serves_writes_with_no_node_grpc() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "standalone".to_string(),
+        auto_open_accounts: 0, // this test only checks the submit's tx_id
         ..ClusterTestingConfig::standalone()
     })
     .await

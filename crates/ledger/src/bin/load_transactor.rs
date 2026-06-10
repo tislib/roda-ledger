@@ -103,7 +103,6 @@ fn main() {
     data_dir.push(format!("roda_load_transactor_{}", rand::random::<u64>()));
     let config = LedgerConfig {
         // +1 so SYSTEM_ACCOUNT_ID (0) and accounts 1..=account_count all fit.
-        max_accounts: account_count as usize + 1,
         storage: StorageConfig {
             data_dir: data_dir.to_string_lossy().into_owned(),
             temporary: true,
@@ -152,6 +151,15 @@ fn main() {
         "#", "time", "TPS", "proc'd", "P50", "P99", "in-flight"
     );
     println!("  +-----+--------+------------+------------+----------+----------+------------+");
+
+    // Existence enforcement (ADR-022): open accounts 1..=account_count first.
+    current_id += 1;
+    let mut open_tx = Transaction::new(Operation::OpenAccount {
+        count: account_count as u32,
+        user_ref: 0,
+    });
+    open_tx.id = current_id;
+    submit_and_wait(&push_ctx, open_tx);
 
     loop {
         current_id += 1;

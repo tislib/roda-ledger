@@ -91,6 +91,16 @@ async fn get_transaction_status_reaches_terminal_state() {
 async fn get_balance_reflects_deposit_after_snapshot() {
     let (proxy, _h) = common::build_ledger_proxy(3).await;
     let acct = 1_003u64;
+    // Open accounts so the deposit passes existence enforcement (ADR-022).
+    proxy
+        .submit_operation(Request::new(pb::SubmitOperationRequest {
+            operation: Some(Operation::OpenAccount(pb::OpenAccount {
+                count: 2_000,
+                user_ref: 0,
+            })),
+        }))
+        .await
+        .expect("open accounts");
     let tx = proxy
         .submit_operation(Request::new(pb::SubmitOperationRequest {
             operation: Some(Operation::Deposit(pb::Deposit {
@@ -107,7 +117,10 @@ async fn get_balance_reflects_deposit_after_snapshot() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let bal = proxy
-            .get_balance(Request::new(pb::GetBalanceRequest { account_id: acct }))
+            .get_balance(Request::new(pb::GetBalanceRequest {
+                account_id: acct,
+                include_linked: false,
+            }))
             .await
             .expect("get_balance")
             .into_inner();
@@ -213,7 +226,10 @@ async fn node_selector_unknown_id_returns_invalid_argument() {
     let (proxy, _h) = common::build_ledger_proxy(3).await;
     let err = proxy
         .get_balance(req_with_node_selector(
-            pb::GetBalanceRequest { account_id: 1 },
+            pb::GetBalanceRequest {
+                account_id: 1,
+                include_linked: false,
+            },
             999,
         ))
         .await

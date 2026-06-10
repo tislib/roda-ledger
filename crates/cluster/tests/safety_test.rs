@@ -373,6 +373,7 @@ async fn no_leader_blocks_writes() {
         label: "safety_no_leader".to_string(),
         replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
+        auto_open_accounts: 0, // no leader to open against; test only checks write rejection
         ..ClusterTestingConfig::cluster(3)
     })
     .await
@@ -430,6 +431,12 @@ async fn no_leader_blocks_writes() {
         ctl.node_id(new_leader_idx).unwrap()
     );
 
+    // Open the account now that a leader exists (auto-open was disabled for
+    // this test so the no-leader phase had nothing to commit).
+    ctl.open_accounts((ACCOUNT + 1) as u32)
+        .await
+        .expect("open accounts");
+
     // Submit succeeds against the new leader.
     let r = ctl
         .deposit_and_wait(ACCOUNT, AMOUNT, 999, WaitLevel::ClusterCommit)
@@ -458,7 +465,6 @@ async fn no_leader_blocks_writes() {
 //    invariant intact on every surviving node.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[ignore]
 async fn mid_election_cluster_commit_not_lost() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_mid_election".to_string(),

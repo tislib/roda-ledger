@@ -1,5 +1,6 @@
 use crate::config::StorageConfig;
 use crate::layout::{active_wal_path, parse_segment_id};
+use crate::wal_scan::WalScanner;
 use crate::wal_tail::WalTailer;
 use crate::{Segment, SegmentStaus};
 use spdlog::{info, warn};
@@ -145,6 +146,12 @@ impl Storage {
     /// read forward from that cursor.
     pub fn wal_tailer(self: &Arc<Self>, from_tx_id: u64) -> WalTailer {
         WalTailer::new(self.clone(), from_tx_id)
+    }
+
+    /// Build a backward [`WalScanner`] bound to this storage. Each `scan*` call
+    /// carries its own `from_tx_id` + `max_scan` bounds.
+    pub fn wal_scanner(self: &Arc<Self>) -> WalScanner {
+        WalScanner::new(self.clone())
     }
 
     /// DIAG-flake-replication: on-disk size of the active `wal.bin`,

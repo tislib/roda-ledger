@@ -34,6 +34,7 @@ fn test_duplicate_user_ref_rejected_with_dedup() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test uses account 1
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -64,6 +65,7 @@ fn test_duplicate_user_ref_both_processed_when_user_ref_zero() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test uses account 1
 
     let id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -94,6 +96,7 @@ fn test_zero_user_ref_bypasses_dedup() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(10); // test uses account 1
 
     let _id1 = ledger.submit(Operation::Deposit {
         account: 1,
@@ -119,6 +122,7 @@ fn test_restart_no_reprocessing() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(10); // test uses account 1; opened accounts survive restart
 
         let mut last_id = 0u64;
         for _ in 0..initial {
@@ -164,6 +168,7 @@ fn test_recovery_idempotent_multiple_restarts() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(10); // test uses account 1; opened accounts survive restart
 
         let mut last_id = 0u64;
         for _ in 0..10_000 {
@@ -202,6 +207,7 @@ fn test_tx_id_continuity_across_restarts() {
     {
         let mut ledger = Ledger::new(make_config(&dir));
         ledger.start().unwrap();
+        ledger.open_accounts(10); // test uses account 1; opened accounts survive restart
 
         let mut last_id = 0u64;
         for _ in 0..100 {

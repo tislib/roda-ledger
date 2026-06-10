@@ -119,6 +119,15 @@ fn main() {
     );
     println!("  +-----+--------+------------+------------+----------+----------+");
 
+    // Existence enforcement (ADR-022): open accounts 1..=account_count first.
+    current_id += 1;
+    let mut open_tx = Transaction::new(Operation::OpenAccount {
+        count: account_count as u32,
+        user_ref: 0,
+    });
+    open_tx.id = current_id;
+    runner.process_direct(&ctx, open_tx);
+
     loop {
         let sample = unit.is_multiple_of(sample_every);
 

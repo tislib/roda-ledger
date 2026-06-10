@@ -241,7 +241,7 @@ async fn test_get_account_history() {
         .await
         .unwrap();
 
-    let history = client.get_account_history(1, 0, 10).await.unwrap();
+    let history = client.get_account_history(1, 0, 0).await.unwrap();
     assert!(!history.entries.is_empty());
 }
 

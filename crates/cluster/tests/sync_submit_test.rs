@@ -8,6 +8,7 @@ mod tests {
     fn test_submit_and_wait_processed_deposit() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let result = ledger.submit_and_wait(
             Operation::Deposit {
@@ -26,6 +27,7 @@ mod tests {
     fn test_submit_and_wait_committed_deposit() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let result = ledger.submit_and_wait(
             Operation::Deposit {
@@ -44,6 +46,7 @@ mod tests {
     fn test_submit_and_wait_snapshotted_deposit() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let result = ledger.submit_and_wait(
             Operation::Deposit {
@@ -66,6 +69,7 @@ mod tests {
     fn test_submit_and_wait_rejection_insufficient_funds() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         // Withdraw from empty account — should be rejected immediately
         let result = ledger.submit_and_wait(
@@ -84,6 +88,7 @@ mod tests {
     fn test_submit_and_wait_rejection_at_processed_level() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let result = ledger.submit_and_wait(
             Operation::Withdrawal {
@@ -101,6 +106,7 @@ mod tests {
     fn test_submit_and_wait_transfer_committed() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         // Deposit first
         ledger.submit_and_wait(
@@ -131,6 +137,7 @@ mod tests {
     fn test_submit_batch_and_wait() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let ops = vec![
             Operation::Deposit {
@@ -165,6 +172,7 @@ mod tests {
     fn test_submit_batch_and_wait_with_rejection() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let ops = vec![
             Operation::Deposit {
@@ -196,6 +204,7 @@ mod tests {
     fn test_submit_batch_and_wait_empty() {
         let mut ledger = Ledger::new(LedgerConfig::temp());
         ledger.start().unwrap();
+        ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         let results = ledger.submit_batch_and_wait(vec![], InternalWaitLevel::Committed);
         assert!(results.is_empty());

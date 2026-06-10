@@ -180,6 +180,10 @@ pub struct ClusterTestingConfig {
     /// removes it in `Drop`.
     pub data_dir_root: Option<PathBuf>,
     pub retry_config: RetryConfig,
+    /// Pre-open this many accounts (ids `1..=N`) once the leader settles, so
+    /// tests can deposit without an explicit `OpenAccount` (ADR-022 existence
+    /// enforcement). `0` disables it (for tests that assert exact tx_ids).
+    pub auto_open_accounts: u32,
 }
 
 impl Default for ClusterTestingConfig {
@@ -198,6 +202,7 @@ impl Default for ClusterTestingConfig {
             autostart: true,
             data_dir_root: None,
             retry_config: RetryConfig::default(),
+            auto_open_accounts: 1024,
         }
     }
 }
@@ -415,8 +420,27 @@ impl ClusterTestingControl {
             ctl.start_all().await?;
             ctl.wait_for_all_tcp(Duration::from_secs(5)).await?;
             ctl.rebuild_cluster_client().await?;
+            // Pre-open a block of accounts (ids 1..=N) so tests can deposit
+            // without an explicit OpenAccount (replicated at ClusterCommit).
+            ctl.open_accounts(config.auto_open_accounts).await?;
         }
         Ok(ctl)
+    }
+
+    /// Open `count` accounts (ids `1..=count`) on the current leader and wait
+    /// for ClusterCommit, so subsequent deposits pass existence enforcement
+    /// (ADR-022). `count == 0` is a no-op. Used by `start` for auto-open and by
+    /// tests that disable auto-open but still need accounts.
+    pub async fn open_accounts(&self, count: u32) -> Result<(), ClusterTestingError> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.wait_for_leader(Duration::from_secs(5)).await?;
+        self.client()
+            .open_account_and_wait(count, 0, lproto::WaitLevel::ClusterCommit)
+            .await
+            .map_err(|e| ClusterTestingError::Run(format!("open_accounts: {e}")))?;
+        Ok(())
     }
 
     /// (Re)build the embedded [`ClusterClient`] from every currently

@@ -13,7 +13,11 @@ pub use storage::StorageConfig;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct LedgerConfig {
-    pub max_accounts: usize,
+    /// Initial transactor account-array capacity; grows on demand (see `resize_factor`).
+    pub initial_account_size: usize,
+    /// Geometric growth increment for the account array:
+    /// `new_cap = ceil(cap * (1 + resize_factor))`.
+    pub resize_factor: f64,
     pub wait_strategy: WaitStrategy,
     pub storage: StorageConfig,
 
@@ -38,7 +42,8 @@ fn default_seal_check_internal() -> Duration {
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
-            max_accounts: 1_000_000,
+            initial_account_size: 1 << 10,
+            resize_factor: 0.75,
             ring_size: 1 << 20,
             storage: StorageConfig::default(),
             wait_strategy: WaitStrategy::Balanced,
@@ -75,7 +80,6 @@ impl LedgerConfig {
         // don't each allocate ~1.7 GB of index buffers. Tests that need
         // larger limits override these fields.
         Self {
-            max_accounts: 10_000,
             storage: StorageConfig {
                 data_dir: dir.to_string_lossy().to_string(),
                 temporary: true,

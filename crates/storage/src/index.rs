@@ -57,7 +57,12 @@ impl Segment {
                 WalEntry::Entry(e) => {
                     account_entries.push((e.account_id, current_tx_id));
                 }
-                WalEntry::Link(_) | WalEntry::FunctionRegistered(_) | WalEntry::Term(_) => {}
+                WalEntry::Link(_)
+                | WalEntry::FunctionRegistered(_)
+                | WalEntry::Term(_)
+                | WalEntry::AccountOpened(_)
+                | WalEntry::AccountLinked(_)
+                | WalEntry::AccountFlagsUpdated(_) => {}
             }
             offset += 40;
         }

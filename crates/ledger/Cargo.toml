@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "tx_ring_bench"
 harness = false
+
+[[bench]]
+name = "transactor_computer_bench"
+harness = false

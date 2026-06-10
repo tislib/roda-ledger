@@ -165,6 +165,9 @@ impl<'r> Recover<'r> {
                 || kind == WalEntryKind::Link as u8
                 || kind == WalEntryKind::TxTerm as u8
                 || kind == WalEntryKind::FunctionRegistered as u8
+                || kind == WalEntryKind::AccountOpened as u8
+                || kind == WalEntryKind::AccountLinked as u8
+                || kind == WalEntryKind::AccountFlagsUpdated as u8
             {
                 // ── Follower: buffer it until the closing metadata ──────
                 if follower_slices.is_empty() {
@@ -252,6 +255,9 @@ impl<'r> Recover<'r> {
                 || kind == WalEntryKind::Link as u8
                 || kind == WalEntryKind::TxTerm as u8
                 || kind == WalEntryKind::FunctionRegistered as u8
+                || kind == WalEntryKind::AccountOpened as u8
+                || kind == WalEntryKind::AccountLinked as u8
+                || kind == WalEntryKind::AccountFlagsUpdated as u8
             {
                 follower_slices.push(&data[off..off + ENTRY_SIZE]);
                 off += ENTRY_SIZE;
@@ -308,7 +314,14 @@ impl<'r> Recover<'r> {
                 )
             })?;
         let mut last_tx_id = 0;
+        let mut next_account_id = 1u64;
+        // (parent_id, type_id, child_id) links replayed from AccountLinked
+        // records, seeded into the transactor + snapshot at finalization.
+        let mut recover_links: Vec<(u64, u16, u64)> = Vec::new();
         let mut recover_balances = HashMap::new();
+        // (id → flags) from the snapshot's accounts + replayed `AccountOpened`,
+        // overlaid onto the transactor + snapshot at finalization.
+        let mut recover_flags: HashMap<u64, u64> = HashMap::new();
         // Trailer layout: a transaction's followers precede its `TxMetadata`, which
         // supplies the tx_id, the watermark decision, and the index ordering. Hold
         // the in-flight followers until the metadata; the buffer carries across
@@ -338,8 +351,9 @@ impl<'r> Recover<'r> {
                     })?
                     .unwrap();
 
-                for (account_id, balance) in data.balances {
+                for (account_id, balance, flags) in data.accounts {
                     recover_balances.insert(account_id, balance);
+                    recover_flags.insert(account_id, flags);
                     self.seal
                         .recover_balance(account_id as usize, balance)
                         .map_err(|e| {
@@ -351,9 +365,47 @@ impl<'r> Recover<'r> {
                                 ),
                             )
                         })?;
+                    self.seal
+                        .recover_account_flags(account_id as usize, flags)
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "failed to recover flags for account {} from snapshot: {}",
+                                    account_id, e
+                                ),
+                            )
+                        })?;
+                }
+
+                // Snapshot-persisted links (ADR-022 §3): seed recover's tracker
+                // and Seal's so they survive into the next snapshot Seal writes.
+                for (parent_id, type_id, child_id) in data.links {
+                    recover_links.push((parent_id, type_id, child_id));
+                    self.seal
+                        .recover_link(parent_id, type_id, child_id)
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!("failed to recover link from snapshot: {}", e),
+                            )
+                        })?;
                 }
 
                 last_tx_id = data.last_tx_id;
+
+                // Snapshot-persisted allocator high-water (ADR-022): seed both
+                // recover's tracker and Seal's. The post-snapshot WAL replay
+                // bumps it further.
+                next_account_id = next_account_id.max(data.next_account_id);
+                self.seal
+                    .recover_next_account_id(data.next_account_id)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("failed to recover next_account_id from snapshot: {}", e),
+                        )
+                    })?;
 
                 // Pair: load the function snapshot for the same segment
                 // and seed both Seal's function map and the WASM runtime
@@ -444,17 +496,15 @@ impl<'r> Recover<'r> {
                             return;
                         }
                         last_tx_id = metadata.tx_id;
-                        snapshot.recover_index_tx_metadata(metadata);
+                        // Index the whole transaction (meta + followers, as-is).
+                        snapshot.recover_index_transaction(metadata, &group);
                         for follower in group.drain(..) {
                             match follower {
                                 WalEntry::Entry(entry) => {
                                     recover_balances
                                         .insert(entry.account_id, entry.computed_balance);
-                                    snapshot.recover_index_tx_entry(metadata.tx_id, &entry);
                                 }
-                                WalEntry::Link(link) => {
-                                    snapshot.recover_index_tx_link(metadata.tx_id, &link);
-                                }
+                                WalEntry::Link(_) => {}
                                 WalEntry::FunctionRegistered(f) if function_apply_err.is_none() => {
                                     if let Err(e) = transactor.recover_function_registered(&f) {
                                         function_apply_err = Some(std::io::Error::new(
@@ -481,6 +531,19 @@ impl<'r> Recover<'r> {
                                             ),
                                         ));
                                     }
+                                }
+                                WalEntry::AccountOpened(a) => {
+                                    let end = a.begin_account_id + a.count as u64;
+                                    next_account_id = next_account_id.max(end);
+                                    for id in a.begin_account_id..end {
+                                        recover_flags.insert(id, a.flags);
+                                    }
+                                }
+                                WalEntry::AccountLinked(a) => {
+                                    recover_links.push((a.parent_id, a.type_id, a.child_id));
+                                }
+                                WalEntry::AccountFlagsUpdated(a) => {
+                                    recover_flags.insert(a.account_id, a.new_flags);
                                 }
                                 _ => {}
                             }
@@ -519,7 +582,8 @@ impl<'r> Recover<'r> {
                         return;
                     }
                     last_tx_id = metadata.tx_id;
-                    snapshot.recover_index_tx_metadata(metadata);
+                    // Index the whole transaction (meta + followers, as-is).
+                    snapshot.recover_index_transaction(metadata, &group);
 
                     // Only non-duplicate committed transactions belong in the dedup cache.
                     if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
@@ -533,11 +597,8 @@ impl<'r> Recover<'r> {
                         match follower {
                             WalEntry::Entry(entry) => {
                                 recover_balances.insert(entry.account_id, entry.computed_balance);
-                                snapshot.recover_index_tx_entry(metadata.tx_id, &entry);
                             }
-                            WalEntry::Link(link) => {
-                                snapshot.recover_index_tx_link(metadata.tx_id, &link);
-                            }
+                            WalEntry::Link(_) => {}
                             WalEntry::FunctionRegistered(f) if function_apply_err.is_none() => {
                                 if let Err(e) = transactor.recover_function_registered(&f) {
                                     function_apply_err = Some(std::io::Error::new(
@@ -563,6 +624,19 @@ impl<'r> Recover<'r> {
                                     ));
                                 }
                             }
+                            WalEntry::AccountOpened(a) => {
+                                let end = a.begin_account_id + a.count as u64;
+                                next_account_id = next_account_id.max(end);
+                                for id in a.begin_account_id..end {
+                                    recover_flags.insert(id, a.flags);
+                                }
+                            }
+                            WalEntry::AccountLinked(a) => {
+                                recover_links.push((a.parent_id, a.type_id, a.child_id));
+                            }
+                            WalEntry::AccountFlagsUpdated(a) => {
+                                recover_flags.insert(a.account_id, a.new_flags);
+                            }
                             _ => {}
                         }
                     }
@@ -579,8 +653,33 @@ impl<'r> Recover<'r> {
             return Err(e);
         }
 
+        // Reconstruct account existence from the high-water BEFORE overlaying
+        // balances: recover_account_layout sets the OPEN/SYSTEM status flags,
+        // recover_balances only writes `.balance`. Also "keep up with" any
+        // account id present in the recovered balance set (D11 / point 4).
+        let recovered_high_water = recover_balances
+            .keys()
+            .copied()
+            .max()
+            .map(|m| m.saturating_add(1))
+            .unwrap_or(0);
+        next_account_id = next_account_id.max(recovered_high_water);
+        self.transactor.recover_account_layout(next_account_id);
         self.transactor.recover_balances(&recover_balances);
+        // Overlay the exact per-account flags (snapshot + replayed
+        // `AccountOpened`) so PROGRAMMED buckets aren't left as blanket-OPEN.
+        self.transactor.recover_account_flags(&recover_flags);
+        self.snapshot.recover_account_layout(next_account_id);
         self.snapshot.recover_balances(&recover_balances);
+        self.snapshot.recover_account_flags(&recover_flags);
+        // Seed parent→bucket links (ADR-022 §3) so the recovered leader
+        // resolves buckets and the read side can enumerate them.
+        for (parent, type_id, child) in &recover_links {
+            self.transactor
+                .recover_account_link(*parent, *type_id, *child);
+            self.snapshot
+                .recover_account_link(*parent, *type_id, *child);
+        }
 
         // Clamp pipeline indices to min(replayed, watermark). When the
         // watermark is u64::MAX (the unbounded default used by `recover`),
@@ -642,5 +741,97 @@ impl<'r> Recover<'r> {
             }
         }
         Ok(best)
+    }
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+    use storage::entities::{AccountOpened, EntryKind, TxEntry};
+
+    fn follower_bytes(f: &WalEntry) -> Vec<u8> {
+        match f {
+            WalEntry::AccountOpened(a) => bytemuck::bytes_of(a).to_vec(),
+            WalEntry::Entry(e) => bytemuck::bytes_of(e).to_vec(),
+            _ => unreachable!("test only emits AccountOpened/Entry followers"),
+        }
+    }
+
+    /// On-disk bytes for one committed tx: followers then the closing
+    /// `TxMetadata`, carrying the trailer CRC the validator recomputes.
+    fn tx_bytes(tx_id: u64, followers: &[WalEntry]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut digest = 0u32;
+        for f in followers {
+            let bytes = follower_bytes(f);
+            digest = crc32c::crc32c_append(digest, &bytes);
+            body.extend_from_slice(&bytes);
+        }
+        let mut meta = TxMetadata {
+            entry_type: WalEntryKind::TxMetadata as u8,
+            fail_reason: FailReason::NONE,
+            sub_item_count: followers.len() as u16,
+            crc32c: 0,
+            tx_id,
+            timestamp: 0,
+            user_ref: 0,
+            tag: [0; 8],
+        };
+        digest = crc32c::crc32c_append(digest, bytemuck::bytes_of(&meta));
+        meta.crc32c = digest;
+        body.extend_from_slice(bytemuck::bytes_of(&meta));
+        body
+    }
+
+    fn entry(account_id: u64, amount: u64, kind: EntryKind, computed_balance: i64) -> WalEntry {
+        WalEntry::Entry(TxEntry {
+            entry_type: WalEntryKind::TxEntry as u8,
+            kind,
+            _pad0: [0; 6],
+            _pad1: [0; 8],
+            account_id,
+            amount,
+            computed_balance,
+        })
+    }
+
+    // Regression: the crash-scan path must treat AccountOpened (kind 7) as a
+    // valid follower, not "unexpected record kind" → non-recoverable.
+    #[test]
+    fn validate_accepts_open_account_tx() {
+        let buf = tx_bytes(
+            1,
+            &[WalEntry::AccountOpened(AccountOpened::new(1, 5, 0, 0))],
+        );
+        let n = Recover::validate_wal_transactions(&buf).expect("OpenAccount tx must validate");
+        assert_eq!(n, buf.len());
+    }
+
+    #[test]
+    fn has_valid_tx_after_sees_open_account_tx() {
+        let buf = tx_bytes(
+            7,
+            &[WalEntry::AccountOpened(AccountOpened::new(1, 5, 0, 0))],
+        );
+        assert!(Recover::has_valid_tx_after(&buf, 0));
+    }
+
+    // An OpenAccount tx mid-stream (followed by a deposit) must not break the
+    // scan — exercises the follower-buffer reset across an AccountOpened group.
+    #[test]
+    fn validate_accepts_open_account_then_deposit() {
+        let mut buf = tx_bytes(
+            1,
+            &[WalEntry::AccountOpened(AccountOpened::new(1, 5, 0, 0))],
+        );
+        buf.extend_from_slice(&tx_bytes(
+            2,
+            &[
+                entry(0, 100, EntryKind::Credit, -100),
+                entry(1, 100, EntryKind::Debit, 100),
+            ],
+        ));
+        let n = Recover::validate_wal_transactions(&buf).expect("both txs valid");
+        assert_eq!(n, buf.len());
     }
 }

@@ -41,6 +41,7 @@ fn test_wal_segment_rotation() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // account_id must exist before deposits
 
         for _ in 0..num_transactions {
             last_tx_id = ledger.submit(Operation::Deposit {
@@ -153,6 +154,7 @@ fn test_crc_sidecar_format() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // account 1 must exist before deposits
 
         for _ in 0..num_transactions {
             last_tx_id = ledger.submit(Operation::Deposit {

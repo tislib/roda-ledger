@@ -45,11 +45,12 @@ fn main() {
     let account_count = args.account_count;
     let wait_mode = args.wait;
     let mut ledger = Ledger::new(LedgerConfig {
-        max_accounts: account_count as usize,
         log_level: Info,
         ..LedgerConfig::bench()
     });
     ledger.start().unwrap();
+    // Existence enforcement (ADR-022): open the accounts the load hits (1..=N).
+    ledger.open_accounts(account_count.max(1) as u32);
 
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);

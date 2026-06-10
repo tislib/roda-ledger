@@ -1,6 +1,7 @@
 use crate::config::LedgerConfig;
 use crate::pipeline::SealContext;
-use spdlog::{debug, error, warn};
+use crate::transactor::grow_capacity;
+use spdlog::{debug, error};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -18,6 +19,19 @@ pub struct Seal {
 struct SealRunner {
     storage: Arc<Storage>,
     balances: Vec<i64>,
+    /// Per-account flags (ADR-022), parallel to `balances`; set from
+    /// `AccountOpened` records and written into the snapshot so PROGRAMMED
+    /// buckets recover with their real status (not blanket OPEN).
+    flags: Vec<u64>,
+    /// Parent→bucket links `(parent_id, type_id) → child_id`, written into the
+    /// snapshot so links survive a snapshot-based restart.
+    links: HashMap<(u64, u16), u64>,
+    /// Account allocator high-water (ADR-022): the next id to allocate. Bumped
+    /// by `AccountOpened` records as segments seal, and written into each
+    /// snapshot so recovery reconstructs OPEN status for zero-balance accounts.
+    next_account_id: u64,
+    /// Geometric growth factor for `balances` (ADR-022), from config.
+    resize_factor: f64,
     /// Latest `(version, crc32c)` per function name. `crc32c == 0` means
     /// the name's most recent record is an unregister; the entry stays in
     /// the map so the function snapshot preserves the audit trail
@@ -33,7 +47,11 @@ impl Seal {
         Self {
             runner: Some(SealRunner {
                 storage,
-                balances: vec![0; config.max_accounts],
+                balances: vec![0; config.initial_account_size],
+                flags: vec![0; config.initial_account_size],
+                links: HashMap::new(),
+                next_account_id: 1,
+                resize_factor: config.resize_factor,
                 function_map: HashMap::new(),
                 seal_check_internal: config.seal_check_internal,
                 seal_step_id: seal_step_id.clone(),
@@ -104,7 +122,57 @@ impl Seal {
         computed_balance: i64,
     ) -> std::io::Result<()> {
         if let Some(mut runner) = self.runner.take() {
+            runner.ensure_balance_capacity(account_id + 1);
             runner.balances[account_id] = computed_balance;
+            self.runner = Some(runner);
+            Ok(())
+        } else {
+            Err(std::io::Error::other("Seal already started"))
+        }
+    }
+
+    /// Seed Seal's account allocator high-water during recovery (ADR-022) from
+    /// the snapshot's `next_account_id`; forward-replayed `AccountOpened`
+    /// records then bump it further as later segments seal.
+    pub(crate) fn recover_next_account_id(&mut self, next_account_id: u64) -> std::io::Result<()> {
+        if let Some(mut runner) = self.runner.take() {
+            runner.next_account_id = runner.next_account_id.max(next_account_id);
+            runner.ensure_balance_capacity(next_account_id as usize);
+            self.runner = Some(runner);
+            Ok(())
+        } else {
+            Err(std::io::Error::other("Seal already started"))
+        }
+    }
+
+    /// Seed Seal's per-account flags during recovery (ADR-022) — from a snapshot
+    /// account or a forward-replayed `AccountOpened` — so the next snapshot Seal
+    /// writes carries the correct status for every account.
+    pub(crate) fn recover_account_flags(
+        &mut self,
+        account_id: usize,
+        flags: u64,
+    ) -> std::io::Result<()> {
+        if let Some(mut runner) = self.runner.take() {
+            runner.ensure_balance_capacity(account_id + 1);
+            runner.flags[account_id] = flags;
+            self.runner = Some(runner);
+            Ok(())
+        } else {
+            Err(std::io::Error::other("Seal already started"))
+        }
+    }
+
+    /// Seed a parent→bucket link during recovery (ADR-022) so it survives into
+    /// the next snapshot Seal writes.
+    pub(crate) fn recover_link(
+        &mut self,
+        parent_id: u64,
+        type_id: u16,
+        child_id: u64,
+    ) -> std::io::Result<()> {
+        if let Some(mut runner) = self.runner.take() {
+            runner.links.insert((parent_id, type_id), child_id);
             self.runner = Some(runner);
             Ok(())
         } else {
@@ -136,6 +204,15 @@ impl Seal {
 }
 
 impl SealRunner {
+    /// Grow `balances` to cover `needed` ids (geometric, ADR-022).
+    fn ensure_balance_capacity(&mut self, needed: usize) {
+        if needed > self.balances.len() {
+            let new_cap = grow_capacity(self.balances.len(), self.resize_factor, needed);
+            self.balances.resize(new_cap, 0);
+            self.flags.resize(new_cap, 0);
+        }
+    }
+
     fn run(&mut self, ctx: SealContext) {
         while ctx.is_running() {
             self.seal_step_id
@@ -230,15 +307,27 @@ impl SealRunner {
         segment.visit_wal_records(|entry| match entry {
             WalEntry::Entry(e) => {
                 let id = e.account_id as usize;
-                if id < self.balances.len() {
-                    self.balances[id] = e.computed_balance;
-                } else {
-                    warn!("Seal: account ID {} exceeds balance vector length", id);
-                }
+                self.ensure_balance_capacity(id + 1);
+                self.balances[id] = e.computed_balance;
             }
             WalEntry::FunctionRegistered(f) => {
                 self.function_map
                     .insert(f.name_str().to_string(), (f.version, f.crc32c));
+            }
+            WalEntry::AccountOpened(a) => {
+                let end = a.begin_account_id + a.count as u64;
+                self.next_account_id = self.next_account_id.max(end);
+                self.ensure_balance_capacity(end as usize);
+                for id in a.begin_account_id..end {
+                    self.flags[id as usize] = a.flags;
+                }
+            }
+            WalEntry::AccountLinked(a) => {
+                self.links.insert((a.parent_id, a.type_id), a.child_id);
+            }
+            WalEntry::AccountFlagsUpdated(a) => {
+                self.ensure_balance_capacity(a.account_id as usize + 1);
+                self.flags[a.account_id as usize] = a.new_flags;
             }
             _ => {}
         })?;
@@ -246,22 +335,33 @@ impl SealRunner {
         // Write the balance + function snapshots at the configured cadence.
         let snapshot_frequency = self.storage.config().snapshot_frequency;
         if snapshot_frequency > 0 && segment.id().is_multiple_of(snapshot_frequency) {
-            let mut snapshot_records: Vec<(u64, i64)> = self
-                .balances
+            // Persist every existent account (flags != 0) plus any funded
+            // account (balance != 0, e.g. SYSTEM): (id, balance, flags).
+            let mut snapshot_records: Vec<(u64, i64, u64)> = self
+                .flags
                 .iter()
                 .enumerate()
-                .filter_map(|(id, &bal)| {
-                    if bal != 0 {
-                        Some((id as u64, bal))
+                .filter_map(|(id, &flags)| {
+                    let bal = self.balances[id];
+                    if flags != 0 || bal != 0 {
+                        Some((id as u64, bal, flags))
                     } else {
                         None
                     }
                 })
                 .collect();
-            snapshot_records.sort_unstable_by_key(|(id, _)| *id);
+            snapshot_records.sort_unstable_by_key(|(id, _, _)| *id);
+
+            let mut snapshot_links: Vec<(u64, u16, u64)> =
+                self.links.iter().map(|(&(p, t), &c)| (p, t, c)).collect();
+            snapshot_links.sort_unstable();
 
             debug!("Seal: saving snapshot for WAL segment {}", segment.id());
-            if let Err(e) = segment.save_snapshot(&snapshot_records[..]) {
+            if let Err(e) = segment.save_snapshot(
+                self.next_account_id,
+                &snapshot_records[..],
+                &snapshot_links[..],
+            ) {
                 error!(
                     "Seal: failed to save snapshot for segment {}: {}",
                     segment.id(),

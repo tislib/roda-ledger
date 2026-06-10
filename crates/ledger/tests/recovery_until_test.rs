@@ -87,19 +87,23 @@ fn truncated_transactions_are_lost_across_plain_restart() {
     // so segments past tx 100 stay closed-but-unsealed — exactly the
     // state truncation is allowed to operate on.
     let temp_dir = fresh_temp_dir("plain_restart");
-    let n: u64 = 200;
-    let watermark: u64 = 100;
+    // open_accounts commits tx 1, so account-1 deposits are tx 2..=101 and
+    // account-2 deposits are tx 102..=201. The watermark cuts right after
+    // account 1 (= last account-1 tx = 101); total committed n = 201.
+    let n: u64 = 201;
+    let watermark: u64 = 101;
 
     {
         let mut ledger = Ledger::new(small_segment_no_snapshot_config(&temp_dir));
         ledger.start().unwrap();
+        ledger.open_accounts(3); // ids 1,2,3 — opened before any deposit (tx 1)
 
-        // 100 deposits to account 1 (tx_id 1..=100). Allow these to
+        // 100 deposits to account 1 (tx_id 2..=101). Allow these to
         // seal — they are "cluster-committed" in our test model.
         // Submit in two waves of 50 each to give the WAL stage's
         // per-loop-iteration rotation check room to fire on the
         // segment boundary (50-tx segments).
-        ledger.set_seal_watermark(100);
+        ledger.set_seal_watermark(watermark);
         for _ in 0..2 {
             for _ in 0..50 {
                 ledger.submit(Operation::Deposit {
@@ -110,10 +114,10 @@ fn truncated_transactions_are_lost_across_plain_restart() {
             }
             wait_for_commit_and_snapshot(&ledger, ledger.last_commit_id().max(1));
         }
-        wait_for_commit_and_snapshot(&ledger, 100);
+        wait_for_commit_and_snapshot(&ledger, watermark);
 
-        // 100 deposits to account 2 (tx 101..=200). seal_watermark
-        // stays at 100 so segments containing these txs DO NOT seal.
+        // 100 deposits to account 2 (tx 102..=201). seal_watermark
+        // stays at 101 so segments containing these txs DO NOT seal.
         // Same wave-of-50 pattern. Note: `submit_batch` returns the
         // batch's *first* tx_id (`start_id`), not the last — so the
         // wait target is `start_id + 49`.
@@ -184,7 +188,8 @@ fn truncated_transactions_are_lost_across_plain_restart() {
         );
 
         // Submit one more transaction. Sequencer must continue from
-        // watermark + 1 (= 101), not from N + 1 (= 201).
+        // watermark + 1 (= 102), not from N + 1 (= 202). Account 3 was
+        // opened in phase 1 (tx 1 ≤ watermark), so it survives recovery.
         let next = ledger.submit(Operation::Deposit {
             account: 3,
             amount: 7,
@@ -209,11 +214,15 @@ fn truncation_with_no_segment_rotation_active_only() {
     // without snapshot involvement.
     let temp_dir = fresh_temp_dir("active_only");
     let n: u64 = 50;
-    let watermark: u64 = 30;
+    // open_accounts is tx 1, so every deposit below is shifted by +1.
+    // Total committed = n + 2 (open + n acct-1 deposits + 1 acct-2 deposit).
+    // The original cut after "26 acct1 + 1 acct2 + 3 acct1" lands at tx 31.
+    let watermark: u64 = 31;
 
     {
         let mut ledger = Ledger::new(single_segment_config(&temp_dir));
         ledger.start().unwrap();
+        ledger.open_accounts(2); // ids 1,2 — opened before deposits (tx 1)
         for i in 0..n {
             ledger.submit(Operation::Deposit {
                 account: 1,
@@ -229,8 +238,8 @@ fn truncation_with_no_segment_rotation_active_only() {
                 });
             }
         }
-        ledger.wait_for_transaction(n + 1);
-        assert_eq!(ledger.last_commit_id(), n + 1);
+        ledger.wait_for_transaction(n + 2);
+        assert_eq!(ledger.last_commit_id(), n + 2);
         assert_eq!(ledger.get_balance(1), n as i64);
         assert_eq!(ledger.get_balance(2), 100);
     }
@@ -239,9 +248,9 @@ fn truncation_with_no_segment_rotation_active_only() {
         let mut ledger = Ledger::new(single_segment_config(&temp_dir));
         ledger.start_with_recovery_until(watermark).unwrap();
         assert_eq!(ledger.last_commit_id(), watermark);
-        // First 26 deposits to account 1 (tx 1..=26), then a deposit to
-        // account 2 (tx 27), then 3 more to account 1 (tx 28..=30).
-        // So at watermark=30: account 1 has 29, account 2 has 100.
+        // tx 1 opens accounts; then 26 deposits to account 1 (tx 2..=27),
+        // a deposit to account 2 (tx 28), then 3 more to account 1
+        // (tx 29..=31). So at watermark=31: account 1 has 29, account 2 has 100.
         assert_eq!(ledger.get_balance(1), 29);
         assert_eq!(ledger.get_balance(2), 100);
     }
@@ -266,29 +275,33 @@ fn watermark_above_last_tx_is_a_noop() {
     let temp_dir = fresh_temp_dir("noop");
     let n: u64 = 30;
 
+    let last_tx; // includes the open tx (tx 1), so this is n + 1
     {
         let mut ledger = Ledger::new(single_segment_config(&temp_dir));
         ledger.start().unwrap();
+        ledger.open_accounts(1); // id 1 — opened before deposits (tx 1)
+        let mut id = 0u64;
         for _ in 0..n {
-            ledger.submit(Operation::Deposit {
+            id = ledger.submit(Operation::Deposit {
                 account: 1,
                 amount: 2,
                 user_ref: 0,
             });
         }
-        ledger.wait_for_transaction(n);
-        assert_eq!(ledger.last_commit_id(), n);
+        last_tx = id;
+        ledger.wait_for_transaction(last_tx);
+        assert_eq!(ledger.last_commit_id(), last_tx);
         assert_eq!(ledger.get_balance(1), (n * 2) as i64);
     }
 
     {
         let mut ledger = Ledger::new(single_segment_config(&temp_dir));
         ledger
-            .start_with_recovery_until(10_000) // far above n
+            .start_with_recovery_until(10_000) // far above last_tx
             .unwrap();
         assert_eq!(
             ledger.last_commit_id(),
-            n,
+            last_tx,
             "watermark above last_tx must clamp to last_tx, not the watermark"
         );
         assert_eq!(ledger.get_balance(1), (n * 2) as i64);
@@ -312,6 +325,7 @@ fn start_with_recovery_until_errors_when_sealed_segment_would_need_truncation() 
     {
         let mut ledger = Ledger::new(small_segment_no_snapshot_config(&temp_dir));
         ledger.start().unwrap();
+        ledger.open_accounts(1); // id 1 — opened before deposits (tx 1)
         // Default seal_watermark = u64::MAX → segments seal freely.
         //
         // The WAL stage's rotation check fires once per outer loop
@@ -367,7 +381,8 @@ fn start_with_recovery_until_errors_when_sealed_segment_would_need_truncation() 
     {
         let mut ledger = Ledger::new(small_segment_no_snapshot_config(&temp_dir));
         ledger.start().unwrap();
-        assert_eq!(ledger.last_commit_id(), 200);
+        // 201 = open tx (tx 1) + 200 deposits.
+        assert_eq!(ledger.last_commit_id(), 201);
         assert_eq!(ledger.get_balance(1), 200);
     }
 
@@ -383,6 +398,7 @@ fn watermark_at_zero_drops_everything() {
     {
         let mut ledger = Ledger::new(single_segment_config(&temp_dir));
         ledger.start().unwrap();
+        ledger.open_accounts(9); // ids 1..=9 — opened before deposits (tx 1)
         for _ in 0..20 {
             ledger.submit(Operation::Deposit {
                 account: 9,
@@ -390,8 +406,9 @@ fn watermark_at_zero_drops_everything() {
                 user_ref: 0,
             });
         }
-        ledger.wait_for_transaction(20);
-        assert_eq!(ledger.last_commit_id(), 20);
+        // 21 = open tx (tx 1) + 20 deposits.
+        ledger.wait_for_transaction(21);
+        assert_eq!(ledger.last_commit_id(), 21);
         assert_eq!(ledger.get_balance(9), 100);
     }
 
@@ -401,13 +418,21 @@ fn watermark_at_zero_drops_everything() {
         assert_eq!(ledger.last_commit_id(), 0);
         assert_eq!(ledger.get_balance(9), 0);
 
+        // watermark 0 dropped the original open too, so account 9 no longer
+        // exists — re-open it. The sequencer restarts at 1, so this open is
+        // tx 1 and the following deposit is tx 2.
+        let reopen = ledger.open_accounts(9);
+        assert_eq!(
+            reopen.tx_id, 1,
+            "sequencer must resume from 1 after dropping everything"
+        );
         let next = ledger.submit(Operation::Deposit {
             account: 9,
             amount: 7,
             user_ref: 0,
         });
-        assert_eq!(next, 1);
-        ledger.wait_for_transaction(1);
+        assert_eq!(next, 2);
+        ledger.wait_for_transaction(2);
         assert_eq!(ledger.get_balance(9), 7);
     }
 
@@ -415,7 +440,7 @@ fn watermark_at_zero_drops_everything() {
     {
         let mut ledger = Ledger::new(single_segment_config(&temp_dir));
         ledger.start().unwrap();
-        assert_eq!(ledger.last_commit_id(), 1);
+        assert_eq!(ledger.last_commit_id(), 2);
         assert_eq!(ledger.get_balance(9), 7);
     }
 

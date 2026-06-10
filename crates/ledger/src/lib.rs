@@ -14,6 +14,7 @@ pub mod test_support;
 pub mod tools;
 pub mod transaction;
 pub mod transactor;
+pub mod transactor_computer;
 pub mod tx_ring;
 pub mod wait_strategy;
 pub mod wal;

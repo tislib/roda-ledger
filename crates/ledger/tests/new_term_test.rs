@@ -47,6 +47,7 @@ fn new_term_advances_commit_index() {
 fn new_term_interleaved_with_transfers_all_commit() {
     let mut ledger = Ledger::new(LedgerConfig::temp());
     ledger.start().unwrap();
+    ledger.open_accounts(2); // ids 1..=2
 
     let r1 = ledger.submit_and_wait(
         Operation::Deposit {

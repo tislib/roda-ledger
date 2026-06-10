@@ -62,6 +62,11 @@ fn manual_replication_leader_to_follower() {
     let leader = named_ledger("leader", 10_000_000);
     let follower = named_ledger("follower", 20_000);
 
+    // Open the deposit account on the leader (tx_id 1). The follower replays
+    // this OpenAccount via the tailer (positioned at tx_id 1) before any
+    // deposit, so account existence is reconstructed on both sides.
+    let open_tx_id = leader.open_accounts(1).tx_id; // id 1
+
     // Share follower across threads; main thread only verifies, replication
     // thread drives append_wal_entries.
     let follower = Arc::new(Mutex::new(follower));
@@ -127,8 +132,9 @@ fn manual_replication_leader_to_follower() {
         let results = leader.submit_batch_and_wait(ops, WaitLevel::Committed);
         last_leader_tx = results.last().unwrap().tx_id;
     }
-    assert_eq!(last_leader_tx, total_tx);
-    assert_eq!(leader.last_commit_id(), total_tx);
+    // The open consumed tx_id 1, so the deposits occupy the next `total_tx` ids.
+    assert_eq!(last_leader_tx, open_tx_id + total_tx);
+    assert_eq!(leader.last_commit_id(), open_tx_id + total_tx);
 
     // 5. Wait for follower commit + snapshot indexes to catch up.
     wait_for(

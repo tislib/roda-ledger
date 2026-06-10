@@ -171,11 +171,12 @@ fn main() {
 
     let mut ledger = Ledger::new(LedgerConfig {
         // +1 so SYSTEM_ACCOUNT_ID (0) and accounts 1..=account_count all fit.
-        max_accounts: account_count as usize + 1,
         log_level: Info,
         ..LedgerConfig::bench()
     });
     ledger.start().unwrap();
+    // Existence enforcement (ADR-022): open the accounts the load hits (1..=N).
+    ledger.open_accounts(account_count as u32);
     let ledger = Arc::new(ledger);
 
     let scenarios = [

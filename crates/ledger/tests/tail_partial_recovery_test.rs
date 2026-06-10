@@ -48,6 +48,7 @@ fn unique_dir(name: &str) -> String {
 fn run_and_clean_shutdown(dir: &str, tx_count: u64) -> i64 {
     let mut ledger = Ledger::new(make_config(dir));
     ledger.start().unwrap();
+    ledger.open_accounts(100); // open before deposits
     let mut last_id = 0u64;
     for _ in 0..tx_count {
         last_id = ledger.submit(Operation::Deposit {

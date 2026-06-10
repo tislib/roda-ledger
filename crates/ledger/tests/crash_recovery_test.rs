@@ -24,7 +24,6 @@ fn crash_recovery_test() {
     // Phase 1: Insert transactions — WAL replay will be used on restart (no snapshot at 64MB segments)
     {
         let config = LedgerConfig {
-            max_accounts: 1_000_000,
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
                 snapshot_frequency: 2,
@@ -36,6 +35,7 @@ fn crash_recovery_test() {
 
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open accounts before deposits; survives restart
 
         let mut last_tx_id = 0;
         for _ in 0..num_transactions {
@@ -59,7 +59,6 @@ fn crash_recovery_test() {
     // Phase 2: Start again and add more transactions
     {
         let config = LedgerConfig {
-            max_accounts: 1_000_000,
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
                 snapshot_frequency: 2,
@@ -93,7 +92,6 @@ fn crash_recovery_test() {
     // Phase 3: Start again and verify
     {
         let config = LedgerConfig {
-            max_accounts: 1_000_000,
             storage: StorageConfig {
                 data_dir: temp_dir.to_string(),
                 snapshot_frequency: 2,

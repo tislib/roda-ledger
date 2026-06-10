@@ -89,9 +89,12 @@ fn standalone_default_is_valid() {
 /// No Node service, no quorum, no replication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn standalone_serves_writes_with_no_node_grpc() {
-    let ctl = ClusterTestingControl::start(ClusterTestingConfig::standalone())
-        .await
-        .expect("start");
+    let ctl = ClusterTestingControl::start(ClusterTestingConfig {
+        auto_open_accounts: 0, // this test only checks the submit's tx_id
+        ..ClusterTestingConfig::standalone()
+    })
+    .await
+    .expect("start");
 
     assert_eq!(
         ctl.node_port(0).expect("node_port"),

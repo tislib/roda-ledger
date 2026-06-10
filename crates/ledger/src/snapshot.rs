@@ -1,13 +1,17 @@
 use crate::balance::Balance;
 use crate::config::LedgerConfig;
-use crate::index::{IndexedTxEntry, IndexedTxLink, TransactionIndexer};
+use crate::index::{IndexedTxEntry, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
+use crate::transaction::CommittedTransaction;
+use crate::transactor::{STATUS_OPEN, STATUS_SYSTEM, grow_capacity, set_flag};
+use arc_swap::ArcSwap;
+use crossbeam_skiplist::SkipMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use storage::Storage;
-use storage::entities::{TxEntry, TxLink, TxMetadata, WalEntry};
+use storage::entities::{SYSTEM_ACCOUNT_ID, TxMetadata, WalEntry};
 
 /// A query to be executed by the Snapshot stage against the `TransactionIndexer`.
 ///
@@ -20,82 +24,130 @@ pub struct QueryRequest {
 
 /// Discriminant for the query type.
 pub enum QueryKind {
-    GetTransaction {
-        tx_id: u64,
-    },
-    GetAccountHistory {
-        account_id: u64,
-        from_tx_id: u64,
-        limit: usize,
-    },
-}
-
-/// Response payload returned via the `QueryRequest.respond` callback.
-/// Transaction query result containing entries and links.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionResult {
-    pub entries: Vec<IndexedTxEntry>,
-    pub links: Vec<IndexedTxLink>,
+    GetTransaction { tx_id: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryResponse {
-    Transaction(Option<TransactionResult>),
+    Transaction(Option<CommittedTransaction>),
     AccountHistory(Vec<IndexedTxEntry>),
 }
 
+/// Snapshot read-side account cell (ADR-022), mirroring `TransactorAccount`:
+/// a signed balance plus an 8-lane `flags` word (lane 0 = status). Both are
+/// atomic so the single-writer Snapshot stage publishes lock-free to the
+/// many concurrent query readers.
+pub struct SnapshotAccount {
+    pub balance: AtomicI64,
+    pub flags: AtomicU64,
+}
+
+impl SnapshotAccount {
+    fn new() -> Self {
+        Self {
+            balance: AtomicI64::new(0),
+            flags: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Lock-free, growable account vector for the read side (ADR-022). Reads
+/// `load()` the current generation; growth (rare, driven by `OpenAccount`)
+/// builds a larger copy and `store()`s it. The Snapshot stage (and recovery,
+/// pre-start) is the sole writer, so copy-then-swap loses no updates; readers
+/// are eventually consistent (an in-flight reader may briefly hold the older,
+/// shorter generation).
+type Accounts = Arc<ArcSwap<Vec<SnapshotAccount>>>;
+
+/// Parent→bucket links (ADR-022 §3): `(parent_id, type_id) → child_id`.
+/// Ordered, so a parent's buckets form a contiguous range scan. Shared
+/// lock-free — the snapshot writer inserts; query readers range/get.
+type Links = Arc<SkipMap<(u64, u16), u64>>;
+
 pub struct Snapshot {
-    balances: Arc<Vec<AtomicI64>>,
+    accounts: Accounts,
+    links: Links,
     indexer: Option<TransactionIndexer>,
     storage: Arc<Storage>,
+    resize_factor: f64,
 }
 
 struct SnapshotRunner {
-    balances: Arc<Vec<AtomicI64>>,
+    accounts: Accounts,
+    links: Links,
     indexer: TransactionIndexer,
     storage: Arc<Storage>,
     /// First tx id to tail (recovered `snapshot_index` + 1).
     from_tx_id: u64,
+    resize_factor: f64,
 }
 
 impl Snapshot {
     pub fn new(config: &LedgerConfig, storage: Arc<Storage>) -> Self {
-        let account_count = config.max_accounts;
-        let balances: Arc<Vec<AtomicI64>> =
-            Arc::new((0..account_count).map(|_| AtomicI64::new(0)).collect());
-
-        let account_heads_size = Self::next_power_of_two(account_count);
+        // Start small and grow on OpenAccount; recovery resizes to the
+        // persisted allocator high-water (ADR-022).
+        let initial = config.initial_account_size.max(1);
+        let accounts: Accounts = Arc::new(ArcSwap::from_pointee(
+            (0..initial)
+                .map(|_| SnapshotAccount::new())
+                .collect::<Vec<_>>(),
+        ));
+        // Only account 0 (SYSTEM) is existent at genesis; ids 1.. stay absent.
+        Self::mark_system_account(&accounts.load());
 
         Self {
-            balances,
+            accounts,
+            links: Arc::new(SkipMap::new()),
             indexer: Some(TransactionIndexer::new(
                 config.index_circle1_size(),
                 config.index_circle2_size(),
-                account_heads_size,
             )),
             storage,
+            resize_factor: config.resize_factor,
         }
     }
 
-    fn next_power_of_two(n: usize) -> usize {
-        if n == 0 {
-            return 1;
+    /// Bootstrap account 0 (SYSTEM) as existent — ONLY id 0. Every other cell
+    /// stays `flags = 0` (NOT_EXISTENT) until opened. Matches the transactor.
+    fn mark_system_account(accounts: &[SnapshotAccount]) {
+        if let Some(sys) = accounts.first() {
+            let mut f = 0u64;
+            set_flag(&mut f, 0, STATUS_SYSTEM);
+            sys.flags.store(f, Ordering::Release);
         }
-        let mut power = 1;
-        while power < n {
-            power *= 2;
+    }
+
+    /// Grow the account vector to cover `needed` ids (geometric, ADR-022),
+    /// preserving existing balances/flags. No-op when already large enough.
+    /// Safe because the Snapshot stage (and recovery, pre-start) is the only
+    /// writer: it copies the current cells and swaps in the larger generation.
+    fn ensure_capacity(accounts: &ArcSwap<Vec<SnapshotAccount>>, needed: usize, factor: f64) {
+        let cur = accounts.load();
+        if needed <= cur.len() {
+            return;
         }
-        power
+        let new_cap = grow_capacity(cur.len(), factor, needed);
+        let mut next: Vec<SnapshotAccount> = Vec::with_capacity(new_cap);
+        for a in cur.iter() {
+            next.push(SnapshotAccount {
+                balance: AtomicI64::new(a.balance.load(Ordering::Acquire)),
+                flags: AtomicU64::new(a.flags.load(Ordering::Acquire)),
+            });
+        }
+        next.resize_with(new_cap, SnapshotAccount::new);
+        accounts.store(Arc::new(next));
     }
 
     pub fn start(&mut self, ctx: SnapshotContext) -> std::io::Result<JoinHandle<()>> {
         // Resume tailing the durable WAL right after the last tx recovery applied.
         let from_tx_id = ctx.get_processed_index() + 1;
         let runner = SnapshotRunner {
-            balances: self.balances.clone(),
+            accounts: self.accounts.clone(),
+            links: self.links.clone(),
             indexer: self.indexer.take().unwrap(),
             storage: self.storage.clone(),
             from_tx_id,
+            resize_factor: self.resize_factor,
         };
         std::thread::Builder::new()
             .name("snapshot".to_string())
@@ -106,37 +158,98 @@ impl Snapshot {
     }
 
     pub(crate) fn recover_balances(&mut self, balances: &HashMap<u64, Balance>) {
+        if let Some(&max_id) = balances.keys().max() {
+            Self::ensure_capacity(&self.accounts, max_id as usize + 1, self.resize_factor);
+        }
+        let acc = self.accounts.load();
         for (account_id, balance) in balances {
-            self.balances[*account_id as usize].store(*balance, Ordering::Release);
+            if let Some(a) = acc.get(*account_id as usize) {
+                a.balance.store(*balance, Ordering::Release);
+            }
         }
     }
 
-    pub(crate) fn recover_index_tx_metadata(&mut self, metadata: &TxMetadata) {
-        if let Some(indexer) = &mut self.indexer {
-            indexer.insert_tx(metadata.tx_id);
+    /// Reconstruct account status from the recovered allocator high-water
+    /// (ADR-022): grow to cover it, then mark SYSTEM(0) plus `[1, next)` OPEN.
+    /// Mirrors the transactor so the read-side reflects existence for
+    /// opened-but-unfunded accounts.
+    pub(crate) fn recover_account_layout(&mut self, next_account_id: u64) {
+        Self::ensure_capacity(&self.accounts, next_account_id as usize, self.resize_factor);
+        let acc = self.accounts.load();
+        Self::mark_system_account(&acc);
+        let mut open = 0u64;
+        set_flag(&mut open, 0, STATUS_OPEN);
+        let upper = (next_account_id as usize).min(acc.len());
+        for id in 1..upper {
+            acc[id].flags.store(open, Ordering::Release);
         }
     }
 
-    pub(crate) fn recover_index_tx_link(&mut self, tx_id: u64, link: &TxLink) {
-        if let Some(indexer) = &mut self.indexer {
-            indexer.insert_link(tx_id, link.kind(), link.to_tx_id);
+    /// Recovery hook: replay an `AccountLinked` record into the link map so
+    /// the read side can resolve/enumerate a parent's buckets (ADR-022 §3).
+    pub(crate) fn recover_account_link(&mut self, parent_id: u64, type_id: u16, child_id: u64) {
+        self.links.insert((parent_id, type_id), child_id);
+    }
+
+    /// Recovery hook: overlay exact per-account flags (snapshot + replayed
+    /// `AccountOpened`) so the read side reflects PROGRAMMED/SYSTEM correctly.
+    /// SYSTEM(0) is skipped — `recover_account_layout` owns it.
+    pub(crate) fn recover_account_flags(&mut self, flags: &HashMap<u64, u64>) {
+        if let Some(&max_id) = flags.keys().max() {
+            Self::ensure_capacity(&self.accounts, max_id as usize + 1, self.resize_factor);
+        }
+        let acc = self.accounts.load();
+        for (&account_id, &f) in flags {
+            if account_id == SYSTEM_ACCOUNT_ID {
+                continue;
+            }
+            if let Some(a) = acc.get(account_id as usize) {
+                a.flags.store(f, Ordering::Release);
+            }
         }
     }
 
-    pub(crate) fn recover_index_tx_entry(&mut self, tx_id: u64, entry: &TxEntry) {
+    pub(crate) fn recover_index_transaction(&mut self, meta: &TxMetadata, followers: &[WalEntry]) {
         if let Some(indexer) = &mut self.indexer {
-            indexer.insert_entry(
-                tx_id,
-                entry.account_id,
-                entry.amount,
-                entry.kind,
-                entry.computed_balance,
-            )
+            indexer.insert_transaction(meta, followers);
         }
     }
 
     pub fn get_balance(&self, account_id: u64) -> Balance {
-        self.balances[account_id as usize].load(Ordering::Acquire)
+        self.accounts
+            .load()
+            .get(account_id as usize)
+            .map(|a| a.balance.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Raw 8-lane flags word for `account_id` (lane 0 = status). Lets query
+    /// handlers distinguish OPEN / PROGRAMMED / SYSTEM / absent accounts.
+    /// Returns 0 (NOT_EXISTENT) for ids beyond the current vector.
+    pub fn get_flags(&self, account_id: u64) -> u64 {
+        self.accounts
+            .load()
+            .get(account_id as usize)
+            .map(|a| a.flags.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Per-type linked-bucket balances for `parent_id` (ADR-022 §8): range-scan
+    /// the link table for `(parent_id, *)` and read each child's balance.
+    pub fn linked_balances(&self, parent_id: u64) -> Vec<(u16, Balance)> {
+        let accounts = self.accounts.load();
+        self.links
+            .range((parent_id, 0)..=(parent_id, u16::MAX))
+            .map(|e| {
+                let type_id = e.key().1;
+                let child = *e.value();
+                let bal = accounts
+                    .get(child as usize)
+                    .map(|a| a.balance.load(Ordering::Acquire))
+                    .unwrap_or(0);
+                (type_id, bal)
+            })
+            .collect()
     }
 }
 
@@ -148,39 +261,55 @@ impl SnapshotRunner {
         let mut tailer = self.storage.wal_tailer(self.from_tx_id);
         // Trailer layout: buffer a transaction's followers until its TxMetadata clears
         // the commit gate, then apply index + balances together (invisible until durable).
-        let mut entries: Vec<TxEntry> = Vec::new();
-        let mut links: Vec<TxLink> = Vec::new();
+        let mut group: Vec<WalEntry> = Vec::new();
         while ctx.is_running() {
-            entries.clear();
-            links.clear();
+            group.clear();
             let progressed = tailer.tail_entries(|wal_entry| {
                 match wal_entry {
                     // Not durable yet: tail_entries retains this group; re-read once committed.
                     WalEntry::Metadata(m) if m.tx_id > ctx.commit_index() => return false,
                     WalEntry::Metadata(m) => {
-                        self.indexer.insert_tx(m.tx_id);
-                        for e in entries.drain(..) {
-                            self.indexer.insert_entry(
-                                m.tx_id,
-                                e.account_id,
-                                e.amount,
-                                e.kind,
-                                e.computed_balance,
-                            );
-                            self.balances[e.account_id as usize]
-                                .store(e.computed_balance, Ordering::Release);
-                        }
-                        for l in links.drain(..) {
-                            self.indexer.insert_link(m.tx_id, l.kind(), l.to_tx_id);
+                        // Index the whole transaction: meta + all followers, stored as-is.
+                        self.indexer.insert_transaction(&m, &group);
+                        // Apply balances and status flags from the followers.
+                        for follower in group.drain(..) {
+                            match follower {
+                                WalEntry::Entry(e) => {
+                                    let acc = self.accounts.load();
+                                    if let Some(a) = acc.get(e.account_id as usize) {
+                                        a.balance.store(e.computed_balance, Ordering::Release);
+                                    }
+                                }
+                                WalEntry::AccountOpened(a) => {
+                                    // Grow to cover the opened range, then publish its flags.
+                                    let end = (a.begin_account_id + a.count as u64) as usize;
+                                    Snapshot::ensure_capacity(
+                                        &self.accounts,
+                                        end,
+                                        self.resize_factor,
+                                    );
+                                    let acc = self.accounts.load();
+                                    let begin = a.begin_account_id as usize;
+                                    for id in begin..end.min(acc.len()) {
+                                        acc[id].flags.store(a.flags, Ordering::Release);
+                                    }
+                                }
+                                WalEntry::AccountLinked(a) => {
+                                    self.links.insert((a.parent_id, a.type_id), a.child_id);
+                                }
+                                WalEntry::AccountFlagsUpdated(a) => {
+                                    let acc = self.accounts.load();
+                                    if let Some(slot) = acc.get(a.account_id as usize) {
+                                        slot.flags.store(a.new_flags, Ordering::Release);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         ctx.set_processed_index(m.tx_id);
                     }
-                    WalEntry::Entry(e) => {
-                        entries.push(e);
-                    }
-                    WalEntry::Link(l) => links.push(l),
-                    // TxTerm / FunctionRegistered carry no query index.
-                    _ => {}
+                    // Buffer every follower as-is until its metadata clears the gate.
+                    other => group.push(other),
                 }
                 true
             });
@@ -190,20 +319,12 @@ impl SnapshotRunner {
 
                 let response = match q.kind {
                     QueryKind::GetTransaction { tx_id } => {
-                        let result = self.indexer.get_transaction(tx_id).map(|entries| {
-                            let links = self.indexer.get_links(tx_id).cloned().unwrap_or_default();
-                            TransactionResult { entries, links }
-                        });
+                        let result = self
+                            .indexer
+                            .get_transaction(tx_id)
+                            .map(|(meta, entries)| CommittedTransaction { meta, entries });
                         QueryResponse::Transaction(result)
                     }
-                    QueryKind::GetAccountHistory {
-                        account_id,
-                        from_tx_id,
-                        limit,
-                    } => QueryResponse::AccountHistory(
-                        self.indexer
-                            .get_account_history(account_id, from_tx_id, limit),
-                    ),
                 };
                 (q.respond)(response);
             } else if !progressed {

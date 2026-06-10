@@ -33,6 +33,7 @@ fn test_replay_identical_balances() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before any balance ops
 
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -135,6 +136,7 @@ fn test_replay_across_many_segments() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before any balance ops
 
         let mut last_id = 0u64;
         for i in 0..total_deposits {
@@ -208,6 +210,7 @@ fn test_replay_with_rejections() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before any balance ops
 
         // Deposit 1000 into account 1
         let mut last_id = 0u64;
@@ -285,6 +288,7 @@ fn test_replay_snapshot_plus_partial_wal() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(100); // open before any balance ops
 
         // Submit enough for multiple sealed segments with snapshots
         let mut last_id = 0u64;

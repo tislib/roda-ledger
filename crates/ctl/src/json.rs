@@ -46,6 +46,25 @@ pub fn wal_entry_to_json(entry: &WalEntry, current_tx_id: u64) -> serde_json::Va
             "unregister": f.is_unregister(),
         }),
         WalEntry::Term(_) => serde_json::json!({ "type": "Term" }),
+        WalEntry::AccountOpened(a) => serde_json::json!({
+            "type": "AccountOpened",
+            "begin_account_id": a.begin_account_id,
+            "count": a.count,
+            "flags": a.flags,
+            "user_ref": a.user_ref,
+        }),
+        WalEntry::AccountLinked(a) => serde_json::json!({
+            "type": "AccountLinked",
+            "parent_id": a.parent_id,
+            "type_id": a.type_id,
+            "child_id": a.child_id,
+        }),
+        WalEntry::AccountFlagsUpdated(a) => serde_json::json!({
+            "type": "AccountFlagsUpdated",
+            "account_id": a.account_id,
+            "prev_flags": a.prev_flags,
+            "new_flags": a.new_flags,
+        }),
     }
 }
 
@@ -126,6 +145,36 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
                 .unwrap_or(0);
             Ok(WalEntry::FunctionRegistered(FunctionRegistered::new(
                 name, version, crc32c,
+            )))
+        }
+        "AccountOpened" => {
+            let begin_account_id = value["begin_account_id"]
+                .as_u64()
+                .ok_or("missing begin_account_id")?;
+            let count = value["count"].as_u64().ok_or("missing count")? as u32;
+            let flags = value.get("flags").and_then(|v| v.as_u64()).unwrap_or(0);
+            let user_ref = value.get("user_ref").and_then(|v| v.as_u64()).unwrap_or(0);
+            Ok(WalEntry::AccountOpened(AccountOpened::new(
+                begin_account_id,
+                count,
+                flags,
+                user_ref,
+            )))
+        }
+        "AccountLinked" => {
+            let parent_id = value["parent_id"].as_u64().ok_or("missing parent_id")?;
+            let type_id = value["type_id"].as_u64().ok_or("missing type_id")? as u16;
+            let child_id = value["child_id"].as_u64().ok_or("missing child_id")?;
+            Ok(WalEntry::AccountLinked(AccountLinked::new(
+                parent_id, type_id, child_id,
+            )))
+        }
+        "AccountFlagsUpdated" => {
+            let account_id = value["account_id"].as_u64().ok_or("missing account_id")?;
+            let prev_flags = value["prev_flags"].as_u64().ok_or("missing prev_flags")?;
+            let new_flags = value["new_flags"].as_u64().ok_or("missing new_flags")?;
+            Ok(WalEntry::AccountFlagsUpdated(AccountFlagsUpdated::new(
+                account_id, prev_flags, new_flags,
             )))
         }
         other => Err(format!("unknown record type: {}", other)),

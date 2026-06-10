@@ -116,8 +116,12 @@ fn run_backpressure_scenario(
     let fault = ledger.fault_injector();
     let _guard = FaultGuard(fault.clone());
 
-    inject(&fault);
     ledger.start().unwrap();
+    // Open the target account before the fault stalls the WAL — the submitter
+    // deposits into id 7, which the ledger now requires to exist. Injecting
+    // after the open keeps the fault active for the whole submitter run.
+    ledger.open_accounts(7); // ids 1..=7
+    inject(&fault);
 
     let ledger = Arc::new(ledger);
     let submitted = Arc::new(AtomicU64::new(0));

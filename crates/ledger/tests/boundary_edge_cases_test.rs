@@ -4,38 +4,47 @@ use std::time::Duration;
 use storage::StorageConfig;
 use storage::entities::FailReason;
 
-/// Account at max_accounts fails with ACCOUNT_LIMIT_EXCEEDED.
+/// Existence enforcement near the snapshot capacity (`max_accounts`).
+/// The old open-ceiling is gone: opening a large count succeeds, a deposit
+/// into an opened id works, and a deposit into an unopened id that is still
+/// below `max_accounts` is rejected with ACCOUNT_NOT_FOUND. (Depositing into
+/// an id >= max_accounts is unsupported — the snapshot Vec is sized to it —
+/// so this test stays strictly below the cap.)
 #[test]
 fn test_max_accounts_boundary() {
     let config = LedgerConfig {
-        max_accounts: 100,
         seal_check_internal: Duration::from_millis(10),
         ..LedgerConfig::temp()
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
 
-    // Account 99 (last valid) should succeed
+    // Opening 90 accounts (ids 1..=90) succeeds — there is no open ceiling.
+    let opened = ledger.open_accounts(90);
+    assert_eq!(opened.fail_reason, FailReason::NONE, "open should succeed");
+
+    // Account 90 (opened, < max_accounts) should accept a deposit.
     let ok_id = ledger.submit(Operation::Deposit {
-        account: 99,
+        account: 90,
         amount: 1,
         user_ref: 0,
     });
     ledger.wait_for_transaction(ok_id);
     let status = ledger.get_transaction_status(ok_id);
-    assert!(status.is_ok(), "account 99 should be valid");
-    assert_eq!(ledger.get_balance(99), 1);
+    assert!(status.is_ok(), "opened account 90 should be valid");
+    assert_eq!(ledger.get_balance(90), 1);
 
-    // Account 100 (out of bounds) should fail
+    // Account 95 was never opened (still < max_accounts) → ACCOUNT_NOT_FOUND.
     let fail_id = ledger.submit(Operation::Deposit {
-        account: 100,
+        account: 95,
         amount: 1,
         user_ref: 0,
     });
     ledger.wait_for_transaction(fail_id);
     let status = ledger.get_transaction_status(fail_id);
-    assert!(status.is_err(), "account 100 should be rejected");
-    assert_eq!(status.error_reason(), FailReason::ACCOUNT_LIMIT_EXCEEDED);
+    assert!(status.is_err(), "unopened account 95 should be rejected");
+    assert_eq!(status.error_reason(), FailReason::ACCOUNT_NOT_FOUND);
+    assert_eq!(ledger.get_balance(95), 0);
 }
 
 /// Deposit of amount 0 - verify defined behavior.
@@ -47,6 +56,7 @@ fn test_zero_amount_deposit() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(1); // id 1
 
     let id = ledger.submit(Operation::Deposit {
         account: 1,
@@ -68,6 +78,7 @@ fn test_single_transaction() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(1); // id 1
 
     let id = ledger.submit(Operation::Deposit {
         account: 1,
@@ -105,6 +116,7 @@ fn test_segment_exact_boundary_rotation() {
         };
         let mut ledger = Ledger::new(config);
         ledger.start().unwrap();
+        ledger.open_accounts(1); // id 1 — reconstructed from the WAL on restart
 
         let mut last_id = 0u64;
         for _ in 0..total_deposits {
@@ -152,6 +164,7 @@ fn test_self_transfer() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(3); // ids 1..=3 (uses 3)
 
     // Fund account 3
     let dep_id = ledger.submit(Operation::Deposit {
@@ -183,6 +196,7 @@ fn test_transfer_insufficient_funds() {
     };
     let mut ledger = Ledger::new(config);
     ledger.start().unwrap();
+    ledger.open_accounts(2); // ids 1..=2
 
     let dep_id = ledger.submit(Operation::Deposit {
         account: 1,

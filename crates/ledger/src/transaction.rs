@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
+pub use storage::entities::CommittedTransaction;
 use storage::entities::FailReason;
+
+/// Result of [`crate::ledger::Ledger::get_account_history`]: the matched
+/// transactions (newest→oldest) plus `scan_last_tx_id` — the oldest tx_id the
+/// backward scan reached. To page further into the past, re-query with
+/// `from_tx_id = scan_last_tx_id`.
+#[derive(Clone, Debug)]
+pub struct AccountHistory {
+    pub transactions: Vec<CommittedTransaction>,
+    pub scan_last_tx_id: u64,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Operation {
@@ -45,6 +56,10 @@ pub enum Operation {
         node_count: u16,
         node_voted: u16,
     },
+    /// Open a contiguous range of `count` accounts (`count == 0` ⇒ 1). The
+    /// committed transaction's `AccountOpened` record carries the begin id and
+    /// count; querying the tx yields the `[begin, end)` range.
+    OpenAccount { count: u32, user_ref: u64 },
 }
 
 impl Operation {
@@ -55,6 +70,7 @@ impl Operation {
             Operation::Withdrawal { user_ref, .. } => *user_ref,
             Operation::Function { user_ref, .. } => *user_ref,
             Operation::FunctionRegistration { user_ref, .. } => *user_ref,
+            Operation::OpenAccount { user_ref, .. } => *user_ref,
             Operation::NewTerm { .. } => 0,
         }
     }
@@ -76,6 +92,17 @@ pub enum WaitLevel {
 pub struct SubmitResult {
     pub tx_id: u64,
     pub fail_reason: FailReason,
+}
+
+/// Result of `Ledger::open_accounts`: the committed open's id range, read back
+/// from the `AccountOpened` record. `begin_account_id`/`count` are valid only
+/// when `fail_reason == NONE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAccountsResult {
+    pub tx_id: u64,
+    pub fail_reason: FailReason,
+    pub begin_account_id: u64,
+    pub count: u32,
 }
 
 impl Transaction {
