@@ -4,6 +4,9 @@
 
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::transaction::{CommittedTransaction, Operation, WaitLevel};
+use std::fs;
+use std::time::Duration;
+use storage::StorageConfig;
 
 fn start() -> Ledger {
     let mut l = Ledger::new(LedgerConfig::temp());
@@ -68,4 +71,79 @@ fn account_history_newest_first_filtered_windowed_paginated() {
 
     // Never-opened account: empty history.
     assert!(l.get_account_history(9999, 0, 0).transactions.is_empty());
+}
+
+fn unique_dir(name: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("temp_{}_{}", name, nanos)
+}
+
+/// Account history reads the durable WAL via `WalScanner` — it spans sealed
+/// segments and survives a cold restart (migrated from the cold-path tests).
+#[test]
+fn account_history_spans_sealed_segments_and_survives_restart() {
+    let dir = unique_dir("account_history_cold");
+    // Small segments + seal so the deposits rotate into sealed segments.
+    let make_config = || LedgerConfig {
+        storage: StorageConfig {
+            data_dir: dir.clone(),
+            transaction_count_per_segment: 1000,
+            snapshot_frequency: 0,
+            ..Default::default()
+        },
+        seal_check_internal: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    // Interleave account 5 (even i) and account 2 (odd i): 1000 deposits each.
+    let account5_deposits = 1000;
+
+    // Phase 1: query live, while the WAL spans sealed + active segments.
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        ledger.open_accounts(10); // tx1: AccountOpened(1..=10), covers account 5
+        let mut last = 0;
+        for i in 0..2000u64 {
+            let account = if i % 2 == 0 { 5 } else { 2 };
+            last = ledger.submit(Operation::Deposit {
+                account,
+                amount: 100,
+                user_ref: i,
+            });
+        }
+        ledger.wait_for_transaction(last);
+        ledger.wait_for_seal();
+
+        let live = ledger.get_account_history(5, 0, 0);
+        assert_eq!(
+            live.transactions.len(),
+            account5_deposits + 1,
+            "account-5 deposits + the covering open; account-2 txs excluded"
+        );
+        assert_eq!(live.scan_last_tx_id, 1, "scanned back to the WAL start");
+        for w in live.transactions.windows(2) {
+            assert!(w[0].meta.tx_id > w[1].meta.tx_id, "newest-first");
+        }
+        drop(ledger);
+    }
+
+    // Phase 2: cold restart — same history rebuilt from disk, no in-memory index.
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        let cold = ledger.get_account_history(5, 0, 0);
+        assert_eq!(cold.transactions.len(), account5_deposits + 1);
+        assert_eq!(
+            cold.transactions.last().unwrap().meta.tx_id,
+            1,
+            "oldest is the open that created account 5"
+        );
+        drop(ledger);
+    }
+
+    fs::remove_dir_all(&dir).ok();
 }
