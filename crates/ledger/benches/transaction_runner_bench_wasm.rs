@@ -10,7 +10,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::ledger::WaitStrategy;
 use ledger::test_support::mock_pipeline;
-use ledger::transactor::TransactorRunner;
+use ledger::transactor::runner::TransactorRunner;
 use ledger::transactor::transaction::{Operation, Transaction};
 use ledger::transactor::wasm_runtime::WasmRuntime;
 use std::sync::Arc;
