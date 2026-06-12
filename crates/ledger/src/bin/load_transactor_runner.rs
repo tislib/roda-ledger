@@ -1,6 +1,6 @@
 use clap::Parser;
 use ledger::test_support::mock_pipeline;
-use ledger::transactor::runner::TransactorRunner;
+use ledger::transactor::runner::Runner;
 use ledger::transactor::transaction::{Operation, Transaction};
 use ledger::transactor::wasm_runtime::WasmRuntime;
 use ledger::wait_strategy::WaitStrategy;
@@ -78,7 +78,7 @@ fn main() {
     let (_pipeline, writer, _drain) = mock_pipeline(1024, args.ring_size, WaitStrategy::Balanced);
     let ctx = _pipeline.transactor_context();
     // +1 so SYSTEM_ACCOUNT_ID (0) and accounts 1..=account_count all fit.
-    let mut runner = TransactorRunner::new(account_count as usize + 1, runtime, writer);
+    let mut runner = Runner::new(account_count as usize + 1, runtime, writer);
 
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);

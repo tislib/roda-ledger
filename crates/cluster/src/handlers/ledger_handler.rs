@@ -2,7 +2,7 @@ use crate::consensus::state::Consensus;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::ledger as proto;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use ledger::transactor::computer::STATUS_PROGRAMMED;
+use ledger::transactor::STATUS_PROGRAMMED;
 use ledger::transactor::transaction::Operation;
 use spdlog::{trace, warn};
 use std::collections::BTreeMap;

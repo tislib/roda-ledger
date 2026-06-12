@@ -1,10 +1,9 @@
 use crate::dedup::{DedupCache, DedupResult};
 use crate::ledger::WaitStrategy;
 use crate::pipeline::TransactorContext;
-use crate::transactor;
 use crate::transactor::transaction::{Operation, Transaction, TransactionInput};
 use crate::transactor::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
-use crate::transactor::{TransactorAccount, TransactorComputer, grow_capacity};
+use crate::transactor::{Computer, TransactorAccount, grow_capacity};
 use crate::tx_ring::writer::TxRingWriter;
 use crossbeam_skiplist::SkipMap;
 use std::cell::RefCell;
@@ -14,25 +13,25 @@ use std::sync::Arc;
 use storage::entities::{FailReason, FunctionRegistered, SYSTEM_ACCOUNT_ID, WalEntry};
 use storage::entries::wal_tx_term_entry;
 
-pub struct TransactorRunner {
+pub struct Runner {
     pub(super) rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     pub(super) transaction_buffer: Vec<Transaction>,
     pub(super) expected_next_id: u64,
     pub(super) pending: BTreeMap<u64, Transaction>,
     pub(super) input_retry_count: u64,
     pub(super) dedup: DedupCache,
-    pub(super) state: Rc<RefCell<TransactorComputer>>,
+    pub(super) state: Rc<RefCell<Computer>>,
     pub(super) wasm_engine: WasmRuntimeEngine,
 }
 
-impl TransactorRunner {
+impl Runner {
     /// Standalone constructor used by benches (no pipeline / no queues).
     pub fn new(
         max_accounts: usize,
         wasm_runtime: Arc<WasmRuntime>,
         ring_writer: TxRingWriter,
     ) -> Self {
-        let state = Rc::new(RefCell::new(TransactorComputer::new(
+        let state = Rc::new(RefCell::new(Computer::new(
             max_accounts,
             ring_writer,
             WaitStrategy::default(),
@@ -489,14 +488,14 @@ impl TransactorRunner {
                             if !s.ensure_capacity(ctx, 2) {
                                 return max_tx_id;
                             }
-                            s.begin(transactor::build_wasm_tag(0), user_ref, timestamp);
+                            s.begin(build_wasm_tag(0), user_ref, timestamp);
                             s.fail(FailReason::INVALID_OPERATION);
                         }
                         Some(caller) => {
                             // Record the tagged header (drop the borrow before WASM
                             // runs so host imports can borrow_mut the same state).
                             self.state.borrow_mut().begin(
-                                transactor::build_wasm_tag(caller.crc32c()),
+                                build_wasm_tag(caller.crc32c()),
                                 user_ref,
                                 timestamp,
                             );
@@ -555,4 +554,16 @@ impl TransactorRunner {
         self.input_retry_count = 0;
         self.state.borrow_mut().reset_step();
     }
+}
+
+/// Build the 8-byte `TxMetadata.tag` for a WASM-driven transaction:
+/// `[b'f', b'n', b'w', b'\n', crc[0], crc[1], crc[2], crc[3]]`. The
+/// literal prefix lets `roda-ctl unpack` render it as `"fnw\n4a2f1c3d"`,
+/// and the embedded CRC32C identifies the exact binary.
+#[inline]
+pub fn build_wasm_tag(crc32c: u32) -> [u8; 8] {
+    let bytes = crc32c.to_le_bytes();
+    [
+        b'f', b'n', b'w', b'\n', bytes[0], bytes[1], bytes[2], bytes[3],
+    ]
 }

@@ -10,7 +10,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::ledger::WaitStrategy;
 use ledger::test_support::mock_pipeline;
-use ledger::transactor::runner::TransactorRunner;
+use ledger::transactor::runner::Runner;
 use ledger::transactor::transaction::{Operation, Transaction};
 use ledger::transactor::wasm_runtime::WasmRuntime;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ fn transaction_runner_bench_wasm(c: &mut Criterion) {
     // Ring writer + context + background drain so process_direct never blocks.
     let (pipeline, writer, _drain) = mock_pipeline(1024, 1 << 16, WaitStrategy::Balanced);
     let ctx = pipeline.transactor_context();
-    let mut runner = TransactorRunner::new(10_000_000, runtime.clone(), writer);
+    let mut runner = Runner::new(10_000_000, runtime.clone(), writer);
     let mut current_id = 0u64;
 
     group.throughput(Throughput::Elements(1));

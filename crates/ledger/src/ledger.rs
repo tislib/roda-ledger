@@ -6,10 +6,10 @@ use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse, Snapshot};
+use crate::transactor::Transactor;
 use crate::transactor::transaction::{
     AccountHistory, OpenAccountsResult, Operation, SubmitResult, TransactionStatus, WaitLevel,
 };
-use crate::transactor::transactor::Transactor;
 pub use crate::transactor::wasm_runtime::FunctionInfo;
 use crate::transactor::wasm_runtime::{WasmRuntime, validate_name};
 use crate::tx_ring::ring::TxRing;
