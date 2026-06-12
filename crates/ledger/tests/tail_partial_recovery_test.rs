@@ -10,7 +10,7 @@
 
 use ledger::config::LedgerConfig;
 use ledger::ledger::Ledger;
-use ledger::transaction::Operation;
+use ledger::transactor::transaction::Operation;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;

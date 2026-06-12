@@ -7,7 +7,7 @@
 
 use ledger::fault::LedgerFaultInjector;
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::Operation;
+use ledger::transactor::transaction::Operation;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};

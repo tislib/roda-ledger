@@ -3,7 +3,7 @@
 //! `[to_tx_id, from_tx_id]` window, with `scan_last_tx_id` for pagination.
 
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::{CommittedTransaction, Operation, WaitLevel};
+use ledger::transactor::transaction::{CommittedTransaction, Operation, WaitLevel};
 use std::fs;
 use std::time::Duration;
 use storage::StorageConfig;

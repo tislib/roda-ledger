@@ -5,7 +5,7 @@
 
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use ledger::transaction::Operation;
+use ledger::transactor::transaction::Operation;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;

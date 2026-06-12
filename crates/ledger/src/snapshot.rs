@@ -2,7 +2,7 @@ use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::index::{IndexedTxEntry, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
-use crate::transaction::CommittedTransaction;
+use crate::transactor::transaction::CommittedTransaction;
 use crate::transactor::{STATUS_OPEN, STATUS_SYSTEM, grow_capacity, set_flag};
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;

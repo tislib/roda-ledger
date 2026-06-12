@@ -21,13 +21,13 @@
 //!     global wipe, unrelated cache entries are untouched.
 //!   - host functions read the transactor state via
 //!     `caller.data().borrow_mut()` — no tx_id is carried through the
-//!     wasmtime boundary; the transactor calls [`TransactorComputer::init`]
+//!     wasmtime boundary; the transactor calls [`Computer::init`]
 //!     once per transaction and state methods pick the current id up
 //!     from the field.
 //!
 //! No `unsafe`, no raw pointers, no generics.
 
-use crate::transactor::TransactorComputer;
+use crate::transactor::Computer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -57,10 +57,10 @@ type ExecTypedFunc = TypedFunc<(i64, i64, i64, i64, i64, i64, i64, i64), i32>;
 
 /// Store data threaded through wasmtime host calls: the shared mutable
 /// transactor state. The transactor writes its per-transaction id into
-/// the state via [`TransactorComputer::init`] before calling
+/// the state via [`Computer::init`] before calling
 /// [`FunctionCaller::execute`], so no `tx_id` ever crosses the wasmtime
 /// boundary.
-pub type WasmStoreData = Rc<RefCell<TransactorComputer>>;
+pub type WasmStoreData = Rc<RefCell<Computer>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmRuntime — shared compiled-module registry
@@ -504,7 +504,7 @@ impl FunctionCaller {
 /// registrations.
 pub struct WasmRuntimeEngine {
     runtime: Arc<WasmRuntime>,
-    state: Rc<RefCell<TransactorComputer>>,
+    state: Rc<RefCell<Computer>>,
     /// Wrapped in `Rc<RefCell<>>` so every produced [`FunctionCaller`]
     /// can carry an `Rc::clone` and `execute(params)` without the
     /// caller threading the store through the call site.
@@ -516,7 +516,7 @@ impl WasmRuntimeEngine {
     /// Build a new per-Transactor engine. Creates the long-lived `Store`
     /// holding an `Rc::clone(&state)` so every host call sees the same
     /// mutable transactor state.
-    pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<TransactorComputer>>) -> Self {
+    pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<Computer>>) -> Self {
         let store = Rc::new(RefCell::new(Store::new(
             runtime.engine(),
             Rc::clone(&state),
@@ -608,7 +608,7 @@ impl WasmRuntimeEngine {
     /// Shared reference to the `TransactorComputer` handle held by the
     /// engine's Store. Useful for tests.
     #[inline]
-    pub fn state(&self) -> &Rc<RefCell<TransactorComputer>> {
+    pub fn state(&self) -> &Rc<RefCell<Computer>> {
         &self.state
     }
 

@@ -1,7 +1,7 @@
 //! Integration tests for ADR-015 `Ledger::append_wal_entries` + `WalTailer`.
 
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 use std::time::{Duration, Instant};
 use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 

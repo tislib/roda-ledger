@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ledger::transactor_computer::TransactorComputer;
+use ledger::transactor::Computer;
 use ledger::tx_ring::ring::TxRing;
 use ledger::wait_strategy::WaitStrategy;
 use std::time::Duration;
@@ -18,7 +18,7 @@ fn deposit_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     let (writer, mut reader) = TxRing::new(1 << 16);
-    let mut s = TransactorComputer::new(ACCOUNTS as usize + 1, writer, WaitStrategy::Balanced);
+    let mut s = Computer::new(ACCOUNTS as usize + 1, writer, WaitStrategy::Balanced);
     s.tx_ring_pusher.reserve();
     s.open_accounts(ACCOUNTS as u32, 0); // ids 1..=ACCOUNTS → OPEN
     s.tx_ring_pusher.commit();

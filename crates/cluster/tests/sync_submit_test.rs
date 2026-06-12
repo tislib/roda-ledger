@@ -1,6 +1,6 @@
 mod tests {
     use ledger::ledger::{Ledger, LedgerConfig};
-    use ledger::transaction::{Operation, WaitLevel as InternalWaitLevel};
+    use ledger::transactor::transaction::{Operation, WaitLevel as InternalWaitLevel};
 
     // ---- Ledger API (library-mode) tests ----
 

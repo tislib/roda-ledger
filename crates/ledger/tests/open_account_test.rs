@@ -1,5 +1,5 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 use std::time::Duration;
 use storage::StorageConfig;
 use storage::entities::FailReason;

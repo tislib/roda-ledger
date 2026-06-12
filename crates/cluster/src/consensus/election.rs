@@ -1,6 +1,6 @@
 use super::state::Consensus;
 use crate::config::Config;
-use ledger::transaction::Operation;
+use ledger::transactor::transaction::Operation;
 use proto::node::RequestVoteRequest;
 use proto::node::node_client::NodeClient;
 use raft::{NodeId, RequestVote, Role, VoteOutcome};

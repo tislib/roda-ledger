@@ -7,7 +7,7 @@
 use clap::{Parser, ValueEnum};
 use ledger::config::LedgerConfig;
 use ledger::ledger::Ledger;
-use ledger::transaction::Operation;
+use ledger::transactor::transaction::Operation;
 use roda_latency_tracker::latency_measurer::{LatencyMeasurer, LatencyStats};
 use spdlog::Level::Info;
 use std::hint::spin_loop;

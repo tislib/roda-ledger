@@ -2,7 +2,7 @@
 //! `append_wal_entries` on the follower (ADR-015 smoke test).
 
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 use ledger::wait_strategy::WaitStrategy;
 use spdlog::Level;
 use std::sync::{

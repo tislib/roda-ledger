@@ -10,7 +10,7 @@
 //! (`LedgerConfig::temp`) so tests are independent and isolable.
 
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 use storage::StorageConfig;
 
 // ──────────────────────────────────────────────────────────────────────────

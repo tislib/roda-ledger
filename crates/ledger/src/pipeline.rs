@@ -11,7 +11,7 @@
 
 use crate::config::LedgerConfig;
 use crate::snapshot::QueryRequest;
-use crate::transaction::TransactionInput;
+use crate::transactor::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
@@ -466,10 +466,10 @@ impl LedgerContext {
         match self
             .pipeline
             .sequencer_to_transactor
-            .push(crate::transaction::TransactionInput::Replicated(entries))
+            .push(TransactionInput::Replicated(entries))
         {
             Ok(()) => Ok(()),
-            Err(crate::transaction::TransactionInput::Replicated(returned)) => Err(returned),
+            Err(TransactionInput::Replicated(returned)) => Err(returned),
             Err(_) => unreachable!(
                 "push_replicated_entries pushed Replicated; only Replicated can come back"
             ),

@@ -1,5 +1,5 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 
 /// `Operation::NewTerm` is an internal cluster op that emits a
 /// `TxMetadata` with a single `TxTerm` sub-item. Both records carry the

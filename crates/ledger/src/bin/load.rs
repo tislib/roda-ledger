@@ -1,7 +1,7 @@
 use clap::Parser;
 use ledger::config::LedgerConfig;
 use ledger::ledger::Ledger;
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use spdlog::Level::Info;
 use std::time::{Duration, Instant};
