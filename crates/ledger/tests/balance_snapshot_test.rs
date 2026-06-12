@@ -1,5 +1,5 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::{Operation, WaitLevel};
 
 #[test]
 fn test_balance_always_guaranteed_when_wait_level_is_snapshotted() {

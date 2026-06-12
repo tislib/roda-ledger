@@ -27,7 +27,7 @@
 //!
 //! No `unsafe`, no raw pointers, no generics.
 
-use crate::transactor::TransactorComputer;
+use crate::transactor::transactor::TransactorComputer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;

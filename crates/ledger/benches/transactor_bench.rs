@@ -1,9 +1,9 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::ledger::{LedgerConfig, WaitStrategy};
 use ledger::test_support::mock_pipeline;
-use ledger::transaction::{Operation, Transaction, TransactionInput};
 use ledger::transactor::Transactor;
-use ledger::wasm_runtime::WasmRuntime;
+use ledger::transactor::transaction::{Operation, Transaction, TransactionInput};
+use ledger::transactor::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
 use std::sync::Arc;
 use std::time::Duration;

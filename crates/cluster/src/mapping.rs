@@ -1,6 +1,6 @@
 use ::proto::ledger as proto;
-use ledger::transaction::CommittedTransaction;
-use ledger::transaction::{Operation, TransactionStatus};
+use ledger::transactor::transaction::CommittedTransaction;
+use ledger::transactor::transaction::{Operation, TransactionStatus};
 use storage::entities::{
     AccountFlagsUpdated, AccountLinked, AccountOpened, EntryKind, FunctionRegistered, TxEntry,
     TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,

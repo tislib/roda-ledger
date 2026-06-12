@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ledger::transactor_computer::TransactorComputer;
+use ledger::transactor::transactor_computer::TransactorComputer;
 use ledger::tx_ring::ring::TxRing;
 use ledger::wait_strategy::WaitStrategy;
 use std::time::Duration;

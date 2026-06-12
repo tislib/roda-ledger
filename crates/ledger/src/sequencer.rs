@@ -1,5 +1,5 @@
 use crate::pipeline::SequencerContext;
-use crate::transaction::{Operation, Transaction, TransactionBatch, TransactionInput};
+use crate::transactor::transaction::{Operation, Transaction, TransactionBatch, TransactionInput};
 use std::hint::spin_loop;
 use std::thread::yield_now;
 

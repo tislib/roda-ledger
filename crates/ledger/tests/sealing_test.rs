@@ -1,5 +1,5 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transaction::Operation;
+use ledger::transactor::transaction::Operation;
 use std::path::Path;
 use std::time::Duration;
 use storage::{Storage, StorageConfig};

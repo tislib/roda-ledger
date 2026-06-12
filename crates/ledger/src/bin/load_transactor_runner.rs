@@ -1,9 +1,9 @@
 use clap::Parser;
 use ledger::test_support::mock_pipeline;
-use ledger::transaction::{Operation, Transaction};
 use ledger::transactor::TransactorRunner;
+use ledger::transactor::transaction::{Operation, Transaction};
+use ledger::transactor::wasm_runtime::WasmRuntime;
 use ledger::wait_strategy::WaitStrategy;
-use ledger::wasm_runtime::WasmRuntime;
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

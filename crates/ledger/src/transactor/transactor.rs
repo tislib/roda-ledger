@@ -2,10 +2,10 @@ use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::dedup::{DedupCache, DedupResult};
 use crate::pipeline::TransactorContext;
-use crate::transaction::{Operation, Transaction, TransactionInput};
+use crate::transactor::transaction::{Operation, Transaction, TransactionInput};
+use crate::transactor::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
 use crate::tx_ring::writer::TxRingWriter;
 use crate::wait_strategy::WaitStrategy;
-use crate::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
 use crossbeam_skiplist::SkipMap;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -20,7 +20,7 @@ use storage::entries::wal_tx_term_entry;
 // linked_account/verify/rollback/finalize) lives in `transactor_computer.rs`.
 // Re-export it + the shared cell/flag/grow helpers so existing
 // `crate::transactor::X` imports (snapshot, seal, wasm_runtime) keep resolving.
-pub(crate) use crate::transactor_computer::{
+pub(crate) use crate::transactor::transactor_computer::{
     STATUS_OPEN, STATUS_SYSTEM, TransactorAccount, TransactorComputer, grow_capacity,
     new_account_vec, set_flag,
 };

@@ -2,8 +2,8 @@ use crate::consensus::state::Consensus;
 use crate::ledger_slot::LedgerSlot;
 use ::proto::ledger as proto;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
-use ledger::transaction::Operation;
-use ledger::transactor_computer::STATUS_PROGRAMMED;
+use ledger::transactor::transaction::Operation;
+use ledger::transactor::transactor_computer::STATUS_PROGRAMMED;
 use spdlog::{trace, warn};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -317,7 +317,7 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         // for this case.
         if matches!(
             self.ledger.current().get_transaction_status(tx_id),
-            ledger::transaction::TransactionStatus::NotFound
+            ledger::transactor::transaction::TransactionStatus::NotFound
         ) {
             return Ok(Response::new(proto::WaitForTransactionResponse {
                 outcome: proto::WaitOutcome::NotFound as i32,
