@@ -711,21 +711,6 @@ mod tests {
         )
     }
 
-    // #[test]
-    // fn open_accounts_marks_range_open_and_emits_one_follower() {
-    //     let (_r, mut s) = raw_state(16, 64);
-    //     s.init(1);
-    //     s.begin(*b"OPENACC\0", 7, 0);
-    //     let begin = s.open_accounts(3, 7);
-    //     assert_eq!(begin, 1);
-    //     assert_eq!(s.next_account_id, 4);
-    //     assert_eq!(status(s.balances[0].flags), STATUS_SYSTEM);
-    //     assert_eq!(status(s.balances[1].flags), STATUS_OPEN);
-    //     assert_eq!(status(s.balances[3].flags), STATUS_OPEN);
-    //     assert_eq!(status(s.balances[4].flags), STATUS_NOT_EXISTENT);
-    //     assert_eq!(s.tx_ring_pusher.cursor(), 1);
-    // }
-
     #[test]
     fn open_accounts_count_zero_opens_one() {
         let (_r, mut s) = raw_state(16, 64);
@@ -760,23 +745,6 @@ mod tests {
         assert_eq!(first, again, "second call resolves the same bucket");
         assert_eq!(s.next_account_id, first + 1, "no second allocation");
     }
-
-    // #[test]
-    // fn rollback_reverses_linked_account_create() {
-    //     let (_r, mut s) = raw_state(16, 64);
-    //     s.init(1);
-    //     s.begin(*b"WASMFN\0\0", 0, 0);
-    //     let hold = s.linked_account(5, 7);
-    //     assert_eq!(hold, 1);
-    //     assert_eq!(s.next_account_id, 2);
-    //
-    //     s.rollback();
-    //     assert_eq!(s.next_account_id, 1);
-    //     assert_eq!(status(s.balances[hold as usize].flags), STATUS_NOT_EXISTENT);
-    //
-    //     s.begin(*b"WASMFN\0\0", 0, 0);
-    //     assert_eq!(s.linked_account(5, 7), 1);
-    // }
 
     #[test]
     fn credit_debit_require_existence() {
