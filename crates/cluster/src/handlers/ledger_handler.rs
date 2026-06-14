@@ -94,6 +94,23 @@ impl LedgerHandler {
             term_start_tx_id: tx_term_start,
         }
     }
+
+    /// Enqueue a snapshot-stage query and await its reply without blocking a
+    /// tokio worker. `Ledger::query` hands the request to the snapshot stage,
+    /// which runs `respond` on its own thread when the result is ready; the
+    /// callback wakes this await through a one-slot tokio channel.
+    async fn query(&self, kind: QueryKind) -> Result<QueryResponse, Status> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.ledger.current().query(QueryRequest {
+            kind,
+            respond: Box::new(move |resp| {
+                let _ = tx.try_send(resp);
+            }),
+        });
+        rx.recv()
+            .await
+            .ok_or_else(|| Status::internal("snapshot query dropped without responding"))
+    }
 }
 
 #[tonic::async_trait]
@@ -138,16 +155,19 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         let level = result_wait_level(req.cluster_wait);
         let op = crate::mapping::submit_and_wait_result_request_to_op(req)?;
 
-        let ledger = self.ledger.current();
-        let tx_id = ledger.submit(op);
+        let tx_id = self.ledger.current().submit(op);
         // Wait for the requested durability, then read the committed result from
         // the snapshot index (CLUSTER_COMMIT implies SNAPSHOT, so it's present).
         self.wait_for_transaction_level(tx_id, level).await?;
 
-        let transaction = ledger
-            .get_transaction_block(tx_id)
-            .map(crate::mapping::transaction_to_proto)
-            .ok_or_else(|| Status::internal("transaction missing from snapshot after wait"))?;
+        let transaction = match self.query(QueryKind::GetTransaction { tx_id }).await? {
+            QueryResponse::Transaction(Some(tx)) => crate::mapping::transaction_to_proto(tx),
+            _ => {
+                return Err(Status::internal(
+                    "transaction missing from snapshot after wait",
+                ));
+            }
+        };
 
         Ok(Response::new(proto::SubmitAndWaitResultResponse {
             transaction: Some(transaction),
@@ -237,8 +257,7 @@ impl proto::ledger_server::Ledger for LedgerHandler {
             operations.push(crate::mapping::batch_result_operation_to_op(op_req)?);
         }
 
-        let ledger = self.ledger.current();
-        let start_transaction_id = ledger.submit_batch(operations);
+        let start_transaction_id = self.ledger.current().submit_batch(operations);
 
         // Empty batch — nothing to wait for or read back.
         if len == 0 {
@@ -254,7 +273,17 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         self.wait_for_transaction_level(last_tx_id, level).await?;
 
         let tx_ids: Vec<u64> = (start_transaction_id..=last_tx_id).collect();
-        let mut found = ledger.get_transactions_block(&tx_ids);
+        let mut found: std::collections::HashMap<u64, _> = match self
+            .query(QueryKind::GetTransactionBatch {
+                tx_ids: tx_ids.clone(),
+            })
+            .await?
+        {
+            QueryResponse::TransactionBatch(txs) => {
+                txs.into_iter().map(|t| (t.tx_id(), t)).collect()
+            }
+            _ => return Err(Status::internal("unexpected snapshot query response")),
+        };
         let mut transactions = Vec::with_capacity(len);
         for tx_id in tx_ids {
             let tx = found

@@ -74,9 +74,6 @@ async fn get_transaction_status_reaches_terminal_state() {
         if status.status == pb::TransactionStatus::OnSnapshot as i32
             || status.status == pb::TransactionStatus::Committed as i32
         {
-            // A rejected tx terminates in ERROR, so reaching COMMITTED /
-            // ON_SNAPSHOT already implies success (GetStatusResponse no
-            // longer carries fail_reason).
             return;
         }
         if std::time::Instant::now() >= deadline {
