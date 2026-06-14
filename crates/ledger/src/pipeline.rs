@@ -48,6 +48,10 @@ pub struct Pipeline {
     /// Last segment id sealed by the seal stage.
     seal_index: CachePadded<AtomicU32>,
 
+    /// Monotonic counter the seal stage bumps each pass; lets `wait_for_seal`
+    /// observe progress without the `Ledger` holding the `Seal`.
+    seal_step_id: CachePadded<AtomicU64>,
+
     /// Cluster-commit gate consulted by the seal stage (ADR-0016 §10).
     /// A segment may only be sealed once **every** transaction it
     /// contains has `tx_id <= seal_watermark`. The cluster supervisor
@@ -91,6 +95,7 @@ impl Pipeline {
             commit_index: CachePadded::new(AtomicU64::new(0)),
             snapshot_index: CachePadded::new(AtomicU64::new(0)),
             seal_index: CachePadded::new(AtomicU32::new(0)),
+            seal_step_id: CachePadded::new(AtomicU64::new(0)),
             seal_watermark: CachePadded::new(AtomicU64::new(u64::MAX)),
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
@@ -177,32 +182,20 @@ impl Pipeline {
         self.seal_index.load(Ordering::Acquire)
     }
 
+    /// Monotonic seal-progress counter (bumped each seal pass). Read by
+    /// `Ledger::wait_for_seal` to confirm the seal stage is progressing.
+    pub fn seal_step_id(&self) -> u64 {
+        self.seal_step_id.load(Ordering::Relaxed)
+    }
+
     /// Try to push a query onto the WAL→Snapshot queue without blocking.
     /// Used by `Ledger::query` which manages its own backpressure.
     pub fn try_push_query(&self, msg: QueryRequest) -> Result<(), QueryRequest> {
         self.snapshot_query.push(msg)
     }
 
-    // ─── recovery setters (crate-internal) ──────────────────────────────────
-
-    pub(crate) fn set_compute_index(&self, id: u64) {
-        self.compute_index.store(id, Ordering::Release);
-    }
-
-    pub(crate) fn set_snapshot_index(&self, id: u64) {
-        self.snapshot_index.store(id, Ordering::Release);
-    }
-
     pub(crate) fn set_sequencer_next_id(&self, next_id: u64) {
         self.sequencer_index.store(next_id, Ordering::Release);
-    }
-
-    pub(crate) fn set_commit_index(&self, next_id: u64) {
-        self.commit_index.store(next_id, Ordering::Release);
-    }
-
-    pub(crate) fn set_seal_index(&self, id: u32) {
-        self.seal_index.store(id, Ordering::Release);
     }
 
     // ─── cluster-driven seal gate (ADR-0016 §10) ────────────────────────────
@@ -442,6 +435,13 @@ impl SealContext {
     #[inline(always)]
     pub fn seal_watermark(&self) -> u64 {
         self.pipeline.get_seal_watermark()
+    }
+
+    /// Bump the monotonic seal-progress counter on the pipeline so
+    /// `Ledger::wait_for_seal` can observe progress without holding the `Seal`.
+    #[inline(always)]
+    pub fn bump_seal_step_id(&self) {
+        self.pipeline.seal_step_id.fetch_add(1, Ordering::Relaxed);
     }
 }
 

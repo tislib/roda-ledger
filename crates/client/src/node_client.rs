@@ -86,6 +86,22 @@ pub struct SubmitResult {
     pub fail_reason: u32,
 }
 
+/// Extract `(tx_id, fail_reason)` from a `SubmitAndWaitResult` /
+/// `SubmitBatchAndWaitResult` reply's committed transaction. Both values
+/// live on the closing `TxMetadata`; a malformed reply degrades to zeros.
+fn submit_result_from_tx(tx: Option<proto::CommitedTransaction>) -> SubmitResult {
+    match tx.and_then(|t| t.meta).and_then(|w| w.entry) {
+        Some(proto::wal_entry::Entry::Metadata(m)) => SubmitResult {
+            tx_id: m.tx_id,
+            fail_reason: m.fail_reason,
+        },
+        _ => SubmitResult {
+            tx_id: 0,
+            fail_reason: 0,
+        },
+    }
+}
+
 /// Pipeline progress indices.
 #[derive(Debug, Clone)]
 pub struct PipelineIndex {
@@ -390,13 +406,15 @@ impl NodeClient {
     // -- Submit and wait ----------------------------------------------------
 
     /// Submit a deposit and wait until it reaches the given pipeline level.
+    /// Status-only: returns the transaction id. Use `deposit_and_wait_result`
+    /// when you need the committed outcome (`fail_reason`).
     pub async fn deposit_and_wait(
         &self,
         account: u64,
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_retry("deposit_and_wait", || async {
             let mut client = self.inner.clone();
             trace!("deposit_and_wait: account = {:?}, amount = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", account, amount, user_ref, wait_level, self.url);
@@ -413,21 +431,48 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok(SubmitResult {
-                tx_id: resp.transaction_id,
-                fail_reason: resp.fail_reason,
-            })
+            Ok(resp.transaction_id)
+        })
+        .await
+    }
+
+    /// Submit a deposit, wait for the SNAPSHOT stage, and return the committed
+    /// transaction's `tx_id` + `fail_reason`.
+    pub async fn deposit_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_retry("deposit_and_wait_result", || async {
+            let mut client = self.inner.clone();
+            let resp = client
+                .submit_and_wait_result(proto::SubmitAndWaitResultRequest {
+                    operation: Some(proto::submit_and_wait_result_request::Operation::Deposit(
+                        proto::Deposit {
+                            account,
+                            amount,
+                            user_ref,
+                        },
+                    )),
+                    cluster_wait,
+                })
+                .await?
+                .into_inner();
+            Ok(submit_result_from_tx(resp.transaction))
         })
         .await
     }
 
     /// Open `count` (>= 1) sequential accounts and wait (ADR-022).
+    /// Status-only: returns the transaction id.
     pub async fn open_account_and_wait(
         &self,
         count: u32,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_retry("open_account_and_wait", || async {
             let mut client = self.inner.clone();
             let resp = client
@@ -439,22 +484,20 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok(SubmitResult {
-                tx_id: resp.transaction_id,
-                fail_reason: resp.fail_reason,
-            })
+            Ok(resp.transaction_id)
         })
         .await
     }
 
-    /// Submit a withdrawal and wait.
+    /// Submit a withdrawal and wait. Status-only: returns the transaction id.
+    /// Use `withdraw_and_wait_result` when you need the `fail_reason`.
     pub async fn withdraw_and_wait(
         &self,
         account: u64,
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_retry("withdraw_and_wait", || async {
             let mut client = self.inner.clone();
             trace!("withdraw_and_wait: account = {:?}, amount = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", account, amount, user_ref, wait_level, self.url);
@@ -471,15 +514,42 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok(SubmitResult {
-                tx_id: resp.transaction_id,
-                fail_reason: resp.fail_reason,
-            })
+            Ok(resp.transaction_id)
         })
         .await
     }
 
-    /// Submit a transfer and wait.
+    /// Submit a withdrawal, wait for the SNAPSHOT stage, and return the
+    /// committed transaction's `tx_id` + `fail_reason`.
+    pub async fn withdraw_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_retry("withdraw_and_wait_result", || async {
+            let mut client = self.inner.clone();
+            let resp = client
+                .submit_and_wait_result(proto::SubmitAndWaitResultRequest {
+                    operation: Some(proto::submit_and_wait_result_request::Operation::Withdrawal(
+                        proto::Withdrawal {
+                            account,
+                            amount,
+                            user_ref,
+                        },
+                    )),
+                    cluster_wait,
+                })
+                .await?
+                .into_inner();
+            Ok(submit_result_from_tx(resp.transaction))
+        })
+        .await
+    }
+
+    /// Submit a transfer and wait. Status-only: returns the transaction id.
+    /// Use `transfer_and_wait_result` when you need the `fail_reason`.
     pub async fn transfer_and_wait(
         &self,
         from: u64,
@@ -487,7 +557,7 @@ impl NodeClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_retry("transfer_and_wait", || async {
             let mut client = self.inner.clone();
             trace!("transfer_and_wait: from = {:?}, to = {:?}, amount = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", from, to, amount, user_ref, wait_level, self.url);
@@ -505,10 +575,38 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok(SubmitResult {
-                tx_id: resp.transaction_id,
-                fail_reason: resp.fail_reason,
-            })
+            Ok(resp.transaction_id)
+        })
+        .await
+    }
+
+    /// Submit a transfer, wait for the SNAPSHOT stage, and return the
+    /// committed transaction's `tx_id` + `fail_reason`.
+    pub async fn transfer_and_wait_result(
+        &self,
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_retry("transfer_and_wait_result", || async {
+            let mut client = self.inner.clone();
+            let resp = client
+                .submit_and_wait_result(proto::SubmitAndWaitResultRequest {
+                    operation: Some(proto::submit_and_wait_result_request::Operation::Transfer(
+                        proto::Transfer {
+                            from,
+                            to,
+                            amount,
+                            user_ref,
+                        },
+                    )),
+                    cluster_wait,
+                })
+                .await?
+                .into_inner();
+            Ok(submit_result_from_tx(resp.transaction))
         })
         .await
     }
@@ -551,13 +649,14 @@ impl NodeClient {
     }
 
     /// Submit a batch of deposit operations and wait for the given level.
-    /// Each entry is `(account, amount, user_ref)`.
-    /// Returns one `SubmitResult` per operation.
+    /// Each entry is `(account, amount, user_ref)`. Status-only: returns one
+    /// transaction id per operation. Use `deposit_batch_and_wait_result` for
+    /// the committed outcomes.
     pub async fn deposit_batch_and_wait(
         &self,
         deposits: &[(u64, u64, u64)],
         wait_level: proto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>> {
+    ) -> Result<Vec<u64>> {
         self.with_retry("deposit_batch_and_wait", || async {
             let mut client = self.inner.clone();
             trace!(
@@ -586,26 +685,62 @@ impl NodeClient {
                 .await?
                 .into_inner();
 
-            Ok(resp
-                .results
+            Ok(resp.results.iter().map(|r| r.transaction_id).collect())
+        })
+        .await
+    }
+
+    /// Submit a batch of deposits, wait for the SNAPSHOT stage, and return one
+    /// `SubmitResult` (`tx_id` + `fail_reason`) per operation, in order.
+    pub async fn deposit_batch_and_wait_result(
+        &self,
+        deposits: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>> {
+        self.with_retry("deposit_batch_and_wait_result", || async {
+            let mut client = self.inner.clone();
+            let operations = deposits
                 .iter()
-                .map(|r| SubmitResult {
-                    tx_id: r.transaction_id,
-                    fail_reason: r.fail_reason,
+                .map(|(account, amount, user_ref)| {
+                    proto::submit_batch_and_wait_result_request::Operation {
+                        operation: Some(
+                            proto::submit_batch_and_wait_result_request::operation::Operation::Deposit(
+                                proto::Deposit {
+                                    account: *account,
+                                    amount: *amount,
+                                    user_ref: *user_ref,
+                                },
+                            ),
+                        ),
+                    }
                 })
+                .collect();
+
+            let resp = client
+                .submit_batch_and_wait_result(proto::SubmitBatchAndWaitResultRequest {
+                    operations,
+                    cluster_wait,
+                })
+                .await?
+                .into_inner();
+
+            Ok(resp
+                .transactions
+                .into_iter()
+                .map(|t| submit_result_from_tx(Some(t)))
                 .collect())
         })
         .await
     }
 
     /// Submit a batch of transfer operations and wait for the given level.
-    /// Each entry is `(from, to, amount)`.
-    /// Returns one `SubmitResult` per operation.
+    /// Each entry is `(from, to, amount)`. Status-only: returns one transaction
+    /// id per operation. Use `transfer_batch_and_wait_result` for the outcomes.
     pub async fn transfer_batch_and_wait(
         &self,
         transfers: &[(u64, u64, u64)],
         wait_level: proto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>> {
+    ) -> Result<Vec<u64>> {
         self.with_retry("transfer_batch_and_wait", || async {
             let mut client = self.inner.clone();
             trace!(
@@ -635,13 +770,50 @@ impl NodeClient {
                 .await?
                 .into_inner();
 
-            Ok(resp
-                .results
+            Ok(resp.results.iter().map(|r| r.transaction_id).collect())
+        })
+        .await
+    }
+
+    /// Submit a batch of transfers, wait for the SNAPSHOT stage, and return one
+    /// `SubmitResult` (`tx_id` + `fail_reason`) per operation, in order.
+    pub async fn transfer_batch_and_wait_result(
+        &self,
+        transfers: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>> {
+        self.with_retry("transfer_batch_and_wait_result", || async {
+            let mut client = self.inner.clone();
+            let operations = transfers
                 .iter()
-                .map(|r| SubmitResult {
-                    tx_id: r.transaction_id,
-                    fail_reason: r.fail_reason,
+                .map(|(from, to, amount)| {
+                    proto::submit_batch_and_wait_result_request::Operation {
+                        operation: Some(
+                            proto::submit_batch_and_wait_result_request::operation::Operation::Transfer(
+                                proto::Transfer {
+                                    from: *from,
+                                    to: *to,
+                                    amount: *amount,
+                                    user_ref: 0,
+                                },
+                            ),
+                        ),
+                    }
                 })
+                .collect();
+
+            let resp = client
+                .submit_batch_and_wait_result(proto::SubmitBatchAndWaitResultRequest {
+                    operations,
+                    cluster_wait,
+                })
+                .await?
+                .into_inner();
+
+            Ok(resp
+                .transactions
+                .into_iter()
+                .map(|t| submit_result_from_tx(Some(t)))
                 .collect())
         })
         .await
@@ -693,8 +865,10 @@ impl NodeClient {
 
     // -- Transaction status -------------------------------------------------
 
-    /// Get the status of a single transaction.
-    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<(i32, u32)> {
+    /// Get the pipeline status of a single transaction. The wire response no
+    /// longer carries a fail reason; read the committed transaction (e.g. via a
+    /// `*_and_wait_result` call or `get_transaction`) when you need that.
+    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<i32> {
         self.with_retry("get_transaction_status", || async {
             let mut client = self.inner.clone();
             trace!(
@@ -708,16 +882,13 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok((resp.status, resp.fail_reason))
+            Ok(resp.status)
         })
         .await
     }
 
-    /// Get statuses for multiple transactions. Returns `(status, fail_reason)` pairs.
-    pub async fn get_transaction_statuses(
-        &self,
-        transaction_ids: &[u64],
-    ) -> Result<Vec<(i32, u32)>> {
+    /// Get pipeline statuses for multiple transactions, one per input id.
+    pub async fn get_transaction_statuses(&self, transaction_ids: &[u64]) -> Result<Vec<i32>> {
         self.with_retry("get_transaction_statuses", || async {
             let mut client = self.inner.clone();
             trace!(
@@ -730,11 +901,7 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok(resp
-                .results
-                .iter()
-                .map(|r| (r.status, r.fail_reason))
-                .collect())
+            Ok(resp.results.iter().map(|r| r.status).collect())
         })
         .await
     }
@@ -965,15 +1132,16 @@ impl NodeClient {
         .await
     }
 
-    /// Submit an `Operation::Function` with 8 positional `i64` params
-    /// and wait until the given pipeline level.
+    /// Submit an `Operation::Function` with 8 positional `i64` params and wait
+    /// until the given pipeline level. Status-only: returns the transaction id.
+    /// Use `submit_function_and_wait_result` when you need the `fail_reason`.
     pub async fn submit_function_and_wait(
         &self,
         name: &str,
         params: [i64; 8],
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_retry("submit_function_and_wait", || async {
             let mut client = self.inner.clone();
             trace!("submit_function_and_wait: name = {:?}, params = {:?}, user_ref = {:?}, wait_level = {:?} at node_url: {:?}", name, params, user_ref, wait_level, self.url);
@@ -990,10 +1158,36 @@ impl NodeClient {
                 })
                 .await?
                 .into_inner();
-            Ok(SubmitResult {
-                tx_id: resp.transaction_id,
-                fail_reason: resp.fail_reason,
-            })
+            Ok(resp.transaction_id)
+        })
+        .await
+    }
+
+    /// Submit an `Operation::Function`, wait for the SNAPSHOT stage, and return
+    /// the committed transaction's `tx_id` + `fail_reason`.
+    pub async fn submit_function_and_wait_result(
+        &self,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_retry("submit_function_and_wait_result", || async {
+            let mut client = self.inner.clone();
+            let resp = client
+                .submit_and_wait_result(proto::SubmitAndWaitResultRequest {
+                    operation: Some(proto::submit_and_wait_result_request::Operation::Function(
+                        proto::Function {
+                            name: name.to_string(),
+                            params: params.to_vec(),
+                            user_ref,
+                        },
+                    )),
+                    cluster_wait,
+                })
+                .await?
+                .into_inner();
+            Ok(submit_result_from_tx(resp.transaction))
         })
         .await
     }

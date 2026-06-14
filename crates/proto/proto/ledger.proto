@@ -2,411 +2,319 @@ syntax = "proto3";
 
 package roda.ledger.v1;
 
-// Ledger is the primary service for submitting and querying financial transactions.
-// All monetary amounts are in integer minor units (e.g. cents, not dollars).
-// No floating point is used anywhere in this API.
-//
-// All RPCs are unary. Batching is done by grouping multiple operations or IDs
-// inside a single request message. The client controls batch size.
+// All monetary amounts are integer minor units (e.g. cents); no floating point.
+// All RPCs are unary — batching means grouping operations or IDs in one request.
 service Ledger {
 
-  // SubmitOperation submits a single financial operation to the ledger.
-  // Returns immediately with a transaction_id once the operation is sequenced.
-  // Each operation is atomic and serialized in the global order.
-  // The transaction_id is monotonically increasing and globally ordered.
-  // Use GetTransactionStatus or GetTransactionStatuses to poll for finality.
+  // Fire-and-forget: returns once the operation is sequenced, before it is
+  // executed, persisted, or snapshotted. Poll status for finality.
   rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
 
-  // SubmitAndWait blocks until the specified WaitLevel is reached.
-  // Returns the full result including status and fail_reason.
+  // SubmitAndWait blocks until the operation reaches the requested WaitLevel.
   rpc SubmitAndWait(SubmitAndWaitRequest) returns (SubmitAndWaitResponse);
+  // SubmitAndWaitResult always waits for the SNAPSHOT stage, then returns the
+  // committed transaction read back from the snapshot.
+  rpc SubmitAndWaitResult(SubmitAndWaitResultRequest) returns (SubmitAndWaitResultResponse);
 
-  // SubmitBatch submits multiple operations in a single round trip.
-  // Operations are sequenced and executed in the order provided in the request,
-  // however, there is no global order guarantee (meaning other transactions from
-  // different clients may be interleaved between operations in this batch).
-  // There is no atomic guarantee for the whole batch — each operation is
-  // independent and atomic on its own. Failure of one does not affect others.
-  // Results are returned in the same order as the input operations.
-  // Prefer this over repeated SubmitOperation calls for high-throughput ingestion.
+  // The whole batch is sequenced and executed as one contiguous, in-order block;
+  // no other client's transactions interleave. Not atomic as a whole — a crash
+  // mid-batch keeps already-committed operations; each operation is itself atomic.
   rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
 
-  // SubmitBatchAndWait blocks until all operations in the batch reach the specified WaitLevel.
-  // Returns the full result including status and fail_reason per operation.
+  // SubmitBatchAndWait blocks until every operation reaches the requested WaitLevel.
   rpc SubmitBatchAndWait(SubmitBatchAndWaitRequest) returns (SubmitBatchAndWaitResponse);
+  // SubmitBatchAndWaitResult waits for every operation to reach the SNAPSHOT stage,
+  // then returns the committed transactions read back from the snapshot.
+  rpc SubmitBatchAndWaitResult(SubmitBatchAndWaitResultRequest) returns (SubmitBatchAndWaitResultResponse);
 
-  // GetBalance returns the current balance for a single account.
-  // Balance reflects all transactions that have reached ON_SNAPSHOT stage.
-  // For accounts that have never received a transaction, returns 0.
-  //
-  // GetBalance is not linearizable by default — it reflects the Snapshotter stage,
-  // which may lag behind committed transactions. To achieve a linearizable read
-  // after a write, poll GetBalance until last_snapshot_tx_id >= your transaction_id.
-  // Alternatively, use GetPipelineIndex to check snapshot_index before reading.
+  // Reflects only ON_SNAPSHOT transactions, so it may lag committed writes.
+  // For a read-your-write, poll until last_snapshot_tx_id >= your transaction_id.
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
 
-  // GetBalances returns balances for multiple accounts in a single round trip.
-  // Results are returned in the same order as the input account_ids.
-  //
-  // GetBalances is not linearizable by default — it reflects the Snapshotter stage,
-  // which may lag behind committed transactions. To achieve a linearizable read
-  // after a write, poll GetBalances until last_snapshot_tx_id >= your transaction_id.
-  // Alternatively, use GetPipelineIndex to check snapshot_index before reading.
+  // Like GetBalance but for many accounts; the same snapshot-lag caveat applies.
   rpc GetBalances(GetBalancesRequest) returns (GetBalancesResponse);
 
-  // GetTransactionStatus returns the current pipeline stage of a single transaction.
-  // See TransactionStatus for the meaning of each stage.
   rpc GetTransactionStatus(GetStatusRequest) returns (GetStatusResponse);
 
-  // GetTransactionStatuses returns the pipeline stage of multiple transactions
-  // in a single round trip. Results are returned in the same order as the input IDs.
-  // Use this to poll a batch of submitted transactions for finality instead of
-  // calling GetTransactionStatus N times.
   rpc GetTransactionStatuses(GetStatusesRequest) returns (GetStatusesResponse);
 
-  // GetPipelineIndex returns the current progress index of each pipeline stage.
-  // Use this for health checks, lag monitoring, and determining when a bulk load
-  // is complete without querying individual transactions.
   rpc GetPipelineIndex(GetPipelineIndexRequest) returns (GetPipelineIndexResponse);
 
-  // GetTransaction retrieves the full details of a specific transaction by ID.
-  // Queries the in-memory index first (hot tier); falls back to sealed segment
-  // files on a cache miss (cold tier). Required for payment status checks,
-  // reconciliation, and audit.
+  // Looks up the in-memory index first (hot), falls back to sealed segments (cold).
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
 
-  // GetAccountHistory retrieves transactions involving a specific account,
-  // newest first, with pagination. Queries the in-memory index first; falls
-  // back to sealed segments on a cache miss. Required for account statements,
-  // balance verification, and dispute resolution.
+  // Transactions for an account, newest-first and paginated; hot index then sealed segments.
   rpc GetAccountHistory(GetAccountHistoryRequest) returns (GetAccountHistoryResponse);
 
-  // WaitForTransaction blocks until the transaction reaches the requested WaitLevel,
-  // or the outcome is known (not found, or term mismatch).
-  // Pass term=0 to skip term checking (behaves like a dumb wait).
+  // Blocks until the transaction reaches the WaitLevel, or the outcome is known
+  // (not found / term mismatch).
   rpc WaitForTransaction(WaitForTransactionRequest) returns (WaitForTransactionResponse);
 
-  // ---- ADR-014: WASM Function Registry ----
+  // ---- WASM function registry ----
 
-  // RegisterFunction installs (or replaces, with override=true) a compiled
-  // WASM module under a snake_case name. The binary must export an
-  // `execute(i64 x 8) -> i32` entry point. Blocks until the Snapshot stage
-  // has committed the record and the runtime reflects the new handler —
-  // subsequent Function operations referencing `name` are guaranteed to see it.
+  // Blocks until the record is snapshotted and the runtime reflects the new
+  // handler, so subsequent Function operations referencing `name` see it.
   rpc RegisterFunction(RegisterFunctionRequest) returns (RegisterFunctionResponse);
 
-  // UnregisterFunction removes the handler for `name`. Blocks until the
-  // handler is gone from the runtime. Subsequent Function operations
-  // referencing `name` return INVALID_OPERATION.
+  // Blocks until the handler is gone; later Function operations on `name` return INVALID_OPERATION.
   rpc UnregisterFunction(UnregisterFunctionRequest) returns (UnregisterFunctionResponse);
 
-  // ListFunctions returns metadata for every currently-loaded function.
   rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
 
-  // GetLog reads raw WAL records over [from_tx_id, to_tx_id] from this node's
-  // local committed WAL. Hard-capped at 10,000 records; paginate via next_tx_id.
+  // Reads raw WAL records over [from_tx_id, to_tx_id] from this node's local WAL; paginate via next_tx_id.
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
 
-  // GetTerms returns Raft term boundaries and this node's per-term vote
-  // decisions. Useful for visualising election history. Querying every
-  // node and joining by term reconstructs who voted for whom.
-  //
-  // Reads two local logs: term.log (boundaries committed by an elected
-  // leader) and vote.log (this node's vote decisions). A term may appear
-  // in only one of the two logs — see has_term_record / has_vote_record.
+  // Returns this node's Raft term boundaries (term.log) and vote decisions (vote.log);
+  // a term may appear in only one log — see has_term_record / has_vote_record.
   rpc GetTerms(GetTermsRequest) returns (GetTermsResponse);
 }
 
 // ---- Operation messages ----
 
-// SubmitOperationRequest wraps one of the supported operation types.
-// Exactly one operation field must be set. Setting zero or more than one is an error.
-// Used by the fire-and-forget SubmitOperation RPC.
+// Exactly one operation must be set; setting none or more than one is an error.
 message SubmitOperationRequest {
   oneof operation {
     Deposit     deposit = 1;
     Withdrawal  withdrawal = 2;
     Transfer    transfer = 3;
-    OpenAccount open_account = 4; // ADR-022: open a block of accounts
+    OpenAccount open_account = 4;
     Function    function = 5;
   }
 }
 
-// SubmitAndWaitRequest wraps an operation with a WaitLevel.
-// Used by the blocking SubmitAndWait RPC.
 message SubmitAndWaitRequest {
   oneof operation {
     Deposit     deposit = 1;
     Withdrawal  withdrawal = 2;
     Transfer    transfer = 3;
-    OpenAccount open_account = 4; // ADR-022: open a block of accounts
+    OpenAccount open_account = 4;
     Function    function = 5;
   }
   WaitLevel wait_level = 6;
 }
 
+message SubmitAndWaitResultRequest {
+  oneof operation {
+    Deposit     deposit = 1;
+    Withdrawal  withdrawal = 2;
+    Transfer    transfer = 3;
+    OpenAccount open_account = 4;
+    Function    function = 5;
+  }
+  // When true the server waits for CLUSTER_COMMIT (quorum-durable) before
+  // reading the result back; otherwise it waits for the SNAPSHOT stage.
+  // CLUSTER_COMMIT implies SNAPSHOT, so the committed transaction is always
+  // available once the wait returns.
+  bool cluster_wait = 6;
+}
+
 enum WaitLevel {
-  WAIT_LEVEL_COMPUTED = 0; // if omitted in request, used for async SubmitOperation
+  WAIT_LEVEL_COMPUTED = 0; // Zero value, used by async SubmitOperation when omitted.
   WAIT_LEVEL_COMMITTED = 1;
   WAIT_LEVEL_SNAPSHOT = 2;
   WAIT_LEVEL_CLUSTER_COMMIT = 3;
 }
 
-// Deposit credits an account from the system source.
-// The system source (SYSTEM_SOURCE) absorbs the corresponding debit to maintain
-// the zero-sum invariant. Deposits never fail due to insufficient funds.
+// Deposit credits an account; the system source absorbs the debit to keep the
+// ledger zero-sum. Never fails for insufficient funds.
 message Deposit {
-  uint64 account = 1; // Target account ID. Must be < max_accounts.
-  uint64 amount = 2; // Amount to deposit in minor units. Must be > 0.
-  uint64 user_ref = 3; // Opaque external reference. Stored in WAL, not interpreted
-  // by the ledger. Use this to link to your own database record
-  // (e.g. an order ID, payment ID).
+  uint64 account = 1; // Target account. Must be < max_accounts.
+  uint64 amount = 2; // Minor units. Must be > 0.
+  uint64 user_ref = 3; // Opaque external reference, stored in the WAL (e.g. your order/payment ID).
 }
 
-// OpenAccount opens `count` (>= 1) sequential accounts (ADR-022). The opened
-// ids are allocated from the current high-water; the first id is returned via
-// the transaction's AccountOpened record (query GetTransaction to read it).
+// Opens `count` sequential accounts. The first id is returned in the transaction's
+// AccountOpened record (read it via GetTransaction).
 message OpenAccount {
   uint32 count = 1; // Number of accounts to open. 0 is treated as 1.
   uint64 user_ref = 2; // Opaque external reference, stored in the WAL.
 }
 
-// Withdrawal debits an account to the system sink.
-// The system sink (SYSTEM_SINK) absorbs the corresponding credit to maintain
-// the zero-sum invariant. Fails with INSUFFICIENT_FUNDS if balance < amount.
+// Withdrawal debits an account; the system sink absorbs the credit to keep the
+// ledger zero-sum. Fails with INSUFFICIENT_FUNDS if balance < amount.
 message Withdrawal {
-  uint64 account = 1; // Source account ID. Must be < max_accounts.
-  uint64 amount = 2; // Amount to withdraw in minor units. Must be > 0.
-  uint64 user_ref = 3; // Opaque external reference. See Deposit.user_ref.
+  uint64 account = 1; // Source account. Must be < max_accounts.
+  uint64 amount = 2; // Minor units. Must be > 0.
+  uint64 user_ref = 3; // See Deposit.user_ref.
 }
 
-// Transfer moves funds between two accounts atomically.
-// No value enters or leaves the system — both credit and debit happen in the same transaction.
-// Fails with INSUFFICIENT_FUNDS if from account balance < amount.
-// If from == to, the operation is a no-op and succeeds immediately.
+// Transfer moves funds between two accounts atomically. Fails with INSUFFICIENT_FUNDS
+// if the source balance < amount. If from == to it is a no-op and succeeds.
 message Transfer {
-  uint64 from = 1; // Source account ID. Must be < max_accounts.
-  uint64 to = 2; // Destination account ID. Must be < max_accounts.
-  uint64 amount = 3; // Amount to transfer in minor units. Must be > 0.
-  uint64 user_ref = 4; // Opaque external reference. See Deposit.user_ref.
+  uint64 from = 1; // Source account. Must be < max_accounts.
+  uint64 to = 2; // Destination account. Must be < max_accounts.
+  uint64 amount = 3; // Minor units. Must be > 0.
+  uint64 user_ref = 4; // See Deposit.user_ref.
 }
 
-// Function invokes a registered WASM function (ADR-014).
-// The function ABI is fixed-arity: exactly 8 `i64` positional parameters.
-// Proto3 has no fixed-length array type, so `params` stays `repeated int64`
-// on the wire; the server coerces to `[i64; 8]` by zero-padding short
-// lists and dropping anything beyond the first 8 values.
+// Function invokes a registered WASM function. The ABI is fixed at 8 `i64` params;
+// proto3 lacks fixed arrays, so the server zero-pads short `params` and drops any beyond 8.
 message Function {
-  string         name = 1; // Operation name (snake_case, max 32 bytes).
+  string         name = 1; // snake_case, max 32 bytes.
   repeated int64 params = 2; // 0..=8 positional parameters; short lists are zero-padded.
-  uint64         user_ref = 3; // Opaque external reference. See Deposit.user_ref.
+  uint64         user_ref = 3; // See Deposit.user_ref.
 }
 
 // ---- Submit responses ----
 
-// SubmitOperationResponse is returned after an operation is sequenced.
-// The transaction_id is assigned by the Sequencer and is available immediately —
-// before the operation has been executed, persisted, or snapshotted.
-// Used by the fire-and-forget SubmitOperation RPC.
+// transaction_id is assigned at sequencing — before execution, persistence, or snapshot.
 message SubmitOperationResponse {
-  uint64 transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
-  uint64 term = 2; // Current leader term at the moment of the reply. 0 in single-node mode.
+  uint64 transaction_id = 1; // Monotonically increasing, globally ordered.
+  uint64 term = 2; // Leader term at reply time. 0 in single-node mode.
 }
 
-// SubmitAndWaitResponse is returned after the operation reaches the requested WaitLevel.
-// Contains the full result including status and fail_reason.
 message SubmitAndWaitResponse {
-  uint64   transaction_id = 1; // Monotonically increasing, globally ordered transaction ID.
-  uint32   fail_reason = 2; // 0 if status == COMMITTED. See FailReason codes.
-  uint64   term = 3; // Current leader term at the moment of the reply. 0 in single-node mode.
+  uint64   transaction_id = 1; // Monotonically increasing, globally ordered.
+  uint64   term = 3; // Leader term at reply time. 0 in single-node mode.
 }
 
-// SubmitBatchRequest submits multiple operations in a single round trip.
-// Used by the fire-and-forget SubmitBatch RPC.
+message SubmitAndWaitResultResponse {
+  CommitedTransaction transaction = 1;
+  uint64   term = 2; // Leader term at reply time. 0 in single-node mode.
+}
+
 message SubmitBatchRequest {
-  repeated SubmitOperationRequest operations = 1; // Operations to submit, in order.
-  // Each is independent — failure of one
-  // does not affect others.
+  repeated SubmitOperationRequest operations = 1; // Executed in this order, contiguously.
 }
 
-// SubmitBatchResponse returns one result per input operation, same order.
 message SubmitBatchResponse {
-  repeated SubmitOperationResponse results = 1; // One result per input operation, same order.
-  uint64 term = 2; // Current leader term at the moment of the reply. 0 in single-node mode.
+  repeated SubmitOperationResponse results = 1; // One per input operation, same order.
+  uint64 term = 2; // Leader term at reply time. 0 in single-node mode.
 }
 
-// SubmitBatchAndWaitRequest submits multiple operations and blocks until all reach WaitLevel.
 message SubmitBatchAndWaitRequest {
-  repeated SubmitAndWaitRequest operations = 1; // Operations to submit, in order.
-  WaitLevel                     wait_level = 2; // Pipeline stage to wait for.
+  repeated SubmitAndWaitRequest operations = 1; // In order.
+  WaitLevel                     wait_level = 2; // Stage to wait for.
 }
 
-// SubmitBatchAndWaitResponse returns the full result per operation after WaitLevel is reached.
+message SubmitBatchAndWaitResultRequest {
+  message Operation {
+    oneof operation {
+      Deposit     deposit = 1;
+      Withdrawal  withdrawal = 2;
+      Transfer    transfer = 3;
+      OpenAccount open_account = 4;
+      Function    function = 5;
+    }
+  }
+  repeated Operation operations = 1; // In order.
+  // See SubmitAndWaitResultRequest.cluster_wait.
+  bool cluster_wait = 2;
+}
+
 message SubmitBatchAndWaitResponse {
-  repeated SubmitAndWaitResponse results = 1; // One result per input operation, same order.
-  uint64 term = 2; // Current leader term at the moment of the reply. 0 in single-node mode.
+  repeated SubmitAndWaitResponse results = 1; // One per input operation, same order.
+  uint64 term = 2; // Leader term at reply time. 0 in single-node mode.
+}
+
+message SubmitBatchAndWaitResultResponse {
+  repeated CommitedTransaction transactions = 1; // One per input operation, same order.
+  uint64 term = 2; // Leader term at reply time. 0 in single-node mode.
 }
 
 // ---- Balance messages ----
 
 message GetBalanceRequest {
-  uint64 account_id = 1; // Account to query. Returns 0 if never touched.
-  bool include_linked = 2; // ADR-022 §8: also return per-type linked-bucket balances.
+  uint64 account_id = 1; // Returns 0 if the account was never touched.
+  bool include_linked = 2; // Also return per-type linked-bucket balances.
 }
 
 message GetBalanceResponse {
-  int64 balance = 1; // Current balance in minor units. May be negative for liability
-  // or system accounts. Reflects only transactions that have reached
-  // ON_SNAPSHOT — see TransactionStatus for stage definitions.
-  uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
-  // this ID are reflected in the balance. The actual
-  // last snapshot ID might be slightly higher.
-  repeated LinkedBalance linked = 3; // ADR-022 §8: per-type linked-bucket balances (if requested).
-  uint64 flags = 4; // ADR-022: the account's 8-lane flags word (lane 0 = status).
+  int64 balance = 1; // Minor units; may be negative for liability/system accounts. Reflects only ON_SNAPSHOT tx.
+  uint64 last_snapshot_tx_id = 2; // All tx up to and including this ID are reflected; the true snapshot ID may be higher.
+  repeated LinkedBalance linked = 3; // Per-type linked-bucket balances (only if requested).
+  uint64 flags = 4; // The account's 8-lane flags word (lane 0 = status).
 }
 
-// A single linked bucket's balance, keyed by its program-defined type_id.
+// A linked bucket's balance, keyed by its program-defined type_id.
 message LinkedBalance {
   uint32 type_id = 1;
   int64 balance = 2;
 }
 
 message GetBalancesRequest {
-  repeated uint64 account_ids = 1; // Accounts to query. Duplicates allowed.
+  repeated uint64 account_ids = 1; // Duplicates allowed.
 }
 
 message GetBalancesResponse {
-  repeated int64 balances = 1; // One balance per input account_id, in the same order.
-  // Returns 0 for accounts that have never been touched.
-  uint64 last_snapshot_tx_id = 2; // Indicates that all transactions up to and including
-  // this ID are reflected in the balances.
+  repeated int64 balances = 1; // One per input account_id, same order; 0 if never touched.
+  uint64 last_snapshot_tx_id = 2; // All tx up to and including this ID are reflected.
 }
 
 // ---- Status messages ----
 
-// GetStatusRequest now accepts an optional term for fencing.
-// If term != 0 and current term != request term, returns TERM_MISMATCH
-// and populates term + term_start_tx_id instead of status.
 message GetStatusRequest {
   uint64 transaction_id = 1;
-  uint64 term = 2; // Optional. 0 = do not check term.
+  uint64 term = 2; // Optional fencing term. 0 = do not check.
 }
 
 message GetStatusResponse {
   TransactionStatus status = 1;
-  uint32            fail_reason = 2;
-  // Populated only when term != 0 and a mismatch is detected.
-  // status will be unset in this case.
-  bool              term_mismatch = 3;
+  bool              term_mismatch = 3; // Set when the request term mismatched; status is then unset.
   uint64            term = 4; // The superseding term.
   uint64            term_start_tx_id = 5; // First tx_id of the superseding term.
 }
 
 message GetStatusesRequest {
-  repeated uint64 transaction_ids = 1; // Transaction IDs to query.
+  repeated uint64 transaction_ids = 1;
 }
 
 message GetStatusesResponse {
-  repeated GetStatusResponse results = 1; // One result per input transaction_id, same order.
+  repeated GetStatusResponse results = 1; // One per input transaction_id, same order.
 }
 
-// TransactionStatus represents the pipeline stage a transaction has reached.
-// Stages are strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
-// ERROR is a terminal state reachable only from PENDING (rejected before or during execution).
+// Pipeline stages, strictly ordered: PENDING → COMPUTED → COMMITTED → ON_SNAPSHOT.
+// ERROR is terminal, reachable only from PENDING.
 enum TransactionStatus {
-  // PENDING: Sequenced but not yet processed by the Transactor.
-  // The transaction has a transaction_id but business logic has not run.
-  // Balance has not changed. Not durable.
+  // Sequenced only; business logic has not run and the balance is unchanged. Not durable.
   PENDING = 0;
 
-  // COMPUTED: The Transactor has executed the business logic.
-  // Balance changes are live in the Transactor's in-memory state.
-  // NOT yet written to WAL — a crash at this point would lose this transaction.
-  // GetBalance does not yet reflect this transaction.
+  // Business logic executed; the balance change is in memory but not yet in WAL — a crash loses it.
   COMPUTED = 1;
 
-  // COMMITTED: The WAL Storer has flushed the transaction to disk.
-  // The transaction is durable — it will survive a crash and be replayed on restart.
-  // GetBalance does not yet reflect this transaction (that requires ON_SNAPSHOT).
+  // Flushed to WAL: durable and replayed on restart. GetBalance still does not reflect it.
   COMMITTED = 2;
 
-  // ON_SNAPSHOT: The Snapshotter has applied the transaction's entries to the balance cache.
-  // GetBalance now reflects this transaction. This is the final successful state —
-  // durable and queryable.
+  // Applied to the balance cache; GetBalance now reflects it. Final successful state.
   ON_SNAPSHOT = 3;
 
-  // ERROR: The transaction was rejected. Business logic ran but a constraint was
-  // violated (e.g. insufficient funds, zero-sum violation). A WAL record was written
-  // for audit purposes. No balance changes occurred. Check fail_reason for the cause.
+  // Rejected by a constraint (e.g. insufficient funds). A WAL record is written for
+  // audit and no balance change occurs. Check fail_reason for the cause.
   ERROR = 4;
 
-  // TX_NOT_FOUND: The transaction_id was never sequenced by this node, OR the
-  // caller supplied `term != 0` and that term does not match the term that
-  // covered the transaction. In the wrong-term case, `term` and
-  // `term_start_tx_id` on the response identify the actual covering term
-  // so the caller can replay against the correct node/branch.
-  //
-  // The `TX_` prefix avoids the proto3 enum-value-sibling rule collision
-  // with `WaitOutcome::NOT_FOUND`.
+  // tx_id was never sequenced here, or the supplied term does not cover it (then
+  // term/term_start_tx_id identify the covering term). The TX_ prefix avoids a
+  // proto3 enum-sibling collision with WaitOutcome::NOT_FOUND.
   TX_NOT_FOUND = 5;
 }
 
 // ---- Pipeline index ----
 
-// GetPipelineIndexRequest has no parameters.
 message GetPipelineIndexRequest {}
 
-// GetPipelineIndexResponse returns the highest transaction_id fully processed
-// by each pipeline stage. Maps directly to Ledger::last_compute_id(),
-// last_commit_id(), and last_snapshot_id() in library mode.
-//
-// Common use cases:
-//   Health check:          all three indexes should be advancing
-//   Commit lag:            computed_index - committed_index
-//   Snapshot lag:          committed_index - snapshot_index
-//   Bulk load completion:  poll until snapshot_index >= last submitted transaction_id
+// Highest transaction_id fully processed by each pipeline stage.
 message GetPipelineIndexResponse {
-  // computed_index: highest transaction_id processed by the Transactor.
-  // Business logic has run. Balance changes are in memory but not yet durable.
-  // Maps to Ledger::last_compute_id().
-  uint64 compute_index = 1;
-
-  // committed_index: highest transaction_id flushed to WAL.
-  // All transactions at or below this index are durable and crash-safe.
-  // Maps to Ledger::last_commit_id().
-  uint64 commit_index = 2;
-
-  // snapshot_index: highest transaction_id applied to the balance cache.
-  // GetBalance reflects all transactions at or below this index.
-  // Maps to Ledger::last_snapshot_id().
-  uint64 snapshot_index = 3;
-
-  uint64 term = 4; // Current term
-
-  // cluster_commit_index: highest transaction_id known quorum-committed.
-  // On the leader this is Quorum::get(). On followers this is the watermark
-  // advertised by the most recent AppendEntries from the leader, clamped to
-  // the follower's last_commit_id. 0 in single-node mode.
+  uint64 compute_index = 1; // Executed by the Transactor (in memory, not durable). Ledger::last_compute_id().
+  uint64 commit_index = 2; // Flushed to WAL (durable, crash-safe). Ledger::last_commit_id().
+  uint64 snapshot_index = 3; // Applied to the balance cache; GetBalance reflects up to here. Ledger::last_snapshot_id().
+  uint64 term = 4; // Current term.
+  // Highest tx known quorum-committed. Leader: Quorum::get(). Follower: leader's
+  // advertised watermark clamped to last_commit_id. 0 in single-node mode.
   uint64 cluster_commit_index = 5;
-
-  // is_leader: true iff the responding node is currently the cluster
-  // leader (its `RoleFlag` reads as `Leader`). Used by cluster-aware
-  // clients to discover which node serves writes without having to
-  // attempt one. Always true in single-node Standalone mode.
-  bool is_leader = 6;
+  bool is_leader = 6; // True iff this node is the current leader. Always true in single-node mode.
 }
 
-// ---- Transaction query (ADR-008) ----
+// ---- Transaction query ----
 
 message GetTransactionRequest {
   uint64 tx_id = 1;
 }
 
 message GetTransactionResponse {
-  Transaction transaction = 1;
+  CommitedTransaction transaction = 1;
 }
 
-message Transaction {
+message CommitedTransaction {
   WalEntry meta = 1;
   repeated WalEntry items = 2;
 }
@@ -429,34 +337,30 @@ message WaitForTransactionRequest {
 
 message WaitForTransactionResponse {
   WaitOutcome outcome = 1;
-  uint64      term = 2; // The term that superseded. Only set on TERM_MISMATCH.
-  uint64      term_start_tx_id = 3; // First tx_id of the superseding term. Only set on TERM_MISMATCH.
-  // Transactions between this and your tx_id are lost.
+  uint64      term = 2; // Superseding term. Only set on TERM_MISMATCH.
+  uint64      term_start_tx_id = 3; // First tx_id of the superseding term; tx between it and yours are lost.
 }
 
 enum WaitOutcome {
-  REACHED = 0; // Transaction reached the requested WaitLevel.
-  NOT_FOUND = 1; // transaction_id is unknown — too old, never existed, or compacted.
-  TERM_MISMATCH = 2; // Term changed before this transaction committed. It is lost.
-  // Inspect term and term_start_tx_id to determine the loss boundary.
+  REACHED = 0; // Reached the requested WaitLevel.
+  NOT_FOUND = 1; // Unknown transaction_id — too old, never existed, or compacted.
+  TERM_MISMATCH = 2; // Term changed before commit; the transaction is lost (see term/term_start_tx_id).
 }
 
-// ---- Account history query (ADR-008) ----
+// ---- Account history query ----
 
 message GetAccountHistoryRequest {
   uint64 account_id = 1;
   uint64 from_tx_id = 2;  // 0 = latest; the backward scan starts here (newest→oldest).
-  uint64 to_tx_id = 3;  // oldest tx_id to include; the scan stops below it (0 = to the WAL start).
+  uint64 to_tx_id = 3;  // Oldest tx_id to include; the scan stops below it (0 = to the WAL start).
 }
 
 message GetAccountHistoryResponse {
-  repeated Transaction transactions = 1;
-  // Oldest tx_id the scan reached. To page further into the past, send this
-  // value back as `from_tx_id` in the next request.
-  uint64 scan_last_tx_id = 2;
+  repeated CommitedTransaction transactions = 1;
+  uint64 scan_last_tx_id = 2; // Oldest tx_id reached; send back as from_tx_id to page further into the past.
 }
 
-// ---- ADR-014: Function Registry ----
+// ---- Function registry ----
 
 message RegisterFunctionRequest {
   string name = 1;   // snake_case, max 32 bytes
@@ -503,8 +407,8 @@ message GetLogResponse {
   uint64 last_commit_tx_id = 3; // node's last_commit_id at read time.
 }
 
-// WalLogRecord mirrors the in-memory WalEntry enum (storage::entities::WalEntry).
-// Field numbers 6 and 7 are retired (formerly WalSegmentHeader / WalSegmentSealed).
+// Mirrors the in-memory storage::entities::WalEntry enum.
+// Field numbers 6 and 7 are retired (formerly WalSegmentHeader / WalSegmentSealed) — do not reuse.
 message WalEntry {
   oneof entry {
     WalTxMetadata         metadata = 1;
@@ -525,8 +429,7 @@ message WalTxMetadata {
   uint32 crc32c = 4;
   uint64 timestamp = 5;
   uint64 user_ref = 6;
-  // Trailing-null-trimmed UTF-8 when valid, else 16-char lowercase hex.
-  string tag = 7;
+  string tag = 7; // Trailing-null-trimmed UTF-8 when valid, else 16-char lowercase hex.
 }
 
 message WalTxEntry {
@@ -583,15 +486,15 @@ message GetTermsRequest {
 }
 
 message GetTermsResponse {
-  repeated TermInfo terms = 1;       // ascending by term.
-  uint64   current_term = 2;        // mirror.current_term() at read time.
-  uint64   next_term = 3;        // 0 = no more; else first term not returned.
+  repeated TermInfo terms = 1; // Ascending by term.
+  uint64   current_term = 2; // Current term at read time.
+  uint64   next_term = 3; // 0 = no more; else first term not returned.
 }
 
 message TermInfo {
   uint64 term = 1;
   uint64 start_tx_id = 2; // 0 if no boundary committed (vote-only term).
-  uint64 voted_for = 3; // this node's vote in this term; 0 = none granted.
+  uint64 voted_for = 3; // This node's vote in this term; 0 = none granted.
   bool   has_term_record = 4; // true if term.log has a boundary for this term.
   bool   has_vote_record = 5; // true if vote.log has an entry for this term.
 }

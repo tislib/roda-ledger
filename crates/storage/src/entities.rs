@@ -353,20 +353,32 @@ pub struct CommittedTransaction {
     pub entries: Vec<WalEntry>,
 }
 
-// Safety checks for bytemuck
-unsafe impl Pod for WalEntryKind {}
-unsafe impl Zeroable for WalEntryKind {}
+impl CommittedTransaction {
+    pub fn tx_id(&self) -> u64 {
+        self.meta.tx_id
+    }
+    pub fn is_err(&self) -> bool {
+        self.meta.fail_reason != FailReason::NONE
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.meta.fail_reason == FailReason::NONE
+    }
+
+    pub fn get_fail_reason(&self) -> FailReason {
+        self.meta.fail_reason
+    }
+}
+
 unsafe impl Pod for EntryKind {}
 unsafe impl Zeroable for EntryKind {}
-unsafe impl Pod for TxLinkKind {}
-unsafe impl Zeroable for TxLinkKind {}
 
 // Hard compile-time guarantees: every WAL entry must be exactly 40 bytes.
-const _: () = assert!(std::mem::size_of::<TxMetadata>() == 40);
-const _: () = assert!(std::mem::size_of::<TxEntry>() == 40);
-const _: () = assert!(std::mem::size_of::<TxLink>() == 40);
-const _: () = assert!(std::mem::size_of::<FunctionRegistered>() == 40);
-const _: () = assert!(std::mem::size_of::<TxTerm>() == 40);
-const _: () = assert!(std::mem::size_of::<AccountOpened>() == 40);
-const _: () = assert!(std::mem::size_of::<AccountLinked>() == 40);
-const _: () = assert!(std::mem::size_of::<AccountFlagsUpdated>() == 40);
+const _: () = assert!(size_of::<TxMetadata>() == 40);
+const _: () = assert!(size_of::<TxEntry>() == 40);
+const _: () = assert!(size_of::<TxLink>() == 40);
+const _: () = assert!(size_of::<FunctionRegistered>() == 40);
+const _: () = assert!(size_of::<TxTerm>() == 40);
+const _: () = assert!(size_of::<AccountOpened>() == 40);
+const _: () = assert!(size_of::<AccountLinked>() == 40);
+const _: () = assert!(size_of::<AccountFlagsUpdated>() == 40);

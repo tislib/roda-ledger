@@ -24,26 +24,25 @@ fn test_max_accounts_boundary() {
     assert_eq!(opened.fail_reason, FailReason::NONE, "open should succeed");
 
     // Account 90 (opened, < max_accounts) should accept a deposit.
-    let ok_id = ledger.submit(Operation::Deposit {
+    let ok_result = ledger.submit_and_wait_result(Operation::Deposit {
         account: 90,
         amount: 1,
         user_ref: 0,
     });
-    ledger.wait_for_transaction(ok_id);
-    let status = ledger.get_transaction_status(ok_id);
-    assert!(status.is_ok(), "opened account 90 should be valid");
+    assert!(!ok_result.is_err(), "opened account 90 should be valid");
     assert_eq!(ledger.get_balance(90), 1);
 
     // Account 95 was never opened (still < max_accounts) → ACCOUNT_NOT_FOUND.
-    let fail_id = ledger.submit(Operation::Deposit {
+    let fail_result = ledger.submit_and_wait_result(Operation::Deposit {
         account: 95,
         amount: 1,
         user_ref: 0,
     });
-    ledger.wait_for_transaction(fail_id);
-    let status = ledger.get_transaction_status(fail_id);
-    assert!(status.is_err(), "unopened account 95 should be rejected");
-    assert_eq!(status.error_reason(), FailReason::ACCOUNT_NOT_FOUND);
+    assert!(
+        fail_result.is_err(),
+        "unopened account 95 should be rejected"
+    );
+    assert_eq!(fail_result.get_fail_reason(), FailReason::ACCOUNT_NOT_FOUND);
     assert_eq!(ledger.get_balance(95), 0);
 }
 
@@ -205,17 +204,15 @@ fn test_transfer_insufficient_funds() {
     });
     ledger.wait_for_transaction(dep_id);
 
-    let xfer_id = ledger.submit(Operation::Transfer {
+    let xfer_result = ledger.submit_and_wait_result(Operation::Transfer {
         from: 1,
         to: 2,
         amount: 100, // more than balance
         user_ref: 0,
     });
-    ledger.wait_for_transaction(xfer_id);
 
-    let status = ledger.get_transaction_status(xfer_id);
     assert!(
-        status.is_err(),
+        xfer_result.is_err(),
         "transfer with insufficient funds should be rejected"
     );
     assert_eq!(ledger.get_balance(1), 50, "from balance unchanged");

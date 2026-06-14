@@ -64,4 +64,10 @@ impl Sequencer {
     pub(crate) fn last_id(&self) -> u64 {
         self.ctx.last_id()
     }
+
+    /// Resume id allocation after recovery: the next id handed out is
+    /// `last_tx_id + 1`, so recovered tx_ids are never re-issued.
+    pub fn recover(&self, last_tx_id: u64) {
+        self.ctx.set_next_id(last_tx_id + 1);
+    }
 }

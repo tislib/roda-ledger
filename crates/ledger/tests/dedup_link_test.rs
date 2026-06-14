@@ -89,26 +89,20 @@ fn test_dedup_rejects_duplicate_deposit() {
         amount: 500,
         user_ref: 100,
     });
-    let id2 = ledger.submit(Operation::Deposit {
+    let result2 = ledger.submit_and_wait_result(Operation::Deposit {
         account: 1,
         amount: 500,
         user_ref: 100,
     });
-    ledger.wait_for_transaction(id2);
-
+    assert!(result2.is_err(), "second tx should be ERROR");
+    assert_eq!(result2.get_fail_reason(), FailReason::DUPLICATE);
     assert_eq!(
         ledger.get_balance(1),
         500,
         "only first deposit should commit"
     );
-    assert!(
-        ledger.get_transaction_status(id2).is_err(),
-        "second tx should be ERROR"
-    );
-    assert_eq!(
-        ledger.get_transaction_status(id2).error_reason(),
-        FailReason::DUPLICATE
-    );
+    assert!(result2.is_err(), "second tx should be ERROR");
+    assert_eq!(result2.get_fail_reason(), FailReason::DUPLICATE);
 }
 
 /// Duplicate submission produces a TxLink { kind: Duplicate } pointing to original.
@@ -148,21 +142,20 @@ fn test_different_user_refs_not_deduped() {
     ledger.start().unwrap();
     ledger.open_accounts(100);
 
-    let id1 = ledger.submit(Operation::Deposit {
+    let result1 = ledger.submit_and_wait_result(Operation::Deposit {
         account: 1,
         amount: 100,
         user_ref: 1,
     });
-    let id2 = ledger.submit(Operation::Deposit {
+    let result2 = ledger.submit_and_wait_result(Operation::Deposit {
         account: 1,
         amount: 100,
         user_ref: 2,
     });
-    ledger.wait_for_transaction(id2);
 
     assert_eq!(ledger.get_balance(1), 200);
-    assert!(ledger.get_transaction_status(id1).is_ok());
-    assert!(ledger.get_transaction_status(id2).is_ok());
+    assert!(!result1.is_err());
+    assert!(!result2.is_err());
 }
 
 /// Multiple retries with same user_ref all get rejected.
@@ -219,13 +212,12 @@ fn test_dedup_transfer() {
         amount: 300,
         user_ref: 55,
     });
-    let id2 = ledger.submit(Operation::Transfer {
+    let result2 = ledger.submit_and_wait_result(Operation::Transfer {
         from: 1,
         to: 2,
         amount: 300,
         user_ref: 55, // duplicate
     });
-    ledger.wait_for_transaction(id2);
 
     assert_eq!(
         ledger.get_balance(1),
@@ -233,10 +225,7 @@ fn test_dedup_transfer() {
         "only one transfer should happen"
     );
     assert_eq!(ledger.get_balance(2), 300);
-    assert_eq!(
-        ledger.get_transaction_status(id2).error_reason(),
-        FailReason::DUPLICATE
-    );
+    assert_eq!(result2.get_fail_reason(), FailReason::DUPLICATE);
 }
 
 /// Dedup works for withdrawals.
@@ -300,22 +289,18 @@ fn test_dedup_survives_restart() {
         ledger.open_accounts(100);
 
         // Same user_ref should be rejected after restart
-        let id2 = ledger.submit(Operation::Deposit {
+        let result2 = ledger.submit_and_wait_result(Operation::Deposit {
             account: 1,
             amount: 500,
             user_ref: 999,
         });
-        ledger.wait_for_transaction(id2);
 
         assert_eq!(
             ledger.get_balance(1),
             500,
             "duplicate after restart should be rejected"
         );
-        assert_eq!(
-            ledger.get_transaction_status(id2).error_reason(),
-            FailReason::DUPLICATE
-        );
+        assert_eq!(result2.get_fail_reason(), FailReason::DUPLICATE);
     }
 
     let _ = fs::remove_dir_all(dir);
@@ -400,22 +385,18 @@ fn test_dedup_cross_operation_types() {
         user_ref: 50,
     });
     // Second: withdrawal with same user_ref=50 — should be deduped
-    let id2 = ledger.submit(Operation::Withdrawal {
+    let result2 = ledger.submit_and_wait_result(Operation::Withdrawal {
         account: 1,
         amount: 100,
         user_ref: 50,
     });
-    ledger.wait_for_transaction(id2);
 
     assert_eq!(
         ledger.get_balance(1),
         1100,
         "withdrawal with same user_ref should be rejected"
     );
-    assert_eq!(
-        ledger.get_transaction_status(id2).error_reason(),
-        FailReason::DUPLICATE
-    );
+    assert_eq!(result2.get_fail_reason(), FailReason::DUPLICATE);
 }
 // ��─ Link query tests ─────────────────────────────────────────────────────────
 
@@ -540,15 +521,14 @@ fn test_new_user_ref_after_restart() {
         ledger.open_accounts(100);
 
         // Different user_ref should succeed
-        let id2 = ledger.submit(Operation::Deposit {
+        let result2 = ledger.submit_and_wait_result(Operation::Deposit {
             account: 1,
             amount: 200,
             user_ref: 222,
         });
-        ledger.wait_for_transaction(id2);
 
         assert_eq!(ledger.get_balance(1), 300);
-        assert!(ledger.get_transaction_status(id2).is_ok());
+        assert!(!result2.is_err());
     }
 
     let _ = fs::remove_dir_all(dir);

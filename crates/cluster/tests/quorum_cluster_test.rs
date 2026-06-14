@@ -18,7 +18,7 @@ async fn leader_counts_itself_in_quorum() {
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("ClusterCommit");
     assert_eq!(r.fail_reason, 0);
@@ -132,7 +132,7 @@ async fn new_leader_self_slot_repopulated_after_transition() {
     // First write under new leader must reach ClusterCommit.
     let started = Instant::now();
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 6, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 6, true)
         .await
         .expect("first write under new leader");
     assert_eq!(r.fail_reason, 0);

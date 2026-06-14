@@ -1,6 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::config::LedgerConfig;
 use ledger::ledger::WaitStrategy;
+use ledger::recover::ActiveSnapshot;
 use ledger::test_support::{ring_pipeline, ring_push};
 use ledger::wal::Wal;
 use std::sync::Arc;
@@ -50,8 +51,15 @@ fn wal_bench(c: &mut Criterion) {
 
     // The WAL owns the reader: it reads each entry and frees its ring slot (on
     // write), so the feeder never blocks forever.
-    let mut wal = Wal::new(storage.clone(), reader);
-    let wal_handles = wal.start(pipeline.wal_context()).unwrap();
+    let active_snapshot = ActiveSnapshot::empty();
+    let wal_handles = Wal {
+        ctx: pipeline.wal_context(),
+        active_snapshot: &active_snapshot,
+        storage: storage.clone(),
+        ring_reader: reader,
+    }
+    .start()
+    .unwrap();
 
     let mut current_id = 0u64;
     group.bench_function("write", |b| {

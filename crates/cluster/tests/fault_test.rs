@@ -22,7 +22,7 @@ async fn kill_leader_no_committed_tx_lost() {
     let mut bal_pre: i64 = 0;
     for ur in 1..=15u64 {
         let r = ctl
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT, AMOUNT, ur, true)
             .await
             .unwrap();
         assert_eq!(r.fail_reason, 0);
@@ -56,7 +56,7 @@ async fn kill_follower_leader_continues() {
 
     // Quorum still 2/3 reachable. ClusterCommit must succeed.
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 2, true)
         .await
         .expect("ClusterCommit with one follower down");
     assert_eq!(r.fail_reason, 0);
@@ -114,7 +114,7 @@ async fn kill_two_of_five_cluster_continues() {
     }
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("2/5 down still leaves quorum");
     assert_eq!(r.fail_reason, 0);
@@ -192,7 +192,7 @@ async fn repeated_leader_churn_preserves_commits() {
     for _ in 0..3 {
         for _ in 0..5 {
             let r = ctl
-                .deposit_and_wait(ACCOUNT, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+                .deposit_and_wait_result(ACCOUNT, AMOUNT, user_ref, true)
                 .await
                 .unwrap();
             acked.push(r.tx_id);
@@ -294,7 +294,7 @@ async fn slow_follower_does_not_block_majority() {
     ctl.stop_node(follower_idx).await.expect("stop");
     for ur in 1..=20u64 {
         let r = ctl
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT, AMOUNT, ur, true)
             .await
             .expect("ClusterCommit");
         assert_eq!(r.fail_reason, 0);
@@ -522,7 +522,7 @@ async fn wal_stuck_on_follower_does_not_block_commit() {
     // Leader + other follower = 2-of-3 quorum, so ClusterCommit
     // succeeds even with the third node's WAL stuck.
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("ClusterCommit must succeed with one follower's WAL stuck");
     assert_eq!(r.fail_reason, 0);
@@ -563,7 +563,7 @@ async fn wal_slow_on_leader_still_commits() {
     };
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("ClusterCommit must still close under Slow");
     assert_eq!(r.fail_reason, 0);
@@ -648,7 +648,7 @@ async fn clear_all_faults_releases_everything() {
     .expect("cluster_commit advanced");
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 2, true)
         .await
         .expect("fresh submit must commit after clear_all");
     assert_eq!(r.fail_reason, 0);

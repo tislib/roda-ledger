@@ -264,9 +264,21 @@ impl ClusterClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.leader
             .deposit_and_wait(account, amount, user_ref, wait_level)
+            .await
+    }
+
+    pub async fn deposit_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .deposit_and_wait_result(account, amount, user_ref, cluster_wait)
             .await
     }
 
@@ -276,9 +288,21 @@ impl ClusterClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.leader
             .deposit_and_wait_no_retry(account, amount, user_ref, wait_level)
+            .await
+    }
+
+    pub async fn deposit_and_wait_no_retry_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .deposit_and_wait_no_retry_result(account, amount, user_ref, cluster_wait)
             .await
     }
 
@@ -287,7 +311,7 @@ impl ClusterClient {
         count: u32,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.leader
             .open_account_and_wait(count, user_ref, wait_level)
             .await
@@ -299,9 +323,21 @@ impl ClusterClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.leader
             .withdraw_and_wait(account, amount, user_ref, wait_level)
+            .await
+    }
+
+    pub async fn withdraw_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .withdraw_and_wait_result(account, amount, user_ref, cluster_wait)
             .await
     }
 
@@ -312,9 +348,22 @@ impl ClusterClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.leader
             .transfer_and_wait(from, to, amount, user_ref, wait_level)
+            .await
+    }
+
+    pub async fn transfer_and_wait_result(
+        &self,
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .transfer_and_wait_result(from, to, amount, user_ref, cluster_wait)
             .await
     }
 
@@ -326,9 +375,19 @@ impl ClusterClient {
         &self,
         deposits: &[(u64, u64, u64)],
         wait_level: proto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>> {
+    ) -> Result<Vec<u64>> {
         self.leader
             .deposit_batch_and_wait(deposits, wait_level)
+            .await
+    }
+
+    pub async fn deposit_batch_and_wait_result(
+        &self,
+        deposits: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>> {
+        self.leader
+            .deposit_batch_and_wait_result(deposits, cluster_wait)
             .await
     }
 
@@ -336,9 +395,19 @@ impl ClusterClient {
         &self,
         transfers: &[(u64, u64, u64)],
         wait_level: proto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>> {
+    ) -> Result<Vec<u64>> {
         self.leader
             .transfer_batch_and_wait(transfers, wait_level)
+            .await
+    }
+
+    pub async fn transfer_batch_and_wait_result(
+        &self,
+        transfers: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>> {
+        self.leader
+            .transfer_batch_and_wait_result(transfers, cluster_wait)
             .await
     }
 
@@ -348,9 +417,21 @@ impl ClusterClient {
         params: [i64; 8],
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.leader
             .submit_function_and_wait(name, params, user_ref, wait_level)
+            .await
+    }
+
+    pub async fn submit_function_and_wait_result(
+        &self,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.leader
+            .submit_function_and_wait_result(name, params, user_ref, cluster_wait)
             .await
     }
 
@@ -425,17 +506,14 @@ impl ClusterClient {
         .await
     }
 
-    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<(i32, u32)> {
+    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<i32> {
         self.with_read_retry("get_transaction_status", move |c| async move {
             c.get_transaction_status(transaction_id).await
         })
         .await
     }
 
-    pub async fn get_transaction_statuses(
-        &self,
-        transaction_ids: &[u64],
-    ) -> Result<Vec<(i32, u32)>> {
+    pub async fn get_transaction_statuses(&self, transaction_ids: &[u64]) -> Result<Vec<i32>> {
         let transaction_ids: Arc<[u64]> = transaction_ids.into();
         self.with_read_retry("get_transaction_statuses", move |c| {
             let transaction_ids = transaction_ids.clone();
@@ -653,9 +731,23 @@ impl ClusterLeaderClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_leader_retry("deposit_and_wait", move |c| async move {
             c.deposit_and_wait(account, amount, user_ref, wait_level)
+                .await
+        })
+        .await
+    }
+
+    pub async fn deposit_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_leader_retry("deposit_and_wait_result", move |c| async move {
+            c.deposit_and_wait_result(account, amount, user_ref, cluster_wait)
                 .await
         })
         .await
@@ -667,9 +759,21 @@ impl ClusterLeaderClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         let c = &self.nodes[self.current_leader_index()];
         c.deposit_and_wait(account, amount, user_ref, wait_level)
+            .await
+    }
+
+    pub async fn deposit_and_wait_no_retry_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        let c = &self.nodes[self.current_leader_index()];
+        c.deposit_and_wait_result(account, amount, user_ref, cluster_wait)
             .await
     }
 
@@ -678,7 +782,7 @@ impl ClusterLeaderClient {
         count: u32,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_leader_retry("open_account_and_wait", move |c| async move {
             c.open_account_and_wait(count, user_ref, wait_level).await
         })
@@ -691,9 +795,23 @@ impl ClusterLeaderClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_leader_retry("withdraw_and_wait", move |c| async move {
             c.withdraw_and_wait(account, amount, user_ref, wait_level)
+                .await
+        })
+        .await
+    }
+
+    pub async fn withdraw_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_leader_retry("withdraw_and_wait_result", move |c| async move {
+            c.withdraw_and_wait_result(account, amount, user_ref, cluster_wait)
                 .await
         })
         .await
@@ -706,9 +824,24 @@ impl ClusterLeaderClient {
         amount: u64,
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         self.with_leader_retry("transfer_and_wait", move |c| async move {
             c.transfer_and_wait(from, to, amount, user_ref, wait_level)
+                .await
+        })
+        .await
+    }
+
+    pub async fn transfer_and_wait_result(
+        &self,
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        self.with_leader_retry("transfer_and_wait_result", move |c| async move {
+            c.transfer_and_wait_result(from, to, amount, user_ref, cluster_wait)
                 .await
         })
         .await
@@ -727,7 +860,7 @@ impl ClusterLeaderClient {
         &self,
         deposits: &[(u64, u64, u64)],
         wait_level: proto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>> {
+    ) -> Result<Vec<u64>> {
         let deposits: Arc<[(u64, u64, u64)]> = deposits.into();
         self.with_leader_retry("deposit_batch_and_wait", move |c| {
             let deposits = deposits.clone();
@@ -736,15 +869,41 @@ impl ClusterLeaderClient {
         .await
     }
 
+    pub async fn deposit_batch_and_wait_result(
+        &self,
+        deposits: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>> {
+        let deposits: Arc<[(u64, u64, u64)]> = deposits.into();
+        self.with_leader_retry("deposit_batch_and_wait_result", move |c| {
+            let deposits = deposits.clone();
+            async move { c.deposit_batch_and_wait_result(&deposits, cluster_wait).await }
+        })
+        .await
+    }
+
     pub async fn transfer_batch_and_wait(
         &self,
         transfers: &[(u64, u64, u64)],
         wait_level: proto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>> {
+    ) -> Result<Vec<u64>> {
         let transfers: Arc<[(u64, u64, u64)]> = transfers.into();
         self.with_leader_retry("transfer_batch_and_wait", move |c| {
             let transfers = transfers.clone();
             async move { c.transfer_batch_and_wait(&transfers, wait_level).await }
+        })
+        .await
+    }
+
+    pub async fn transfer_batch_and_wait_result(
+        &self,
+        transfers: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>> {
+        let transfers: Arc<[(u64, u64, u64)]> = transfers.into();
+        self.with_leader_retry("transfer_batch_and_wait_result", move |c| {
+            let transfers = transfers.clone();
+            async move { c.transfer_batch_and_wait_result(&transfers, cluster_wait).await }
         })
         .await
     }
@@ -755,12 +914,30 @@ impl ClusterLeaderClient {
         params: [i64; 8],
         user_ref: u64,
         wait_level: proto::WaitLevel,
-    ) -> Result<SubmitResult> {
+    ) -> Result<u64> {
         let name: Arc<str> = name.into();
         self.with_leader_retry("submit_function_and_wait", move |c| {
             let name = name.clone();
             async move {
                 c.submit_function_and_wait(&name, params, user_ref, wait_level)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn submit_function_and_wait_result(
+        &self,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult> {
+        let name: Arc<str> = name.into();
+        self.with_leader_retry("submit_function_and_wait_result", move |c| {
+            let name = name.clone();
+            async move {
+                c.submit_function_and_wait_result(&name, params, user_ref, cluster_wait)
                     .await
             }
         })
@@ -811,17 +988,14 @@ impl ClusterLeaderClient {
         .await
     }
 
-    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<(i32, u32)> {
+    pub async fn get_transaction_status(&self, transaction_id: u64) -> Result<i32> {
         self.with_leader_retry("get_transaction_status", move |c| async move {
             c.get_transaction_status(transaction_id).await
         })
         .await
     }
 
-    pub async fn get_transaction_statuses(
-        &self,
-        transaction_ids: &[u64],
-    ) -> Result<Vec<(i32, u32)>> {
+    pub async fn get_transaction_statuses(&self, transaction_ids: &[u64]) -> Result<Vec<i32>> {
         let transaction_ids: Arc<[u64]> = transaction_ids.into();
         self.with_leader_retry("get_transaction_statuses", move |c| {
             let transaction_ids = transaction_ids.clone();

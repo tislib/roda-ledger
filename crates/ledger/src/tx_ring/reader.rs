@@ -65,6 +65,8 @@ impl TxRingReader {
 
     /// Copy of slot `idx` — random-access read for tests/inspection. The caller
     /// must keep `idx` inside `[released, write_index)`.
+    /// used only for testing purposes
+    #[cfg(test)]
     pub fn get(&self, idx: usize) -> WalEntry {
         // SAFETY: in-window slots are never overwritten by the gated writer.
         unsafe { *self.ring.slots[idx & (self.ring.capacity - 1)].get() }

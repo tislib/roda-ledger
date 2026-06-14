@@ -5,7 +5,6 @@ use crate::transactor::transaction::{Operation, Transaction, TransactionInput};
 use crate::transactor::wasm_runtime::{WasmRuntime, WasmRuntimeEngine};
 use crate::transactor::{Computer, TransactorAccount, grow_capacity};
 use crate::tx_ring::writer::TxRingWriter;
-use crossbeam_skiplist::SkipMap;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -14,7 +13,6 @@ use storage::entities::{FailReason, FunctionRegistered, SYSTEM_ACCOUNT_ID, WalEn
 use storage::entries::wal_tx_term_entry;
 
 pub struct Runner {
-    pub(super) rejected_transactions: Arc<SkipMap<u64, FailReason>>,
     pub(super) transaction_buffer: Vec<Transaction>,
     pub(super) expected_next_id: u64,
     pub(super) pending: BTreeMap<u64, Transaction>,
@@ -40,7 +38,6 @@ impl Runner {
         Self {
             expected_next_id: 1,
             pending: BTreeMap::new(),
-            rejected_transactions: Arc::new(Default::default()),
             transaction_buffer: Vec::with_capacity(1),
             input_retry_count: 0,
             dedup: DedupCache::new(0),
@@ -336,8 +333,6 @@ impl Runner {
                         return max_tx_id;
                     }
                     s.emit_duplicate(user_ref, timestamp, original_tx_id);
-                    self.rejected_transactions
-                        .insert(tx_id, FailReason::DUPLICATE);
                     continue;
                 }
                 DedupResult::Proceed => {}
@@ -532,7 +527,6 @@ impl Runner {
                 s.finalize_failed(fail_reason);
 
                 drop(s);
-                self.rejected_transactions.insert(tx_id, fail_reason);
                 self.dedup.insert(user_ref, tx_id);
             } else {
                 s.finalize_committed();

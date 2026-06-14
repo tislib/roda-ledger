@@ -1,6 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::config::LedgerConfig;
 use ledger::ledger::WaitStrategy;
+use ledger::recover::ActiveSnapshot;
 use ledger::snapshot::Snapshot;
 use ledger::test_support::{ring_pipeline, ring_push};
 use ledger::wal::Wal;
@@ -53,12 +54,21 @@ fn snapshot_bench(c: &mut Criterion) {
     let (pipeline, mut writer, reader) = ring_pipeline(1 << 20, 1 << 16, WaitStrategy::Balanced);
 
     // Real WAL: persists groups to disk and advances commit_index; owns the ring reader.
-    let mut wal = Wal::new(storage.clone(), reader);
-    let wal_handles = wal.start(pipeline.wal_context()).unwrap();
+    let active_snapshot = ActiveSnapshot::empty();
+    let wal_handles = Wal {
+        ctx: pipeline.wal_context(),
+        active_snapshot: &active_snapshot,
+        storage: storage.clone(),
+        ring_reader: reader,
+    }
+    .start()
+    .unwrap();
 
     // Snapshot tails the durable WAL (no ring, no releaser) and indexes committed groups.
     let mut snapshot = Snapshot::new(&config, storage.clone());
-    let snap_handle = snapshot.start(pipeline.snapshot_context()).unwrap();
+    let snap_handle = snapshot
+        .start(pipeline.snapshot_context(), &active_snapshot)
+        .unwrap();
 
     let mut current_id = 0u64;
     group.bench_function("process", |b| {

@@ -14,15 +14,12 @@ fn started(config: LedgerConfig) -> Ledger {
 /// reflects it, so `get_balance` is current afterward).
 fn deposit(ledger: &Ledger, account: u64, amount: u64) -> FailReason {
     ledger
-        .submit_and_wait(
-            Operation::Deposit {
-                account,
-                amount,
-                user_ref: 0,
-            },
-            WaitLevel::OnSnapshot,
-        )
-        .fail_reason
+        .submit_and_wait_result(Operation::Deposit {
+            account,
+            amount,
+            user_ref: 0,
+        })
+        .get_fail_reason()
 }
 
 #[test]

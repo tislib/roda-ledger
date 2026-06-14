@@ -127,7 +127,7 @@ async fn single_node_cluster_boots_directly_as_leader() {
     assert_eq!(leader_idx, 0);
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("submit");
     assert_eq!(r.fail_reason, 0);
@@ -160,7 +160,7 @@ async fn two_node_cluster_requires_both_for_cluster_commit() {
         .expect("leader");
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("first ClusterCommit ack");
     assert!(r.fail_reason == 0 || r.fail_reason == 7);
@@ -218,7 +218,7 @@ async fn three_node_cluster_tolerates_one_failure() {
 
     // 2/3 alive — majority intact, ClusterCommit must still succeed.
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("ClusterCommit with one follower down");
     assert_eq!(r.fail_reason, 0);
@@ -250,7 +250,7 @@ async fn five_node_cluster_tolerates_two_failures() {
     }
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .expect("ClusterCommit with 2 of 5 down");
     assert_eq!(r.fail_reason, 0);

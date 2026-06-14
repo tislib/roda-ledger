@@ -7,7 +7,7 @@
 //! not user-addressable).
 
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transactor::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::Operation;
 use std::time::Duration;
 use storage::StorageConfig;
 use storage::entities::FailReason;
@@ -60,28 +60,22 @@ fn start_ledger() -> Ledger {
 
 fn deposit(ledger: &Ledger, account: u64, amount: u64) -> FailReason {
     ledger
-        .submit_and_wait(
-            Operation::Deposit {
-                account,
-                amount,
-                user_ref: 0,
-            },
-            WaitLevel::OnSnapshot,
-        )
-        .fail_reason
+        .submit_and_wait_result(Operation::Deposit {
+            account,
+            amount,
+            user_ref: 0,
+        })
+        .get_fail_reason()
 }
 
 fn call(ledger: &Ledger, name: &str, main: i64, amount: i64) -> FailReason {
     ledger
-        .submit_and_wait(
-            Operation::Function {
-                name: name.to_string(),
-                params: [main, amount, 0, 0, 0, 0, 0, 0],
-                user_ref: 0,
-            },
-            WaitLevel::OnSnapshot,
-        )
-        .fail_reason
+        .submit_and_wait_result(Operation::Function {
+            name: name.to_string(),
+            params: [main, amount, 0, 0, 0, 0, 0, 0],
+            user_ref: 0,
+        })
+        .get_fail_reason()
 }
 
 #[test]
@@ -275,15 +269,12 @@ const SET_FLAG_WAT: &str = r#"
 
 fn set_lane(ledger: &Ledger, account: i64, lane: i64, value: i64) -> FailReason {
     ledger
-        .submit_and_wait(
-            Operation::Function {
-                name: "setflag".to_string(),
-                params: [account, lane, value, 0, 0, 0, 0, 0],
-                user_ref: 0,
-            },
-            WaitLevel::OnSnapshot,
-        )
-        .fail_reason
+        .submit_and_wait_result(Operation::Function {
+            name: "setflag".to_string(),
+            params: [account, lane, value, 0, 0, 0, 0, 0],
+            user_ref: 0,
+        })
+        .get_fail_reason()
 }
 
 #[test]

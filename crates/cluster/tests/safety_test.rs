@@ -64,7 +64,7 @@ async fn idempotent_retry_across_failover() {
     let first_half: Vec<(u64, u64, u64)> = (1..=half).map(|ur| (ACCOUNT, AMOUNT, ur)).collect();
 
     let r1 = ctl
-        .deposit_batch_and_wait(&first_half, WaitLevel::ClusterCommit)
+        .deposit_batch_and_wait_result(&first_half, true)
         .await
         .expect("first half ack under L1");
     assert_eq!(r1.len() as u64, half);
@@ -94,7 +94,7 @@ async fn idempotent_retry_across_failover() {
     let full_batch: Vec<(u64, u64, u64)> = (1..=total).map(|ur| (ACCOUNT, AMOUNT, ur)).collect();
 
     let r2 = ctl
-        .deposit_batch_and_wait(&full_batch, WaitLevel::ClusterCommit)
+        .deposit_batch_and_wait_result(&full_batch, true)
         .await
         .expect("retry batch under L2");
     assert_eq!(r2.len() as u64, total);
@@ -169,7 +169,7 @@ async fn balance_state_in_sync_after_failover() {
     // Fund A with 1000 on the leader; ack ClusterCommit so it's on
     // majority of WALs (and replicated to whichever survivor wins).
     let r = ctl
-        .deposit_and_wait(ACC_A, 1000, /*user_ref=*/ 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACC_A, 1000, /*user_ref=*/ 1, true)
         .await
         .expect("fund A");
     assert_eq!(r.fail_reason, 0);
@@ -190,12 +190,12 @@ async fn balance_state_in_sync_after_failover() {
     // Transfer 600 from A to B on the new leader. The new leader's
     // Transactor must validate against an up-to-date `balances[A]`.
     let r = ctl
-        .transfer_and_wait(
+        .transfer_and_wait_result(
             ACC_A,
             ACC_B,
             600,
             /*user_ref=*/ 2,
-            WaitLevel::ClusterCommit,
+            true,
         )
         .await
         .expect("transfer A→B");
@@ -252,7 +252,7 @@ async fn acked_cluster_commit_survives_full_restart() {
     let mut acked_tx_ids: Vec<u64> = Vec::with_capacity(n as usize);
     for ur in 1..=n {
         let r = ctl
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT, AMOUNT, ur, true)
             .await
             .expect("deposit_and_wait");
         assert_eq!(r.fail_reason, 0);
@@ -314,7 +314,7 @@ async fn rotational_restart_resilience() {
     let mut baseline_ids: Vec<u64> = Vec::with_capacity(baseline_count as usize);
     for ur in 1..=baseline_count {
         let r = ctl
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT, AMOUNT, ur, true)
             .await
             .expect("baseline deposit");
         assert_eq!(r.fail_reason, 0);
@@ -439,7 +439,7 @@ async fn no_leader_blocks_writes() {
 
     // Submit succeeds against the new leader.
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 999, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 999, true)
         .await
         .expect("submit succeeds once leader exists");
     assert_eq!(r.fail_reason, 0);
@@ -484,7 +484,7 @@ async fn mid_election_cluster_commit_not_lost() {
     let mut acked: Vec<u64> = Vec::with_capacity(n as usize);
     for ur in 1..=n {
         let r = ctl
-            .deposit_and_wait(ACCOUNT, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT, AMOUNT, ur, true)
             .await
             .expect("ClusterCommit deposit");
         assert_eq!(r.fail_reason, 0);

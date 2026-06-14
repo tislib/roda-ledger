@@ -1,4 +1,5 @@
 use crate::pipeline::WalContext;
+use crate::recover::ActiveSnapshot;
 use crate::tx_ring::reader::TxRingReader;
 use crate::wait_strategy::WaitStrategy;
 use arc_swap::ArcSwap;
@@ -7,33 +8,37 @@ use std::thread::JoinHandle;
 use storage::entities::WalEntry;
 use storage::{Segment, Storage, Syncer};
 
-pub struct Wal {
-    storage: Arc<Storage>,
-    /// Ring reader, moved into the WalRunner on `start`. The WAL is the sole ring
-    /// consumer: it reads each entry and frees its slot (on write) via this reader.
-    reader: Option<TxRingReader>,
+/// One-shot launcher for the WAL threads. Holds exactly what `start` needs;
+/// `start` consumes `self`, restores resume state from `active_snapshot`, spawns
+/// the writer + committer, and drops `self` while they keep running.
+pub struct Wal<'a> {
+    pub ctx: WalContext,
+    pub active_snapshot: &'a ActiveSnapshot,
+    pub storage: Arc<Storage>,
+    pub ring_reader: TxRingReader,
 }
 
-impl Wal {
-    pub fn new(storage: Arc<Storage>, reader: TxRingReader) -> Self {
-        Self {
+impl Wal<'_> {
+    pub fn start(self) -> std::io::Result<Vec<JoinHandle<()>>> {
+        let Wal {
+            ctx,
+            active_snapshot,
             storage,
-            reader: Some(reader),
-        }
-    }
+            ring_reader,
+        } = self;
 
-    pub fn start(&mut self, ctx: WalContext) -> std::io::Result<[JoinHandle<()>; 2]> {
-        let reader = self
-            .reader
-            .take()
-            .expect("Wal::start called twice (reader already taken)");
+        // The WAL owns these indices: everything ≤ last_tx_id is already durable.
+        ctx.set_write_index(active_snapshot.last_tx_id);
+        ctx.set_commit_index(active_snapshot.last_tx_id);
+
         let active_segment_sync: Arc<ArcSwap<Option<Syncer>>> = Arc::new(ArcSwap::new(None.into()));
 
         let mut wal_runner = WalRunner::new(
-            self.storage.clone(),
+            storage,
             active_segment_sync.clone(),
-            reader,
+            ring_reader,
             &ctx,
+            active_snapshot.last_tx_id,
         );
         let wal_ctx_clone = ctx.clone();
         let wal_th = std::thread::Builder::new()
@@ -51,7 +56,7 @@ impl Wal {
                 wal_committer.run(ctx);
             })?;
 
-        Ok([wal_th, wal_commit_th])
+        Ok(vec![wal_th, wal_commit_th])
     }
 }
 
@@ -74,19 +79,22 @@ impl WalRunner {
         active_segment_sync: Arc<ArcSwap<Option<Syncer>>>,
         reader: TxRingReader,
         ctx: &WalContext,
+        last_tx_id: u64,
     ) -> Self {
         let active_segment = storage.active_segment().unwrap();
         let syncer = active_segment.syncer().expect("Failed to get syncer");
         active_segment_sync.store(Arc::new(Some(syncer)));
         let wait_strategy = ctx.wait_strategy();
+        // Resume bookkeeping so rotation accounts for txs already on disk.
+        let segment_start_tx_id = active_segment.first_tx_id_in_wal_data().unwrap_or(0);
 
         Self {
             storage,
             active_segment_sync,
             retry_count: 0,
             active_segment,
-            last_received_tx_id: 0,
-            segment_start_tx_id: 0,
+            last_received_tx_id: last_tx_id,
+            segment_start_tx_id,
             wait_strategy,
             reader: Some(reader),
         }

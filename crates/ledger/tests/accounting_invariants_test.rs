@@ -76,16 +76,14 @@ fn test_insufficient_funds_rejected() {
     ledger.wait_for_transaction(dep_id);
     assert_eq!(ledger.get_balance(5), 100);
 
-    let wd_id = ledger.submit(Operation::Withdrawal {
+    let result = ledger.submit_and_wait_result(Operation::Withdrawal {
         account: 5,
         amount: 200,
         user_ref: 0,
     });
-    ledger.wait_for_transaction(wd_id);
 
-    let status = ledger.get_transaction_status(wd_id);
-    assert!(status.is_err(), "withdrawal should have been rejected");
-    assert_eq!(status.error_reason(), FailReason::INSUFFICIENT_FUNDS);
+    assert!(result.is_err(), "withdrawal should have been rejected");
+    assert_eq!(result.get_fail_reason(), FailReason::INSUFFICIENT_FUNDS);
     assert_eq!(
         ledger.get_balance(5),
         100,

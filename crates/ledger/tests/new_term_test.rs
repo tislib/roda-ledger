@@ -1,5 +1,5 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transactor::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::Operation;
 
 /// `Operation::NewTerm` is an internal cluster op that emits a
 /// `TxMetadata` with a single `TxTerm` sub-item. Both records carry the
@@ -13,30 +13,27 @@ fn new_term_advances_commit_index() {
     let mut ledger = Ledger::new(LedgerConfig::temp());
     ledger.start().unwrap();
 
-    let result = ledger.submit_and_wait(
-        Operation::NewTerm {
-            term: 1,
-            node_id: 1,
-            node_count: 3,
-            node_voted: 2,
-        },
-        WaitLevel::Committed,
-    );
+    let result = ledger.submit_and_wait_result(Operation::NewTerm {
+        term: 1,
+        node_id: 1,
+        node_count: 3,
+        node_voted: 2,
+    });
 
     assert!(
-        result.tx_id > 0,
+        result.tx_id() > 0,
         "tx_id should be assigned by the sequencer"
     );
     assert!(
-        result.fail_reason.is_success(),
+        result.is_success(),
         "NewTerm should not be rejected (got {:?})",
-        result.fail_reason
+        result.get_fail_reason()
     );
     assert!(
-        ledger.last_commit_id() >= result.tx_id,
+        ledger.last_commit_id() >= result.tx_id(),
         "commit_index ({}) did not reach NewTerm tx_id ({})",
         ledger.last_commit_id(),
-        result.tx_id
+        result.tx_id()
     );
 }
 
@@ -49,43 +46,34 @@ fn new_term_interleaved_with_transfers_all_commit() {
     ledger.start().unwrap();
     ledger.open_accounts(2); // ids 1..=2
 
-    let r1 = ledger.submit_and_wait(
-        Operation::Deposit {
-            account: 1,
-            amount: 100,
-            user_ref: 1,
-        },
-        WaitLevel::Committed,
-    );
-    assert!(r1.fail_reason.is_success());
+    let r1 = ledger.submit_and_wait_result(Operation::Deposit {
+        account: 1,
+        amount: 100,
+        user_ref: 1,
+    });
+    assert!(r1.is_success());
 
-    let r2 = ledger.submit_and_wait(
-        Operation::NewTerm {
-            term: 2,
-            node_id: 1,
-            node_count: 3,
-            node_voted: 2,
-        },
-        WaitLevel::Committed,
-    );
-    assert!(r2.fail_reason.is_success());
+    let r2 = ledger.submit_and_wait_result(Operation::NewTerm {
+        term: 2,
+        node_id: 1,
+        node_count: 3,
+        node_voted: 2,
+    });
+    assert!(r2.is_success());
 
-    let r3 = ledger.submit_and_wait(
-        Operation::Deposit {
-            account: 2,
-            amount: 50,
-            user_ref: 2,
-        },
-        WaitLevel::Committed,
-    );
-    assert!(r3.fail_reason.is_success());
+    let r3 = ledger.submit_and_wait_result(Operation::Deposit {
+        account: 2,
+        amount: 50,
+        user_ref: 2,
+    });
+    assert!(r3.is_success());
 
-    assert!(r1.tx_id < r2.tx_id);
-    assert!(r2.tx_id < r3.tx_id);
+    assert!(r1.tx_id() < r2.tx_id());
+    assert!(r2.tx_id() < r3.tx_id());
     assert!(
-        ledger.last_commit_id() >= r3.tx_id,
+        ledger.last_commit_id() >= r3.tx_id(),
         "commit_index ({}) did not reach final tx_id ({})",
         ledger.last_commit_id(),
-        r3.tx_id
+        r3.tx_id()
     );
 }

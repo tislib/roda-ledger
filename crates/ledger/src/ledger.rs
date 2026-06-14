@@ -6,9 +6,9 @@ use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
 use crate::snapshot::{QueryKind, QueryRequest, QueryResponse, Snapshot};
-use crate::transactor::Transactor;
+use crate::transactor;
 use crate::transactor::transaction::{
-    AccountHistory, OpenAccountsResult, Operation, SubmitResult, TransactionStatus, WaitLevel,
+    AccountHistory, OpenAccountsResult, Operation, TransactionStatus, WaitLevel,
 };
 pub use crate::transactor::wasm_runtime::FunctionInfo;
 use crate::transactor::wasm_runtime::{WasmRuntime, validate_name};
@@ -16,20 +16,19 @@ use crate::tx_ring::ring::TxRing;
 pub use crate::wait_strategy::WaitStrategy;
 use crate::wal::Wal;
 use spdlog::{LevelFilter, debug, info};
+use std::collections::HashMap;
 use std::io;
+use std::io::Error;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use storage::WalTailer;
-use storage::entities::{FailReason, WalEntry};
+use storage::entities::{CommittedTransaction, FailReason, WalEntry};
 use storage::{Segment, Storage};
 
 pub struct Ledger {
     sequencer: Sequencer,
-    transactor: Transactor,
-    wal: Wal,
     snapshot: Snapshot,
-    seal: Seal,
     storage: Arc<Storage>,
     pipeline: Arc<Pipeline>,
     wasm_runtime: Arc<WasmRuntime>,
@@ -61,21 +60,14 @@ impl Ledger {
 
         // SPSC tx ring: writer → transactor, reader → WAL. No Arc, not held by
         // the pipeline; the WAL reads and frees slots (on ingest) via the reader.
-        let (ring_writer, ring_reader) = TxRing::new(config.ring_size);
 
         let pipeline = Pipeline::new(&config);
         let wasm_runtime = Arc::new(WasmRuntime::new(storage.clone()));
         let snapshot = Snapshot::new(&config, storage.clone());
-        let seal = Seal::new(&config, storage.clone());
-        let transactor = Transactor::new(&config, wasm_runtime.clone(), ring_writer);
-        let wal = Wal::new(storage.clone(), ring_reader);
 
         Self {
             sequencer: Sequencer::new(pipeline.sequencer_context()),
-            transactor,
-            wal,
             snapshot,
-            seal,
             storage,
             pipeline,
             wasm_runtime,
@@ -121,19 +113,16 @@ impl Ledger {
                 format!("function `{}` is already registered", name),
             ));
         }
-        let res = self.submit_and_wait(
-            Operation::FunctionRegistration {
-                name: name.to_string(),
-                binary: binary.to_vec(),
-                override_existing,
-                user_ref: 0,
-            },
-            WaitLevel::Computed,
-        );
-        if res.fail_reason.is_failure() {
+        let res = self.submit_and_wait_result(Operation::FunctionRegistration {
+            name: name.to_string(),
+            binary: binary.to_vec(),
+            override_existing,
+            user_ref: 0,
+        });
+        if res.is_err() {
             return Err(io::Error::other(format!(
                 "function registration failed: {:?}",
-                res.fail_reason
+                res.get_fail_reason()
             )));
         }
         let version = self.wasm_runtime.version_of(name).ok_or_else(|| {
@@ -160,19 +149,16 @@ impl Ledger {
         let next_version = prev
             .checked_add(1)
             .ok_or_else(|| io::Error::other("function version overflow (u16 exhausted)"))?;
-        let res = self.submit_and_wait(
-            Operation::FunctionRegistration {
-                name: name.to_string(),
-                binary: Vec::new(),
-                override_existing: true,
-                user_ref: 0,
-            },
-            WaitLevel::Computed,
-        );
-        if res.fail_reason.is_failure() {
+        let res = self.submit_and_wait_result(Operation::FunctionRegistration {
+            name: name.to_string(),
+            binary: Vec::new(),
+            override_existing: true,
+            user_ref: 0,
+        });
+        if res.is_err() {
             return Err(io::Error::other(format!(
                 "function unregistration failed: {:?}",
-                res.fail_reason
+                res.get_fail_reason()
             )));
         }
         Ok(next_version)
@@ -264,8 +250,6 @@ impl Ledger {
         }
         if self.pipeline.last_compute_id() < transaction_id {
             TransactionStatus::Pending
-        } else if let Some(reason) = self.transactor.transaction_rejection_reason(transaction_id) {
-            TransactionStatus::Error(reason)
         } else if self.pipeline.last_commit_id() < transaction_id {
             TransactionStatus::Computed
         } else if self.pipeline.last_snapshot_id() < transaction_id {
@@ -334,10 +318,50 @@ impl Ledger {
         rx.recv().expect("query_block: failed to receive response")
     }
 
-    pub fn submit_and_wait(&self, operation: Operation, level: WaitLevel) -> SubmitResult {
+    pub fn get_transaction_block(&self, tx_id: u64) -> Option<CommittedTransaction> {
+        let res = self.query_block(QueryRequest {
+            kind: QueryKind::GetTransaction { tx_id },
+            respond: Box::new(|_| {}),
+        });
+        match res {
+            QueryResponse::Transaction(Some(tx)) => Some(tx),
+            _ => None,
+        }
+    }
+
+    pub fn get_transactions_block(&self, tx_ids: &[u64]) -> HashMap<u64, CommittedTransaction> {
+        let res = self.query_block(QueryRequest {
+            kind: QueryKind::GetTransactionBatch {
+                tx_ids: tx_ids.to_vec(),
+            },
+            respond: Box::new(|_| {}),
+        });
+        match res {
+            QueryResponse::TransactionBatch(txs) => {
+                txs.into_iter().map(|tx| (tx.tx_id(), tx)).collect()
+            }
+            _ => HashMap::new(),
+        }
+    }
+
+    pub fn submit_and_wait(&self, operation: Operation, level: WaitLevel) -> TransactionStatus {
         let tx_id = self.submit(operation);
         self.wait_for_transaction_level(tx_id, level);
-        self.build_submit_result(tx_id)
+
+        self.get_transaction_status(tx_id)
+    }
+
+    pub fn submit_and_wait_result(&self, operation: Operation) -> CommittedTransaction {
+        let tx_id = self.submit(operation);
+        self.wait_for_transaction_level(tx_id, WaitLevel::OnSnapshot);
+
+        let transaction = self.get_transaction_block(tx_id);
+
+        if let Some(transaction) = transaction {
+            transaction
+        } else {
+            panic!("it should be impossible to get a None transaction from submit_and_wait_result");
+        }
     }
 
     /// Open `count` accounts; wait until the snapshot reflects the tx, then read
@@ -347,11 +371,16 @@ impl Ledger {
         let tx_id = self.submit(Operation::OpenAccount { count, user_ref: 0 });
         self.wait_for_transaction_level(tx_id, WaitLevel::OnSnapshot);
 
-        let status = self.get_transaction_status(tx_id);
-        if status.is_err() {
+        let transaction = self.get_transaction_block(tx_id);
+        if transaction.is_none() {
+            // should be impossible, but if it happens, there are serious internal bug
+            panic!("open_accounts: failed to get transaction block");
+        }
+        let transaction = transaction.unwrap();
+        if transaction.is_err() {
             return OpenAccountsResult {
                 tx_id,
-                fail_reason: status.error_reason(),
+                fail_reason: transaction.get_fail_reason(),
                 begin_account_id: 0,
                 count: 0,
             };
@@ -385,30 +414,44 @@ impl Ledger {
         &self,
         ops: Vec<Operation>,
         level: WaitLevel,
-    ) -> Vec<SubmitResult> {
+    ) -> Vec<TransactionStatus> {
         let tx_ids: Vec<u64> = ops.into_iter().map(|op| self.submit(op)).collect();
         if let Some(&last) = tx_ids.last() {
             self.wait_for_transaction_level(last, level);
         }
+
         tx_ids
             .into_iter()
-            .map(|tx_id| self.build_submit_result(tx_id))
+            .map(|tx_id| return self.get_transaction_status(tx_id))
             .collect()
     }
 
-    fn build_submit_result(&self, tx_id: u64) -> SubmitResult {
-        let status = self.get_transaction_status(tx_id);
-        if status.is_err() {
-            SubmitResult {
-                tx_id,
-                fail_reason: status.error_reason(),
-            }
-        } else {
-            SubmitResult {
-                tx_id,
-                fail_reason: storage::entities::FailReason::NONE,
-            }
+    pub fn submit_batch_and_wait_result(
+        &self,
+        ops: Vec<Operation>,
+        level: WaitLevel,
+    ) -> Vec<CommittedTransaction> {
+        let tx_ids: Vec<u64> = ops.into_iter().map(|op| self.submit(op)).collect();
+        if let Some(&last) = tx_ids.last() {
+            self.wait_for_transaction_level(last, level);
+            // Results are read from the snapshot index; ensure the batch is indexed
+            // (the snapshot indexes in tx order, so the last id implies the rest).
+            self.wait_for_transaction_level(last, WaitLevel::OnSnapshot);
         }
+
+        let result = self.get_transactions_block(&tx_ids);
+
+        tx_ids
+            .into_iter()
+            .map(|tx_id| {
+                let transaction = result.get(&tx_id);
+                if let Some(transaction) = transaction {
+                    return transaction.clone();
+                } else {
+                    panic!("it should be impossible to get a None transaction from submit_batch_and_wait_result");
+                }
+            })
+            .collect()
     }
 
     pub fn wait_for_transaction_level(&self, transaction_id: u64, level: WaitLevel) {
@@ -417,16 +460,6 @@ impl Ledger {
         let timeout = Duration::from_secs(10);
 
         while self.pipeline.is_running() {
-            // On error, return immediately regardless of wait level
-            if self.pipeline.last_compute_id() >= transaction_id
-                && self
-                    .transactor
-                    .transaction_rejection_reason(transaction_id)
-                    .is_some()
-            {
-                return;
-            }
-
             let reached = match level {
                 WaitLevel::Computed => self.pipeline.last_compute_id() >= transaction_id,
                 WaitLevel::Committed => self.pipeline.last_commit_id() >= transaction_id,
@@ -444,10 +477,6 @@ impl Ledger {
                 return;
             }
         }
-    }
-
-    pub fn get_rejected_count(&self) -> u64 {
-        self.transactor.get_rejected_count()
     }
 
     /// Drive the cluster-commit gate consulted by the seal stage
@@ -586,14 +615,14 @@ impl Ledger {
         self.wait_for_pass();
 
         let mut retry_count = 0;
-        let start_seal_step_id = self.seal.seal_step_id();
+        let start_seal_step_id = self.pipeline.seal_step_id();
         while self.pipeline.is_running() {
             let segment_count = self.storage.last_segment_id() - 1;
             if segment_count == self.pipeline.last_sealed_id() {
                 return;
             }
 
-            let cur_seal_step_id = self.seal.seal_step_id();
+            let cur_seal_step_id = self.pipeline.seal_step_id();
             debug_assert!(start_seal_step_id + 100 > cur_seal_step_id);
 
             retry_count += 1;
@@ -602,168 +631,78 @@ impl Ledger {
     }
 
     pub fn start(&mut self) -> std::io::Result<()> {
-        debug!("Starting Ledger stages...");
-
-        // Crash recovery: must run BEFORE normal recovery.
-        Recover::crash_recover_if_needed(&self.storage).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed crash recovery during start: {}", e),
-            )
-        })?;
-
-        self.recover(u64::MAX).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to recover ledger during start: {}", e),
-            )
-        })?;
-        self.handles.push(
-            self.transactor
-                .start(self.pipeline.transactor_context())
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
-                })?,
-        );
-        self.handles.extend(
-            self.wal.start(self.pipeline.wal_context()).map_err(|e| {
-                std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
-            })?,
-        );
-        self.handles.push(
-            self.snapshot
-                .start(self.pipeline.snapshot_context())
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
-                })?,
-        );
-        if !self.config.disable_seal {
-            self.handles.push(
-                self.seal.start(self.pipeline.seal_context()).map_err(|e| {
-                    io::Error::new(e.kind(), format!("failed to start seal: {}", e))
-                })?,
-            );
-        }
-
-        debug!("Ledger started successfully.");
-
-        Ok(())
+        self.start_with_recovery_until(u64::MAX)
     }
 
-    fn recover(&mut self, watermark: u64) -> std::io::Result<()> {
-        let mut recover = Recover::new(
-            &mut self.transactor,
-            &mut self.snapshot,
-            &mut self.seal,
-            &self.pipeline,
-            &self.storage,
-        );
-
-        recover.recover_until(watermark).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to recover ledger state: {}", e))
-        })
-    }
-
-    /// Boot variant of [`Self::start`] used by the cluster's
-    /// recovery-mode reseed path (ADR-0016 §9 / §10). Truncates any
-    /// WAL content above `watermark`, replays snapshot + WAL up to and
-    /// including `watermark`, then spawns the pipeline stages — matching
-    /// `start()`'s behaviour from that point onward.
-    ///
-    /// Intended use is **boot-time only**, on a freshly constructed
-    /// `Ledger` whose stages have not been started yet. The cluster
-    /// supervisor invokes this exactly once when it detects log
-    /// divergence on an incoming `AppendEntries`: it drops the live
-    /// `Arc<Ledger>` and reconstructs through this path with
-    /// `watermark = leader_commit_tx_id` from the rejecting request.
-    /// No leader code path ever calls this.
-    ///
-    /// Sequence:
-    /// 1. ADR-006 crash-recovery on the active `wal.bin`.
-    /// 2. Physical truncation: delete every segment fully past
-    ///    `watermark`, byte-truncate the segment that straddles it,
-    ///    discard stale snapshots, recompute `last_segment_id`.
-    /// 3. Replay snapshot + WAL bounded by `watermark`. Pipeline
-    ///    indices are clamped to `min(replayed_last_tx, watermark)`.
-    /// 4. Spawn transactor/wal/snapshot/(seal) — same as `start()`.
-    ///
-    /// `watermark = u64::MAX` is equivalent to `start()` (no
-    /// truncation, no snapshot filter, no clamp).
-    pub fn start_with_recovery_until(&mut self, watermark: u64) -> std::io::Result<()> {
+    pub fn start_with_recovery_until(&mut self, watermark: u64) -> io::Result<()> {
         info!("Starting Ledger with recovery watermark = {}...", watermark);
 
         // Crash recovery first: a torn tail in wal.bin should be fixed
         // before we reason about which records cross the watermark.
-        Recover::crash_recover_if_needed(&self.storage).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed crash recovery during start_with_recovery_until: {}",
-                    e
-                ),
-            )
-        })?;
+        Recover::crash_recover_if_needed(&self.storage)?;
 
         // Physical truncation — fail fast if we cannot uphold the
         // watermark on disk. Idempotent: re-running on already-truncated
         // state is a no-op.
-        self.storage.truncate_wal_above(watermark).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed truncate_wal_above({}) during start: {}",
-                    watermark, e
-                ),
-            )
-        })?;
+        self.storage.truncate_wal_above(watermark)?;
 
-        // Pin the seal-stage gate to the recovery watermark BEFORE
-        // recovery's pre-seal pass and before spawning stages.
-        // Without this, both the recovery pre-seal and the freshly
-        // spawned seal stage would observe the default `u64::MAX` and
-        // seal segments whose last_tx sits above the cluster-commit
-        // watermark — turning recoverable diverged tail into
-        // immutable sealed history (ADR-0016 §10). The cluster
-        // supervisor will advance this watermark forward as new
-        // commits arrive.
+        // Pin the seal-stage gate to the recovery watermark before spawning
+        // stages. Without this, the freshly spawned seal stage would observe
+        // the default `u64::MAX` and seal segments whose last_tx sits above the
+        // cluster-commit watermark — turning recoverable diverged tail into
+        // immutable sealed history (ADR-0016 §10). The cluster supervisor
+        // advances this watermark forward as new commits arrive.
         if watermark != u64::MAX {
             self.pipeline.set_seal_watermark(watermark);
         }
 
-        self.recover(watermark).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed bounded recovery (watermark={}) during start: {}",
-                    watermark, e
-                ),
-            )
-        })?;
+        let mut recover = Recover::new(&self.storage);
+        let active_snapshot = recover.recover_until(watermark)?;
 
+        // Each stage restores the pipeline index it owns from the recovered state.
+        self.sequencer.recover(active_snapshot.last_tx_id);
+
+        let (ring_writer, ring_reader) = TxRing::new(self.config.ring_size);
+
+        // Start Transactor
         self.handles.push(
-            self.transactor
-                .start(self.pipeline.transactor_context())
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start transactor: {}", e))
-                })?,
+            transactor::Transactor {
+                ctx: self.pipeline.transactor_context(),
+                active_snapshot: &active_snapshot,
+                config: &self.config,
+                wasm_runtime: self.wasm_runtime.clone(),
+                ring_writer,
+            }
+            .start()?,
         );
+
+        // Start WAL
         self.handles.extend(
-            self.wal.start(self.pipeline.wal_context()).map_err(|e| {
-                std::io::Error::new(e.kind(), format!("failed to start wal: {}", e))
-            })?,
+            Wal {
+                ctx: self.pipeline.wal_context(),
+                active_snapshot: &active_snapshot,
+                storage: self.storage.clone(),
+                ring_reader,
+            }
+            .start()
+            .map_err(|e| Error::new(e.kind(), format!("failed to start wal: {}", e)))?,
         );
         self.handles.push(
             self.snapshot
-                .start(self.pipeline.snapshot_context())
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start snapshot: {}", e))
-                })?,
+                .start(self.pipeline.snapshot_context(), &active_snapshot)
+                .map_err(|e| Error::new(e.kind(), format!("failed to start snapshot: {}", e)))?,
         );
         if !self.config.disable_seal {
-            self.handles
-                .push(self.seal.start(self.pipeline.seal_context()).map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("failed to start seal: {}", e))
-                })?);
+            self.handles.push(
+                Seal {
+                    ctx: self.pipeline.seal_context(),
+                    active_snapshot: &active_snapshot,
+                    storage: self.storage.clone(),
+                    config: &self.config,
+                }
+                .start()
+                .map_err(|e| Error::new(e.kind(), format!("failed to start seal: {}", e)))?,
+            );
         }
 
         debug!(

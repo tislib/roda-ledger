@@ -88,12 +88,6 @@ pub enum WaitLevel {
     OnSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubmitResult {
-    pub tx_id: u64,
-    pub fail_reason: FailReason,
-}
-
 /// Result of `Ledger::open_accounts`: the committed open's id range, read back
 /// from the `AccountOpened` record. `begin_account_id`/`count` are valid only
 /// when `fail_reason == NONE`.
@@ -111,12 +105,11 @@ impl Transaction {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     #[default]
     NotFound, // Transaction isn't found in the pipeline
     Pending,
-    Error(FailReason),
     Computed,   // By Transactor
     Committed,  // Written to WAL
     OnSnapshot, // Balances are reflected from the snapshot
@@ -127,7 +120,6 @@ impl TransactionStatus {
         match self {
             Self::NotFound => false,
             Self::Pending => false,
-            Self::Error(_) => false,
             Self::Computed => false,
             Self::Committed => true,
             Self::OnSnapshot => true,
@@ -138,25 +130,9 @@ impl TransactionStatus {
         match self {
             Self::NotFound => false,
             Self::Pending => false,
-            Self::Error(_) => false,
             Self::Computed => false,
             Self::Committed => false,
             Self::OnSnapshot => true,
-        }
-    }
-
-    pub fn is_ok(&self) -> bool {
-        !self.is_err()
-    }
-
-    pub fn is_err(&self) -> bool {
-        matches!(self, Self::Error(_))
-    }
-
-    pub fn error_reason(&self) -> FailReason {
-        match self {
-            Self::Error(reason) => *reason,
-            _ => unreachable!(),
         }
     }
 }

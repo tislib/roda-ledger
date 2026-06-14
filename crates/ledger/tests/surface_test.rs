@@ -1,7 +1,7 @@
 //! Integration tests for ADR-015 `Ledger::append_wal_entries` + `WalTailer`.
 
 use ledger::ledger::{Ledger, LedgerConfig, StorageConfig};
-use ledger::transactor::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::Operation;
 use std::time::{Duration, Instant};
 use storage::entities::{EntryKind, FailReason, TxEntry, TxMetadata, WalEntry, WalEntryKind};
 
@@ -83,16 +83,13 @@ fn record_tx_ids(buf: &[u8], n_records: usize) -> Vec<u64> {
 
 /// Drive a deposit through the normal client path and block until committed.
 fn deposit_client(ledger: &Ledger, account: u64, amount: u64) -> u64 {
-    let r = ledger.submit_and_wait(
-        Operation::Deposit {
-            account,
-            amount,
-            user_ref: 0,
-        },
-        WaitLevel::Committed,
-    );
-    assert!(r.fail_reason.is_success());
-    r.tx_id
+    let r = ledger.submit_and_wait_result(Operation::Deposit {
+        account,
+        amount,
+        user_ref: 0,
+    });
+    assert!(r.is_success());
+    r.tx_id()
 }
 
 // ── append_wal_entries ──────────────────────────────────────────────────────

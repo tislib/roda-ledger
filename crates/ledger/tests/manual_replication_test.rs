@@ -129,8 +129,8 @@ fn manual_replication_leader_to_follower() {
                 user_ref: 0,
             })
             .collect();
-        let results = leader.submit_batch_and_wait(ops, WaitLevel::Committed);
-        last_leader_tx = results.last().unwrap().tx_id;
+        let results = leader.submit_batch_and_wait_result(ops, WaitLevel::Committed);
+        last_leader_tx = results.last().unwrap().tx_id();
     }
     // The open consumed tx_id 1, so the deposits occupy the next `total_tx` ids.
     assert_eq!(last_leader_tx, open_tx_id + total_tx);

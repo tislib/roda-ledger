@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 /// Flip-flop deduplication cache (ADR-009, ADR-013).
 ///
@@ -14,6 +15,13 @@ pub struct DedupCache {
     previous: FxHashMap<u64, u64>,
     window_size: u64,
     window_start_tx_id: u64,
+}
+
+impl DedupCache {
+    pub(crate) fn recover(&mut self, previous: HashMap<u64, u64>, active: HashMap<u64, u64>) {
+        self.active.extend(active);
+        self.previous.extend(previous);
+    }
 }
 
 /// Result of a dedup check.
@@ -64,34 +72,6 @@ impl DedupCache {
             return;
         }
         self.active.insert(user_ref, tx_id);
-    }
-
-    /// Rebuild a single entry during WAL recovery.
-    ///
-    /// `tx_id` is the transaction's ID. Entries within `2 × window_size` of
-    /// `last_tx_id` are inserted into the appropriate bucket.
-    pub fn recover_entry(&mut self, user_ref: u64, tx_id: u64, last_tx_id: u64) {
-        if user_ref == 0 {
-            return;
-        }
-
-        // Only recover entries within the dedup window (2 × window_size)
-        if self.window_size > 0 && last_tx_id.saturating_sub(tx_id) > 2 * self.window_size {
-            return;
-        }
-
-        // Initialize window_start on first recovery entry
-        if self.window_start_tx_id == 0 && self.window_size > 0 {
-            // Place window start so that current entries fall into active
-            self.window_start_tx_id = last_tx_id.saturating_sub(self.window_size);
-        }
-
-        // Place in active or previous based on tx_id relative to window boundary
-        if tx_id >= self.window_start_tx_id {
-            self.active.insert(user_ref, tx_id);
-        } else {
-            self.previous.insert(user_ref, tx_id);
-        }
     }
 
     fn maybe_flip(&mut self, tx_id: u64) {
@@ -161,26 +141,5 @@ mod tests {
         assert!(matches!(cache.check(999, 12), DedupResult::Proceed));
         // Second flip at tx_id=23 — entry should be gone
         assert!(matches!(cache.check(100, 23), DedupResult::Proceed));
-    }
-
-    #[test]
-    fn recover_entry_within_window() {
-        let mut cache = DedupCache::new(1000);
-        let last_tx_id = 5000u64;
-        // Entry from 500 transactions ago — within 2×window (2000)
-        cache.recover_entry(100, last_tx_id - 500, last_tx_id);
-        match cache.check(100, last_tx_id) {
-            DedupResult::Duplicate(tx_id) => assert_eq!(tx_id, last_tx_id - 500),
-            DedupResult::Proceed => panic!("expected duplicate after recovery"),
-        }
-    }
-
-    #[test]
-    fn recover_entry_outside_window_ignored() {
-        let mut cache = DedupCache::new(1000);
-        let last_tx_id = 5000u64;
-        // Entry from 2500 transactions ago — outside 2×window (2000)
-        cache.recover_entry(100, last_tx_id - 2500, last_tx_id);
-        assert!(matches!(cache.check(100, last_tx_id), DedupResult::Proceed));
     }
 }
