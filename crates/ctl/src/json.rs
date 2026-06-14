@@ -26,7 +26,7 @@ pub fn wal_entry_to_json(entry: &WalEntry, current_tx_id: u64) -> serde_json::Va
             "tx_id": current_tx_id,
             "account_id": e.account_id,
             "amount": e.amount,
-            "kind": if e.kind == EntryKind::Credit { "Credit" } else { "Debit" },
+            "kind": if e.kind == EntryKind::CREDIT { "Credit" } else { "Debit" },
             "computed_balance": e.computed_balance,
         }),
         WalEntry::Link(l) => serde_json::json!({
@@ -102,8 +102,8 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
             let account_id = value["account_id"].as_u64().ok_or("missing account_id")?;
             let amount = value["amount"].as_u64().ok_or("missing amount")?;
             let kind = match value["kind"].as_str().ok_or("missing kind")? {
-                "Credit" => EntryKind::Credit,
-                "Debit" => EntryKind::Debit,
+                "Credit" => EntryKind::CREDIT,
+                "Debit" => EntryKind::DEBIT,
                 other => return Err(format!("unknown kind: {}", other)),
             };
             let computed_balance = value["computed_balance"]

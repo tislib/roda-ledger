@@ -134,7 +134,7 @@ fn assert_is_deposit(ledger: &Ledger, tx_id: u64, account: u64, amount: u64) {
         .entries
         .iter()
         .find_map(|e| match e {
-            WalEntry::Entry(en) if en.account_id == account && en.kind == EntryKind::Debit => {
+            WalEntry::Entry(en) if en.account_id == account && en.kind == EntryKind::DEBIT => {
                 Some(en)
             }
             _ => None,

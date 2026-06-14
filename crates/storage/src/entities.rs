@@ -15,11 +15,10 @@ pub enum WalEntryKind {
     AccountFlagsUpdated = 9,
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum EntryKind {
-    Credit = 0,
-    Debit = 1,
+pub struct EntryKind;
+impl EntryKind {
+    pub const CREDIT: u8 = 0;
+    pub const DEBIT: u8 = 1;
 }
 
 pub const SYSTEM_ACCOUNT_ID: u64 = 0;
@@ -127,7 +126,7 @@ pub fn decode_tag(s: &str) -> [u8; 8] {
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxEntry {
     pub entry_type: u8,        // 1 @ 0  — WalEntryKind::TxEntry
-    pub kind: EntryKind,       // 1 @ 1  — Credit or Debit
+    pub kind: u8,              // 1 @ 1  — EntryKind::CREDIT | EntryKind::DEBIT
     pub _pad0: [u8; 6],        // 6 @ 2
     pub _pad1: [u8; 8],        // 8 @ 8  — reserved (tx_id is on the trailing TxMetadata)
     pub account_id: u64,       // 8 @ 16
@@ -369,9 +368,6 @@ impl CommittedTransaction {
         self.meta.fail_reason
     }
 }
-
-unsafe impl Pod for EntryKind {}
-unsafe impl Zeroable for EntryKind {}
 
 // Hard compile-time guarantees: every WAL entry must be exactly 40 bytes.
 const _: () = assert!(size_of::<TxMetadata>() == 40);

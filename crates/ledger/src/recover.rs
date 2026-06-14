@@ -588,7 +588,7 @@ mod validator_tests {
         body
     }
 
-    fn entry(account_id: u64, amount: u64, kind: EntryKind, computed_balance: i64) -> WalEntry {
+    fn entry(account_id: u64, amount: u64, kind: u8, computed_balance: i64) -> WalEntry {
         WalEntry::Entry(TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
             kind,
@@ -632,8 +632,8 @@ mod validator_tests {
         buf.extend_from_slice(&tx_bytes(
             2,
             &[
-                entry(0, 100, EntryKind::Credit, -100),
-                entry(1, 100, EntryKind::Debit, 100),
+                entry(0, 100, EntryKind::CREDIT, -100),
+                entry(1, 100, EntryKind::DEBIT, 100),
             ],
         ));
         let n = Recover::validate_wal_transactions(&buf).expect("both txs valid");

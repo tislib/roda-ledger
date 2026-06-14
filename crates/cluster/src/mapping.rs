@@ -177,9 +177,10 @@ fn metadata_to_proto(m: TxMetadata) -> proto::WalTxMetadata {
 }
 
 fn entry_to_proto(x: TxEntry, tx_id: u64) -> proto::WalTxEntry {
-    let kind = match x.kind {
-        EntryKind::Credit => proto::EntryKind::Credit,
-        EntryKind::Debit => proto::EntryKind::Debit,
+    let kind = if x.kind == EntryKind::CREDIT {
+        proto::EntryKind::Credit
+    } else {
+        proto::EntryKind::Debit
     };
     proto::WalTxEntry {
         tx_id,

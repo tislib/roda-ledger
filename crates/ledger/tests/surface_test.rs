@@ -52,7 +52,7 @@ fn deposit_entries(tx_id: u64, account: u64, amount: u64) -> Vec<WalEntry> {
     // entry inherits it implicitly.
     let entry = TxEntry {
         entry_type: WalEntryKind::TxEntry as u8,
-        kind: EntryKind::Credit,
+        kind: EntryKind::CREDIT,
         _pad0: [0; 6],
         _pad1: [0; 8],
         account_id: account,

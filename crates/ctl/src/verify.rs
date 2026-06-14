@@ -145,7 +145,7 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                     // computed_balance must equal prev_balance ± amount.
                     // Convention (from transactor.rs): Debit → balance += amount,
                     //                                  Credit → balance -= amount.
-                    let delta: i64 = if e.kind == EntryKind::Debit {
+                    let delta: i64 = if e.kind == EntryKind::DEBIT {
                         e.amount as i64
                     } else {
                         -(e.amount as i64)
@@ -334,12 +334,12 @@ fn flush_pending(
         if !entries.is_empty() {
             let debit_total: u64 = entries
                 .iter()
-                .filter(|e| e.kind == EntryKind::Debit)
+                .filter(|e| e.kind == EntryKind::DEBIT)
                 .map(|e| e.amount)
                 .sum();
             let credit_total: u64 = entries
                 .iter()
-                .filter(|e| e.kind == EntryKind::Credit)
+                .filter(|e| e.kind == EntryKind::CREDIT)
                 .map(|e| e.amount)
                 .sum();
             if debit_total != credit_total {

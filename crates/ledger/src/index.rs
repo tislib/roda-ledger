@@ -182,7 +182,7 @@ mod tests {
         }
     }
 
-    fn entry(account_id: u64, amount: u64, kind: EntryKind, computed_balance: i64) -> WalEntry {
+    fn entry(account_id: u64, amount: u64, kind: u8, computed_balance: i64) -> WalEntry {
         WalEntry::Entry(TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
             kind,
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn get_transaction_single_entry_hit() {
         let mut idx = small();
-        idx.insert_transaction(&meta(1), &[entry(100, 500, EntryKind::Credit, 500)]);
+        idx.insert_transaction(&meta(1), &[entry(100, 500, EntryKind::CREDIT, 500)]);
 
         let (m, entries) = idx.get_transaction(1).expect("cache hit expected");
         assert_eq!(m.tx_id, 1);
@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(e.account_id, 100);
         assert_eq!(e.amount, 500);
         assert_eq!(e.computed_balance, 500);
-        assert_eq!(e.kind, EntryKind::Credit);
+        assert_eq!(e.kind, EntryKind::CREDIT);
     }
 
     #[test]
@@ -224,8 +224,8 @@ mod tests {
         idx.insert_transaction(
             &meta(2),
             &[
-                entry(200, 1_000, EntryKind::Debit, -1_000),
-                entry(201, 1_000, EntryKind::Credit, 1_000),
+                entry(200, 1_000, EntryKind::DEBIT, -1_000),
+                entry(201, 1_000, EntryKind::CREDIT, 1_000),
             ],
         );
 
@@ -245,8 +245,8 @@ mod tests {
     fn get_transaction_miss_after_circle1_eviction() {
         let mut idx = small(); // circle1_size = 16 → mask = 15
         // tx_id 1 and tx_id 17 both map to slot 1
-        idx.insert_transaction(&meta(1), &[entry(100, 100, EntryKind::Credit, 100)]);
-        idx.insert_transaction(&meta(17), &[entry(101, 200, EntryKind::Debit, -200)]);
+        idx.insert_transaction(&meta(1), &[entry(100, 100, EntryKind::CREDIT, 100)]);
+        idx.insert_transaction(&meta(17), &[entry(101, 200, EntryKind::DEBIT, -200)]);
 
         assert!(idx.get_transaction(1).is_none()); // evicted
         assert!(idx.get_transaction(17).is_some());
@@ -256,12 +256,12 @@ mod tests {
     fn get_transaction_miss_after_circle2_eviction() {
         let mut idx = TransactionIndexer::new(16, 4); // circle2 wraps quickly
 
-        idx.insert_transaction(&meta(1), &[entry(100, 10, EntryKind::Credit, 10)]);
+        idx.insert_transaction(&meta(1), &[entry(100, 10, EntryKind::CREDIT, 10)]);
         for tx_id in 2..=4 {
-            idx.insert_transaction(&meta(tx_id), &[entry(tx_id * 10, 1, EntryKind::Credit, 1)]);
+            idx.insert_transaction(&meta(tx_id), &[entry(tx_id * 10, 1, EntryKind::CREDIT, 1)]);
         }
         // one more entry overwrites circle2 slot 0 (where tx 1 was)
-        idx.insert_transaction(&meta(5), &[entry(50, 1, EntryKind::Credit, 1)]);
+        idx.insert_transaction(&meta(5), &[entry(50, 1, EntryKind::CREDIT, 1)]);
 
         assert!(idx.get_transaction(1).is_none());
     }

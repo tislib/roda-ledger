@@ -254,13 +254,10 @@ impl Computer {
             .walk(self.tx_start_index, end, |entry| match entry {
                 WalEntry::Entry(e) => {
                     if let Some(acct) = self.balances.get_mut(e.account_id as usize) {
-                        match e.kind {
-                            EntryKind::Credit => {
-                                acct.balance = acct.balance.saturating_add(e.amount as i64);
-                            }
-                            EntryKind::Debit => {
-                                acct.balance = acct.balance.saturating_sub(e.amount as i64);
-                            }
+                        if e.kind == EntryKind::CREDIT {
+                            acct.balance = acct.balance.saturating_add(e.amount as i64);
+                        } else {
+                            acct.balance = acct.balance.saturating_sub(e.amount as i64);
                         }
                     }
                 }
@@ -471,7 +468,7 @@ impl Computer {
             _pad1: [0; 8],
             account_id,
             amount,
-            kind: EntryKind::Credit,
+            kind: EntryKind::CREDIT,
             _pad0: [0; 6],
             computed_balance,
         }));
@@ -501,7 +498,7 @@ impl Computer {
             _pad1: [0; 8],
             account_id,
             amount,
-            kind: EntryKind::Debit,
+            kind: EntryKind::DEBIT,
             _pad0: [0; 6],
             computed_balance,
         }));
@@ -633,7 +630,7 @@ mod tests {
         match reader.get(0) {
             WalEntry::Entry(e) => {
                 assert_eq!(e.amount, 100);
-                assert!(matches!(e.kind, EntryKind::Debit));
+                assert_eq!(e.kind, EntryKind::DEBIT);
             }
             _ => panic!("expected a TxEntry at slot 0"),
         }

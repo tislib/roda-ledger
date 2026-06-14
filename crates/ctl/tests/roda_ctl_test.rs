@@ -42,7 +42,7 @@ fn create_test_segment(dir: &Path, segment_id: u32, tx_start: u64, num_txs: u32)
         // account_id=0 is the sending side  (Credit, balance grows negative).
         let e1 = TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
-            kind: EntryKind::Debit,
+            kind: EntryKind::DEBIT,
             _pad0: [0; 6],
             _pad1: [0; 8],
             account_id: 1,
@@ -51,7 +51,7 @@ fn create_test_segment(dir: &Path, segment_id: u32, tx_start: u64, num_txs: u32)
         };
         let e2 = TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
-            kind: EntryKind::Credit,
+            kind: EntryKind::CREDIT,
             _pad0: [0; 6],
             _pad1: [0; 8],
             account_id: 0,
