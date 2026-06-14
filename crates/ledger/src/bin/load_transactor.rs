@@ -1,8 +1,9 @@
 use clap::{Parser, ValueEnum};
 use ledger::config::LedgerConfig;
 use ledger::pipeline::TransactorContext;
+use ledger::recover::ActiveSnapshot;
 use ledger::test_support::mock_pipeline;
-use ledger::transactor::Transactor;
+use ledger::transactor;
 use ledger::transactor::transaction::{Operation, Transaction, TransactionInput};
 use ledger::transactor::wasm_runtime::WasmRuntime;
 use ledger::wait_strategy::WaitStrategy;
@@ -112,10 +113,16 @@ fn main() {
     };
     let storage = Arc::new(Storage::new(config.storage.clone()).expect("init storage"));
     let runtime = Arc::new(WasmRuntime::new(storage));
-    let mut transactor = Transactor::new(&config, runtime, writer);
-    let handle = transactor
-        .start(pipeline.transactor_context())
-        .expect("start transactor");
+    let active_snapshot = ActiveSnapshot::empty();
+    let handle = transactor::Transactor {
+        ctx: pipeline.transactor_context(),
+        active_snapshot: &active_snapshot,
+        config: &config,
+        wasm_runtime: runtime,
+        ring_writer: writer,
+    }
+    .start()
+    .expect("start transactor");
 
     let push_ctx = pipeline.transactor_context();
     let start_time = Instant::now();

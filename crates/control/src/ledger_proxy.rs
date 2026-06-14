@@ -211,6 +211,27 @@ impl Ledger for LedgerProxy {
         .await
     }
 
+    async fn submit_and_wait_result(
+        &self,
+        request: Request<pb::SubmitAndWaitResultRequest>,
+    ) -> Result<Response<pb::SubmitAndWaitResultResponse>, Status> {
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
+        let md = LedgerProxy::forward_metadata(&request);
+        let body = request.into_inner();
+        let cluster = self.handle.client();
+        Self::dispatch_write(
+            "submit_and_wait_result",
+            cluster,
+            md,
+            pinned,
+            move |mut c, md| {
+                let body = body.clone();
+                async move { c.submit_and_wait_result(outbound(md, body)).await }
+            },
+        )
+        .await
+    }
+
     async fn submit_batch(
         &self,
         request: Request<pb::SubmitBatchRequest>,
@@ -242,6 +263,27 @@ impl Ledger for LedgerProxy {
             move |mut c, md| {
                 let body = body.clone();
                 async move { c.submit_batch_and_wait(outbound(md, body)).await }
+            },
+        )
+        .await
+    }
+
+    async fn submit_batch_and_wait_result(
+        &self,
+        request: Request<pb::SubmitBatchAndWaitResultRequest>,
+    ) -> Result<Response<pb::SubmitBatchAndWaitResultResponse>, Status> {
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
+        let md = LedgerProxy::forward_metadata(&request);
+        let body = request.into_inner();
+        let cluster = self.handle.client();
+        Self::dispatch_write(
+            "submit_batch_and_wait_result",
+            cluster,
+            md,
+            pinned,
+            move |mut c, md| {
+                let body = body.clone();
+                async move { c.submit_batch_and_wait_result(outbound(md, body)).await }
             },
         )
         .await

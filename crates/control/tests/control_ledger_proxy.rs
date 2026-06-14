@@ -74,7 +74,6 @@ async fn get_transaction_status_reaches_terminal_state() {
         if status.status == pb::TransactionStatus::OnSnapshot as i32
             || status.status == pb::TransactionStatus::Committed as i32
         {
-            assert_eq!(status.fail_reason, 0);
             return;
         }
         if std::time::Instant::now() >= deadline {

@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use storage::Storage;
+use storage::entities::FunctionRegistered;
 use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 /// The required export name on every registered function.
@@ -321,6 +322,22 @@ impl WasmRuntime {
     /// Recovery hook — replay an unregister record from the WAL.
     pub fn recover_unregister(&self, name: &str) -> io::Result<()> {
         self.unload_function(name)
+    }
+
+    pub fn recover_function(&self, function_registered: &FunctionRegistered) -> io::Result<()> {
+        let fn_name = std::str::from_utf8(&function_registered.name)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            .trim_end_matches('\0');
+
+        if function_registered.crc32c == 0 {
+            self.recover_unregister(fn_name)
+        } else {
+            self.recover_register(
+                fn_name,
+                function_registered.version,
+                function_registered.crc32c,
+            )
+        }
     }
 
     /// Snapshot of every currently-loaded function with its version + CRC32C.

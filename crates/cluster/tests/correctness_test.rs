@@ -24,13 +24,13 @@ async fn balances_converge_across_nodes_after_churn() {
     for round in 0..3 {
         for _ in 0..10 {
             let r1 = ctl
-                .deposit_and_wait(ACCOUNT_A, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+                .deposit_and_wait_result(ACCOUNT_A, AMOUNT, user_ref, true)
                 .await
                 .unwrap();
             warn!("r1:{}", r1.tx_id);
             user_ref += 1;
             let r2 = ctl
-                .deposit_and_wait(ACCOUNT_B, AMOUNT, user_ref, WaitLevel::ClusterCommit)
+                .deposit_and_wait_result(ACCOUNT_B, AMOUNT, user_ref, true)
                 .await
                 .unwrap();
             warn!("r2:{}", r2.tx_id);
@@ -99,7 +99,7 @@ async fn cluster_commit_acked_tx_survives_one_node_failure() {
     let mut acked = Vec::new();
     for ur in 1..=10u64 {
         let r = ctl
-            .deposit_and_wait(ACCOUNT_A, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT_A, AMOUNT, ur, true)
             .await
             .unwrap();
         acked.push(r.tx_id);
@@ -173,7 +173,7 @@ async fn wal_is_byte_exact_across_replicas() {
     let mut last_tx_id = 0u64;
     for ur in 1..=20u64 {
         let r = ctl
-            .deposit_and_wait(ACCOUNT_A, AMOUNT, ur, WaitLevel::ClusterCommit)
+            .deposit_and_wait_result(ACCOUNT_A, AMOUNT, ur, true)
             .await
             .expect("deposit");
         last_tx_id = r.tx_id;

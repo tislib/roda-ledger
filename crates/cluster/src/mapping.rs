@@ -82,6 +82,41 @@ pub fn submit_and_wait_request_to_op(
     }
 }
 
+/// Like `submit_and_wait_request_to_op` but for the result RPC's request,
+/// whose `operation` oneof carries no `wait_level` (the server always waits
+/// for the SNAPSHOT stage).
+#[allow(clippy::result_large_err)]
+pub fn submit_and_wait_result_request_to_op(
+    req: proto::SubmitAndWaitResultRequest,
+) -> Result<Operation, tonic::Status> {
+    use proto::submit_and_wait_result_request::Operation as O;
+    match req.operation {
+        Some(O::Deposit(d)) => Ok(deposit_to_op(d)),
+        Some(O::Withdrawal(w)) => Ok(withdrawal_to_op(w)),
+        Some(O::Transfer(t)) => Ok(transfer_to_op(t)),
+        Some(O::Function(n)) => Ok(function_to_op(n)),
+        Some(O::OpenAccount(o)) => Ok(open_account_to_op(o)),
+        None => Err(tonic::Status::invalid_argument("missing operation")),
+    }
+}
+
+/// Map one element of a `SubmitBatchAndWaitResultRequest` (its operations are
+/// the nested `Operation` message, each wrapping the same oneof).
+#[allow(clippy::result_large_err)]
+pub fn batch_result_operation_to_op(
+    op: proto::submit_batch_and_wait_result_request::Operation,
+) -> Result<Operation, tonic::Status> {
+    use proto::submit_batch_and_wait_result_request::operation::Operation as O;
+    match op.operation {
+        Some(O::Deposit(d)) => Ok(deposit_to_op(d)),
+        Some(O::Withdrawal(w)) => Ok(withdrawal_to_op(w)),
+        Some(O::Transfer(t)) => Ok(transfer_to_op(t)),
+        Some(O::Function(n)) => Ok(function_to_op(n)),
+        Some(O::OpenAccount(o)) => Ok(open_account_to_op(o)),
+        None => Err(tonic::Status::invalid_argument("missing operation")),
+    }
+}
+
 pub fn status_to_proto(status: TransactionStatus) -> proto::TransactionStatus {
     match status {
         TransactionStatus::NotFound => proto::TransactionStatus::TxNotFound,
@@ -89,7 +124,6 @@ pub fn status_to_proto(status: TransactionStatus) -> proto::TransactionStatus {
         TransactionStatus::Computed => proto::TransactionStatus::Computed,
         TransactionStatus::Committed => proto::TransactionStatus::Committed,
         TransactionStatus::OnSnapshot => proto::TransactionStatus::OnSnapshot,
-        TransactionStatus::Error(_) => proto::TransactionStatus::Error,
     }
 }
 
@@ -115,16 +149,16 @@ pub fn wal_entry_to_proto(e: WalEntry, tx_id: u64) -> proto::WalEntry {
     proto::WalEntry { entry: Some(entry) }
 }
 
-/// Build a proto `Transaction`: commit `meta` leads, its followers become
-/// `items`. `tx_id` lives only on the metadata, so thread it into each.
-pub fn transaction_to_proto(result: CommittedTransaction) -> proto::Transaction {
+/// Build a proto `CommitedTransaction`: commit `meta` leads, its followers
+/// become `items`. `tx_id` lives only on the metadata, so thread it into each.
+pub fn transaction_to_proto(result: CommittedTransaction) -> proto::CommitedTransaction {
     let tx_id = result.meta.tx_id;
     let items = result
         .entries
         .into_iter()
         .map(|e| wal_entry_to_proto(e, tx_id))
         .collect();
-    proto::Transaction {
+    proto::CommitedTransaction {
         meta: Some(wal_entry_to_proto(WalEntry::Metadata(result.meta), tx_id)),
         items,
     }
@@ -143,9 +177,10 @@ fn metadata_to_proto(m: TxMetadata) -> proto::WalTxMetadata {
 }
 
 fn entry_to_proto(x: TxEntry, tx_id: u64) -> proto::WalTxEntry {
-    let kind = match x.kind {
-        EntryKind::Credit => proto::EntryKind::Credit,
-        EntryKind::Debit => proto::EntryKind::Debit,
+    let kind = if x.kind == EntryKind::CREDIT {
+        proto::EntryKind::Credit
+    } else {
+        proto::EntryKind::Debit
     };
     proto::WalTxEntry {
         tx_id,

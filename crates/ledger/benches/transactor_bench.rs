@@ -1,7 +1,8 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ledger::ledger::{LedgerConfig, WaitStrategy};
+use ledger::recover::ActiveSnapshot;
 use ledger::test_support::mock_pipeline;
-use ledger::transactor::Transactor;
+use ledger::transactor;
 use ledger::transactor::transaction::{Operation, Transaction, TransactionInput};
 use ledger::transactor::wasm_runtime::WasmRuntime;
 use std::hint::spin_loop;
@@ -31,12 +32,34 @@ fn transactor_bench(c: &mut Criterion) {
         .expect("storage"),
     );
     let runtime = Arc::new(WasmRuntime::new(storage));
-    let mut transactor = Transactor::new(&config, runtime, writer);
-
-    let handle = transactor.start(pipeline.transactor_context()).unwrap();
+    let active_snapshot = ActiveSnapshot::empty();
+    let handle = transactor::Transactor {
+        ctx: pipeline.transactor_context(),
+        active_snapshot: &active_snapshot,
+        config: &config,
+        wasm_runtime: runtime,
+        ring_writer: writer,
+    }
+    .start()
+    .unwrap();
 
     let push_ctx = pipeline.transactor_context();
     let mut current_id = 0;
+
+    // Existence enforcement (ADR-022): open the accounts before depositing.
+    current_id += 1;
+    let mut open_tx = Transaction::new(Operation::OpenAccount {
+        count: 10_000_000,
+        user_ref: 0,
+    });
+    open_tx.id = current_id;
+    while let Err(returned) = push_ctx.input().push(TransactionInput::Single(open_tx)) {
+        open_tx = returned.single();
+        spin_loop();
+    }
+    while push_ctx.get_processed_index() < current_id {
+        spin_loop();
+    }
 
     group.bench_function("process", |b| {
         b.iter(|| {

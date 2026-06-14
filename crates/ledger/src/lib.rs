@@ -6,7 +6,7 @@ pub mod fault;
 pub mod index;
 pub mod ledger;
 pub mod pipeline;
-mod recover;
+pub mod recover;
 pub mod seal;
 mod sequencer;
 pub mod snapshot;

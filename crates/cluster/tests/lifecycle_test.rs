@@ -1,7 +1,6 @@
 //! Resource lifecycle: harness drop/cleanup, supervisor abort, restart
 //! semantics on the same data dir.
 
-use ::proto::ledger::WaitLevel;
 use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -94,7 +93,7 @@ async fn cluster_node_restart_preserves_state() {
     let _ = ctl.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
     let r = ctl
-        .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT, AMOUNT, 1, true)
         .await
         .unwrap();
     assert_eq!(r.fail_reason, 0);

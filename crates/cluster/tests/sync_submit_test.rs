@@ -10,17 +10,14 @@ mod tests {
         ledger.start().unwrap();
         ledger.open_accounts(100); // existence enforcement (ADR-022)
 
-        let result = ledger.submit_and_wait(
-            Operation::Deposit {
-                account: 1,
-                amount: 1000,
-                user_ref: 0,
-            },
-            InternalWaitLevel::Computed,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Deposit {
+            account: 1,
+            amount: 1000,
+            user_ref: 0,
+        });
 
-        assert!(result.tx_id > 0);
-        assert!(result.fail_reason.is_success());
+        assert!(result.tx_id() > 0);
+        assert!(result.is_success());
     }
 
     #[test]
@@ -29,17 +26,14 @@ mod tests {
         ledger.start().unwrap();
         ledger.open_accounts(100); // existence enforcement (ADR-022)
 
-        let result = ledger.submit_and_wait(
-            Operation::Deposit {
-                account: 1,
-                amount: 500,
-                user_ref: 0,
-            },
-            InternalWaitLevel::Committed,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Deposit {
+            account: 1,
+            amount: 500,
+            user_ref: 0,
+        });
 
-        assert!(result.tx_id > 0);
-        assert!(result.fail_reason.is_success());
+        assert!(result.tx_id() > 0);
+        assert!(result.is_success());
     }
 
     #[test]
@@ -48,17 +42,14 @@ mod tests {
         ledger.start().unwrap();
         ledger.open_accounts(100); // existence enforcement (ADR-022)
 
-        let result = ledger.submit_and_wait(
-            Operation::Deposit {
-                account: 1,
-                amount: 2000,
-                user_ref: 0,
-            },
-            InternalWaitLevel::OnSnapshot,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Deposit {
+            account: 1,
+            amount: 2000,
+            user_ref: 0,
+        });
 
-        assert!(result.tx_id > 0);
-        assert!(result.fail_reason.is_success());
+        assert!(result.tx_id() > 0);
+        assert!(result.is_success());
 
         // After Snapshotted, balance must reflect the deposit
         let balance = ledger.get_balance(1);
@@ -72,16 +63,13 @@ mod tests {
         ledger.open_accounts(100); // existence enforcement (ADR-022)
 
         // Withdraw from empty account — should be rejected immediately
-        let result = ledger.submit_and_wait(
-            Operation::Withdrawal {
-                account: 1,
-                amount: 500,
-                user_ref: 0,
-            },
-            InternalWaitLevel::Committed,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Withdrawal {
+            account: 1,
+            amount: 500,
+            user_ref: 0,
+        });
 
-        assert!(result.fail_reason.is_failure());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -90,16 +78,13 @@ mod tests {
         ledger.start().unwrap();
         ledger.open_accounts(100); // existence enforcement (ADR-022)
 
-        let result = ledger.submit_and_wait(
-            Operation::Withdrawal {
-                account: 99,
-                amount: 1,
-                user_ref: 0,
-            },
-            InternalWaitLevel::Computed,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Withdrawal {
+            account: 99,
+            amount: 1,
+            user_ref: 0,
+        });
 
-        assert!(result.fail_reason.is_failure());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -118,17 +103,14 @@ mod tests {
             InternalWaitLevel::OnSnapshot,
         );
 
-        let result = ledger.submit_and_wait(
-            Operation::Transfer {
-                from: 1,
-                to: 2,
-                amount: 400,
-                user_ref: 0,
-            },
-            InternalWaitLevel::OnSnapshot,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Transfer {
+            from: 1,
+            to: 2,
+            amount: 400,
+            user_ref: 0,
+        });
 
-        assert!(result.fail_reason.is_success());
+        assert!(result.is_success());
         assert_eq!(ledger.get_balance(1), 600);
         assert_eq!(ledger.get_balance(2), 400);
     }
@@ -157,11 +139,11 @@ mod tests {
             },
         ];
 
-        let results = ledger.submit_batch_and_wait(ops, InternalWaitLevel::OnSnapshot);
+        let results = ledger.submit_batch_and_wait_result(ops, InternalWaitLevel::OnSnapshot);
 
         assert_eq!(results.len(), 3);
         for r in &results {
-            assert!(r.fail_reason.is_success());
+            assert!(r.is_success());
         }
         assert_eq!(ledger.get_balance(1), 100);
         assert_eq!(ledger.get_balance(2), 200);
@@ -192,12 +174,12 @@ mod tests {
             },
         ];
 
-        let results = ledger.submit_batch_and_wait(ops, InternalWaitLevel::OnSnapshot);
+        let results = ledger.submit_batch_and_wait_result(ops, InternalWaitLevel::OnSnapshot);
 
         assert_eq!(results.len(), 3);
-        assert!(results[0].fail_reason.is_success());
-        assert!(results[1].fail_reason.is_failure());
-        assert!(results[2].fail_reason.is_success());
+        assert!(results[0].is_success());
+        assert!(results[1].is_err());
+        assert!(results[2].is_success());
     }
 
     #[test]

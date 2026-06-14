@@ -1,38 +1,55 @@
-use crate::pipeline::Pipeline;
-use crate::seal::Seal;
-use crate::snapshot::Snapshot;
-use crate::transactor::Transactor;
+use crate::balance::Balance;
 use spdlog::{debug, warn};
 use std::collections::HashMap;
-use std::sync::Arc;
-use storage::SegmentStaus::SEALED;
-use storage::entities::{FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind};
+use storage::entities::{
+    CommittedTransaction, FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind,
+};
 use storage::{Segment, Storage};
 
 const ENTRY_SIZE: usize = 40;
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoverAccount {
+    pub balance: Balance,
+    pub flags: u64,
+}
+
+pub struct ActiveSnapshot {
+    pub last_tx_id: u64,
+    pub next_account_id: u64,
+    pub accounts: HashMap<u64, RecoverAccount>,
+    pub functions: Vec<FunctionRegistered>,
+    pub links: Vec<(u64, u16, u64)>,
+    pub last_segment_user_ref_tx_id_map: HashMap<u64, u64>,
+    pub active_segment_user_ref_tx_id_map: HashMap<u64, u64>,
+    pub active_segment_transactions: Vec<CommittedTransaction>,
+}
+
+impl ActiveSnapshot {
+    /// Genesis seed: no accounts/functions/links, allocator at 1 (account 0 is
+    /// SYSTEM). Used as the recovery starting point and by isolated load tests.
+    pub fn empty() -> Self {
+        Self {
+            last_tx_id: 0,
+            next_account_id: 1,
+            accounts: HashMap::new(),
+            functions: Vec::new(),
+            links: Vec::new(),
+            last_segment_user_ref_tx_id_map: HashMap::new(),
+            active_segment_user_ref_tx_id_map: HashMap::new(),
+            active_segment_transactions: Vec::new(),
+        }
+    }
+}
+
 pub struct Recover<'r> {
-    transactor: &'r mut Transactor,
-    snapshot: &'r mut Snapshot,
-    seal: &'r mut Seal,
-    pipeline: &'r Arc<Pipeline>,
     storage: &'r Storage,
     segments: Vec<Segment>,
 }
 
 impl<'r> Recover<'r> {
-    pub fn new(
-        transactor: &'r mut Transactor,
-        snapshot: &'r mut Snapshot,
-        seal: &'r mut Seal,
-        pipeline: &'r Arc<Pipeline>,
-        storage: &'r Storage,
-    ) -> Self {
+    pub fn new(storage: &'r Storage) -> Self {
         Self {
-            transactor,
-            snapshot,
-            seal,
-            pipeline,
             storage,
             segments: vec![],
         }
@@ -270,33 +287,15 @@ impl<'r> Recover<'r> {
         false
     }
 
-    /// Watermark-bounded recovery. The unbounded path is recovered by
-    /// passing `watermark = u64::MAX` (what `Ledger::start` does);
-    /// `Ledger::start_with_recovery_until` (ADR-0016 §9) passes a
-    /// finite watermark. Replays snapshot + WAL up to and including
-    /// `watermark` only; records whose `tx_id > watermark` are visited
-    /// but not applied.
-    ///
-    /// Snapshot selection picks the latest sealed snapshot whose
-    /// `last_tx_id <= watermark`, falling back to genesis (no
-    /// snapshot) when none qualify. Pipeline indices are clamped to
-    /// `min(replayed_last_tx, watermark)`.
-    ///
-    /// The watermark applies only to **transactional** records
-    /// (`Metadata`, `Entry`, `Link`). `FunctionRegistered` records are
-    /// applied or skipped based on whether the most recently observed
-    /// `Metadata` had `tx_id > watermark` — i.e. function registrations
-    /// that occurred *after* the last accepted transaction are dropped
-    /// alongside the diverged tail.
-    ///
-    /// Caller (`Ledger::start_with_recovery_until`) is expected to have
-    /// already invoked `Storage::truncate_wal_above(watermark)`. Even
-    /// without that, `recover_until` is correct on its own — it simply
-    /// won't physically reclaim the disk space of the rejected tail.
-    pub fn recover_until(&mut self, watermark: u64) -> Result<(), std::io::Error> {
-        debug!("Starting recovery (watermark={})...", watermark);
+    /// Build the `ActiveSnapshot` from the latest snapshot (`last_tx_id <=
+    /// watermark_tx_id`) plus the post-snapshot and active WAL. Records whose
+    /// `tx_id > watermark_tx_id` are visited but skipped.
+    pub fn recover_until(
+        &mut self,
+        watermark_tx_id: u64,
+    ) -> Result<ActiveSnapshot, std::io::Error> {
+        debug!("Starting recovery (watermark_tx_id={})...", watermark_tx_id);
 
-        // locate segments
         self.segments = self.storage.list_all_segments().map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -304,338 +303,188 @@ impl<'r> Recover<'r> {
             )
         })?;
 
-        // find the latest snapshot whose covered_up_to_tx ≤ watermark
         let latest_snapshot_segment_id = self
-            .locate_latest_snapshot_segment_id_for_watermark(watermark)
+            .locate_latest_snapshot_segment_id_for_watermark(watermark_tx_id)
             .map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!("failed to locate latest snapshot segment: {}", e),
                 )
             })?;
-        let mut last_tx_id = 0;
-        let mut next_account_id = 1u64;
-        // (parent_id, type_id, child_id) links replayed from AccountLinked
-        // records, seeded into the transactor + snapshot at finalization.
-        let mut recover_links: Vec<(u64, u16, u64)> = Vec::new();
-        let mut recover_balances = HashMap::new();
-        // (id → flags) from the snapshot's accounts + replayed `AccountOpened`,
-        // overlaid onto the transactor + snapshot at finalization.
-        let mut recover_flags: HashMap<u64, u64> = HashMap::new();
-        // Trailer layout: a transaction's followers precede its `TxMetadata`, which
-        // supplies the tx_id, the watermark decision, and the index ordering. Hold
-        // the in-flight followers until the metadata; the buffer carries across
-        // segment seams since a transaction may span a rotation boundary.
-        let mut group: Vec<WalEntry> = Vec::new();
 
-        // restore the latest snapshot
+        let mut snapshot = ActiveSnapshot::empty();
+
+        // Followers precede their closing metadata and may span a segment seam,
+        // so the buffer carries across segments.
+        let mut group: Vec<WalEntry> = Vec::new();
+        // Reset per closed segment; ends holding the last closed segment's map.
+        let mut closed_user_refs: HashMap<u64, u64> = HashMap::new();
+
         for segment in self.segments.iter_mut() {
-            // ignore segments before snapshot
             if segment.id() < latest_snapshot_segment_id {
                 continue;
             }
-
-            // restore the snapshot
             if segment.id() == latest_snapshot_segment_id {
-                let data = segment
-                    .load_snapshot()
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "failed to load snapshot for segment {}: {}",
-                                segment.id(),
-                                e
-                            ),
-                        )
-                    })?
-                    .unwrap();
-
-                for (account_id, balance, flags) in data.accounts {
-                    recover_balances.insert(account_id, balance);
-                    recover_flags.insert(account_id, flags);
-                    self.seal
-                        .recover_balance(account_id as usize, balance)
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "failed to recover balance for account {} from snapshot: {}",
-                                    account_id, e
-                                ),
-                            )
-                        })?;
-                    self.seal
-                        .recover_account_flags(account_id as usize, flags)
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "failed to recover flags for account {} from snapshot: {}",
-                                    account_id, e
-                                ),
-                            )
-                        })?;
-                }
-
-                // Snapshot-persisted links (ADR-022 §3): seed recover's tracker
-                // and Seal's so they survive into the next snapshot Seal writes.
-                for (parent_id, type_id, child_id) in data.links {
-                    recover_links.push((parent_id, type_id, child_id));
-                    self.seal
-                        .recover_link(parent_id, type_id, child_id)
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                e.kind(),
-                                format!("failed to recover link from snapshot: {}", e),
-                            )
-                        })?;
-                }
-
-                last_tx_id = data.last_tx_id;
-
-                // Snapshot-persisted allocator high-water (ADR-022): seed both
-                // recover's tracker and Seal's. The post-snapshot WAL replay
-                // bumps it further.
-                next_account_id = next_account_id.max(data.next_account_id);
-                self.seal
-                    .recover_next_account_id(data.next_account_id)
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("failed to recover next_account_id from snapshot: {}", e),
-                        )
-                    })?;
-
-                // Pair: load the function snapshot for the same segment
-                // and seed both Seal's function map and the WASM runtime
-                // before any FunctionRegistered records are replayed
-                // forward (internal.md §12.3 / §12.4).
-                if let Some(fdata) = segment.load_function_snapshot().map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to load function snapshot for segment {}: {}",
-                            segment.id(),
-                            e
-                        ),
-                    )
-                })? {
-                    for (name, version, crc) in fdata.entries {
-                        self.seal
-                            .recover_function_record(&name, version, crc)
-                            .map_err(|e| {
-                                std::io::Error::new(
-                                    e.kind(),
-                                    format!(
-                                        "failed to seed seal function map for {} v{}: {}",
-                                        name, version, e
-                                    ),
-                                )
-                            })?;
-                        let record = FunctionRegistered::new(&name, version, crc);
-                        self.transactor
-                            .recover_function_registered(&record)
-                            .map_err(|e| {
-                                std::io::Error::new(
-                                    e.kind(),
-                                    format!(
-                                        "recover: function snapshot apply for {} v{} failed: {}",
-                                        name, version, e
-                                    ),
-                                )
-                            })?;
-                    }
-                }
-
+                Self::restore_snapshot(segment, &mut snapshot)?;
                 continue;
             }
-
-            // process the segments after snapshot
-            if segment.status() != SEALED {
-                // Pass the seal-watermark through so `recover_pre_seal`
-                // can sanity-check it: if a closed segment's last tx
-                // is somehow still above the watermark at recovery
-                // time, truncation failed to remove the diverged tail
-                // and we must abort rather than seal unsafe content
-                // (ADR-0016 §10). On healthy data this is always a
-                // pass-through.
-                let sw = self.pipeline.get_seal_watermark();
-                let sealed_id = self.seal.recover_pre_seal(segment, sw).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to recover pre-seal for segment {}: {}",
-                            segment.id(),
-                            e
-                        ),
-                    )
-                })?;
-                self.pipeline.set_seal_index(sealed_id);
-            }
-
             segment.load().map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!("failed to load segment {}: {}", segment.id(), e),
                 )
             })?;
-
-            let snapshot = &mut self.snapshot;
-            let transactor = &*self.transactor;
-            let seal = &mut *self.seal;
-            let mut function_apply_err: Option<std::io::Error> = None;
-            segment
-                .visit_wal_records(|record| match record {
-                    // Trailer layout: the metadata closes the transaction. Decide
-                    // skip/apply here with the authoritative tx_id, then flush the
-                    // followers buffered before it.
-                    WalEntry::Metadata(metadata) => {
-                        if metadata.tx_id > watermark {
-                            group.clear();
-                            return;
-                        }
-                        last_tx_id = metadata.tx_id;
-                        // Index the whole transaction (meta + followers, as-is).
-                        snapshot.recover_index_transaction(metadata, &group);
-                        for follower in group.drain(..) {
-                            match follower {
-                                WalEntry::Entry(entry) => {
-                                    recover_balances
-                                        .insert(entry.account_id, entry.computed_balance);
-                                }
-                                WalEntry::Link(_) => {}
-                                WalEntry::FunctionRegistered(f) if function_apply_err.is_none() => {
-                                    if let Err(e) = transactor.recover_function_registered(&f) {
-                                        function_apply_err = Some(std::io::Error::new(
-                                            e.kind(),
-                                            format!(
-                                                "recover: replay FunctionRegistered({} v{}) failed: {}",
-                                                f.name_str(),
-                                                f.version,
-                                                e
-                                            ),
-                                        ));
-                                    } else if let Err(e) = seal.recover_function_record(
-                                        f.name_str(),
-                                        f.version,
-                                        f.crc32c,
-                                    ) {
-                                        function_apply_err = Some(std::io::Error::new(
-                                            e.kind(),
-                                            format!(
-                                                "recover: seal map update for {} v{} failed: {}",
-                                                f.name_str(),
-                                                f.version,
-                                                e
-                                            ),
-                                        ));
-                                    }
-                                }
-                                WalEntry::AccountOpened(a) => {
-                                    let end = a.begin_account_id + a.count as u64;
-                                    next_account_id = next_account_id.max(end);
-                                    for id in a.begin_account_id..end {
-                                        recover_flags.insert(id, a.flags);
-                                    }
-                                }
-                                WalEntry::AccountLinked(a) => {
-                                    recover_links.push((a.parent_id, a.type_id, a.child_id));
-                                }
-                                WalEntry::AccountFlagsUpdated(a) => {
-                                    recover_flags.insert(a.account_id, a.new_flags);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    other => group.push(*other),
-                })
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to visit wal records for segment {}: {}",
-                            segment.id(),
-                            e
-                        ),
-                    )
-                })?;
-            if let Some(e) = function_apply_err {
-                return Err(e);
-            }
+            closed_user_refs.clear();
+            Self::fold_segment(
+                segment,
+                watermark_tx_id,
+                &mut group,
+                &mut snapshot,
+                &mut closed_user_refs,
+                None,
+            )?;
         }
+        snapshot.last_segment_user_ref_tx_id_map = closed_user_refs;
 
-        // process active WAL records
         let active_segment = self.storage.active_segment().map_err(|e| {
             std::io::Error::new(e.kind(), format!("failed to get active segment: {}", e))
         })?;
-        let snapshot = &mut self.snapshot;
-        let transactor = &mut self.transactor;
-        let seal = &mut *self.seal;
-        let mut function_apply_err: Option<std::io::Error> = None;
-        active_segment
+        let mut active_user_refs: HashMap<u64, u64> = HashMap::new();
+        let mut active_txs: Vec<CommittedTransaction> = Vec::new();
+        Self::fold_segment(
+            &active_segment,
+            watermark_tx_id,
+            &mut group,
+            &mut snapshot,
+            &mut active_user_refs,
+            Some(&mut active_txs),
+        )?;
+        snapshot.active_segment_user_ref_tx_id_map = active_user_refs;
+        snapshot.active_segment_transactions = active_txs;
+
+        // Keep the allocator high-water ahead of every recovered account id.
+        let recovered_high_water = snapshot
+            .accounts
+            .keys()
+            .copied()
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0);
+        snapshot.next_account_id = snapshot.next_account_id.max(recovered_high_water);
+
+        debug!(
+            "Recovery completed (last_tx_id={}, watermark_tx_id={}).",
+            snapshot.last_tx_id, watermark_tx_id
+        );
+
+        Ok(snapshot)
+    }
+
+    /// Seed accounts and links from a segment's snapshot file. No-op when the
+    /// segment has no (or a corrupt) snapshot.
+    fn restore_snapshot(
+        segment: &Segment,
+        snapshot: &mut ActiveSnapshot,
+    ) -> Result<(), std::io::Error> {
+        let data = match segment.load_snapshot().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to load snapshot for segment {}: {}",
+                    segment.id(),
+                    e
+                ),
+            )
+        })? {
+            Some(data) => data,
+            None => return Ok(()),
+        };
+
+        for (account_id, balance, flags) in data.accounts {
+            let account = snapshot.accounts.entry(account_id).or_default();
+            account.balance = balance;
+            account.flags = flags;
+        }
+        for (parent_id, type_id, child_id) in data.links {
+            snapshot.links.push((parent_id, type_id, child_id));
+        }
+        snapshot.last_tx_id = data.last_tx_id;
+        snapshot.next_account_id = snapshot.next_account_id.max(data.next_account_id);
+
+        if let Some(fdata) = segment.load_function_snapshot().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to load function snapshot for segment {}: {}",
+                    segment.id(),
+                    e
+                ),
+            )
+        })? {
+            for (name, version, crc) in fdata.entries {
+                snapshot
+                    .functions
+                    .push(FunctionRegistered::new(&name, version, crc));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold a segment's committed transactions (`tx_id <= watermark_tx_id`) into
+    /// the snapshot's accounts/links and record each `user_ref -> tx_id` in
+    /// `user_ref_map` (dedup set: skips `user_ref == 0` and DUPLICATE txs).
+    fn fold_segment(
+        segment: &Segment,
+        watermark_tx_id: u64,
+        group: &mut Vec<WalEntry>,
+        snapshot: &mut ActiveSnapshot,
+        user_ref_map: &mut HashMap<u64, u64>,
+        mut transactions: Option<&mut Vec<CommittedTransaction>>,
+    ) -> Result<(), std::io::Error> {
+        segment
             .visit_wal_records(|record| match record {
                 WalEntry::Metadata(metadata) => {
-                    if metadata.tx_id > watermark {
+                    if metadata.tx_id > watermark_tx_id {
                         group.clear();
                         return;
                     }
-                    last_tx_id = metadata.tx_id;
-                    // Index the whole transaction (meta + followers, as-is).
-                    snapshot.recover_index_transaction(metadata, &group);
-
-                    // Only non-duplicate committed transactions belong in the dedup cache.
+                    snapshot.last_tx_id = metadata.tx_id;
+                    // Only committed, non-duplicate user transactions feed dedup.
                     if metadata.user_ref != 0 && metadata.fail_reason != FailReason::DUPLICATE {
-                        transactor.dedup_cache_mut().recover_entry(
-                            metadata.user_ref,
-                            metadata.tx_id,
-                            last_tx_id,
-                        );
+                        user_ref_map.insert(metadata.user_ref, metadata.tx_id);
+                    }
+                    // Retain the committed tx so the snapshot can warm its index.
+                    if let Some(txs) = transactions.as_mut() {
+                        txs.push(CommittedTransaction {
+                            meta: *metadata,
+                            entries: group.clone(),
+                        });
                     }
                     for follower in group.drain(..) {
                         match follower {
                             WalEntry::Entry(entry) => {
-                                recover_balances.insert(entry.account_id, entry.computed_balance);
-                            }
-                            WalEntry::Link(_) => {}
-                            WalEntry::FunctionRegistered(f) if function_apply_err.is_none() => {
-                                if let Err(e) = transactor.recover_function_registered(&f) {
-                                    function_apply_err = Some(std::io::Error::new(
-                                        e.kind(),
-                                        format!(
-                                            "recover: replay FunctionRegistered({} v{}) failed: {}",
-                                            f.name_str(),
-                                            f.version,
-                                            e
-                                        ),
-                                    ));
-                                } else if let Err(e) =
-                                    seal.recover_function_record(f.name_str(), f.version, f.crc32c)
-                                {
-                                    function_apply_err = Some(std::io::Error::new(
-                                        e.kind(),
-                                        format!(
-                                            "recover: seal map update for {} v{} failed: {}",
-                                            f.name_str(),
-                                            f.version,
-                                            e
-                                        ),
-                                    ));
-                                }
+                                snapshot
+                                    .accounts
+                                    .entry(entry.account_id)
+                                    .or_default()
+                                    .balance = entry.computed_balance;
                             }
                             WalEntry::AccountOpened(a) => {
                                 let end = a.begin_account_id + a.count as u64;
-                                next_account_id = next_account_id.max(end);
+                                snapshot.next_account_id = snapshot.next_account_id.max(end);
                                 for id in a.begin_account_id..end {
-                                    recover_flags.insert(id, a.flags);
+                                    snapshot.accounts.entry(id).or_default().flags = a.flags;
                                 }
                             }
                             WalEntry::AccountLinked(a) => {
-                                recover_links.push((a.parent_id, a.type_id, a.child_id));
+                                snapshot.links.push((a.parent_id, a.type_id, a.child_id));
                             }
                             WalEntry::AccountFlagsUpdated(a) => {
-                                recover_flags.insert(a.account_id, a.new_flags);
+                                snapshot.accounts.entry(a.account_id).or_default().flags =
+                                    a.new_flags;
+                            }
+                            WalEntry::FunctionRegistered(f) => {
+                                snapshot.functions.push(f);
                             }
                             _ => {}
                         }
@@ -646,57 +495,13 @@ impl<'r> Recover<'r> {
             .map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
-                    format!("failed to visit active wal records: {}", e),
+                    format!(
+                        "failed to visit wal records for segment {}: {}",
+                        segment.id(),
+                        e
+                    ),
                 )
-            })?;
-        if let Some(e) = function_apply_err {
-            return Err(e);
-        }
-
-        // Reconstruct account existence from the high-water BEFORE overlaying
-        // balances: recover_account_layout sets the OPEN/SYSTEM status flags,
-        // recover_balances only writes `.balance`. Also "keep up with" any
-        // account id present in the recovered balance set (D11 / point 4).
-        let recovered_high_water = recover_balances
-            .keys()
-            .copied()
-            .max()
-            .map(|m| m.saturating_add(1))
-            .unwrap_or(0);
-        next_account_id = next_account_id.max(recovered_high_water);
-        self.transactor.recover_account_layout(next_account_id);
-        self.transactor.recover_balances(&recover_balances);
-        // Overlay the exact per-account flags (snapshot + replayed
-        // `AccountOpened`) so PROGRAMMED buckets aren't left as blanket-OPEN.
-        self.transactor.recover_account_flags(&recover_flags);
-        self.snapshot.recover_account_layout(next_account_id);
-        self.snapshot.recover_balances(&recover_balances);
-        self.snapshot.recover_account_flags(&recover_flags);
-        // Seed parent→bucket links (ADR-022 §3) so the recovered leader
-        // resolves buckets and the read side can enumerate them.
-        for (parent, type_id, child) in &recover_links {
-            self.transactor
-                .recover_account_link(*parent, *type_id, *child);
-            self.snapshot
-                .recover_account_link(*parent, *type_id, *child);
-        }
-
-        // Clamp pipeline indices to min(replayed, watermark). When the
-        // watermark is u64::MAX (the unbounded default used by `recover`),
-        // this is a no-op.
-        let effective_last = last_tx_id.min(watermark);
-        self.pipeline.set_compute_index(effective_last);
-        self.pipeline.set_snapshot_index(effective_last);
-        self.pipeline.set_commit_index(effective_last);
-        self.pipeline
-            .set_sequencer_next_id(effective_last.saturating_add(1));
-
-        debug!(
-            "Recovery completed successfully (last_tx_id={}, watermark={}).",
-            effective_last, watermark
-        );
-
-        Ok(())
+            })
     }
 
     fn locate_latest_snapshot_segment_id(&self) -> Result<u32, std::io::Error> {
@@ -747,7 +552,7 @@ impl<'r> Recover<'r> {
 #[cfg(test)]
 mod validator_tests {
     use super::*;
-    use storage::entities::{AccountOpened, EntryKind, TxEntry};
+    use storage::entities::{AccountOpened, EntryKind, FailReason, TxEntry};
 
     fn follower_bytes(f: &WalEntry) -> Vec<u8> {
         match f {
@@ -783,7 +588,7 @@ mod validator_tests {
         body
     }
 
-    fn entry(account_id: u64, amount: u64, kind: EntryKind, computed_balance: i64) -> WalEntry {
+    fn entry(account_id: u64, amount: u64, kind: u8, computed_balance: i64) -> WalEntry {
         WalEntry::Entry(TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
             kind,
@@ -827,8 +632,8 @@ mod validator_tests {
         buf.extend_from_slice(&tx_bytes(
             2,
             &[
-                entry(0, 100, EntryKind::Credit, -100),
-                entry(1, 100, EntryKind::Debit, 100),
+                entry(0, 100, EntryKind::CREDIT, -100),
+                entry(1, 100, EntryKind::DEBIT, 100),
             ],
         ));
         let n = Recover::validate_wal_transactions(&buf).expect("both txs valid");

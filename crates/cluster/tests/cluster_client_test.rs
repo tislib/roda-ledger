@@ -59,7 +59,7 @@ async fn cluster_client_routes_writes_to_leader_and_reads_round_robin() {
 
     // Write — ClusterClient finds the leader on its own.
     let r = cluster
-        .deposit_and_wait(ACCOUNT_A, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT_A, AMOUNT, 1, true)
         .await
         .expect("deposit");
     assert_eq!(r.fail_reason, 0);
@@ -123,7 +123,7 @@ async fn cluster_client_exposes_leader_and_per_node_clients() {
     // Leader client (writes only succeed via leader).
     let r = cluster
         .leader()
-        .deposit_and_wait(ACCOUNT_A, AMOUNT, 7, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT_A, AMOUNT, 7, true)
         .await
         .expect("leader deposit");
     assert!(r.fail_reason == 0 || r.fail_reason == 7);
@@ -160,7 +160,7 @@ async fn cluster_client_writes_survive_leader_failover() {
 
     // Pre-failover write.
     let r = cluster
-        .deposit_and_wait(ACCOUNT_A, AMOUNT, 1, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT_A, AMOUNT, 1, true)
         .await
         .expect("pre-failover deposit");
     assert_eq!(r.fail_reason, 0);
@@ -182,13 +182,13 @@ async fn cluster_client_writes_survive_leader_failover() {
     // built-in retry should land on the new leader without any
     // intervention from the test.
     let r = cluster
-        .deposit_and_wait(ACCOUNT_A, AMOUNT, 2, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT_A, AMOUNT, 2, true)
         .await
         .expect("post-failover deposit");
     assert_eq!(r.fail_reason, 0);
 
     let r = cluster
-        .deposit_and_wait(ACCOUNT_A, AMOUNT, 3, WaitLevel::ClusterCommit)
+        .deposit_and_wait_result(ACCOUNT_A, AMOUNT, 3, true)
         .await
         .expect("second post-failover deposit");
     assert_eq!(r.fail_reason, 0);
@@ -234,7 +234,7 @@ async fn cluster_client_transfer_after_leader_restart() {
 
     // Transfer through the cluster client — should auto-route.
     let r = cluster
-        .transfer_and_wait(ACCOUNT_A, ACCOUNT_B, 400, 2, WaitLevel::ClusterCommit)
+        .transfer_and_wait_result(ACCOUNT_A, ACCOUNT_B, 400, 2, true)
         .await
         .expect("transfer");
     assert_eq!(r.fail_reason, 0);
@@ -279,7 +279,7 @@ async fn node_client_works_standalone() {
         .expect("connect node");
 
     let r = client
-        .deposit_and_wait(ACCOUNT_A, AMOUNT, 1, WaitLevel::Snapshot)
+        .deposit_and_wait_result(ACCOUNT_A, AMOUNT, 1, false)
         .await
         .expect("deposit");
     assert_eq!(r.fail_reason, 0);

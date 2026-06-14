@@ -5,7 +5,6 @@
 //! - Leader's replication thread ships WAL bytes via AppendEntries.
 //! - Follower's balances catch up to the leader's.
 
-use ::proto::ledger::WaitLevel;
 use cluster::testing::{ClusterTestingConfig, ClusterTestingControl};
 use std::time::Duration;
 use storage::entities::SYSTEM_ACCOUNT_ID;
@@ -59,7 +58,7 @@ async fn cluster_leader_replicates_to_follower() {
     let total_tx = 200u64;
     let deposits: Vec<(u64, u64, u64)> = (0..total_tx).map(|i| (account, amount, i + 1)).collect();
     let results = ctl
-        .deposit_batch_and_wait(&deposits, WaitLevel::ClusterCommit)
+        .deposit_batch_and_wait_result(&deposits, true)
         .await
         .expect("leader batch deposit");
     assert_eq!(results.len(), total_tx as usize);

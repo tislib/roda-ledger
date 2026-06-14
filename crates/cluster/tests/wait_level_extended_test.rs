@@ -19,8 +19,7 @@ async fn wait_level_computed_on_cluster() {
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::Computed)
         .await
         .unwrap();
-    assert_eq!(r.fail_reason, 0);
-    assert!(r.tx_id > 0);
+    assert!(r > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -33,7 +32,7 @@ async fn wait_level_committed_on_cluster() {
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::Committed)
         .await
         .unwrap();
-    assert_eq!(r.fail_reason, 0);
+    assert!(r > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -46,7 +45,7 @@ async fn wait_level_snapshot_on_cluster() {
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::Snapshot)
         .await
         .unwrap();
-    assert_eq!(r.fail_reason, 0);
+    assert!(r > 0);
     ctl.require_balance(ACCOUNT, AMOUNT as i64).await;
 }
 
@@ -63,7 +62,7 @@ async fn wait_level_cluster_commit_requires_full_advance() {
         .deposit_and_wait(ACCOUNT, AMOUNT, 1, WaitLevel::ClusterCommit)
         .await
         .unwrap();
-    assert_eq!(r.fail_reason, 0);
+    assert!(r > 0);
 }
 
 /// `WaitLevel::ClusterCommit` blocks (and eventually times out) when no

@@ -56,7 +56,7 @@ async fn test_transfer() {
 async fn test_deposit_and_wait_snapshot() {
     let (_ctl, client) = setup().await;
     let result = client
-        .deposit_and_wait(1, 500, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(1, 500, 0, false)
         .await
         .unwrap();
 
@@ -71,7 +71,7 @@ async fn test_deposit_and_wait_snapshot() {
 async fn test_withdraw_and_wait_insufficient_funds() {
     let (_ctl, client) = setup().await;
     let result = client
-        .withdraw_and_wait(99, 1000, 0, WaitLevel::Committed)
+        .withdraw_and_wait_result(99, 1000, 0, false)
         .await
         .unwrap();
 
@@ -88,7 +88,7 @@ async fn test_transfer_and_wait() {
         .unwrap();
 
     let result = client
-        .transfer_and_wait(1, 2, 400, 0, WaitLevel::Snapshot)
+        .transfer_and_wait_result(1, 2, 400, 0, false)
         .await
         .unwrap();
 
@@ -119,7 +119,7 @@ async fn test_deposit_batch() {
 async fn test_deposit_batch_and_wait() {
     let (_ctl, client) = setup().await;
     let results = client
-        .deposit_batch_and_wait(&[(1, 100, 0), (2, 200, 0)], WaitLevel::Snapshot)
+        .deposit_batch_and_wait_result(&[(1, 100, 0), (2, 200, 0)], false)
         .await
         .unwrap();
 
@@ -160,25 +160,24 @@ async fn test_get_balances() {
 async fn test_get_transaction_status() {
     let (_ctl, client) = setup().await;
     let result = client
-        .deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(1, 1000, 0, false)
         .await
         .unwrap();
 
-    let (status, fail_reason) = client.get_transaction_status(result.tx_id).await.unwrap();
+    let status = client.get_transaction_status(result.tx_id).await.unwrap();
 
     assert_eq!(status, 3); // ON_SNAPSHOT
-    assert_eq!(fail_reason, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_transaction_statuses() {
     let (_ctl, client) = setup().await;
     let r1 = client
-        .deposit_and_wait(1, 100, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(1, 100, 0, false)
         .await
         .unwrap();
     let r2 = client
-        .deposit_and_wait(2, 200, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(2, 200, 0, false)
         .await
         .unwrap();
 
@@ -188,8 +187,8 @@ async fn test_get_transaction_statuses() {
         .unwrap();
 
     assert_eq!(statuses.len(), 2);
-    assert_eq!(statuses[0].0, 3); // ON_SNAPSHOT
-    assert_eq!(statuses[1].0, 3);
+    assert_eq!(statuses[0], 3); // ON_SNAPSHOT
+    assert_eq!(statuses[1], 3);
 }
 
 // -- Pipeline index ---------------------------------------------------------
@@ -198,7 +197,7 @@ async fn test_get_transaction_statuses() {
 async fn test_get_pipeline_index() {
     let (_ctl, client) = setup().await;
     let result = client
-        .deposit_and_wait(1, 100, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(1, 100, 0, false)
         .await
         .unwrap();
 
@@ -214,7 +213,7 @@ async fn test_get_pipeline_index() {
 async fn test_get_transaction() {
     let (_ctl, client) = setup().await;
     let result = client
-        .deposit_and_wait(5, 777, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(5, 777, 0, false)
         .await
         .unwrap();
 
@@ -265,7 +264,7 @@ async fn test_deposit_restart_withdraw() {
     // handle rather than going through the higher-level harness API) --
     let client = ctl.raw_client_for_slot(0).expect("raw client").clone();
     let result = client
-        .deposit_and_wait(1, 1000, 0, WaitLevel::Snapshot)
+        .deposit_and_wait_result(1, 1000, 0, false)
         .await
         .unwrap();
     assert_eq!(result.fail_reason, 0);
@@ -277,7 +276,7 @@ async fn test_deposit_restart_withdraw() {
 
     // -- Use the SAME client (no reconnect logic exercised yet) --
     let result = client
-        .withdraw_and_wait(1, 300, 0, WaitLevel::Snapshot)
+        .withdraw_and_wait_result(1, 300, 0, false)
         .await
         .unwrap();
     assert_eq!(result.fail_reason, 0);

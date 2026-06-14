@@ -2,11 +2,11 @@ use crate::balance::Balance;
 use crate::config::LedgerConfig;
 use crate::index::{IndexedTxEntry, TransactionIndexer};
 use crate::pipeline::SnapshotContext;
+use crate::recover::ActiveSnapshot;
 use crate::transactor::transaction::CommittedTransaction;
 use crate::transactor::{STATUS_OPEN, STATUS_SYSTEM, grow_capacity, set_flag};
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -25,11 +25,13 @@ pub struct QueryRequest {
 /// Discriminant for the query type.
 pub enum QueryKind {
     GetTransaction { tx_id: u64 },
+    GetTransactionBatch { tx_ids: Vec<u64> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryResponse {
     Transaction(Option<CommittedTransaction>),
+    TransactionBatch(Vec<CommittedTransaction>),
     AccountHistory(Vec<IndexedTxEntry>),
 }
 
@@ -138,9 +140,16 @@ impl Snapshot {
         accounts.store(Arc::new(next));
     }
 
-    pub fn start(&mut self, ctx: SnapshotContext) -> std::io::Result<JoinHandle<()>> {
-        // Resume tailing the durable WAL right after the last tx recovery applied.
-        let from_tx_id = ctx.get_processed_index() + 1;
+    pub fn start(
+        &mut self,
+        ctx: SnapshotContext,
+        active_snapshot: &ActiveSnapshot,
+    ) -> std::io::Result<JoinHandle<()>> {
+        // Restore read-side state synchronously so reads are correct the moment
+        // `start` returns, then resume tailing the WAL after the recovered tail.
+        self.recover_from(active_snapshot);
+        ctx.set_processed_index(active_snapshot.last_tx_id);
+        let from_tx_id = active_snapshot.last_tx_id + 1;
         let runner = SnapshotRunner {
             accounts: self.accounts.clone(),
             links: self.links.clone(),
@@ -157,15 +166,25 @@ impl Snapshot {
             })
     }
 
-    pub(crate) fn recover_balances(&mut self, balances: &HashMap<u64, Balance>) {
-        if let Some(&max_id) = balances.keys().max() {
-            Self::ensure_capacity(&self.accounts, max_id as usize + 1, self.resize_factor);
-        }
+    /// Restore accounts, links, and the transaction index from `active_snapshot`
+    /// (read-side self-recovery), written into the shared cells before the runner
+    /// starts. The index is warmed from the active segment's committed txs.
+    fn recover_from(&mut self, snap: &ActiveSnapshot) {
+        self.recover_account_layout(snap.next_account_id);
         let acc = self.accounts.load();
-        for (account_id, balance) in balances {
-            if let Some(a) = acc.get(*account_id as usize) {
-                a.balance.store(*balance, Ordering::Release);
+        for (&id, account) in &snap.accounts {
+            if let Some(a) = acc.get(id as usize) {
+                a.balance.store(account.balance, Ordering::Release);
+                if id != SYSTEM_ACCOUNT_ID {
+                    a.flags.store(account.flags, Ordering::Release);
+                }
             }
+        }
+        for &(parent_id, type_id, child_id) in &snap.links {
+            self.links.insert((parent_id, type_id), child_id);
+        }
+        for tx in &snap.active_segment_transactions {
+            self.recover_index_transaction(&tx.meta, &tx.entries);
         }
     }
 
@@ -173,7 +192,7 @@ impl Snapshot {
     /// (ADR-022): grow to cover it, then mark SYSTEM(0) plus `[1, next)` OPEN.
     /// Mirrors the transactor so the read-side reflects existence for
     /// opened-but-unfunded accounts.
-    pub(crate) fn recover_account_layout(&mut self, next_account_id: u64) {
+    fn recover_account_layout(&mut self, next_account_id: u64) {
         Self::ensure_capacity(&self.accounts, next_account_id as usize, self.resize_factor);
         let acc = self.accounts.load();
         Self::mark_system_account(&acc);
@@ -185,31 +204,9 @@ impl Snapshot {
         }
     }
 
-    /// Recovery hook: replay an `AccountLinked` record into the link map so
-    /// the read side can resolve/enumerate a parent's buckets (ADR-022 §3).
-    pub(crate) fn recover_account_link(&mut self, parent_id: u64, type_id: u16, child_id: u64) {
-        self.links.insert((parent_id, type_id), child_id);
-    }
-
-    /// Recovery hook: overlay exact per-account flags (snapshot + replayed
-    /// `AccountOpened`) so the read side reflects PROGRAMMED/SYSTEM correctly.
-    /// SYSTEM(0) is skipped — `recover_account_layout` owns it.
-    pub(crate) fn recover_account_flags(&mut self, flags: &HashMap<u64, u64>) {
-        if let Some(&max_id) = flags.keys().max() {
-            Self::ensure_capacity(&self.accounts, max_id as usize + 1, self.resize_factor);
-        }
-        let acc = self.accounts.load();
-        for (&account_id, &f) in flags {
-            if account_id == SYSTEM_ACCOUNT_ID {
-                continue;
-            }
-            if let Some(a) = acc.get(account_id as usize) {
-                a.flags.store(f, Ordering::Release);
-            }
-        }
-    }
-
-    pub(crate) fn recover_index_transaction(&mut self, meta: &TxMetadata, followers: &[WalEntry]) {
+    /// Insert one recovered transaction (meta + followers) into the index so
+    /// recent transactions are queryable immediately after recovery.
+    fn recover_index_transaction(&mut self, meta: &TxMetadata, followers: &[WalEntry]) {
         if let Some(indexer) = &mut self.indexer {
             indexer.insert_transaction(meta, followers);
         }
@@ -324,6 +321,14 @@ impl SnapshotRunner {
                             .get_transaction(tx_id)
                             .map(|(meta, entries)| CommittedTransaction { meta, entries });
                         QueryResponse::Transaction(result)
+                    }
+                    QueryKind::GetTransactionBatch { tx_ids } => {
+                        let txs = tx_ids
+                            .iter()
+                            .filter_map(|&id| self.indexer.get_transaction(id))
+                            .map(|(meta, entries)| CommittedTransaction { meta, entries })
+                            .collect();
+                        QueryResponse::TransactionBatch(txs)
                     }
                 };
                 (q.respond)(response);

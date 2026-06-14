@@ -613,7 +613,7 @@ impl ScenarioRunner {
             // as an ordering would let `TX_NOT_FOUND=5 >= ON_SNAPSHOT=3`
             // silently satisfy the wait when the queried node has no
             // record of the tx (e.g. post-failover loss).
-            let (status, fail_reason) = client
+            let status = client
                 .get_transaction_status(tx)
                 .await
                 .map_err(client_err)?;
@@ -621,8 +621,7 @@ impl ScenarioRunner {
                 s if (1..=3).contains(&s) && s >= target => return Ok(()),
                 4 => {
                     return Err(RunError::AssertionFailed(format!(
-                        "tx {tx} reached ERROR status (fail_reason={fail_reason}) while \
-                         waiting for level >= {target}"
+                        "tx {tx} reached ERROR status while waiting for level >= {target}"
                     )));
                 }
                 // 0 (PENDING) or 5 (TX_NOT_FOUND): keep polling. A
@@ -747,7 +746,7 @@ impl ScenarioRunner {
         a: &AssertTxStatus,
     ) -> Result<(), RunError> {
         let tx = resolve_tx(ctx, &a.tx)?;
-        let (status, _) = client
+        let status = client
             .get_transaction_status(tx)
             .await
             .map_err(client_err)?;
@@ -1090,27 +1089,23 @@ async fn submit_once(
             } => Ok(client
                 .deposit_and_wait(*account, *amount, user_ref, wl)
                 .await
-                .map_err(client_err)?
-                .tx_id),
+                .map_err(client_err)?),
             SubmitOp::Withdraw {
                 account, amount, ..
             } => Ok(client
                 .withdraw_and_wait(*account, *amount, user_ref, wl)
                 .await
-                .map_err(client_err)?
-                .tx_id),
+                .map_err(client_err)?),
             SubmitOp::Transfer {
                 from, to, amount, ..
             } => Ok(client
                 .transfer_and_wait(*from, *to, *amount, user_ref, wl)
                 .await
-                .map_err(client_err)?
-                .tx_id),
+                .map_err(client_err)?),
             SubmitOp::Function { name, params, .. } => Ok(client
                 .submit_function_and_wait(name, params_to_arr(params), user_ref, wl)
                 .await
-                .map_err(client_err)?
-                .tx_id),
+                .map_err(client_err)?),
         }
     } else {
         match op {
@@ -1173,11 +1168,10 @@ async fn submit_batch_once(
         }
     }
     if let Some(wl) = wait_to_proto(wait) {
-        let results = client
+        client
             .deposit_batch_and_wait(&deposits, wl)
             .await
-            .map_err(client_err)?;
-        Ok(results.into_iter().map(|r| r.tx_id).collect())
+            .map_err(client_err)
     } else {
         client.deposit_batch(&deposits).await.map_err(client_err)
     }

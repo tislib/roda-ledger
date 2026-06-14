@@ -259,19 +259,16 @@ fn named_succeeds_after_registration() {
     // Transfer 500 from acct 10 → acct 20 via WASM. The Transactor's
     // built-in credit/debit convention is: `credit(from)` subtracts,
     // `debit(to)` adds (matches `Operation::Transfer`).
-    let result = ledger.submit_and_wait(
-        Operation::Function {
-            name: "transfer".into(),
-            params: [10, 500, 20, 0, 0, 0, 0, 0],
-            user_ref: 1,
-        },
-        WaitLevel::OnSnapshot,
-    );
+    let result = ledger.submit_and_wait_result(Operation::Function {
+        name: "transfer".into(),
+        params: [10, 500, 20, 0, 0, 0, 0, 0],
+        user_ref: 1,
+    });
 
     assert!(
-        result.fail_reason.is_success(),
+        result.is_success(),
         "Named should commit: fail_reason = {:?}",
-        result.fail_reason
+        result.get_fail_reason()
     );
     assert_eq!(ledger.get_balance(10), -500);
     assert_eq!(ledger.get_balance(20), 500);
@@ -285,17 +282,14 @@ fn named_rolls_back_on_nonzero_status() {
         .register_function("reject", &compile(REJECT_WAT), false)
         .unwrap();
 
-    let result = ledger.submit_and_wait(
-        Operation::Function {
-            name: "reject".into(),
-            params: [1, 100, 2, 0, 0, 0, 0, 0],
-            user_ref: 1,
-        },
-        WaitLevel::Committed,
-    );
+    let result = ledger.submit_and_wait_result(Operation::Function {
+        name: "reject".into(),
+        params: [1, 100, 2, 0, 0, 0, 0, 0],
+        user_ref: 1,
+    });
 
-    assert!(result.fail_reason.is_failure(), "status 47 → failure");
-    assert_eq!(result.fail_reason.as_u8(), 47);
+    assert!(result.is_err(), "status 47 → failure");
+    assert_eq!(result.get_fail_reason().as_u8(), 47);
     assert_eq!(ledger.get_balance(1), 0);
     assert_eq!(ledger.get_balance(2), 0);
 }
@@ -315,24 +309,21 @@ fn named_exceeding_entry_limit_rejects_and_rolls_back() {
         .expect("register");
 
     // 33_000 iterations → 66_000 entries, just past the 65_535 cap.
-    let over = ledger.submit_and_wait(
-        Operation::Function {
-            name: "loop_transfer".into(),
-            params: [1, 10, 2, 33_000, 0, 0, 0, 0],
-            user_ref: 1,
-        },
-        WaitLevel::Committed,
-    );
+    let over = ledger.submit_and_wait_result(Operation::Function {
+        name: "loop_transfer".into(),
+        params: [1, 10, 2, 33_000, 0, 0, 0, 0],
+        user_ref: 1,
+    });
     assert!(
-        over.fail_reason.is_failure(),
+        over.is_err(),
         "tx should be rejected: {:?}",
-        over.fail_reason
+        over.get_fail_reason()
     );
     assert_eq!(
-        over.fail_reason.as_u8(),
+        over.get_fail_reason().as_u8(),
         4,
         "expected ENTRY_LIMIT_EXCEEDED (4), got {}",
-        over.fail_reason.as_u8()
+        over.get_fail_reason().as_u8()
     );
     // Rollback restored both accounts to zero.
     assert_eq!(ledger.get_balance(1), 0, "credit side must roll back");
@@ -340,18 +331,15 @@ fn named_exceeding_entry_limit_rejects_and_rolls_back() {
 
     // Sanity: a run that stays under the limit on the same handler still
     // commits — proves the check fires on size only, not on the loop shape.
-    let ok = ledger.submit_and_wait(
-        Operation::Function {
-            name: "loop_transfer".into(),
-            params: [1, 10, 2, 100, 0, 0, 0, 0],
-            user_ref: 2,
-        },
-        WaitLevel::OnSnapshot,
-    );
+    let ok = ledger.submit_and_wait_result(Operation::Function {
+        name: "loop_transfer".into(),
+        params: [1, 10, 2, 100, 0, 0, 0, 0],
+        user_ref: 2,
+    });
     assert!(
-        ok.fail_reason.is_success(),
+        ok.is_success(),
         "200 entries must commit: {:?}",
-        ok.fail_reason
+        ok.get_fail_reason()
     );
     assert_eq!(ledger.get_balance(1), -1_000);
     assert_eq!(ledger.get_balance(2), 1_000);
@@ -360,17 +348,14 @@ fn named_exceeding_entry_limit_rejects_and_rolls_back() {
 #[test]
 fn named_fails_for_unknown_function() {
     let ledger = start_ledger();
-    let result = ledger.submit_and_wait(
-        Operation::Function {
-            name: "nonexistent".into(),
-            params: [0; 8],
-            user_ref: 1,
-        },
-        WaitLevel::Committed,
-    );
-    assert!(result.fail_reason.is_failure());
+    let result = ledger.submit_and_wait_result(Operation::Function {
+        name: "nonexistent".into(),
+        params: [0; 8],
+        user_ref: 1,
+    });
+    assert!(result.is_err());
     // Not-registered → INVALID_OPERATION.
-    assert_eq!(result.fail_reason.as_u8(), 5);
+    assert_eq!(result.get_fail_reason().as_u8(), 5);
 }
 
 #[test]
@@ -382,29 +367,23 @@ fn named_fails_after_unregister() {
         .unwrap();
 
     // Works first.
-    let ok = ledger.submit_and_wait(
-        Operation::Function {
-            name: "transfer".into(),
-            params: [10, 50, 20, 0, 0, 0, 0, 0],
-            user_ref: 1,
-        },
-        WaitLevel::OnSnapshot,
-    );
-    assert!(ok.fail_reason.is_success());
+    let ok = ledger.submit_and_wait_result(Operation::Function {
+        name: "transfer".into(),
+        params: [10, 50, 20, 0, 0, 0, 0, 0],
+        user_ref: 1,
+    });
+    assert!(ok.is_success());
 
     // Unregister and try again.
     ledger.unregister_function("transfer").unwrap();
 
-    let fail = ledger.submit_and_wait(
-        Operation::Function {
-            name: "transfer".into(),
-            params: [10, 50, 20, 0, 0, 0, 0, 0],
-            user_ref: 2,
-        },
-        WaitLevel::Committed,
-    );
-    assert!(fail.fail_reason.is_failure());
-    assert_eq!(fail.fail_reason.as_u8(), 5); // INVALID_OPERATION
+    let fail = ledger.submit_and_wait_result(Operation::Function {
+        name: "transfer".into(),
+        params: [10, 50, 20, 0, 0, 0, 0, 0],
+        user_ref: 2,
+    });
+    assert!(fail.is_err());
+    assert_eq!(fail.get_fail_reason().as_u8(), 5); // INVALID_OPERATION
 }
 
 #[test]
@@ -420,16 +399,13 @@ fn named_uses_latest_version_after_override() {
         .register_function("f", &compile(REJECT_WAT), true)
         .unwrap();
 
-    let result = ledger.submit_and_wait(
-        Operation::Function {
-            name: "f".into(),
-            params: [1, 10, 2, 0, 0, 0, 0, 0],
-            user_ref: 1,
-        },
-        WaitLevel::Committed,
-    );
+    let result = ledger.submit_and_wait_result(Operation::Function {
+        name: "f".into(),
+        params: [1, 10, 2, 0, 0, 0, 0, 0],
+        user_ref: 1,
+    });
     // v2 was installed → should fail with 47.
-    assert_eq!(result.fail_reason.as_u8(), 47);
+    assert_eq!(result.get_fail_reason().as_u8(), 47);
 }
 
 #[test]
@@ -446,19 +422,16 @@ fn register_is_observable_before_and_during_concurrent_txs() {
     for i in 0..tx_count {
         let src = (i % 8) + 1;
         let dst = src + 100;
-        let result = ledger.submit_and_wait(
-            Operation::Function {
-                name: "transfer".into(),
-                params: [src as i64, 1, dst as i64, 0, 0, 0, 0, 0],
-                user_ref: i + 1,
-            },
-            WaitLevel::Committed,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Function {
+            name: "transfer".into(),
+            params: [src as i64, 1, dst as i64, 0, 0, 0, 0, 0],
+            user_ref: i + 1,
+        });
         assert!(
-            result.fail_reason.is_success(),
+            result.is_success(),
             "tx {} failed: {:?}",
             i,
-            result.fail_reason
+            result.get_fail_reason()
         );
     }
 
@@ -494,7 +467,7 @@ fn register_and_call_in_same_batch() {
     ledger.open_accounts(20); // ids 1..=20 (uses 10, 20)
     let binary = compile(TRANSFER_WAT);
 
-    let results = ledger.submit_batch_and_wait(
+    let results = ledger.submit_batch_and_wait_result(
         vec![
             Operation::FunctionRegistration {
                 name: "transfer".into(),
@@ -513,14 +486,14 @@ fn register_and_call_in_same_batch() {
 
     assert_eq!(results.len(), 2);
     assert!(
-        results[0].fail_reason.is_success(),
+        results[0].is_success(),
         "registration should succeed: {:?}",
-        results[0].fail_reason
+        results[0].get_fail_reason()
     );
     assert!(
-        results[1].fail_reason.is_success(),
+        results[1].is_success(),
         "in-batch call should succeed: {:?}",
-        results[1].fail_reason
+        results[1].get_fail_reason()
     );
 
     assert_eq!(ledger.get_balance(10), -100);
@@ -543,7 +516,7 @@ fn unregister_and_call_in_same_batch_fails_call() {
         .register_function("transfer", &compile(TRANSFER_WAT), false)
         .unwrap();
 
-    let results = ledger.submit_batch_and_wait(
+    let results = ledger.submit_batch_and_wait_result(
         vec![
             Operation::FunctionRegistration {
                 name: "transfer".into(),
@@ -562,16 +535,16 @@ fn unregister_and_call_in_same_batch_fails_call() {
 
     assert_eq!(results.len(), 2);
     assert!(
-        results[0].fail_reason.is_success(),
+        results[0].is_success(),
         "unregistration should succeed: {:?}",
-        results[0].fail_reason
+        results[0].get_fail_reason()
     );
     // INVALID_OPERATION (5) — handler is gone.
     assert_eq!(
-        results[1].fail_reason.as_u8(),
+        results[1].get_fail_reason().as_u8(),
         5,
         "post-unregister call must fail with INVALID_OPERATION (got {:?})",
-        results[1].fail_reason
+        results[1].get_fail_reason()
     );
     assert!(ledger.list_functions().is_empty());
 }
@@ -630,15 +603,12 @@ fn handler_loads_after_restart() {
         // Fire enough ops to cross the 5-tx segment boundary so at least
         // one segment seals.
         for i in 0..12 {
-            let r = ledger.submit_and_wait(
-                Operation::Function {
-                    name: "transfer".into(),
-                    params: [1, 10, 2, 0, 0, 0, 0, 0],
-                    user_ref: i + 1,
-                },
-                WaitLevel::OnSnapshot,
-            );
-            assert!(r.fail_reason.is_success(), "submit {} failed", i);
+            let r = ledger.submit_and_wait_result(Operation::Function {
+                name: "transfer".into(),
+                params: [1, 10, 2, 0, 0, 0, 0, 0],
+                user_ref: i + 1,
+            });
+            assert!(r.is_success(), "submit {} failed", i);
         }
         ledger.wait_for_seal();
         // ledger drops here — wal.stop is written, no crash recovery on
@@ -692,18 +662,15 @@ fn handler_loads_after_restart() {
     // funded accounts 1/2 (whose existence is restored via the recovered
     // balances). Phase 1 left balance(1) = -120, balance(2) = +120; this
     // transfer adds another credit(1,20)/debit(2,20).
-    let r = ledger.submit_and_wait(
-        Operation::Function {
-            name: "transfer".into(),
-            params: [1, 20, 2, 0, 0, 0, 0, 0],
-            user_ref: 999,
-        },
-        WaitLevel::OnSnapshot,
-    );
+    let r = ledger.submit_and_wait_result(Operation::Function {
+        name: "transfer".into(),
+        params: [1, 20, 2, 0, 0, 0, 0, 0],
+        user_ref: 999,
+    });
     assert!(
-        r.fail_reason.is_success(),
+        r.is_success(),
         "Named after snapshot-restore failed: {:?}",
-        r.fail_reason
+        r.get_fail_reason()
     );
     assert_eq!(ledger.get_balance(1), -140);
     assert_eq!(ledger.get_balance(2), 140);
@@ -776,15 +743,12 @@ fn latest_version_preserved_after_restart() {
     );
 
     // v2 rejects → fail_reason = 47.
-    let r = ledger.submit_and_wait(
-        Operation::Function {
-            name: "fee".into(),
-            params: [1, 1, 2, 0, 0, 0, 0, 0],
-            user_ref: 9_999,
-        },
-        WaitLevel::Committed,
-    );
-    assert_eq!(r.fail_reason.as_u8(), 47);
+    let r = ledger.submit_and_wait_result(Operation::Function {
+        name: "fee".into(),
+        params: [1, 1, 2, 0, 0, 0, 0, 0],
+        user_ref: 9_999,
+    });
+    assert_eq!(r.get_fail_reason().as_u8(), 47);
 }
 
 #[test]

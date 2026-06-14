@@ -558,7 +558,7 @@ mod tests {
         // preceding `TxMetadata`).
         WalEntry::Entry(TxEntry {
             entry_type: WalEntryKind::TxEntry as u8,
-            kind: EntryKind::Credit,
+            kind: EntryKind::CREDIT,
             _pad0: [0; 6],
             _pad1: [0; 8],
             account_id: 1,

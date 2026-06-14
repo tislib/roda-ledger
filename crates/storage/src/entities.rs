@@ -15,11 +15,10 @@ pub enum WalEntryKind {
     AccountFlagsUpdated = 9,
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum EntryKind {
-    Credit = 0,
-    Debit = 1,
+pub struct EntryKind;
+impl EntryKind {
+    pub const CREDIT: u8 = 0;
+    pub const DEBIT: u8 = 1;
 }
 
 pub const SYSTEM_ACCOUNT_ID: u64 = 0;
@@ -127,7 +126,7 @@ pub fn decode_tag(s: &str) -> [u8; 8] {
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct TxEntry {
     pub entry_type: u8,        // 1 @ 0  — WalEntryKind::TxEntry
-    pub kind: EntryKind,       // 1 @ 1  — Credit or Debit
+    pub kind: u8,              // 1 @ 1  — EntryKind::CREDIT | EntryKind::DEBIT
     pub _pad0: [u8; 6],        // 6 @ 2
     pub _pad1: [u8; 8],        // 8 @ 8  — reserved (tx_id is on the trailing TxMetadata)
     pub account_id: u64,       // 8 @ 16
@@ -353,20 +352,29 @@ pub struct CommittedTransaction {
     pub entries: Vec<WalEntry>,
 }
 
-// Safety checks for bytemuck
-unsafe impl Pod for WalEntryKind {}
-unsafe impl Zeroable for WalEntryKind {}
-unsafe impl Pod for EntryKind {}
-unsafe impl Zeroable for EntryKind {}
-unsafe impl Pod for TxLinkKind {}
-unsafe impl Zeroable for TxLinkKind {}
+impl CommittedTransaction {
+    pub fn tx_id(&self) -> u64 {
+        self.meta.tx_id
+    }
+    pub fn is_err(&self) -> bool {
+        self.meta.fail_reason != FailReason::NONE
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.meta.fail_reason == FailReason::NONE
+    }
+
+    pub fn get_fail_reason(&self) -> FailReason {
+        self.meta.fail_reason
+    }
+}
 
 // Hard compile-time guarantees: every WAL entry must be exactly 40 bytes.
-const _: () = assert!(std::mem::size_of::<TxMetadata>() == 40);
-const _: () = assert!(std::mem::size_of::<TxEntry>() == 40);
-const _: () = assert!(std::mem::size_of::<TxLink>() == 40);
-const _: () = assert!(std::mem::size_of::<FunctionRegistered>() == 40);
-const _: () = assert!(std::mem::size_of::<TxTerm>() == 40);
-const _: () = assert!(std::mem::size_of::<AccountOpened>() == 40);
-const _: () = assert!(std::mem::size_of::<AccountLinked>() == 40);
-const _: () = assert!(std::mem::size_of::<AccountFlagsUpdated>() == 40);
+const _: () = assert!(size_of::<TxMetadata>() == 40);
+const _: () = assert!(size_of::<TxEntry>() == 40);
+const _: () = assert!(size_of::<TxLink>() == 40);
+const _: () = assert!(size_of::<FunctionRegistered>() == 40);
+const _: () = assert!(size_of::<TxTerm>() == 40);
+const _: () = assert!(size_of::<AccountOpened>() == 40);
+const _: () = assert!(size_of::<AccountLinked>() == 40);
+const _: () = assert!(size_of::<AccountFlagsUpdated>() == 40);

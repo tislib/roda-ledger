@@ -918,8 +918,8 @@ impl ClusterTestingControl {
         amount: u64,
         user_ref: u64,
         wait_level: lproto::WaitLevel,
-    ) -> Result<SubmitResult, ClusterTestingError> {
-        let r = self
+    ) -> Result<u64, ClusterTestingError> {
+        let tx_id = self
             .cluster_client_or_err()?
             .deposit_and_wait(account, amount, user_ref, wait_level)
             .await
@@ -927,24 +927,65 @@ impl ClusterTestingControl {
                 op: "deposit_and_wait",
                 source: e,
             })?;
+        self.bump_last_tx_id(tx_id);
+        Ok(tx_id)
+    }
+
+    /// Submit a deposit, wait for the result (SNAPSHOT, or CLUSTER_COMMIT when
+    /// `cluster_wait`), and return the committed `SubmitResult`.
+    pub async fn deposit_and_wait_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .deposit_and_wait_result(account, amount, user_ref, cluster_wait)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_and_wait_result",
+                source: e,
+            })?;
         self.bump_last_tx_id(r.tx_id);
         Ok(r)
     }
 
-    /// Submit a deposit and wait for the requested `WaitLevel`.
+    /// Submit a deposit and wait for the requested `WaitLevel` (no failover retry).
     pub async fn deposit_and_wait_no_retry(
         &self,
         account: u64,
         amount: u64,
         user_ref: u64,
         wait_level: lproto::WaitLevel,
-    ) -> Result<SubmitResult, ClusterTestingError> {
-        let r = self
+    ) -> Result<u64, ClusterTestingError> {
+        let tx_id = self
             .cluster_client_or_err()?
             .deposit_and_wait_no_retry(account, amount, user_ref, wait_level)
             .await
             .map_err(|e| ClusterTestingError::Rpc {
                 op: "deposit_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(tx_id);
+        Ok(tx_id)
+    }
+
+    /// `deposit_and_wait_result` without failover retry.
+    pub async fn deposit_and_wait_no_retry_result(
+        &self,
+        account: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .deposit_and_wait_no_retry_result(account, amount, user_ref, cluster_wait)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_and_wait_result",
                 source: e,
             })?;
         self.bump_last_tx_id(r.tx_id);
@@ -979,13 +1020,35 @@ impl ClusterTestingControl {
         amount: u64,
         user_ref: u64,
         wait_level: lproto::WaitLevel,
-    ) -> Result<SubmitResult, ClusterTestingError> {
-        let r = self
+    ) -> Result<u64, ClusterTestingError> {
+        let tx_id = self
             .cluster_client_or_err()?
             .transfer_and_wait(from, to, amount, user_ref, wait_level)
             .await
             .map_err(|e| ClusterTestingError::Rpc {
                 op: "transfer_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(tx_id);
+        Ok(tx_id)
+    }
+
+    /// Submit a transfer, wait for the result (SNAPSHOT, or CLUSTER_COMMIT when
+    /// `cluster_wait`), and return the committed `SubmitResult`.
+    pub async fn transfer_and_wait_result(
+        &self,
+        from: u64,
+        to: u64,
+        amount: u64,
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .transfer_and_wait_result(from, to, amount, user_ref, cluster_wait)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "transfer_and_wait_result",
                 source: e,
             })?;
         self.bump_last_tx_id(r.tx_id);
@@ -1017,13 +1080,34 @@ impl ClusterTestingControl {
         &self,
         deposits: &[(u64, u64, u64)],
         wait_level: lproto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>, ClusterTestingError> {
-        let results = self
+    ) -> Result<Vec<u64>, ClusterTestingError> {
+        let tx_ids = self
             .cluster_client_or_err()?
             .deposit_batch_and_wait(deposits, wait_level)
             .await
             .map_err(|e| ClusterTestingError::Rpc {
                 op: "deposit_batch_and_wait",
+                source: e,
+            })?;
+        if let Some(&max) = tx_ids.iter().max() {
+            self.bump_last_tx_id(max);
+        }
+        Ok(tx_ids)
+    }
+
+    /// Submit a batch of deposits, wait for the result (SNAPSHOT, or
+    /// CLUSTER_COMMIT when `cluster_wait`), and return one `SubmitResult` each.
+    pub async fn deposit_batch_and_wait_result(
+        &self,
+        deposits: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>, ClusterTestingError> {
+        let results = self
+            .cluster_client_or_err()?
+            .deposit_batch_and_wait_result(deposits, cluster_wait)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "deposit_batch_and_wait_result",
                 source: e,
             })?;
         if let Some(max) = results.iter().map(|r| r.tx_id).max() {
@@ -1037,13 +1121,34 @@ impl ClusterTestingControl {
         &self,
         transfers: &[(u64, u64, u64)],
         wait_level: lproto::WaitLevel,
-    ) -> Result<Vec<SubmitResult>, ClusterTestingError> {
-        let results = self
+    ) -> Result<Vec<u64>, ClusterTestingError> {
+        let tx_ids = self
             .cluster_client_or_err()?
             .transfer_batch_and_wait(transfers, wait_level)
             .await
             .map_err(|e| ClusterTestingError::Rpc {
                 op: "transfer_batch_and_wait",
+                source: e,
+            })?;
+        if let Some(&max) = tx_ids.iter().max() {
+            self.bump_last_tx_id(max);
+        }
+        Ok(tx_ids)
+    }
+
+    /// Submit a batch of transfers, wait for the result (SNAPSHOT, or
+    /// CLUSTER_COMMIT when `cluster_wait`), and return one `SubmitResult` each.
+    pub async fn transfer_batch_and_wait_result(
+        &self,
+        transfers: &[(u64, u64, u64)],
+        cluster_wait: bool,
+    ) -> Result<Vec<SubmitResult>, ClusterTestingError> {
+        let results = self
+            .cluster_client_or_err()?
+            .transfer_batch_and_wait_result(transfers, cluster_wait)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "transfer_batch_and_wait_result",
                 source: e,
             })?;
         if let Some(max) = results.iter().map(|r| r.tx_id).max() {
@@ -1148,13 +1253,12 @@ impl ClusterTestingControl {
         &self,
         tx_id: u64,
         expected_status: lproto::TransactionStatus,
-        expected_fail_reason: u32,
     ) {
         let slot = self
             .ensure_caught_up_at_leader()
             .await
             .unwrap_or_else(|e| panic!("require_transaction_status({tx_id}) catch-up: {e}"));
-        self.assert_transaction_status_at(slot, tx_id, expected_status, expected_fail_reason)
+        self.assert_transaction_status_at(slot, tx_id, expected_status)
             .await;
     }
 
@@ -1169,7 +1273,7 @@ impl ClusterTestingControl {
         let client = self
             .cluster_client_or_err()
             .unwrap_or_else(|e| panic!("require_transaction_committed: {e}"));
-        let (status, fail_reason) = client
+        let status = client
             .node(slot)
             .get_transaction_status(tx_id)
             .await
@@ -1180,31 +1284,21 @@ impl ClusterTestingControl {
             });
         let committed = lproto::TransactionStatus::Committed as i32;
         let on_snapshot = lproto::TransactionStatus::OnSnapshot as i32;
+        // A rejected tx terminates in status ERROR, so COMMITTED / ON_SNAPSHOT
+        // already implies the write succeeded (fail_reason == NONE).
         if status != committed && status != on_snapshot {
             let pi = client.node(slot).get_pipeline_index().await.ok();
             panic!(
                 "require_transaction_committed(tx_id={}, slot={}, last_tx_id={}): \
-                 expected status in {{COMMITTED({}), ON_SNAPSHOT({})}} with fail_reason=0, \
-                 got status={} fail_reason={} (pipeline_index={:?})",
+                 expected status in {{COMMITTED({}), ON_SNAPSHOT({})}}, \
+                 got status={} (pipeline_index={:?})",
                 tx_id,
                 slot,
                 self.last_tx_id(),
                 committed,
                 on_snapshot,
                 status,
-                fail_reason,
                 pi,
-            );
-        }
-        if fail_reason != 0 {
-            panic!(
-                "require_transaction_committed(tx_id={}, slot={}, last_tx_id={}): \
-                 fail_reason={} (status={})",
-                tx_id,
-                slot,
-                self.last_tx_id(),
-                fail_reason,
-                status,
             );
         }
     }
@@ -1214,12 +1308,11 @@ impl ClusterTestingControl {
         slot: usize,
         tx_id: u64,
         expected_status: lproto::TransactionStatus,
-        expected_fail_reason: u32,
     ) {
         let client = self
             .cluster_client_or_err()
             .unwrap_or_else(|e| panic!("require_transaction_status: {e}"));
-        let (status, fail_reason) = client
+        let status = client
             .node(slot)
             .get_transaction_status(tx_id)
             .await
@@ -1229,20 +1322,17 @@ impl ClusterTestingControl {
                 )
             });
         let expected_code = expected_status as i32;
-        if status != expected_code || fail_reason != expected_fail_reason {
+        if status != expected_code {
             let pi = client.node(slot).get_pipeline_index().await.ok();
             panic!(
                 "require_transaction_status(tx_id={}, slot={}, last_tx_id={}): \
-                 expected status={:?}({}) fail_reason={}, \
-                 got status={} fail_reason={} (pipeline_index={:?})",
+                 expected status={:?}({}), got status={} (pipeline_index={:?})",
                 tx_id,
                 slot,
                 self.last_tx_id(),
                 expected_status,
                 expected_code,
-                expected_fail_reason,
                 status,
-                fail_reason,
                 pi,
             );
         }
@@ -1284,13 +1374,13 @@ impl ClusterTestingControl {
             })
     }
 
-    /// Read slot `slot`'s `(status, fail_reason)` for `tx_id`
-    /// without catch-up or assertion.
+    /// Read slot `slot`'s pipeline status (`TransactionStatus as i32`) for
+    /// `tx_id` without catch-up or assertion.
     pub async fn get_transaction_status_on(
         &self,
         slot: usize,
         tx_id: u64,
-    ) -> Result<(i32, u32), ClusterTestingError> {
+    ) -> Result<i32, ClusterTestingError> {
         self.cluster_client_or_err()?
             .node(slot)
             .get_transaction_status(tx_id)
@@ -1309,13 +1399,34 @@ impl ClusterTestingControl {
         params: [i64; 8],
         user_ref: u64,
         wait_level: lproto::WaitLevel,
-    ) -> Result<SubmitResult, ClusterTestingError> {
-        let r = self
+    ) -> Result<u64, ClusterTestingError> {
+        let tx_id = self
             .cluster_client_or_err()?
             .submit_function_and_wait(name, params, user_ref, wait_level)
             .await
             .map_err(|e| ClusterTestingError::Rpc {
                 op: "submit_function_and_wait",
+                source: e,
+            })?;
+        self.bump_last_tx_id(tx_id);
+        Ok(tx_id)
+    }
+
+    /// Submit a WASM function call, wait for the result (SNAPSHOT, or
+    /// CLUSTER_COMMIT when `cluster_wait`), and return the committed result.
+    pub async fn submit_function_and_wait_result(
+        &self,
+        name: &str,
+        params: [i64; 8],
+        user_ref: u64,
+        cluster_wait: bool,
+    ) -> Result<SubmitResult, ClusterTestingError> {
+        let r = self
+            .cluster_client_or_err()?
+            .submit_function_and_wait_result(name, params, user_ref, cluster_wait)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "submit_function_and_wait_result",
                 source: e,
             })?;
         self.bump_last_tx_id(r.tx_id);

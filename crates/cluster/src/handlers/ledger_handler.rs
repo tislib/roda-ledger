@@ -79,7 +79,6 @@ impl LedgerHandler {
         if expected_term != 0 && tx_term != 0 && expected_term != tx_term {
             return proto::GetStatusResponse {
                 status: proto::TransactionStatus::TxNotFound as i32,
-                fail_reason: 0,
                 term_mismatch: true,
                 term: tx_term,
                 term_start_tx_id: tx_term_start,
@@ -87,19 +86,30 @@ impl LedgerHandler {
         }
 
         let status = self.ledger.current().get_transaction_status(tx_id);
-        let fail_reason = if status.is_err() {
-            status.error_reason().as_u8() as u32
-        } else {
-            0
-        };
 
         proto::GetStatusResponse {
             status: crate::mapping::status_to_proto(status) as i32,
-            fail_reason,
             term_mismatch: false,
             term: tx_term,
             term_start_tx_id: tx_term_start,
         }
+    }
+
+    /// Enqueue a snapshot-stage query and await its reply without blocking a
+    /// tokio worker. `Ledger::query` hands the request to the snapshot stage,
+    /// which runs `respond` on its own thread when the result is ready; the
+    /// callback wakes this await through a one-slot tokio channel.
+    async fn query(&self, kind: QueryKind) -> Result<QueryResponse, Status> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.ledger.current().query(QueryRequest {
+            kind,
+            respond: Box::new(move |resp| {
+                let _ = tx.try_send(resp);
+            }),
+        });
+        rx.recv()
+            .await
+            .ok_or_else(|| Status::internal("snapshot query dropped without responding"))
     }
 }
 
@@ -127,20 +137,40 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
         let op = crate::mapping::submit_and_wait_request_to_op(req)?;
 
-        let ledger = self.ledger.current();
-        let tx_id = ledger.submit(op);
+        let tx_id = self.ledger.current().submit(op);
         self.wait_for_transaction_level(tx_id, level).await?;
-
-        let status = ledger.get_transaction_status(tx_id);
-        let fail_reason = if status.is_err() {
-            status.error_reason().as_u8() as u32
-        } else {
-            0
-        };
 
         Ok(Response::new(proto::SubmitAndWaitResponse {
             transaction_id: tx_id,
-            fail_reason,
+            term: self.current_term(),
+        }))
+    }
+
+    async fn submit_and_wait_result(
+        &self,
+        request: Request<proto::SubmitAndWaitResultRequest>,
+    ) -> Result<Response<proto::SubmitAndWaitResultResponse>, Status> {
+        self.ensure_writable()?;
+        let req = request.into_inner();
+        let level = result_wait_level(req.cluster_wait);
+        let op = crate::mapping::submit_and_wait_result_request_to_op(req)?;
+
+        let tx_id = self.ledger.current().submit(op);
+        // Wait for the requested durability, then read the committed result from
+        // the snapshot index (CLUSTER_COMMIT implies SNAPSHOT, so it's present).
+        self.wait_for_transaction_level(tx_id, level).await?;
+
+        let transaction = match self.query(QueryKind::GetTransaction { tx_id }).await? {
+            QueryResponse::Transaction(Some(tx)) => crate::mapping::transaction_to_proto(tx),
+            _ => {
+                return Err(Status::internal(
+                    "transaction missing from snapshot after wait",
+                ));
+            }
+        };
+
+        Ok(Response::new(proto::SubmitAndWaitResultResponse {
+            transaction: Some(transaction),
             term: self.current_term(),
         }))
     }
@@ -201,23 +231,69 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         self.wait_for_transaction_level(last_tx_id, level).await?;
 
         let results = (start_transaction_id..=last_tx_id)
-            .map(|tx_id| {
-                let status = ledger.get_transaction_status(tx_id);
-                let fail_reason = if status.is_err() {
-                    status.error_reason().as_u8() as u32
-                } else {
-                    0
-                };
-                proto::SubmitAndWaitResponse {
-                    transaction_id: tx_id,
-                    fail_reason,
-                    term: self.current_term(),
-                }
+            .map(|tx_id| proto::SubmitAndWaitResponse {
+                transaction_id: tx_id,
+                term: self.current_term(),
             })
             .collect();
 
         Ok(Response::new(proto::SubmitBatchAndWaitResponse {
             results,
+            term: self.current_term(),
+        }))
+    }
+
+    async fn submit_batch_and_wait_result(
+        &self,
+        request: Request<proto::SubmitBatchAndWaitResultRequest>,
+    ) -> Result<Response<proto::SubmitBatchAndWaitResultResponse>, Status> {
+        self.ensure_writable()?;
+        let req = request.into_inner();
+        let level = result_wait_level(req.cluster_wait);
+
+        let len = req.operations.len();
+        let mut operations: Vec<Operation> = Vec::with_capacity(len);
+        for op_req in req.operations {
+            operations.push(crate::mapping::batch_result_operation_to_op(op_req)?);
+        }
+
+        let start_transaction_id = self.ledger.current().submit_batch(operations);
+
+        // Empty batch — nothing to wait for or read back.
+        if len == 0 {
+            return Ok(Response::new(proto::SubmitBatchAndWaitResultResponse {
+                transactions: Vec::new(),
+                term: self.current_term(),
+            }));
+        }
+
+        // tx_ids are monotonic — once the last one reaches the requested
+        // durability, every earlier tx is indexed too, so one wait covers all.
+        let last_tx_id = start_transaction_id + (len - 1) as u64;
+        self.wait_for_transaction_level(last_tx_id, level).await?;
+
+        let tx_ids: Vec<u64> = (start_transaction_id..=last_tx_id).collect();
+        let mut found: std::collections::HashMap<u64, _> = match self
+            .query(QueryKind::GetTransactionBatch {
+                tx_ids: tx_ids.clone(),
+            })
+            .await?
+        {
+            QueryResponse::TransactionBatch(txs) => {
+                txs.into_iter().map(|t| (t.tx_id(), t)).collect()
+            }
+            _ => return Err(Status::internal("unexpected snapshot query response")),
+        };
+        let mut transactions = Vec::with_capacity(len);
+        for tx_id in tx_ids {
+            let tx = found
+                .remove(&tx_id)
+                .ok_or_else(|| Status::internal("transaction missing from snapshot after wait"))?;
+            transactions.push(crate::mapping::transaction_to_proto(tx));
+        }
+
+        Ok(Response::new(proto::SubmitBatchAndWaitResultResponse {
+            transactions,
             term: self.current_term(),
         }))
     }
@@ -654,6 +730,17 @@ const MAX_LOG_RECORDS: u32 = 10_000;
 const DEFAULT_LOG_LIMIT: u32 = 1_000;
 const MAX_TERMS_RECORDS: u32 = 10_000;
 const DEFAULT_TERMS_LIMIT: u32 = 1_000;
+
+/// Durability level for the `*_and_wait_result` RPCs: CLUSTER_COMMIT when the
+/// caller set `cluster_wait`, otherwise SNAPSHOT. Both guarantee the committed
+/// transaction is readable from the snapshot index once the wait returns.
+fn result_wait_level(cluster_wait: bool) -> proto::WaitLevel {
+    if cluster_wait {
+        proto::WaitLevel::ClusterCommit
+    } else {
+        proto::WaitLevel::Snapshot
+    }
+}
 
 /// Map `register_function` / `unregister_function` [`std::io::Error`] kinds
 /// to a canonical `tonic::Status`. Keeps the handler branches uniform.

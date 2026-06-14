@@ -1,5 +1,5 @@
 use ledger::ledger::{Ledger, LedgerConfig};
-use ledger::transactor::transaction::{Operation, WaitLevel};
+use ledger::transactor::transaction::Operation;
 
 #[test]
 fn test_balance_always_guaranteed_when_wait_level_is_snapshotted() {
@@ -13,20 +13,13 @@ fn test_balance_always_guaranteed_when_wait_level_is_snapshotted() {
 
     for i in 0..iterations {
         let amount = 1;
-        let result = ledger.submit_and_wait(
-            Operation::Deposit {
-                account: account_id,
-                amount,
-                user_ref: i as u64,
-            },
-            WaitLevel::OnSnapshot,
-        );
+        let result = ledger.submit_and_wait_result(Operation::Deposit {
+            account: account_id,
+            amount,
+            user_ref: i as u64,
+        });
 
-        assert!(
-            result.fail_reason.is_success(),
-            "Deposit failed at iteration {}",
-            i
-        );
+        assert!(result.is_success(), "Deposit failed at iteration {}", i);
         expected_balance += amount as i64;
 
         let balance = ledger.get_balance(account_id);
