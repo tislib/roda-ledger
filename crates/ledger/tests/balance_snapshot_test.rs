@@ -19,11 +19,7 @@ fn test_balance_always_guaranteed_when_wait_level_is_snapshotted() {
             user_ref: i as u64,
         });
 
-        assert!(
-            result.is_success(),
-            "Deposit failed at iteration {}",
-            i
-        );
+        assert!(result.is_success(), "Deposit failed at iteration {}", i);
         expected_balance += amount as i64;
 
         let balance = ledger.get_balance(account_id);

@@ -877,7 +877,10 @@ impl ClusterLeaderClient {
         let deposits: Arc<[(u64, u64, u64)]> = deposits.into();
         self.with_leader_retry("deposit_batch_and_wait_result", move |c| {
             let deposits = deposits.clone();
-            async move { c.deposit_batch_and_wait_result(&deposits, cluster_wait).await }
+            async move {
+                c.deposit_batch_and_wait_result(&deposits, cluster_wait)
+                    .await
+            }
         })
         .await
     }
@@ -903,7 +906,10 @@ impl ClusterLeaderClient {
         let transfers: Arc<[(u64, u64, u64)]> = transfers.into();
         self.with_leader_retry("transfer_batch_and_wait_result", move |c| {
             let transfers = transfers.clone();
-            async move { c.transfer_batch_and_wait_result(&transfers, cluster_wait).await }
+            async move {
+                c.transfer_batch_and_wait_result(&transfers, cluster_wait)
+                    .await
+            }
         })
         .await
     }

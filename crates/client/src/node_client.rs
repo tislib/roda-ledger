@@ -532,13 +532,15 @@ impl NodeClient {
             let mut client = self.inner.clone();
             let resp = client
                 .submit_and_wait_result(proto::SubmitAndWaitResultRequest {
-                    operation: Some(proto::submit_and_wait_result_request::Operation::Withdrawal(
-                        proto::Withdrawal {
-                            account,
-                            amount,
-                            user_ref,
-                        },
-                    )),
+                    operation: Some(
+                        proto::submit_and_wait_result_request::Operation::Withdrawal(
+                            proto::Withdrawal {
+                                account,
+                                amount,
+                                user_ref,
+                            },
+                        ),
+                    ),
                     cluster_wait,
                 })
                 .await?

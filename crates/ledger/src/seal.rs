@@ -252,9 +252,11 @@ impl SealRunner {
         snapshot_links.sort_unstable();
 
         debug!("Seal: saving snapshot for WAL segment {}", segment.id());
-        if let Err(e) =
-            segment.save_snapshot(self.next_account_id, &snapshot_records[..], &snapshot_links[..])
-        {
+        if let Err(e) = segment.save_snapshot(
+            self.next_account_id,
+            &snapshot_records[..],
+            &snapshot_links[..],
+        ) {
             error!(
                 "Seal: failed to save snapshot for segment {}: {}",
                 segment.id(),

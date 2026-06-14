@@ -190,13 +190,7 @@ async fn balance_state_in_sync_after_failover() {
     // Transfer 600 from A to B on the new leader. The new leader's
     // Transactor must validate against an up-to-date `balances[A]`.
     let r = ctl
-        .transfer_and_wait_result(
-            ACC_A,
-            ACC_B,
-            600,
-            /*user_ref=*/ 2,
-            true,
-        )
+        .transfer_and_wait_result(ACC_A, ACC_B, 600, /*user_ref=*/ 2, true)
         .await
         .expect("transfer A→B");
     assert_eq!(

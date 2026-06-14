@@ -422,7 +422,7 @@ impl Ledger {
 
         tx_ids
             .into_iter()
-            .map(|tx_id| return self.get_transaction_status(tx_id))
+            .map(|tx_id| self.get_transaction_status(tx_id))
             .collect()
     }
 
@@ -444,12 +444,9 @@ impl Ledger {
         tx_ids
             .into_iter()
             .map(|tx_id| {
-                let transaction = result.get(&tx_id);
-                if let Some(transaction) = transaction {
-                    return transaction.clone();
-                } else {
-                    panic!("it should be impossible to get a None transaction from submit_batch_and_wait_result");
-                }
+                result.get(&tx_id).cloned().expect(
+                    "it should be impossible to get a None transaction from submit_batch_and_wait_result",
+                )
             })
             .collect()
     }
