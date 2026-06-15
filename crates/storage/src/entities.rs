@@ -13,6 +13,7 @@ pub enum WalEntryKind {
     AccountOpened = 7,
     AccountLinked = 8,
     AccountFlagsUpdated = 9,
+    Kv = 10,
 }
 
 pub struct EntryKind;
@@ -316,6 +317,39 @@ impl AccountFlagsUpdated {
     }
 }
 
+/// Programmable-state WAL record (ADR-023): one key→value mutation. A trailer
+/// follower like `TxEntry`, carrying no amount. The transactor logs the
+/// resolved value (a counter add records its result, not a delta), so replay
+/// is a plain per-key assignment; `value == 0` deletes the key.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct KvEntry {
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Kv (10)
+    pub _pad0: u8,       // 1 @ 1  — aligns kv_scope
+    pub kv_scope: u16,   // 2 @ 2  — 0 = global, 1 = account
+    pub _pad: [u8; 4],   // 4 @ 4  — zero-written, verified on read
+    pub key: [u32; 4],   // 16 @ 8
+    pub account_id: u64, // 8 @ 24 — 0 = global
+    pub value: i64,      // 8 @ 32 — resolved value; 0 = delete
+} // total: 40 bytes
+
+impl KvEntry {
+    pub const SCOPE_GLOBAL: u16 = 0;
+    pub const SCOPE_ACCOUNT: u16 = 1;
+
+    pub fn new(kv_scope: u16, account_id: u64, key: [u32; 4], value: i64) -> Self {
+        Self {
+            entry_type: WalEntryKind::Kv as u8,
+            _pad0: 0,
+            kv_scope,
+            _pad: [0; 4],
+            key,
+            account_id,
+            value,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalEntry {
     Metadata(TxMetadata),
@@ -326,6 +360,7 @@ pub enum WalEntry {
     AccountOpened(AccountOpened),
     AccountLinked(AccountLinked),
     AccountFlagsUpdated(AccountFlagsUpdated),
+    Kv(KvEntry),
 }
 
 impl WalEntry {
@@ -339,6 +374,7 @@ impl WalEntry {
             WalEntry::AccountOpened(_) => WalEntryKind::AccountOpened,
             WalEntry::AccountLinked(_) => WalEntryKind::AccountLinked,
             WalEntry::AccountFlagsUpdated(_) => WalEntryKind::AccountFlagsUpdated,
+            WalEntry::Kv(_) => WalEntryKind::Kv,
         }
     }
 }
@@ -378,3 +414,5 @@ const _: () = assert!(size_of::<TxTerm>() == 40);
 const _: () = assert!(size_of::<AccountOpened>() == 40);
 const _: () = assert!(size_of::<AccountLinked>() == 40);
 const _: () = assert!(size_of::<AccountFlagsUpdated>() == 40);
+const _: () = assert!(size_of::<KvEntry>() == 40);
+const _: () = assert!(align_of::<KvEntry>() == 8);

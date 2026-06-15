@@ -1,4 +1,5 @@
 mod computer;
+pub mod kv;
 pub mod runner;
 pub mod transaction;
 #[allow(clippy::module_inception)]
@@ -68,6 +69,10 @@ impl Transactor<'_> {
             links.insert((*parent_id, *type_id), *child_id);
         }
 
+        // Programmable KV state (ADR-023): the folded flat key→value map; applied
+        // to the Computer's stores once it is built inside the runner thread.
+        let kv_state = active_snapshot.kv.clone();
+
         // wasm_runtime
         let wasm_runtime_ref = wasm_runtime.as_ref();
         for function_registered in active_snapshot.functions.iter() {
@@ -99,6 +104,7 @@ impl Transactor<'_> {
                     ring_writer,
                     ctx.wait_strategy(),
                 )));
+                state.borrow_mut().recover_kv(&kv_state);
                 let wasm_engine = WasmRuntimeEngine::new(wasm_runtime, Rc::clone(&state));
                 let mut runner = Runner {
                     transaction_buffer: Vec::with_capacity(cap),

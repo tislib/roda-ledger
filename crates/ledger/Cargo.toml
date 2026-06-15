@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "transactor_computer_bench"
 harness = false
+
+[[bench]]
+name = "kv_bench"
+harness = false

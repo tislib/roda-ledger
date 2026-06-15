@@ -80,6 +80,24 @@ pub fn function_snapshot_crc_tmp_path(data_dir: &Path, id: u32) -> PathBuf {
     data_dir.join(format!("function_snapshot_{:06}.crc.tmp", id))
 }
 
+// ── KV snapshot paths (ADR-0023) ──────────────────────────────────────────────
+
+pub fn kv_snapshot_bin_path(data_dir: &Path, id: u32) -> PathBuf {
+    data_dir.join(format!("kv_snapshot_{:06}.bin", id))
+}
+
+pub fn kv_snapshot_crc_path(data_dir: &Path, id: u32) -> PathBuf {
+    data_dir.join(format!("kv_snapshot_{:06}.crc", id))
+}
+
+pub fn kv_snapshot_bin_tmp_path(data_dir: &Path, id: u32) -> PathBuf {
+    data_dir.join(format!("kv_snapshot_{:06}.bin.tmp", id))
+}
+
+pub fn kv_snapshot_crc_tmp_path(data_dir: &Path, id: u32) -> PathBuf {
+    data_dir.join(format!("kv_snapshot_{:06}.crc.tmp", id))
+}
+
 // ── File name parsers ─────────────────────────────────────────────────────────
 
 /// Parses `wal_NNNNNN.bin` → `Some(NNNNNN)`, anything else → `None`.
