@@ -237,6 +237,9 @@ impl Runner {
                             acct.flags = a.new_flags;
                         }
                     }
+                    WalEntry::Kv(kv) => {
+                        state.apply_kv(kv);
+                    }
                     _ => {}
                 }
             }

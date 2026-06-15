@@ -6,6 +6,7 @@
 
 use crate::balance::Balance;
 use crate::pipeline::TransactorContext;
+use crate::transactor::kv::{KvKey, KvStores};
 use crate::tx_ring::writer::TxRingWriter;
 use crate::wait_strategy::WaitStrategy;
 use rustc_hash::FxHashMap;
@@ -106,6 +107,10 @@ pub struct Computer {
     pub(crate) links: FxHashMap<(u64, u16), u64>,
     /// `next_account_id` snapshot at tx start, for rolling back account creates.
     tx_start_next_account_id: u64,
+    /// Programmable KV state (ADR-023): the three stores plus a per-tx undo log
+    /// `(key, prior_value)` replayed by `rollback` to restore a failed tx.
+    pub(crate) kv: KvStores,
+    pub(crate) kv_undo: Vec<(KvKey, i64)>,
 }
 
 impl Computer {
@@ -132,6 +137,8 @@ impl Computer {
             resize_factor: 0.75,
             links: FxHashMap::default(),
             tx_start_next_account_id: 1,
+            kv: KvStores::new(),
+            kv_undo: Vec::new(),
         }
     }
 
@@ -161,6 +168,8 @@ impl Computer {
             resize_factor,
             links,
             tx_start_next_account_id: next_account_id,
+            kv: KvStores::new(),
+            kv_undo: Vec::new(),
         }
     }
 
@@ -191,6 +200,7 @@ impl Computer {
         self.pending_items = 0;
         self.sum = 0;
         self.tx_start_next_account_id = self.next_account_id;
+        self.kv_undo.clear();
     }
 
     /// Push a sub-item and fold it into the running CRC32C / follower count
@@ -285,6 +295,7 @@ impl Computer {
         // high-water. `finalize_failed` then writes a lone trailing metadata.
         self.tx_ring_pusher.rollback_to(self.tx_start_index);
         self.next_account_id = self.tx_start_next_account_id;
+        self.rollback_kv();
         self.running_crc = 0;
         self.pending_items = 0;
     }

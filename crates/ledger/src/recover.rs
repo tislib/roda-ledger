@@ -1,4 +1,5 @@
 use crate::balance::Balance;
+use crate::transactor::kv::KvKey;
 use spdlog::{debug, warn};
 use std::collections::HashMap;
 use storage::entities::{
@@ -20,6 +21,7 @@ pub struct ActiveSnapshot {
     pub accounts: HashMap<u64, RecoverAccount>,
     pub functions: Vec<FunctionRegistered>,
     pub links: Vec<(u64, u16, u64)>,
+    pub kv: HashMap<KvKey, i64>,
     pub last_segment_user_ref_tx_id_map: HashMap<u64, u64>,
     pub active_segment_user_ref_tx_id_map: HashMap<u64, u64>,
     pub active_segment_transactions: Vec<CommittedTransaction>,
@@ -35,6 +37,7 @@ impl ActiveSnapshot {
             accounts: HashMap::new(),
             functions: Vec::new(),
             links: Vec::new(),
+            kv: HashMap::new(),
             last_segment_user_ref_tx_id_map: HashMap::new(),
             active_segment_user_ref_tx_id_map: HashMap::new(),
             active_segment_transactions: Vec::new(),
@@ -185,6 +188,7 @@ impl<'r> Recover<'r> {
                 || kind == WalEntryKind::AccountOpened as u8
                 || kind == WalEntryKind::AccountLinked as u8
                 || kind == WalEntryKind::AccountFlagsUpdated as u8
+                || kind == WalEntryKind::Kv as u8
             {
                 // ── Follower: buffer it until the closing metadata ──────
                 if follower_slices.is_empty() {
@@ -275,6 +279,7 @@ impl<'r> Recover<'r> {
                 || kind == WalEntryKind::AccountOpened as u8
                 || kind == WalEntryKind::AccountLinked as u8
                 || kind == WalEntryKind::AccountFlagsUpdated as u8
+                || kind == WalEntryKind::Kv as u8
             {
                 follower_slices.push(&data[off..off + ENTRY_SIZE]);
                 off += ENTRY_SIZE;
@@ -324,6 +329,8 @@ impl<'r> Recover<'r> {
             if segment.id() < latest_snapshot_segment_id {
                 continue;
             }
+            // The snapshot (balances/accounts/functions/KV) covers this segment and
+            // everything before it; only post-snapshot segments are replayed.
             if segment.id() == latest_snapshot_segment_id {
                 Self::restore_snapshot(segment, &mut snapshot)?;
                 continue;
@@ -427,6 +434,24 @@ impl<'r> Recover<'r> {
                     .push(FunctionRegistered::new(&name, version, crc));
             }
         }
+
+        // KV snapshot (ADR-023): load the checkpointed KV state for this segment.
+        if let Some(kvdata) = segment.load_kv_snapshot().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to load kv snapshot for segment {}: {}",
+                    segment.id(),
+                    e
+                ),
+            )
+        })? {
+            for (kv_scope, account_id, key, value) in kvdata.entries {
+                snapshot
+                    .kv
+                    .insert(KvKey::new(kv_scope, account_id, key), value);
+            }
+        }
         Ok(())
     }
 
@@ -462,6 +487,15 @@ impl<'r> Recover<'r> {
                     }
                     for follower in group.drain(..) {
                         match follower {
+                            // KV (ADR-023): apply to the folded map (post-snapshot tail).
+                            WalEntry::Kv(kv) => {
+                                let key = KvKey::new(kv.kv_scope, kv.account_id, kv.key);
+                                if kv.value == 0 {
+                                    snapshot.kv.remove(&key);
+                                } else {
+                                    snapshot.kv.insert(key, kv.value);
+                                }
+                            }
                             WalEntry::Entry(entry) => {
                                 snapshot
                                     .accounts
