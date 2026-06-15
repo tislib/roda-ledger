@@ -163,7 +163,7 @@ Full documentation: [tislib.net/roda-ledger](https://tislib.net/roda-ledger/)
 | 1 | [Concepts](docs/01-concepts.md) | Mental model, guarantees, invariants |
 | 2 | [API](docs/02-api.md) | Operations, wait levels, gRPC reference |
 | 3 | [Architecture](docs/03-architecture.md) | Pipeline design, stage internals, recovery |
-| 4 | [Internals](docs/04-internals.md) | Data structures, WAL format, lock mechanics |
+| 4 | [Internals](docs/internal.md) | Data structures, WAL format, lock mechanics |
 | + | [WASM Runtime](docs/wasm-runtime.md) | Programmable ledger — ABI, registration, recovery |
 
 ---

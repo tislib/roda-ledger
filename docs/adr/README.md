@@ -13,7 +13,7 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-007](0007-cli-tools.md)                     | CLI Operational Tools | Proposed |
 | [ADR-008](0008-transaction-account-index.md)     | Transaction Index and Query Serving | Accepted |
 | [ADR-009](0009-tx-link-dedup-reversal.md)        | Transaction Links, Deduplication, and Reversal | Accepted |
-| [ADR-010](0010-sync-submit.md)                  | Sync Submit | Accepted |
+| [ADR-010](0010-sync-submit.md)                  | Sync Submit | Proposed |
 | [ADR-011](0011-wal-write-commit-separation.md)  | WAL Write/Commit Separation | Accepted |
 | [ADR-012](0012-e2e-testing.md)                  | E2E Testing Strategy | Proposed |
 | [ADR-013](0013-transaction-count-based-segments.md) | Transaction-Count-Based Segments and Deterministic Dedup | Proposed |
@@ -24,3 +24,6 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-018](0018-fault-injection.md)               | Fault Injection Framework | Proposed |
 | [ADR-019](0019-transaction-ring.md)              | Transaction Ring | Accepted |
 | [ADR-020](0020-wal-trailer-metadata.md)          | Trailer Metadata — Commit-Record WAL Layout | Accepted |
+| [ADR-021](0021-wal-sole-releaser-snapshot-tails-wal.md) | WAL is the Sole Ring Releaser; Snapshot Tails the Durable WAL | Accepted |
+| [ADR-022](0022-account-layouts-and-program-defined-accounts.md) | Account Layouts and Program-Defined Accounts | Proposed |
+| [ADR-023](0023-programmable-state.md)            | Programmable State — Typed KV Stores and the WASM State ABI | Proposed |
