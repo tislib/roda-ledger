@@ -29,3 +29,6 @@
     - [ADR-0018 Fault injection framework](adr/0018-fault-injection.md)
     - [ADR-0019 Transaction ring](adr/0019-transaction-ring.md)
     - [ADR-0020 Trailer metadata — commit-record WAL layout](adr/0020-wal-trailer-metadata.md)
+    - [ADR-0021 WAL sole ring releaser; snapshot tails WAL](adr/0021-wal-sole-releaser-snapshot-tails-wal.md)
+    - [ADR-0022 Account layouts and program-defined accounts](adr/0022-account-layouts-and-program-defined-accounts.md)
+    - [ADR-0024 Temporal index](adr/0024-temporal-index.md)
