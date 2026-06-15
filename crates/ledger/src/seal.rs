@@ -2,6 +2,7 @@ use crate::config::LedgerConfig;
 use crate::pipeline::SealContext;
 use crate::recover::ActiveSnapshot;
 use crate::transactor::grow_capacity;
+use crate::transactor::kv::KvKey;
 use spdlog::{debug, error};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,6 +63,9 @@ struct SealRunner {
     /// Latest `(version, crc32c)` per function name (`crc32c == 0` = unregistered;
     /// kept for the audit trail, internal.md §11.4).
     function_map: HashMap<String, (u16, u32)>,
+    /// Programmable KV state (ADR-023): folded as segments seal and written into
+    /// each snapshot so recovery loads it rather than replaying the whole WAL.
+    kv: HashMap<KvKey, i64>,
     seal_check_internal: Duration,
 }
 
@@ -93,6 +97,7 @@ impl SealRunner {
             next_account_id: snap.next_account_id,
             resize_factor: config.resize_factor,
             function_map,
+            kv: snap.kv.clone(),
             seal_check_internal: config.seal_check_internal,
         }
     }
@@ -223,6 +228,14 @@ impl SealRunner {
                 self.ensure_balance_capacity(a.account_id as usize + 1);
                 self.flags[a.account_id as usize] = a.new_flags;
             }
+            WalEntry::Kv(k) => {
+                let key = KvKey::new(k.kv_scope, k.account_id, k.key);
+                if k.value == 0 {
+                    self.kv.remove(&key);
+                } else {
+                    self.kv.insert(key, k.value);
+                }
+            }
             _ => {}
         })
     }
@@ -280,6 +293,21 @@ impl SealRunner {
         if let Err(e) = segment.save_function_snapshot(&function_records[..]) {
             error!(
                 "Seal: failed to save function snapshot for segment {}: {}",
+                segment.id(),
+                e
+            );
+        }
+
+        // KV snapshot (ADR-023) — the full programmable KV state as-of this segment.
+        let mut kv_records: Vec<(u16, u64, [u32; 4], i64)> = self
+            .kv
+            .iter()
+            .map(|(k, &v)| (k.kv_scope, k.account_id, k.key, v))
+            .collect();
+        kv_records.sort_unstable();
+        if let Err(e) = segment.save_kv_snapshot(&kv_records[..]) {
+            error!(
+                "Seal: failed to save kv snapshot for segment {}: {}",
                 segment.id(),
                 e
             );

@@ -1,6 +1,6 @@
 use crate::balance::Balance;
 use crate::config::LedgerConfig;
-use crate::index::{IndexedTxEntry, TransactionIndexer};
+use crate::index::TransactionIndexer;
 use crate::pipeline::SnapshotContext;
 use crate::recover::ActiveSnapshot;
 use crate::transactor::transaction::CommittedTransaction;
@@ -32,7 +32,6 @@ pub enum QueryKind {
 pub enum QueryResponse {
     Transaction(Option<CommittedTransaction>),
     TransactionBatch(Vec<CommittedTransaction>),
-    AccountHistory(Vec<IndexedTxEntry>),
 }
 
 /// Snapshot read-side account cell (ADR-022), mirroring `TransactorAccount`:

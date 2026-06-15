@@ -8,6 +8,7 @@
 - ADR-014 — WASM Function Registry: adds the KV/effect host verbs to module `ledger`; generalizes `execute(i64×8)->i32` to named, typed event exports.
 - ADR-020 — Trailer Metadata: `KvEntry` is a new trailer follower, under the commit CRC and `sub_item_count`.
 - ADR-022 — Account Layouts: adds KV state to the transactor alongside account state; reuses `account_id` keying and rollback. Consistent with Principle **P1**.
+- ADR-006 — WAL/Snapshot/Seal Durability: KV is checkpointed in a per-segment `kv_snapshot_{N}` file (mirroring the function snapshot); recovery = snapshot + tail replay.
 
 ---
 
@@ -90,7 +91,7 @@ Guest-side ergonomics (safe wrappers, a `path!` macro) are Future Work.
 
 ### 5. Recovery
 
-Pure WAL replay, no state snapshot in v1 (balances and functions keep theirs). The recoverer folds every `KvEntry` into a flat map on `ActiveSnapshot` (last write wins; `value = 0` removes the key):
+KV is **checkpointed in the snapshot**, like balances and functions. The seal stage folds `KvEntry` records into a baseline as segments seal and writes a per-segment **kv-snapshot** file (mirroring the function snapshot). Recovery loads that snapshot into `ActiveSnapshot.kv`, then replays only the **post-snapshot tail** (un-snapshotted sealed segments + the active segment), applying each `KvEntry` last-writer-wins (`value = 0` removes the key):
 
 ```rust
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -98,7 +99,7 @@ pub struct KvKey { pub kv_scope: u16, pub account_id: u64, pub key: [u32; 4] }
 // ActiveSnapshot gains:  pub kv: HashMap<KvKey, i64>
 ```
 
-On startup the transactor takes `ActiveSnapshot.kv` and rebuilds its stores in `kv.rs`, routing each `KvKey` to its store by namespace — recovering itself from the flat map without re-running any module.
+On startup the transactor takes `ActiveSnapshot.kv` and rebuilds its stores in `kv.rs`, routing each `KvKey` to its store by namespace — recovering itself without re-running any module. Recovery cost is bounded by snapshot frequency, exactly like balances.
 
 ---
 
@@ -107,12 +108,12 @@ On startup the transactor takes `ActiveSnapshot.kv` and rebuilds its stores in `
 **Positive**
 - Programmable state, atomic with balances, on the one existing WAL path; the ledger stays domain-agnostic.
 - `KvEntry` is a self-defining key→value record — P1 holds, and a new namespace or shape needs no new WAL type.
-- Recovery is a pure fold over the WAL; the host ABI is additive under `ledger`.
+- Recovery is snapshot + tail replay, bounded by snapshot frequency like balances; the host ABI is additive under `ledger`.
 
 **Negative**
 - Presence ⟺ nonzero forbids a meaningful stored `0` forever (frozen in the format).
 - No permission model — a bad module can corrupt KV state (money still bounded by zero-sum).
-- Replay-only recovery: replay time grows with the KV WAL (see Open Questions).
+- KV adds its own per-segment snapshot file, a small extra write at each seal (mirrors the function snapshot).
 - 4×u32 path width frozen; registers pre-allocate ~512 KB.
 
 **Neutral**
@@ -124,7 +125,6 @@ On startup the transactor takes `ActiveSnapshot.kv` and rebuilds its stores in `
 ## Open Questions (answer in code)
 
 - Host-call overhead × KV-ops/tx at 1M TPS — benchmark with state enabled before trusting the number.
-- Replay time at billions of KV entries with no snapshot — may add a checkpoint purely as an accelerator.
 - Final path width — validate 4×u32 against real paths before freezing; widen a leaf to `u64` if needed.
 
 ---
@@ -139,5 +139,6 @@ On startup the transactor takes `ActiveSnapshot.kv` and rebuilds its stores in `
 - ADR-014, ADR-020, ADR-022 (Principle P1)
 - `crates/storage/src/entities.rs` — `WalEntryKind`, records, `FailReason`
 - `crates/ledger/src/transactor/wasm_runtime.rs` — host linker (`build_host_linker`, `HOST_MODULE`)
-- `crates/ledger/src/transactor/computer.rs`, `recover.rs` — apply / rollback / replay
+- `crates/ledger/src/transactor/computer.rs`, `recover.rs`, `seal.rs` — apply / rollback / replay / KV checkpoint
+- `crates/storage/src/snapshot.rs` — balance / function / KV snapshot files
 - wasmtime — https://github.com/bytecodealliance/wasmtime

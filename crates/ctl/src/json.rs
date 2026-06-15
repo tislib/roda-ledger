@@ -65,6 +65,13 @@ pub fn wal_entry_to_json(entry: &WalEntry, current_tx_id: u64) -> serde_json::Va
             "prev_flags": a.prev_flags,
             "new_flags": a.new_flags,
         }),
+        WalEntry::Kv(k) => serde_json::json!({
+            "type": "Kv",
+            "kv_scope": k.kv_scope,
+            "account_id": k.account_id,
+            "key": k.key,
+            "value": k.value,
+        }),
     }
 }
 
@@ -176,6 +183,20 @@ pub fn json_to_wal_entry(value: &serde_json::Value) -> Result<WalEntry, String> 
             Ok(WalEntry::AccountFlagsUpdated(AccountFlagsUpdated::new(
                 account_id, prev_flags, new_flags,
             )))
+        }
+        "Kv" => {
+            let kv_scope = value["kv_scope"].as_u64().ok_or("missing kv_scope")? as u16;
+            let account_id = value
+                .get("account_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let key_arr = value["key"].as_array().ok_or("missing key")?;
+            let mut key = [0u32; 4];
+            for (i, slot) in key.iter_mut().enumerate() {
+                *slot = key_arr.get(i).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            }
+            let val = value["value"].as_i64().ok_or("missing value")?;
+            Ok(WalEntry::Kv(KvEntry::new(kv_scope, account_id, key, val)))
         }
         other => Err(format!("unknown record type: {}", other)),
     }

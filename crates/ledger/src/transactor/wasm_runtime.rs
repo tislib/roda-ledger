@@ -448,6 +448,177 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
         )
         .expect("register ledger.set_flag");
 
+    // ── Programmable KV state (ADR-023) ──────────────────────────────────────
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "kv_get",
+            |caller: Caller<'_, WasmStoreData>, k0: u32, k1: u32, k2: u32, k3: u32| -> i64 {
+                caller.data().borrow().kv_get([k0, k1, k2, k3])
+            },
+        )
+        .expect("register ledger.kv_get");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "kv_set",
+            |caller: Caller<'_, WasmStoreData>, k0: u32, k1: u32, k2: u32, k3: u32, value: i64| {
+                caller.data().borrow_mut().kv_set([k0, k1, k2, k3], value);
+            },
+        )
+        .expect("register ledger.kv_set");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "kv_get_scoped",
+            |caller: Caller<'_, WasmStoreData>,
+             account_id: u64,
+             k0: u32,
+             k1: u32,
+             k2: u32,
+             k3: u32|
+             -> i64 {
+                caller
+                    .data()
+                    .borrow()
+                    .kv_get_scoped(account_id, [k0, k1, k2, k3])
+            },
+        )
+        .expect("register ledger.kv_get_scoped");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "kv_set_scoped",
+            |caller: Caller<'_, WasmStoreData>,
+             account_id: u64,
+             k0: u32,
+             k1: u32,
+             k2: u32,
+             k3: u32,
+             value: i64| {
+                caller
+                    .data()
+                    .borrow_mut()
+                    .kv_set_scoped(account_id, [k0, k1, k2, k3], value);
+            },
+        )
+        .expect("register ledger.kv_set_scoped");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "kv_add",
+            |caller: Caller<'_, WasmStoreData>,
+             account_id: u64,
+             k0: u32,
+             k1: u32,
+             k2: u32,
+             k3: u32,
+             delta: i64|
+             -> i64 {
+                caller
+                    .data()
+                    .borrow_mut()
+                    .kv_add(account_id, [k0, k1, k2, k3], delta)
+            },
+        )
+        .expect("register ledger.kv_add");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "tree_get",
+            |caller: Caller<'_, WasmStoreData>,
+             account_id: u64,
+             k0: u32,
+             k1: u32,
+             k2: u32,
+             k3: u32|
+             -> i64 {
+                caller
+                    .data()
+                    .borrow()
+                    .tree_get(account_id, [k0, k1, k2, k3])
+            },
+        )
+        .expect("register ledger.tree_get");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "tree_set",
+            |caller: Caller<'_, WasmStoreData>,
+             account_id: u64,
+             k0: u32,
+             k1: u32,
+             k2: u32,
+             k3: u32,
+             value: i64| {
+                caller
+                    .data()
+                    .borrow_mut()
+                    .tree_set(account_id, [k0, k1, k2, k3], value);
+            },
+        )
+        .expect("register ledger.tree_set");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "tree_range",
+            |mut caller: Caller<'_, WasmStoreData>,
+             account_id: u64,
+             k0: u32,
+             k1: u32,
+             k2: u32,
+             lo: u32,
+             hi: u32,
+             out_ptr: u32,
+             cap: u32|
+             -> u32 {
+                // Collect first (drops the Computer borrow), then write each
+                // (k3: u32 @0, value: i64 @8) pair into guest memory at out_ptr.
+                let pairs = caller.data().borrow().tree_range(
+                    account_id,
+                    [k0, k1, k2],
+                    lo,
+                    hi,
+                    cap as usize,
+                );
+                let mem = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(m)) => m,
+                    _ => return 0,
+                };
+                let buf = mem.data_mut(&mut caller);
+                let mut written = 0u32;
+                for (i, (k3, value)) in pairs.iter().enumerate() {
+                    let base = out_ptr as usize + i * 16;
+                    if base + 16 > buf.len() {
+                        break;
+                    }
+                    buf[base..base + 4].copy_from_slice(&k3.to_le_bytes());
+                    buf[base + 8..base + 16].copy_from_slice(&value.to_le_bytes());
+                    written += 1;
+                }
+                written
+            },
+        )
+        .expect("register ledger.tree_range");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "register_read",
+            |caller: Caller<'_, WasmStoreData>, id: u32| -> i64 {
+                caller.data().borrow().register_read(id)
+            },
+        )
+        .expect("register ledger.register_read");
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            "register_write",
+            |caller: Caller<'_, WasmStoreData>, id: u32, value: i64| {
+                caller.data().borrow_mut().register_write(id, value);
+            },
+        )
+        .expect("register ledger.register_write");
+
     linker
 }
 

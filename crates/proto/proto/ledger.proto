@@ -419,6 +419,7 @@ message WalEntry {
     WalAccountOpened      account_opened = 8;
     WalAccountLinked      account_linked = 9;
     WalAccountFlagsUpdated account_flags_updated = 10;
+    WalKvEntry            kv = 11;
   }
 }
 
@@ -476,6 +477,17 @@ message WalAccountFlagsUpdated {
   uint64 account_id = 1;
   uint64 prev_flags = 2;
   uint64 new_flags = 3;
+}
+
+// Programmable KV state record (ADR-023): one key→value mutation.
+message WalKvEntry {
+  uint32 kv_scope = 1;
+  uint64 account_id = 2;
+  uint32 key0 = 3;
+  uint32 key1 = 4;
+  uint32 key2 = 5;
+  uint32 key3 = 6;
+  int64 value = 7;
 }
 
 // ---- Terms / election history query ----

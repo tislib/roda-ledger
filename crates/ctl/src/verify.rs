@@ -198,6 +198,11 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                     pending_sub_items.push(WalEntry::AccountFlagsUpdated(*a));
                 }
             }
+            WalEntry::Kv(k) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::Kv(*k));
+                }
+            }
         }
     });
 

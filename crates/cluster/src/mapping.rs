@@ -2,8 +2,8 @@ use ::proto::ledger as proto;
 use ledger::transactor::transaction::CommittedTransaction;
 use ledger::transactor::transaction::{Operation, TransactionStatus};
 use storage::entities::{
-    AccountFlagsUpdated, AccountLinked, AccountOpened, EntryKind, FunctionRegistered, TxEntry,
-    TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,
+    AccountFlagsUpdated, AccountLinked, AccountOpened, EntryKind, FunctionRegistered, KvEntry,
+    TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,
 };
 
 pub fn deposit_to_op(d: proto::Deposit) -> Operation {
@@ -145,6 +145,7 @@ pub fn wal_entry_to_proto(e: WalEntry, tx_id: u64) -> proto::WalEntry {
         WalEntry::AccountFlagsUpdated(a) => {
             E::AccountFlagsUpdated(account_flags_updated_to_proto(a))
         }
+        WalEntry::Kv(k) => E::Kv(kv_entry_to_proto(k)),
     };
     proto::WalEntry { entry: Some(entry) }
 }
@@ -161,6 +162,18 @@ pub fn transaction_to_proto(result: CommittedTransaction) -> proto::CommitedTran
     proto::CommitedTransaction {
         meta: Some(wal_entry_to_proto(WalEntry::Metadata(result.meta), tx_id)),
         items,
+    }
+}
+
+fn kv_entry_to_proto(k: KvEntry) -> proto::WalKvEntry {
+    proto::WalKvEntry {
+        kv_scope: k.kv_scope as u32,
+        account_id: k.account_id,
+        key0: k.key[0],
+        key1: k.key[1],
+        key2: k.key[2],
+        key3: k.key[3],
+        value: k.value,
     }
 }
 
