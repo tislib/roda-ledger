@@ -7,6 +7,7 @@
 **Amends:**
 - ADR-006 — adds a per-segment temporal-index file (`temporal_index_NNNNNN.bin`) to the seal artifacts.
 - ADR-008 — adds a third per-segment index (`time → tx_id`) and a new query kind, built and served by the same machinery as the transaction and account indexes.
+- ADR-004 — adds a `ResolveTimeToTxId` read RPC to the Ledger gRPC service (and the matching `LedgerHandler` method).
 
 ---
 
@@ -55,7 +56,7 @@ second wins:
 
 ```text
 tx @ 5.67s ─┐
-            ├─► bucket 5  →  tx_id of the 5.67s transaction   (entry(5).or_insert(..))
+            ├─► bucket 5  →  tx_id of the 5.67s transaction   (first tx of the second; 5.68 skipped)
 tx @ 5.68s ─┘
 ```
 
@@ -82,24 +83,35 @@ owned by the snapshot stage (`SnapshotRunner`), exactly as the `TransactionIndex
 owned and read lock-free on the snapshot thread. `Snapshot.indexer: Option<TransactionIndexer>`
 is moved into the runner at start; the temporal map rides alongside it.
 
-**Built inline in the committed-transaction handler.** In `SnapshotRunner::run`, the
-`WalEntry::Metadata(m)` arm already indexes the transaction once it clears the commit
-gate; the temporal insert sits right beside it:
+**Built inline in the committed-transaction handler — guarded so the hot path stays cheap.**
+In `SnapshotRunner::run`, the `WalEntry::Metadata(m)` arm already indexes the transaction
+once it clears the commit gate. Touching the `BTreeMap` on *every* transaction would slow
+the snapshot indexing path, so a companion scalar `last_temporal_bucket_second` gates the
+map: the common case (another transaction in the same second) costs a single integer
+compare, and the map is touched at most once per second.
 
 ```rust
 WalEntry::Metadata(m) => {
     self.indexer.insert_transaction(&m, &group);
-    self.temporal
-        .entry(trunc_secs(m.timestamp))
-        .or_insert(m.tx_id);          // first tx of each second wins
+    let sec = trunc_secs(m.timestamp);
+    if sec != self.last_temporal_bucket_second {   // common path: one integer compare
+        self.temporal.insert(sec, m.tx_id);        // first tx of a new second
+        self.last_temporal_bucket_second = sec;
+    }
     // … apply balances/flags from followers …
 }
 ```
 
+Because `tx_id` and `timestamp` are monotonic, the first transaction to cross into a new
+second is the one recorded for that bucket (the 5.67-over-5.68 rule); empty seconds are
+never inserted.
+
 **Cleared at segment close.** When `m.tx_id % transaction_count_per_segment == 0` — the
-ADR-013 §1 rotation point — the map is `clear()`-ed. So the hot map only ever holds the
-**current active segment's** seconds; older segments are served from cold. (`BTreeMap` is
-node-allocated, so there is no `Vec`-style capacity to retain, but `clear` is cheap.)
+ADR-013 §1 rotation point — the map is `clear()`-ed **and `last_temporal_bucket_second` is
+reset to a sentinel (`u64::MAX`)** so the first transaction of the new segment always
+inserts. So the hot map only ever holds the **current active segment's** seconds; older
+segments are served from cold. (`BTreeMap` is node-allocated, so there is no `Vec`-style
+capacity to retain, but `clear` is cheap.)
 
 **No synchronization.** Inserts (the Metadata handler) and reads (query dispatch) both run
 on the single snapshot-stage thread — the same property that lets `GetTransaction` call
@@ -223,7 +235,42 @@ Flow:
 "Always blocking" matches the existing `*_block` query surface; callers receive an
 `Option<u64>` directly.
 
-### 7. Source-of-truth discipline
+### 7. gRPC surface — proto RPC and `LedgerHandler`
+
+The query is exposed end-to-end over the existing `Ledger` gRPC service — one new RPC, no
+new service (`LedgerServer` is already registered in `crates/cluster/src/node.rs`).
+
+**Proto** (`crates/proto/proto/ledger.proto`, package `roda.ledger.v1`, compiled by
+`crates/proto/build.rs` into `roda::proto::ledger::*`) — a read RPC beside `GetTransaction`
+/ `GetAccountHistory`:
+
+```protobuf
+rpc ResolveTimeToTxId(ResolveTimeToTxIdRequest) returns (ResolveTimeToTxIdResponse);
+
+message ResolveTimeToTxIdRequest  { uint64 unix_timestamp = 1; }
+message ResolveTimeToTxIdResponse { uint64 tx_id = 1; bool found = 2; }
+```
+
+The `found` bool models "no transaction at or before T" as a valid empty answer rather than
+a gRPC `NOT_FOUND` error, following the `GetStatusResponse` bool-flag convention.
+
+**`Ledger`** (`crates/ledger/src/ledger.rs`) — a blocking method mirroring
+`get_transaction_block` over `query_block`:
+
+```rust
+pub fn resolve_time_to_tx_id_block(&self, unix_timestamp: u64) -> Option<u64>;
+```
+
+**`LedgerHandler`** (`crates/cluster/src/handlers/ledger_handler.rs`) — an async
+`resolve_time_to_tx_id` on `impl proto::ledger_server::Ledger`, mirroring the existing
+`get_transaction` handler: build a `QueryRequest { kind: QueryKind::ResolveTimeToTxId {
+unix_timestamp }, respond }`, block on a `sync_channel(1)` via
+`self.ledger.current().query(..)`, then map `TimeToTxId(Some(id)) → { tx_id: id, found:
+true }` and `None → { tx_id: 0, found: false }`. A `NodeClient::resolve_time_to_tx_id(..)`
+convenience mirrors `client.get_transaction(..)`. Scalar `u64`/`bool` need no `mapping.rs`
+converter.
+
+### 8. Source-of-truth discipline
 
 The hot `BTreeMap`, the cold files, and the resident locator are all **acceleration
 structures** — held or persisted for speed, fully rebuildable from the WAL, never
@@ -238,12 +285,17 @@ sole source of truth (`wal_only_source_of_truth_test.rs`).
 - A time-addressable ledger (`time → tx_id`) with O(log n) lookups in both tiers.
 - The hot tier reuses the snapshot stage's single-thread, lock-free model — no atomics or
   locks added.
+- The hot-path cost is one integer compare per transaction (the `last_temporal_bucket_second`
+  guard); the `BTreeMap` is touched at most once per second, so indexing throughput is
+  unaffected.
 - Both in-memory structures are ordered `BTreeMap`s, so `range(..=T).next_back()` answers
   gap-second queries correctly (never a false "nothing here").
 - The cold tier reuses the ADR-008 seal → build → serialize → CRC machinery and the
   ADR-006 sidecar format; little new surface.
 - Clean ownership split: the **sealer** writes cold files for sealed segments; **restore**
   rebuilds the hot map for the active segment.
+- Exposed over the existing `Ledger` gRPC service — one new `ResolveTimeToTxId` RPC, no new
+  service or stage.
 - Everything is derived and rebuildable from the WAL.
 
 ### Negative
@@ -296,4 +348,7 @@ documented here rather than worked around.
   `WalEntry::Metadata` handler), `crates/ledger/src/seal.rs` (`process_seal`),
   `crates/storage/src/index.rs` (`build_indexes` / `write_index_file`),
   `crates/storage/src/layout.rs` (per-segment path helpers),
-  `crates/ledger/src/ledger.rs` (`query_block` / `get_transaction_block`).
+  `crates/ledger/src/ledger.rs` (`query_block` / `get_transaction_block`),
+  `crates/proto/proto/ledger.proto` (Ledger gRPC service),
+  `crates/cluster/src/handlers/ledger_handler.rs` (`get_transaction` handler template),
+  `crates/cluster/src/node.rs` (`LedgerServer` registration).
