@@ -10,6 +10,14 @@ members = [
     "crates/control",
     "crates/ctl",
     "crates/testing",
+    "crates/roda-wasm-abi",
+]
+
+# Example guest modules are standalone wasm crates, built only for
+# wasm32-unknown-unknown; keep them out of normal workspace operations.
+exclude = [
+    "crates/roda-wasm-abi/examples/transfer",
+    "crates/roda-wasm-abi/examples/counter",
 ]
 
 # `cargo run` / `cargo build` from the root act on cluster (which produces the binary).
@@ -50,6 +58,7 @@ anyhow = "1"
 # --- utilities ---
 rand = "0.8"
 bytes = "1.7"
+smallvec = "1"
 roda-latency-tracker = "0.1.1"
 
 # --- CLI parsing (for the binary) ---

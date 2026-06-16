@@ -14,6 +14,7 @@ pub enum WalEntryKind {
     AccountLinked = 8,
     AccountFlagsUpdated = 9,
     Kv = 10,
+    KvConstant = 11,
 }
 
 pub struct EntryKind;
@@ -38,7 +39,13 @@ impl FailReason {
     // 6 retired: ACCOUNT_LIMIT_EXCEEDED removed — u32-id-space exhaustion is
     // unreachable in practice (>50GB), so the allocator panics instead.
     pub const DUPLICATE: Self = Self(7);
-    // 8–127 reserved for future standard reasons
+    // WASM module called a host verb prohibited in the current phase (ADR-023 §6),
+    // e.g. `kv_register_constant` from `execute`, or a data verb from `register`.
+    pub const PROHIBITED_HOST_CALL: Self = Self(8);
+    // `kv_get_constant` looked up a name that was never registered (ADR-023 §6);
+    // execution is stopped so the module cannot proceed with a bogus id.
+    pub const CONSTANT_NOT_FOUND: Self = Self(9);
+    // 10–127 reserved for future standard reasons
     // 128–255 user-defined custom reasons
 
     pub fn is_success(&self) -> bool {
@@ -318,35 +325,64 @@ impl AccountFlagsUpdated {
 }
 
 /// Programmable-state WAL record (ADR-023): one key→value mutation. A trailer
-/// follower like `TxEntry`, carrying no amount. The transactor logs the
-/// resolved value (a counter add records its result, not a delta), so replay
-/// is a plain per-key assignment; `value == 0` deletes the key.
+/// follower like `TxEntry`, carrying no amount. `key` is a packed `KeyPath` and
+/// `value` a packed `Value` (see `kv.rs`); an empty `value` slot deletes the key.
+/// Replay is a plain per-key assignment of the decoded value.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct KvEntry {
-    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::Kv (10)
-    pub _pad0: u8,       // 1 @ 1  — aligns kv_scope
-    pub kv_scope: u16,   // 2 @ 2  — 0 = global, 1 = account
-    pub _pad: [u8; 4],   // 4 @ 4  — zero-written, verified on read
-    pub key: [u32; 4],   // 16 @ 8
-    pub account_id: u64, // 8 @ 24 — 0 = global
-    pub value: i64,      // 8 @ 32 — resolved value; 0 = delete
+    pub entry_type: u8, // 1 @ 0   — WalEntryKind::Kv (10)
+    pub key: [u8; 30],  // 30 @ 1  — packed KeyPath, zero-terminated
+    pub value: [u8; 9], // 9 @ 31  — packed Value; empty = delete
 } // total: 40 bytes
 
 impl KvEntry {
-    pub const SCOPE_GLOBAL: u16 = 0;
-    pub const SCOPE_ACCOUNT: u16 = 1;
-
-    pub fn new(kv_scope: u16, account_id: u64, key: [u32; 4], value: i64) -> Self {
+    /// Build from already-packed `KeyPath` / `Value` slot bytes (`kv.rs` does
+    /// the packing). `KeyPath::pack` / `Value::pack_slot` produce these.
+    pub fn new(key: [u8; 30], value: [u8; 9]) -> Self {
         Self {
             entry_type: WalEntryKind::Kv as u8,
-            _pad0: 0,
-            kv_scope,
-            _pad: [0; 4],
             key,
-            account_id,
             value,
         }
+    }
+}
+
+/// Defines a constant string (ADR-023): binds a `u32` key to a fixed,
+/// null-terminated UTF-8 value. A standalone registration record (like
+/// `FunctionRegistered`), not a trailer follower. The registry of interned
+/// constants a KV key/value can reference by `key` (the referencing `Value`
+/// kind is a follow-up).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq, Eq)]
+pub struct KvConstant {
+    pub entry_type: u8,  // 1 @ 0  — WalEntryKind::KvConstant (11)
+    pub _pad: [u8; 3],   // 3 @ 1  — align key
+    pub key: u32,        // 4 @ 4
+    pub value: [u8; 32], // 32 @ 8 — null-terminated UTF-8; tail zeroed
+} // total: 40 bytes
+
+impl KvConstant {
+    pub fn new(key: u32, value: &[u8]) -> Self {
+        let mut buf = [0u8; 32];
+        let n = value.len().min(32);
+        buf[..n].copy_from_slice(&value[..n]);
+        Self {
+            entry_type: WalEntryKind::KvConstant as u8,
+            _pad: [0; 3],
+            key,
+            value: buf,
+        }
+    }
+
+    /// The string bytes up to the first null (or the full buffer if unterminated).
+    pub fn as_bytes(&self) -> &[u8] {
+        let end = self
+            .value
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.value.len());
+        &self.value[..end]
     }
 }
 
@@ -361,6 +397,7 @@ pub enum WalEntry {
     AccountLinked(AccountLinked),
     AccountFlagsUpdated(AccountFlagsUpdated),
     Kv(KvEntry),
+    KvConstant(KvConstant),
 }
 
 impl WalEntry {
@@ -375,6 +412,7 @@ impl WalEntry {
             WalEntry::AccountLinked(_) => WalEntryKind::AccountLinked,
             WalEntry::AccountFlagsUpdated(_) => WalEntryKind::AccountFlagsUpdated,
             WalEntry::Kv(_) => WalEntryKind::Kv,
+            WalEntry::KvConstant(_) => WalEntryKind::KvConstant,
         }
     }
 }
@@ -415,4 +453,5 @@ const _: () = assert!(size_of::<AccountOpened>() == 40);
 const _: () = assert!(size_of::<AccountLinked>() == 40);
 const _: () = assert!(size_of::<AccountFlagsUpdated>() == 40);
 const _: () = assert!(size_of::<KvEntry>() == 40);
-const _: () = assert!(align_of::<KvEntry>() == 8);
+const _: () = assert!(align_of::<KvEntry>() == 1);
+const _: () = assert!(size_of::<KvConstant>() == 40);

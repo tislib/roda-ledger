@@ -6,6 +6,7 @@ pub mod entries;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
 mod index;
+pub mod kv;
 mod layout;
 mod segment;
 mod snapshot;
@@ -22,6 +23,7 @@ mod wal_zero_copy;
 pub use crate::config::StorageConfig;
 pub use constants::*;
 pub use engine::*;
+pub use kv::{KeyPath, KvError, Value};
 pub use segment::*;
 pub use snapshot::*;
 pub use syncer::*;

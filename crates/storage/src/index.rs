@@ -63,7 +63,8 @@ impl Segment {
                 | WalEntry::AccountOpened(_)
                 | WalEntry::AccountLinked(_)
                 | WalEntry::AccountFlagsUpdated(_)
-                | WalEntry::Kv(_) => {}
+                | WalEntry::Kv(_)
+                | WalEntry::KvConstant(_) => {}
             }
             offset += 40;
         }

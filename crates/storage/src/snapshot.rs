@@ -44,18 +44,21 @@ const FUNCTION_RECORD_NAME_LEN: usize = 32;
 const FUNCTION_RECORD_SIZE: usize = FUNCTION_RECORD_NAME_LEN + 2 + 4; // 38 bytes
 
 /// In-memory representation of a KV snapshot (ADR-023): the full programmable
-/// KV state at the snapshot boundary. Each entry is `(kv_scope, account_id,
-/// key, value)` with `value != 0` (deleted keys are absent). Sorted on disk for
-/// determinism.
+/// KV state at the snapshot boundary. Each entry is the packed `(key, value)`
+/// pair of a `KvEntry` (30-byte `KeyPath` + 9-byte `Value` slot); `constants`
+/// are the interned `(key, null-terminated value)` definitions. Both sorted on
+/// disk for determinism, stored in the one file.
 pub struct KvSnapshotData {
     pub segment_id: u32,
-    pub entries: Vec<(u16, u64, [u32; 4], i64)>,
+    pub entries: Vec<([u8; 30], [u8; 9])>,
+    pub constants: Vec<(u32, [u8; 32])>,
 }
 
 const KV_SNAPSHOT_MAGIC: u32 = 0x4B565354; // "KVST"
-const KV_SNAPSHOT_VERSION: u8 = 1;
+const KV_SNAPSHOT_VERSION: u8 = 2; // v2 appends constant records after entries
 const KV_SNAPSHOT_HEADER_SIZE: usize = 28;
-const KV_RECORD_SIZE: usize = 2 + 8 + 16 + 8; // kv_scope + account_id + key[4] + value = 34
+const KV_RECORD_SIZE: usize = 30 + 9; // packed KeyPath + Value slot = 39
+const KV_CONSTANT_RECORD_SIZE: usize = 4 + 32; // key + value[32] = 36
 
 impl Segment {
     /// Writes a compressed snapshot for this segment to disk (temp files plus
@@ -243,8 +246,13 @@ impl Segment {
 
     /// Write the programmable-KV snapshot for this segment (ADR-023). Mirrors
     /// `save_function_snapshot`: 28-byte header + LZ4-compressed body of 34-byte
-    /// `(kv_scope, account_id, key[4], value)` records, via temp + atomic rename.
-    pub fn save_kv_snapshot(&self, records: &[(u16, u64, [u32; 4], i64)]) -> std::io::Result<()> {
+    /// KV-entry records followed by 36-byte constant records, via temp + atomic
+    /// rename. Entries and constants share the one file, compression, and CRC.
+    pub fn save_kv_snapshot(
+        &self,
+        records: &[([u8; 30], [u8; 9])],
+        constants: &[(u32, [u8; 32])],
+    ) -> std::io::Result<()> {
         let segment_id = self.id();
         let data_dir = Path::new(self.data_dir());
         let bin_tmp = kv_snapshot_bin_tmp_path(data_dir, segment_id);
@@ -253,14 +261,17 @@ impl Segment {
         let crc_final = kv_snapshot_crc_path(data_dir, segment_id);
 
         let entry_count = records.len() as u32;
-        let mut raw_data: Vec<u8> = Vec::with_capacity(records.len() * KV_RECORD_SIZE);
-        for (kv_scope, account_id, key, value) in records {
-            raw_data.extend_from_slice(&kv_scope.to_le_bytes());
-            raw_data.extend_from_slice(&account_id.to_le_bytes());
-            for k in key {
-                raw_data.extend_from_slice(&k.to_le_bytes());
-            }
-            raw_data.extend_from_slice(&value.to_le_bytes());
+        let constant_count = constants.len() as u32;
+        let mut raw_data: Vec<u8> = Vec::with_capacity(
+            records.len() * KV_RECORD_SIZE + constants.len() * KV_CONSTANT_RECORD_SIZE,
+        );
+        for (key, value) in records {
+            raw_data.extend_from_slice(key);
+            raw_data.extend_from_slice(value);
+        }
+        for (key, value) in constants {
+            raw_data.extend_from_slice(&key.to_le_bytes());
+            raw_data.extend_from_slice(value);
         }
 
         let data_crc32c = crc32c::crc32c(&raw_data);
@@ -273,7 +284,8 @@ impl Segment {
         header.extend_from_slice(&segment_id.to_le_bytes()); // 4
         header.extend_from_slice(&entry_count.to_le_bytes()); // 4
         header.push(1u8); // 1 compressed=true
-        header.extend_from_slice(&[0u8; 7]); // 7 pad
+        header.extend_from_slice(&constant_count.to_le_bytes()); // 4
+        header.extend_from_slice(&[0u8; 3]); // 3 pad
         header.extend_from_slice(&data_crc32c.to_le_bytes()); // 4
         debug_assert_eq!(header.len(), KV_SNAPSHOT_HEADER_SIZE);
 
@@ -742,7 +754,9 @@ fn load_kv_snapshot_for_segment(
 
     let compressed = bin_data[offset] != 0;
     offset += 1;
-    offset += 7; // pad
+    let constant_count = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    offset += 3; // pad
 
     let data_crc32c = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
     offset += 4;
@@ -766,7 +780,8 @@ fn load_kv_snapshot_for_segment(
         return Ok(None);
     }
 
-    let expected_data_len = entry_count as usize * KV_RECORD_SIZE;
+    let expected_data_len =
+        entry_count as usize * KV_RECORD_SIZE + constant_count as usize * KV_CONSTANT_RECORD_SIZE;
     if record_data.len() != expected_data_len {
         warn!(
             "{}: data length mismatch (expected={}, got={})",
@@ -780,25 +795,29 @@ fn load_kv_snapshot_for_segment(
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut rec_offset = 0;
     for _ in 0..entry_count {
-        let kv_scope =
-            u16::from_le_bytes(record_data[rec_offset..rec_offset + 2].try_into().unwrap());
-        rec_offset += 2;
-        let account_id =
-            u64::from_le_bytes(record_data[rec_offset..rec_offset + 8].try_into().unwrap());
-        rec_offset += 8;
-        let mut key = [0u32; 4];
-        for k in key.iter_mut() {
-            *k = u32::from_le_bytes(record_data[rec_offset..rec_offset + 4].try_into().unwrap());
-            rec_offset += 4;
-        }
-        let value = i64::from_le_bytes(record_data[rec_offset..rec_offset + 8].try_into().unwrap());
-        rec_offset += 8;
-        entries.push((kv_scope, account_id, key, value));
+        let mut key = [0u8; 30];
+        key.copy_from_slice(&record_data[rec_offset..rec_offset + 30]);
+        rec_offset += 30;
+        let mut value = [0u8; 9];
+        value.copy_from_slice(&record_data[rec_offset..rec_offset + 9]);
+        rec_offset += 9;
+        entries.push((key, value));
+    }
+
+    let mut constants = Vec::with_capacity(constant_count as usize);
+    for _ in 0..constant_count {
+        let key = u32::from_le_bytes(record_data[rec_offset..rec_offset + 4].try_into().unwrap());
+        rec_offset += 4;
+        let mut value = [0u8; 32];
+        value.copy_from_slice(&record_data[rec_offset..rec_offset + 32]);
+        rec_offset += 32;
+        constants.push((key, value));
     }
 
     Ok(Some(KvSnapshotData {
         segment_id,
         entries,
+        constants,
     }))
 }
 
@@ -865,25 +884,33 @@ mod tests {
     #[test]
     fn kv_snapshot_roundtrip() {
         let (seg, _td) = temp_segment();
-        let records = vec![
-            (0u16, 0u64, [1u32, 0, 0, 0], 42i64),  // map global
-            (1u16, 5u64, [7u32, 0, 0, 0], 100i64), // map account
-            (4u16, 0u64, [3u32, 0, 0, 0], -9i64),  // register
-        ];
-        seg.save_kv_snapshot(&records).expect("save");
+        use crate::kv::{KeyPath, Value};
+        let pack = |k: i64, v: i64| {
+            (
+                KeyPath::new([Value::Int(k)]).pack().unwrap(),
+                Value::pack_slot(Some(&Value::Int(v))).unwrap(),
+            )
+        };
+        let records = vec![pack(1, 42), pack(7, 100), pack(3, -9)];
+        let mut pending = [0u8; 32];
+        pending[..7].copy_from_slice(b"PENDING");
+        let constants = vec![(1u32, pending), (2u32, [0u8; 32])];
+        seg.save_kv_snapshot(&records, &constants).expect("save");
         assert!(seg.has_kv_snapshot());
         let loaded = seg.load_kv_snapshot().expect("load").expect("present");
         assert_eq!(loaded.segment_id, seg.id());
         assert_eq!(loaded.entries, records);
+        assert_eq!(loaded.constants, constants);
     }
 
     #[test]
     fn empty_kv_snapshot_roundtrip() {
         let (seg, _td) = temp_segment();
-        seg.save_kv_snapshot(&[]).expect("save empty");
+        seg.save_kv_snapshot(&[], &[]).expect("save empty");
         assert!(seg.has_kv_snapshot());
         let loaded = seg.load_kv_snapshot().expect("load").expect("present");
         assert!(loaded.entries.is_empty());
+        assert!(loaded.constants.is_empty());
     }
 
     #[test]
