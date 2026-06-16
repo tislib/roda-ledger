@@ -1358,6 +1358,23 @@ impl ClusterTestingControl {
             })
     }
 
+    /// Read the KV value at `key` (a "/"-joined path) on slot `slot` (ADR-023).
+    /// Constant components are matched by name.
+    pub async fn get_kv_on(
+        &self,
+        slot: usize,
+        key: &str,
+    ) -> Result<Option<i64>, ClusterTestingError> {
+        self.cluster_client_or_err()?
+            .node(slot)
+            .get_kv(key)
+            .await
+            .map_err(|e| ClusterTestingError::Rpc {
+                op: "get_kv",
+                source: e,
+            })
+    }
+
     /// Read slot `slot`'s pipeline index without catch-up or
     /// assertion.
     pub async fn pipeline_index_on(

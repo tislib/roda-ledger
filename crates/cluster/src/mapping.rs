@@ -2,9 +2,10 @@ use ::proto::ledger as proto;
 use ledger::transactor::transaction::CommittedTransaction;
 use ledger::transactor::transaction::{Operation, TransactionStatus};
 use storage::entities::{
-    AccountFlagsUpdated, AccountLinked, AccountOpened, EntryKind, FunctionRegistered, KvEntry,
-    TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,
+    AccountFlagsUpdated, AccountLinked, AccountOpened, EntryKind, FunctionRegistered, KvConstant,
+    KvEntry, TxEntry, TxLink, TxLinkKind, TxMetadata, TxTerm, WalEntry, encode_tag,
 };
+use storage::{KeyPath, Value};
 
 pub fn deposit_to_op(d: proto::Deposit) -> Operation {
     Operation::Deposit {
@@ -146,6 +147,7 @@ pub fn wal_entry_to_proto(e: WalEntry, tx_id: u64) -> proto::WalEntry {
             E::AccountFlagsUpdated(account_flags_updated_to_proto(a))
         }
         WalEntry::Kv(k) => E::Kv(kv_entry_to_proto(k)),
+        WalEntry::KvConstant(c) => E::KvConstant(kv_constant_to_proto(c)),
     };
     proto::WalEntry { entry: Some(entry) }
 }
@@ -165,15 +167,53 @@ pub fn transaction_to_proto(result: CommittedTransaction) -> proto::CommitedTran
     }
 }
 
+pub(crate) fn value_to_proto(v: &Value) -> proto::WalKvValue {
+    use proto::wal_kv_value::Kind;
+    let kind = match v {
+        Value::Int(i) => Kind::Integer(*i),
+        // Read paths resolve constants first; a bare id renders its display form.
+        Value::ConstResolved(s) => Kind::Constant(s.clone()),
+        Value::Const(_) => Kind::Constant(v.to_string()),
+    };
+    proto::WalKvValue {
+        kind: Some(kind),
+        str: v.to_string(),
+    }
+}
+
+/// Decode a request-side `WalKvValue` into a `Value`; `None` if the oneof is unset.
+pub(crate) fn value_from_proto(v: proto::WalKvValue) -> Option<Value> {
+    use proto::wal_kv_value::Kind;
+    match v.kind? {
+        Kind::Integer(i) => Some(Value::Int(i)),
+        Kind::Constant(s) => Some(Value::from_constant(s)),
+    }
+}
+
+pub(crate) fn keypath_to_proto(k: &KeyPath) -> proto::WalKvKeyPath {
+    proto::WalKvKeyPath {
+        items: k.0.iter().map(value_to_proto).collect(),
+        str: k.to_string(),
+    }
+}
+
+/// Decode a request-side `WalKvKeyPath` into a `KeyPath` (unset value items skipped).
+pub(crate) fn keypath_from_proto(k: proto::WalKvKeyPath) -> KeyPath {
+    KeyPath(k.items.into_iter().filter_map(value_from_proto).collect())
+}
+
 fn kv_entry_to_proto(k: KvEntry) -> proto::WalKvEntry {
+    let (key, value) = k.decode().unwrap_or_default();
     proto::WalKvEntry {
-        kv_scope: k.kv_scope as u32,
-        account_id: k.account_id,
-        key0: k.key[0],
-        key1: k.key[1],
-        key2: k.key[2],
-        key3: k.key[3],
-        value: k.value,
+        key: Some(keypath_to_proto(&key)),
+        value: value.as_ref().map(value_to_proto),
+    }
+}
+
+fn kv_constant_to_proto(c: KvConstant) -> proto::WalKvConstant {
+    proto::WalKvConstant {
+        key: c.key,
+        value: String::from_utf8_lossy(c.as_bytes()).into_owned(),
     }
 }
 

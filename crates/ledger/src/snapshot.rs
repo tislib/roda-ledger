@@ -7,11 +7,12 @@ use crate::transactor::transaction::CommittedTransaction;
 use crate::transactor::{STATUS_OPEN, STATUS_SYSTEM, grow_capacity, set_flag};
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use storage::Storage;
 use storage::entities::{SYSTEM_ACCOUNT_ID, TxMetadata, WalEntry};
+use storage::{KeyPath, Storage, Value};
 
 /// A query to be executed by the Snapshot stage against the `TransactionIndexer`.
 ///
@@ -24,14 +25,29 @@ pub struct QueryRequest {
 
 /// Discriminant for the query type.
 pub enum QueryKind {
-    GetTransaction { tx_id: u64 },
-    GetTransactionBatch { tx_ids: Vec<u64> },
+    GetTransaction {
+        tx_id: u64,
+    },
+    GetTransactionBatch {
+        tx_ids: Vec<u64>,
+    },
+    /// Forward KV lookup: the value for `key` (ADR-023). Boxed to keep
+    /// `QueryRequest` small (the inline `KeyPath` is wide).
+    GetKv {
+        key: Box<KeyPath>,
+    },
+    /// Resolve an interned constant name to its id (ADR-023 §6).
+    GetConstant {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryResponse {
     Transaction(Option<CommittedTransaction>),
     TransactionBatch(Vec<CommittedTransaction>),
+    Kv(Option<Value>),
+    Constant(Option<u32>),
 }
 
 /// Snapshot read-side account cell (ADR-022), mirroring `TransactorAccount`:
@@ -68,6 +84,11 @@ type Links = Arc<SkipMap<(u64, u16), u64>>;
 pub struct Snapshot {
     accounts: Accounts,
     links: Links,
+    /// Read-side KV state (ADR-023), owned by the single-writer `SnapshotRunner`.
+    /// Values are kept **resolved** (`Const` → `ConstResolved`).
+    kv: HashMap<KeyPath, Value>,
+    /// Interned constants `id → value` (ADR-023 §6), used to resolve KV values.
+    constants: HashMap<u32, String>,
     indexer: Option<TransactionIndexer>,
     storage: Arc<Storage>,
     resize_factor: f64,
@@ -76,11 +97,34 @@ pub struct Snapshot {
 struct SnapshotRunner {
     accounts: Accounts,
     links: Links,
+    kv: HashMap<KeyPath, Value>,
+    constants: HashMap<u32, String>,
     indexer: TransactionIndexer,
     storage: Arc<Storage>,
     /// First tx id to tail (recovered `snapshot_index` + 1).
     from_tx_id: u64,
     resize_factor: f64,
+}
+
+/// Resolve a KV value into the snapshot's stored shape: `Const(id)` becomes
+/// `ConstResolved(value)` via the constant registry (empty string if unknown);
+/// everything else is unchanged.
+fn resolve_value(constants: &HashMap<u32, String>, value: Value) -> Value {
+    match value {
+        Value::Const(id) => Value::ConstResolved(constants.get(&id).cloned().unwrap_or_default()),
+        other => other,
+    }
+}
+
+/// Resolve every constant component of a key (so the snapshot keeps fully
+/// resolved keys — a constant component reads back as `ConstResolved(name)`).
+fn resolve_key(constants: &HashMap<u32, String>, key: KeyPath) -> KeyPath {
+    KeyPath(
+        key.0
+            .into_iter()
+            .map(|v| resolve_value(constants, v))
+            .collect(),
+    )
 }
 
 impl Snapshot {
@@ -99,6 +143,8 @@ impl Snapshot {
         Self {
             accounts,
             links: Arc::new(SkipMap::new()),
+            kv: HashMap::new(),
+            constants: HashMap::new(),
             indexer: Some(TransactionIndexer::new(
                 config.index_circle1_size(),
                 config.index_circle2_size(),
@@ -152,6 +198,8 @@ impl Snapshot {
         let runner = SnapshotRunner {
             accounts: self.accounts.clone(),
             links: self.links.clone(),
+            kv: std::mem::take(&mut self.kv),
+            constants: std::mem::take(&mut self.constants),
             indexer: self.indexer.take().unwrap(),
             storage: self.storage.clone(),
             from_tx_id,
@@ -181,6 +229,18 @@ impl Snapshot {
         }
         for &(parent_id, type_id, child_id) in &snap.links {
             self.links.insert((parent_id, type_id), child_id);
+        }
+        // Read-side constant registry + KV baseline (ADR-023): values kept resolved.
+        for (&id, raw) in &snap.constants {
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            self.constants
+                .insert(id, String::from_utf8_lossy(&raw[..end]).into_owned());
+        }
+        for (key, value) in &snap.kv {
+            self.kv.insert(
+                resolve_key(&self.constants, key.clone()),
+                resolve_value(&self.constants, value.clone()),
+            );
         }
         for tx in &snap.active_segment_transactions {
             self.recover_index_transaction(&tx.meta, &tx.entries);
@@ -299,6 +359,34 @@ impl SnapshotRunner {
                                         slot.flags.store(a.new_flags, Ordering::Release);
                                     }
                                 }
+                                WalEntry::Kv(k) => {
+                                    // ADR-023: mirror the mutation into the read-side KV map,
+                                    // keeping key and value in resolved shape.
+                                    if let Ok((key, value)) = k.decode() {
+                                        let key = resolve_key(&self.constants, key);
+                                        match value {
+                                            Some(v) => {
+                                                let v = resolve_value(&self.constants, v);
+                                                self.kv.insert(key, v);
+                                            }
+                                            None => {
+                                                self.kv.remove(&key);
+                                            }
+                                        }
+                                    }
+                                }
+                                WalEntry::KvConstant(c) => {
+                                    // ADR-023 §6: learn the constant so later values resolve.
+                                    let end = c
+                                        .value
+                                        .iter()
+                                        .position(|&b| b == 0)
+                                        .unwrap_or(c.value.len());
+                                    self.constants.insert(
+                                        c.key,
+                                        String::from_utf8_lossy(&c.value[..end]).into_owned(),
+                                    );
+                                }
                                 _ => {}
                             }
                         }
@@ -329,6 +417,13 @@ impl SnapshotRunner {
                             .collect();
                         QueryResponse::TransactionBatch(txs)
                     }
+                    QueryKind::GetKv { key } => QueryResponse::Kv(self.kv.get(&*key).cloned()),
+                    QueryKind::GetConstant { name } => QueryResponse::Constant(
+                        self.constants
+                            .iter()
+                            .find(|(_, v)| v.as_str() == name)
+                            .map(|(&id, _)| id),
+                    ),
                 };
                 (q.respond)(response);
             } else if !progressed {

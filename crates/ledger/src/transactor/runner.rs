@@ -448,6 +448,18 @@ impl Runner {
                             self.state
                                 .borrow_mut()
                                 .push_follower(WalEntry::FunctionRegistered(record));
+                            // Run the module's optional `register` export to define its
+                            // constants in this same registration tx (ADR-023 §6). A
+                            // nonzero status (e.g. a prohibited-call phase violation)
+                            // fails the tx → rollback.
+                            if !is_unregister
+                                && let Some(caller) = self.wasm_engine.caller(&name).cloned()
+                            {
+                                let status = caller.call_register();
+                                if status != 0 {
+                                    self.state.borrow_mut().fail(FailReason::from_u8(status));
+                                }
+                            }
                         }
                         Err(_) => {
                             self.state.borrow_mut().fail(FailReason::INVALID_OPERATION);

@@ -318,6 +318,33 @@ impl Ledger {
         rx.recv().expect("query_block: failed to receive response")
     }
 
+    /// Read-side KV lookup (ADR-023): the resolved value for `key`, or `None`.
+    /// Goes through the snapshot query channel like transaction lookups.
+    pub fn get_kv(&self, key: storage::KeyPath) -> Option<storage::Value> {
+        let res = self.query_block(QueryRequest {
+            kind: QueryKind::GetKv { key: Box::new(key) },
+            respond: Box::new(|_| {}),
+        });
+        match res {
+            QueryResponse::Kv(v) => v,
+            _ => None,
+        }
+    }
+
+    /// Resolve an interned constant name to its id (ADR-023 §6), or `None`.
+    pub fn get_constant(&self, name: &str) -> Option<u32> {
+        let res = self.query_block(QueryRequest {
+            kind: QueryKind::GetConstant {
+                name: name.to_string(),
+            },
+            respond: Box::new(|_| {}),
+        });
+        match res {
+            QueryResponse::Constant(id) => id,
+            _ => None,
+        }
+    }
+
     pub fn get_transaction_block(&self, tx_id: u64) -> Option<CommittedTransaction> {
         let res = self.query_block(QueryRequest {
             kind: QueryKind::GetTransaction { tx_id },

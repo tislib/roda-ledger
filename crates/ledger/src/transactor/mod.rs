@@ -69,9 +69,10 @@ impl Transactor<'_> {
             links.insert((*parent_id, *type_id), *child_id);
         }
 
-        // Programmable KV state (ADR-023): the folded flat key→value map; applied
-        // to the Computer's stores once it is built inside the runner thread.
+        // Programmable KV state (ADR-023): the folded flat key→value map and the
+        // interned constants; applied to the Computer once it is built in the runner.
         let kv_state = active_snapshot.kv.clone();
+        let kv_constants_state = active_snapshot.constants.clone();
 
         // wasm_runtime
         let wasm_runtime_ref = wasm_runtime.as_ref();
@@ -105,6 +106,7 @@ impl Transactor<'_> {
                     ctx.wait_strategy(),
                 )));
                 state.borrow_mut().recover_kv(&kv_state);
+                state.borrow_mut().recover_kv_constants(&kv_constants_state);
                 let wasm_engine = WasmRuntimeEngine::new(wasm_runtime, Rc::clone(&state));
                 let mut runner = Runner {
                     transaction_buffer: Vec::with_capacity(cap),

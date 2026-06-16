@@ -44,6 +44,9 @@ tempfile.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 ringbuf = "0.4"                 # experimental: SPSC ring-buffer throughput bench
+# Guest-side ABI + its `compile_to_wasm` helper: the KV integration tests write
+# modules in Rust and compile them to wasm rather than hand-writing WAT.
+roda-wasm-abi = { path = "../roda-wasm-abi", features = ["tools"] }
 
 [[bench]]
 name = "transactor_bench"
