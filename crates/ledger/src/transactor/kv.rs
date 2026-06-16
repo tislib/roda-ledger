@@ -93,13 +93,19 @@ impl Computer {
     /// id. First sight allocates the next id and logs a `KvConstant` follower;
     /// re-registering an existing name is a no-op that returns the same id.
     /// Callable only in the register phase — the host shim enforces that.
+    /// `name` is the full constant name; the host boundary enforces
+    /// `KV_CONSTANT_NAME_MAX` (so truncating here — which would alias two names
+    /// sharing a prefix — is unnecessary and wrong). The id allocator panics on
+    /// u32 exhaustion rather than reusing an id (matches the account-id policy).
     pub fn kv_register_constant(&mut self, name: &[u8]) -> u32 {
-        let name = &name[..name.len().min(32)];
         if let Some(&id) = self.kv_constants.get(name) {
             return id;
         }
         let id = self.next_constant_id;
-        self.next_constant_id = self.next_constant_id.saturating_add(1);
+        self.next_constant_id = self
+            .next_constant_id
+            .checked_add(1)
+            .expect("kv constant id space exhausted (u32)");
         self.kv_constants.insert(name.to_vec(), id);
         self.push_follower(WalEntry::KvConstant(KvConstant::new(id, name)));
         id
@@ -108,7 +114,7 @@ impl Computer {
     /// Look up a registered constant's id by name (read-only); `None` if it was
     /// never registered. The host shim stops execution on `None`.
     pub fn kv_get_constant(&self, name: &[u8]) -> Option<u32> {
-        self.kv_constants.get(&name[..name.len().min(32)]).copied()
+        self.kv_constants.get(name).copied()
     }
 
     /// Seed the constant registry from the recovery-folded `id → value` map
@@ -210,6 +216,34 @@ mod tests {
         c.kv_set([1, 0, 0, 0], 99);
         c.rollback_kv();
         assert_eq!(c.kv_get([1, 0, 0, 0]), 10);
+    }
+
+    #[test]
+    fn distinct_constant_names_get_distinct_ids() {
+        let mut c = computer();
+        // Two distinct names sharing a 32-byte prefix. `Computer` keys on the
+        // full name (the host boundary enforces the length cap), so these must
+        // get distinct ids — no silent truncation/aliasing in the registry.
+        let mut a = vec![b'x'; 32];
+        a.push(b'A');
+        let mut b = vec![b'x'; 32];
+        b.push(b'B');
+        let id_a = c.kv_register_constant(&a);
+        let id_b = c.kv_register_constant(&b);
+        assert_ne!(
+            id_a, id_b,
+            "distinct constant names must not collide on truncation"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "constant id space exhausted")]
+    fn constant_id_allocator_panics_on_overflow() {
+        let mut c = computer();
+        // At the top of the id space the allocator must panic rather than silently
+        // reuse an id for a new name (matches the account-id u32-exhaustion policy).
+        c.next_constant_id = u32::MAX;
+        c.kv_register_constant(b"alpha");
     }
 
     #[test]

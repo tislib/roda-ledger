@@ -429,6 +429,9 @@ impl Runner {
 
                     // Run the registry mutation against WasmRuntime.
                     let is_unregister = binary.is_empty();
+                    // Prior handler identity, captured so a failed `register()`
+                    // can revert the install when the tx rolls back (ADR-023 §6).
+                    let prior = self.wasm_engine.runtime().handler_identity(&name);
                     let outcome = if is_unregister {
                         self.wasm_engine
                             .runtime()
@@ -457,6 +460,14 @@ impl Runner {
                             {
                                 let status = caller.call_register();
                                 if status != 0 {
+                                    // The tx rolls back, but the registry install +
+                                    // disk write already happened — revert them so
+                                    // the install commits atomically with the WAL
+                                    // record (ADR-023 §6), leaving no divergence.
+                                    let _ = self
+                                        .wasm_engine
+                                        .runtime()
+                                        .revert_registration(&name, prior);
                                     self.state.borrow_mut().fail(FailReason::from_u8(status));
                                 }
                             }

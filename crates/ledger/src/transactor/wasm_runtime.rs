@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use storage::Storage;
-use storage::entities::{FailReason, FunctionRegistered};
+use storage::entities::{FailReason, FunctionRegistered, KV_CONSTANT_NAME_MAX};
 use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 /// The required export name on every registered function.
@@ -386,6 +386,33 @@ impl WasmRuntime {
         self.unload_function(name)
     }
 
+    /// Identity of the currently-loaded handler for `name` — its
+    /// `(version, crc32c)`, or `None` if unloaded. Captured before a
+    /// registration so [`Self::revert_registration`] can restore it.
+    pub fn handler_identity(&self, name: &str) -> Option<(u16, u32)> {
+        self.handlers
+            .read()
+            .expect("handlers lock poisoned")
+            .get(name)
+            .map(|r| (r.version, r.crc32c))
+    }
+
+    /// Undo a just-applied registration when its transaction rolls back
+    /// (e.g. the module's `register()` export failed, ADR-023 §6). Restores
+    /// the `prior` handler by reloading its binary from disk, or unloads the
+    /// function entirely if there was none — so the in-memory registry matches
+    /// the (uncommitted) WAL. Bumps `update_seq`, so every engine's next
+    /// `caller` lookup reconciles.
+    pub fn revert_registration(&self, name: &str, prior: Option<(u16, u32)>) -> io::Result<()> {
+        match prior {
+            Some((version, crc32c)) => {
+                let binary = self.storage.read_function(name, version)?;
+                self.load_function(name, &binary, version, crc32c)
+            }
+            None => self.unload_function(name),
+        }
+    }
+
     pub fn recover_function(&self, function_registered: &FunctionRegistered) -> io::Result<()> {
         let fn_name = std::str::from_utf8(&function_registered.name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -576,6 +603,15 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
                     ));
                 }
                 let name = read_guest_name(&mut caller, name_ptr)?;
+                if name.len() > KV_CONSTANT_NAME_MAX {
+                    caller
+                        .data()
+                        .borrow_mut()
+                        .fail(FailReason::CONSTANT_NAME_TOO_LONG);
+                    return Err(wasmtime::Error::msg(
+                        "constant name exceeds KV_CONSTANT_NAME_MAX bytes",
+                    ));
+                }
                 caller.data().borrow_mut().kv_register_constant(&name);
                 Ok(())
             },
@@ -617,8 +653,10 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
     linker
 }
 
-/// Read a null-terminated UTF-8 name (capped at 32 bytes) from guest memory at
-/// `ptr`. Used by the constant verbs.
+/// Read a null-terminated UTF-8 name from guest memory at `ptr` (the full name —
+/// length is bounded by the guest memory edge, not truncated). The caller
+/// enforces `KV_CONSTANT_NAME_MAX`; silently truncating here would alias two
+/// distinct names that share a prefix. Used by the constant verbs.
 fn read_guest_name(
     caller: &mut Caller<'_, WasmStoreData>,
     ptr: u32,
@@ -634,7 +672,7 @@ fn read_guest_name(
     }
     let rest = &bytes[start..];
     let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-    Ok(rest[..len.min(32)].to_vec())
+    Ok(rest[..len].to_vec())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

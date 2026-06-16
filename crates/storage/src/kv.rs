@@ -352,6 +352,23 @@ mod tests {
     }
 
     #[test]
+    fn numeric_constant_name_does_not_roundtrip_via_string() {
+        // LIMITATION (ADR-023): the string key form is lossy for numeric
+        // constant names. A constant named "100" Displays as "100", but
+        // `from_string("100")` parses it back as `Int(100)` — not the constant —
+        // so it cannot be queried by name via the string form. Non-numeric names
+        // (the common case) are unaffected.
+        let c = Value::from_constant("100");
+        assert_eq!(c.to_string(), "100");
+        let parsed = KeyPath::from_string("100").unwrap();
+        assert_eq!(parsed.0[0], Value::Int(100));
+        assert_ne!(
+            parsed.0[0], c,
+            "numeric constant name aliases an integer key"
+        );
+    }
+
+    #[test]
     fn value_slot_delete_vs_zero() {
         // Empty slot (delete) is distinct from a stored Integer 0.
         let empty = Value::pack_slot(None).unwrap();

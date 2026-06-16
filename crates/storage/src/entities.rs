@@ -45,7 +45,10 @@ impl FailReason {
     // `kv_get_constant` looked up a name that was never registered (ADR-023 §6);
     // execution is stopped so the module cannot proceed with a bogus id.
     pub const CONSTANT_NOT_FOUND: Self = Self(9);
-    // 10–127 reserved for future standard reasons
+    // A constant name exceeds `KV_CONSTANT_NAME_MAX` bytes (ADR-023 §6) and can't
+    // be stored in the `KvConstant` record; rejected rather than silently truncated.
+    pub const CONSTANT_NAME_TOO_LONG: Self = Self(10);
+    // 11–127 reserved for future standard reasons
     // 128–255 user-defined custom reasons
 
     pub fn is_success(&self) -> bool {
@@ -361,6 +364,10 @@ pub struct KvConstant {
     pub key: u32,        // 4 @ 4
     pub value: [u8; 32], // 32 @ 8 — null-terminated UTF-8; tail zeroed
 } // total: 40 bytes
+
+/// Max byte length of an interned constant name/value — the `KvConstant.value`
+/// budget (ADR-023 §6). Names longer than this are rejected at the host boundary.
+pub const KV_CONSTANT_NAME_MAX: usize = 32;
 
 impl KvConstant {
     pub fn new(key: u32, value: &[u8]) -> Self {

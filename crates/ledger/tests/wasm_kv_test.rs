@@ -74,6 +74,14 @@ const PROHIBITED_REGISTER_SRC: &str = r#"
     execute!(|_p| { Status::OK });
 "#;
 
+/// `register` that declares a constant whose name exceeds the 32-byte budget
+/// (33 chars) — the host must reject it rather than silently truncate.
+const OVERLONG_CONST_SRC: &str = r#"
+    use roda_wasm_abi::{execute, kv_register_constant, register, Status};
+    register!(|| { kv_register_constant(c"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); });
+    execute!(|_p| { Status::OK });
+"#;
+
 /// store_alpha(value = p0): declares constant "alpha"; stores value at
 /// kv["alpha"/1].
 const STORE_ALPHA_SRC: &str = r#"
@@ -205,6 +213,153 @@ fn register_prohibited_call_rejected() {
             .register_function("prohibited", &compile(PROHIBITED_REGISTER_SRC), false)
             .is_err(),
         "a data verb (kv_set) called from register() must fail registration"
+    );
+}
+
+// A registration whose `register()` export fails must roll back *completely*
+// (ADR-023 §6: constants commit atomically with the `FunctionRegistered`
+// record). The module is installed into the shared `WasmRuntime` registry
+// *before* `register()` runs, and `Computer::rollback` does not undo that
+// install — so a failed `register()` returns `Err` to the caller yet leaves the
+// module live in the registry, with no committed WAL record. This test pins the
+// invariant the rollback must restore.
+#[test]
+fn failed_register_leaves_no_trace_in_registry() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    ledger.open_accounts(10);
+
+    // register() calls a prohibited verb → the registration tx fails.
+    let res = ledger.register_function("prohibited", &compile(PROHIBITED_REGISTER_SRC), false);
+    assert!(
+        res.is_err(),
+        "registration must fail when register() is prohibited"
+    );
+
+    // The rolled-back tx must leave nothing behind: not in the registry listing…
+    assert!(
+        !ledger
+            .list_functions()
+            .iter()
+            .any(|f| f.name == "prohibited"),
+        "a rolled-back registration must not leave the module installed"
+    );
+    // …and not callable (no committed FunctionRegistered record exists).
+    assert_eq!(
+        call(&ledger, "prohibited", 0, 0),
+        FailReason::INVALID_OPERATION,
+        "a module whose registration was rolled back must not be callable"
+    );
+}
+
+// The concrete harm of an incomplete rollback: state divergence. Whatever the
+// live node reports for a failed registration must equal what a freshly
+// recovered node reports — the recovered node replays only committed WAL
+// records, so if the live registry kept the module the two disagree.
+#[test]
+fn failed_register_consistent_across_recovery() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = format!("temp_kv_failed_register_{}", nanos);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let make_config = || LedgerConfig {
+        storage: StorageConfig {
+            data_dir: temp_dir.clone(),
+            transaction_count_per_segment: 1000,
+            snapshot_frequency: 1,
+            ..Default::default()
+        },
+        seal_check_internal: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    let prohibited = compile(PROHIBITED_REGISTER_SRC);
+
+    // Phase 1: a failing registration on the live node; observe what it reports.
+    let (live_listed, live_callable);
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        ledger.open_accounts(10);
+        let res = ledger.register_function("prohibited", &prohibited, false);
+        assert!(
+            res.is_err(),
+            "registration must fail when register() is prohibited"
+        );
+
+        live_listed = ledger
+            .list_functions()
+            .iter()
+            .any(|f| f.name == "prohibited");
+        live_callable = call(&ledger, "prohibited", 0, 0) == FailReason::NONE;
+
+        // Roll past a seal so recovery exercises the full WAL replay path.
+        let mut last = 0;
+        for _ in 0..2000 {
+            last = ledger.submit(Operation::Deposit {
+                account: 2,
+                amount: 1,
+                user_ref: 0,
+            });
+        }
+        ledger.wait_for_transaction(last);
+        ledger.wait_for_seal();
+        drop(ledger);
+    }
+
+    // Phase 2: recover from the WAL; the recovered view is the source of truth.
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        let rec_listed = ledger
+            .list_functions()
+            .iter()
+            .any(|f| f.name == "prohibited");
+        let rec_callable = call(&ledger, "prohibited", 0, 0) == FailReason::NONE;
+
+        assert_eq!(
+            live_listed, rec_listed,
+            "live node and recovered node disagree on whether the module is registered"
+        );
+        assert_eq!(
+            live_callable, rec_callable,
+            "live node and recovered node disagree on whether the module is callable"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// A constant name longer than the 32-byte budget must be rejected at the host
+// boundary (ADR-023 §6), not silently truncated (which would alias distinct
+// names). Registration fails and leaves no module installed (via the revert).
+#[test]
+fn register_overlong_constant_name_rejected() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    let res = ledger.register_function("longname", &compile(OVERLONG_CONST_SRC), false);
+    assert!(
+        res.is_err(),
+        "a constant name longer than 32 bytes must be rejected at registration"
+    );
+    assert!(
+        !ledger.list_functions().iter().any(|f| f.name == "longname"),
+        "the rejected registration must not leave the module installed"
     );
 }
 

@@ -249,7 +249,8 @@ This establishes Principle **P3** (architecture: *Design principles*). The WAL i
 - Packed/unpacked split: structural equality on the decoded key removes the canonical-encoding hazard,
   and Rust `Ord` (not byte order) defines any future range scan.
 - Explicit empty-value delete kills the old `value == 0` wart — a real `0` is storable.
-- Big-endian content keeps the wire form deterministic and debuggable.
+- Little-endian, minimal-length content keeps the wire form deterministic and debuggable
+  (endianness is a wire detail only — ordering uses the decoded `Ord`, never the packed bytes).
 
 **Negative**
 - Encode/decode on every op (hot-path cost) — benchmark with `kv_bench` before trusting throughput.
