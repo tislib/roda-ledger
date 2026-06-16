@@ -1,0 +1,22 @@
+# Example guest module — built for wasm, detached from the main workspace.
+#   cargo build --release --target wasm32-unknown-unknown \
+#     --manifest-path crates/roda-wasm-abi/examples/counter/Cargo.toml
+
+# Standalone: its own (empty) workspace so it isn't pulled into the repo root.
+[workspace]
+
+[package]
+name = "roda-example-counter"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+roda-wasm-abi = { path = "../.." }
+
+[profile.release]
+opt-level = "s"
+lto = true

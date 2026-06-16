@@ -1,0 +1,27 @@
+# Guest-side ABI crate — independently versioned and published to crates.io
+# (ADR-026). Unlike the internal workspace crates it sets its own `version` and
+# omits `publish = false`. No dependency on any internal crate so it stays
+# self-contained for `cargo publish`.
+[package]
+name = "roda-wasm-abi"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ergonomic, no_std guest-side ABI for writing roda-ledger WASM transaction modules in Rust."
+keywords = ["wasm", "ledger", "abi", "webassembly"]
+categories = ["wasm", "no-std", "api-bindings"]
+readme = "README.md"
+# Example crates are standalone (own workspace, path dep) — keep them in the repo
+# but out of the published tarball.
+exclude = ["examples/"]
+
+[features]
+default = []
+# Host-only build helper (`tools::compile_to_wasm`). Pulls in `std` and shells
+# out to `cargo`, so it is off by default and never compiled for wasm targets —
+# the default crate stays no_std and wasm-clean.
+tools = []
+
+[dependencies]
