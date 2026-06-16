@@ -119,6 +119,11 @@ fn resolve_value(constants: &HashMap<u32, String>, value: Value) -> Value {
 /// Resolve every constant component of a key (so the snapshot keeps fully
 /// resolved keys — a constant component reads back as `ConstResolved(name)`).
 fn resolve_key(constants: &HashMap<u32, String>, key: KeyPath) -> KeyPath {
+    // Fast path: integer-only keys (the common case) need no resolution, so
+    // skip rebuilding the SmallVec.
+    if !key.0.iter().any(|v| matches!(v, Value::Const(_))) {
+        return key;
+    }
     KeyPath(
         key.0
             .into_iter()
@@ -328,7 +333,11 @@ impl SnapshotRunner {
                         // Index the whole transaction: meta + all followers, stored as-is.
                         self.indexer.insert_transaction(&m, &group);
                         // Apply balances and status flags from the followers.
-                        for follower in group.drain(..) {
+                        // Iterate by reference (followers are `Copy` 40-byte
+                        // records): a `drain` would `ptr::read` every element out,
+                        // which dominated the snapshot profile. `clear()` after is
+                        // O(1) (no Drop).
+                        for follower in &group {
                             match follower {
                                 WalEntry::Entry(e) => {
                                     let acc = self.accounts.load();
@@ -390,6 +399,7 @@ impl SnapshotRunner {
                                 _ => {}
                             }
                         }
+                        group.clear();
                         ctx.set_processed_index(m.tx_id);
                     }
                     // Buffer every follower as-is until its metadata clears the gate.
