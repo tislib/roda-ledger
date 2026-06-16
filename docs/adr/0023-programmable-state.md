@@ -68,7 +68,7 @@ A **Value** is `{typeId}{content}`:
 
 - `typeId` is one byte: high 3 bits = `kind` (1..7), low 5 bits = `len - 1` (content length 1..32).
 - `typeId == 0x00` is the **terminator / empty** — no content. (`kind = 0` is reserved for it.)
-- `content` is `len` bytes, **big-endian**.
+- `content` is `len` bytes, **little-endian**.
 
 A **KeyPath** is a sequence of Values terminated by a `0x00` typeId. Zero-padding in the fixed buffer
 self-terminates, so the `Zeroable` tail is a valid (empty) terminator for free. An empty key (first
@@ -77,9 +77,9 @@ byte `0x00`) is invalid.
 | kind | type | content |
 |---|---|---|
 | 0 | terminator / empty | — |
-| 1 | Integer | big-endian signed, minimal length |
-| 2 | Constant | opaque bytes / short string |
-| 3..7 | reserved (String, Blob, Bool, …) | additive |
+| 1 | Integer | little-endian signed, minimal length |
+| 2 | Constant | a `u32` constant **id**, little-endian unsigned minimal length (see §6) |
+| 3..7 | reserved (Blob, Bool, …) | additive |
 
 The encoder uses **minimal length** (no leading zero bytes) to stay inside the 30-byte key / 8-byte
 value budgets; an encoding that overflows the buffer **fails the operation (rollback)**. Minimal
@@ -101,7 +101,7 @@ from absent** — the old "`value == 0` deletes, no meaningful stored zero" wart
 The codec lives in **`crates/storage/src/kv.rs`** (KV-specific, not a general serializer): `Value` and
 `KeyPath` are the unpacked truth, with `pack`/`unpack` to and from the fixed `KvEntry` fields —
 `KeyPath::pack/unpack` for the 30-byte key, `Value::pack_slot/unpack_slot` for the 9-byte value
-(`None` = empty/delete). `Int` uses minimal-length two's-complement big-endian; `pack` rejects an
+(`None` = empty/delete). `Int` uses minimal-length two's-complement little-endian; `pack` rejects an
 empty key and any overflow past the budget.
 
 **Constant strings — `KvConstant` (40 bytes).** A standalone WAL record (`WalEntryKind::KvConstant`,
@@ -117,18 +117,23 @@ shared pool grows only by module-defined constants (§6), never by runtime input
 A single point-access map over the unpacked types from `storage::kv` (§3):
 
 ```rust
-enum Value   { Int(i64), Const(SmallVec<[u8; 8]>) }  // one TLV unit; derives Hash, Eq, Ord
-struct KeyPath(SmallVec<[Value; 4]>);                // a run of Values; derives Hash, Eq, Ord
-
-// in Computer (ledger): delete = remove the entry, so None is never stored
-kv: FxHashMap<KeyPath, Value>
+enum Value {                       // one TLV unit; derives Hash, Eq, Ord
+    Int(i64),
+    Const(u32),                    // unresolved constant id — what the WAL stores
+    ConstResolved(String),         // resolved value — read-side only, never packed
+}
+struct KeyPath(SmallVec<[Value; 4]>);   // a run of Values
+kv: FxHashMap<KeyPath, Value>           // transactor: delete = remove the entry
 ```
 
 `Value` is the single TLV unit — both a `KeyPath` element and the `KvEntry` value slot (the slot is an
-`Option<Value>`, `None` = empty/delete). No scope, no account array, no register array, no tree. Keys
-are decoded at the WAL / guest boundary; the map **never keys on raw packed bytes** (recovery, seal,
-and dedup all key on `KeyPath`). `KeyPath` derives `Ord` — unused in v1 (no range verb), costs
-nothing, and lets an ordered store return additively later.
+`Option<Value>`, `None` = empty/delete). `Const(id)` is an **unresolved** reference (the constant's id,
+packed minimally like `Int` but unsigned); `ConstResolved` carries the resolved string and is **never
+packed** — the **Snapshot read-side** resolves `Const` → `ConstResolved` and only ever keeps resolved
+values (§7). `Value::from_constant(s)` builds a `ConstResolved`. No scope, no account/register array,
+no tree. Keys are decoded at the WAL / guest boundary; the map **never keys on raw packed bytes**
+(recovery, seal, and dedup all key on `KeyPath`). `KeyPath::from_string` parses a `/`-joined path (the
+inverse of `Display`) for query inputs. `KeyPath` derives `Ord` — unused in v1.
 
 The transactor side lives in **`crates/ledger/src/transactor/kv.rs`** — the KV map plus an
 `impl Computer` block with one method per host verb (§5); it reuses `storage::kv::{KeyPath, Value}` as
@@ -136,73 +141,97 @@ both the map key/value and the WAL codec.
 
 ### 5. Host ABI — added to module `ledger`
 
-Keys and values pass as **packed byte buffers** in guest memory; the host decodes them (bounds-checked):
+**v1 is scalar.** The four `u32` key components flatten into an integer `KeyPath` and the value is a
+full `i64` (stored as `Value::Int`); no guest-memory access on the hot path:
 
 ```rust
-// writes the packed value to out; returns its length (0 = absent / empty)
-fn kv_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> u32;
-// empty val_len deletes; both buffers are packed TLV
-fn kv_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32);
-// intern a constant by name (null-terminated UTF-8); create-or-get, returns the stable u32 id
-fn kv_constant(name_ptr: u32) -> u32;
+fn kv_get(k0: u32, k1: u32, k2: u32, k3: u32) -> i64;             // 0 if absent
+fn kv_set(k0: u32, k1: u32, k2: u32, k3: u32, value: i64);
+// constants by null-terminated UTF-8 name in guest memory (§6)
+fn kv_register_constant(name_ptr: u32);            // register phase only; create-if-absent
+fn kv_get_constant(name_ptr: u32) -> u32;          // execute phase; id, or stop on unknown
 ```
 
 Each is a thin shim forwarding to an identically-named `Computer` method, as `credit`/`debit` do
 (ADR-014). A nonzero module return triggers the standard rollback; a per-tx KV undo log restores prior
-values. Guest-side ergonomics (a `path!` builder, typed get/set) are Future Work / `roda-abi`.
+values. The record on the wire is still the packed `KvEntry` (the transactor packs the `KeyPath`/`Value`
+before logging) — only the *host call* is scalar. A **packed-buffer ABI** (`(ptr, len)` keys/values
+for arbitrary `KeyPath`s and string values) plus guest-side ergonomics (a `path!` builder) are
+Future Work / `roda-abi`.
 
 ### 6. Constant definitions — the `register()` export
 
 Constants are **defined in module code, not config**. A module may export `register()`, which the host
 calls **once per instantiation** (at registration, and after any re-instantiation — recovery, a new
-leader). It interns each constant via `kv_constant` and caches the returned id in a module global:
+leader). The host **type-checks `register` (`() -> ()`) at registration** alongside `execute`, rejecting
+a bad signature; the export is optional. At registration the transactor invokes `register()` **inside
+the registration transaction**, so the constants it defines commit atomically with the
+`FunctionRegistered` record (a nonzero return fails the tx → rollback).
+
+Modules stay **stateless** — no globals carry state between `register` and `execute`. `register()` only
+*declares* constants with `kv_register_constant`; `execute` *resolves* them with `kv_get_constant`
+each call:
 
 ```c
-static i32 pending;                    // module global
-
 void register() {
-    pending = kv_constant("PENDING");  // null-terminated string
+    kv_register_constant("PENDING");        // declare; create-if-absent
 }
 
 i32 execute(/* ... */) {
-    // `pending` is just an integer — the stable id of the PENDING constant
+    i32 pending = kv_get_constant("PENDING"); // resolve at call time (no globals)
     kv_set(/* ...key... */, pending);
 }
 ```
 
-`kv_constant(name)` is **create-or-get and idempotent**: the first call for a name allocates the next
-id from the Transactor's monotonic counter and emits a `KvConstant` WAL record (`id → name`); every
-later call — same node or another, this run or a replay — returns the **same id**. Constants are thus
-immutable, created exactly once, and globally stable.
+`kv_register_constant(name)` is **create-if-absent**: the first declaration of a name allocates the
+next id from the Transactor's monotonic counter and emits a `KvConstant` WAL record (`id → name`);
+re-declaring is a no-op. Ids are therefore immutable, created exactly once, and globally stable.
+`kv_get_constant(name)` returns the id, or — if the name was never registered — **stops execution**
+with `FailReason::CONSTANT_NOT_FOUND` (rather than letting the module run with a bogus id).
 
-Because the id comes from the single-threaded Transactor and is logged, replicas and recoveries agree
+Because ids come from the single-threaded Transactor and are logged, replicas and recoveries agree
 **without re-running the module**: a follower replays `KvConstant` records to rebuild the name→id map
-(and the counter), and when it later instantiates the module to execute, `register()` re-resolves the
-same ids (create-or-get finds them — no new records). New `KvConstant` records are therefore written
-only by whichever node first registers the module. The module never mints strings from runtime input —
+(and the counter). `kv_get_constant` reads that map at execute time, so a new leader resolves the same
+ids with no re-`register()` and no cached globals. The module never mints strings from runtime input —
 only its own authored constant names enter the registry — so the pool stays bounded (§3).
+
+**A constant key component keeps its type end-to-end.** `kv_get_constant` returns the id with a
+high-bit tag (`KV_CONST_TAG`); `kv_key` strips it and emits `Value::Const(id)` (not `Value::Int`), so
+the packed `KvEntry` carries `kind = Const` for that component. The Snapshot read-side then resolves
+`Const(id)` → `ConstResolved(name)` in **both keys and values**, so a key written as
+`"tariffs"/tariff_id/…` reads back by name (`KeyPath::from_string("tariffs/1/0/0")` matches) and the
+raw integer id does **not** match — the type is part of the key's identity. (The tag reserves the top
+bit of a `u32` key component; plain integer components are therefore `< 2^31`, which constant ids never
+approach. A future packed-buffer ABI would carry the type without the tag.)
 
 **Callable surface is split by phase** (host-enforced):
 
 | Export | May call | May **not** call |
 |---|---|---|
-| `register()` | `kv_constant` only (for now) | everything else (`kv_get`/`kv_set`, `credit`/`debit`, …) |
-| `execute()` (and other event exports) | every host verb | `kv_constant` |
+| `register()` | `kv_register_constant` only | everything else (`kv_get`/`kv_set`, `kv_get_constant`, `credit`/`debit`, …) |
+| `execute()` (and other event exports) | every host verb (incl. `kv_get_constant`) | `kv_register_constant` |
 
-`kv_constant` is callable **only during the register phase**; calling it from `execute` — or calling
-any data/balance verb from `register` — is rejected with `FailReason::PROHIBITED_HOST_CALL` (the host
-shim sets the reason and traps; the Transactor surfaces it and rolls back, like any other fail reason).
-This keeps constant definition a one-time, registration-time act, separate from per-transaction work:
-`execute` resolves names it already cached as ids in `register`, never defines new ones. The host
-enforces the split by admitting only the phase-appropriate verbs while each export runs.
+Calling a prohibited verb for the phase — `kv_register_constant` from `execute`, or any other verb from
+`register` — is rejected with `FailReason::PROHIBITED_HOST_CALL` (the host shim sets the reason and
+traps; the Transactor surfaces it and rolls back). This keeps constant definition a one-time,
+registration-time act, separate from per-transaction work. The phase and its enforcement live on
+`WasmStoreData`, not scattered through the linker.
 
 ### 7. Recovery
 
 KV is **checkpointed in the snapshot**, like balances. The seal stage folds `KvEntry` records into a
-baseline as segments seal and writes a per-segment kv-snapshot file. Recovery loads that baseline into
-the in-memory map (decoding each record's `KeyPath` / `Value`), then replays the post-snapshot tail
-last-writer-wins (empty value removes the key). Recovery **decodes at the boundary and keys on
-`KeyPath`**, never on raw bytes. Cost is bounded by snapshot frequency, exactly like balances.
+baseline as segments seal and writes a per-segment kv-snapshot file; **interned constants ride in the
+same file** (entry records, then constant records, under one header/compression/CRC), folded from
+`KvConstant` records alongside the KV state. Recovery loads that baseline into the in-memory map
+(decoding each record's `KeyPath` / `Value`) and the constant registry, then replays the post-snapshot
+tail last-writer-wins (empty value removes the key; `KvConstant` re-interns). Recovery **decodes at the
+boundary and keys on `KeyPath`**, never on raw bytes. Cost is bounded by snapshot frequency, exactly
+like balances.
+
+**The Snapshot read-side keeps only resolved values.** It holds the constant registry (`id → value`)
+built from `KvConstant` records, and as it applies each `KvEntry` it resolves a `Const(id)` value to
+`ConstResolved(value)` before storing — so a `get_kv` reader never sees a bare id. (The transactor
+write-side keeps the unresolved `Const(id)`; resolution is a read-side concern.)
 
 ### 8. Scope — self-sufficient state, not a query engine
 
