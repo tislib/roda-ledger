@@ -1097,6 +1097,29 @@ impl NodeClient {
         .await
     }
 
+    /// Read the KV value at `key` (a "/"-joined path, e.g. `"plans/1"`), parsed
+    /// server-side. Returns the integer value, or `None` if absent / non-integer
+    /// (ADR-023). Constant components in `key` are matched by name.
+    pub async fn get_kv(&self, key: &str) -> Result<Option<i64>> {
+        self.with_retry("get_kv", || async {
+            let mut client = self.inner.clone();
+            let resp = client
+                .get_kv(proto::GetKvRequest {
+                    key: Some(proto::WalKvKeyPath {
+                        items: Vec::new(),
+                        str: key.to_string(),
+                    }),
+                })
+                .await?
+                .into_inner();
+            Ok(match resp.value.and_then(|v| v.kind) {
+                Some(proto::wal_kv_value::Kind::Integer(i)) if resp.found => Some(i),
+                _ => None,
+            })
+        })
+        .await
+    }
+
     /// Unregister a WASM function by name. Returns the version stamped on
     /// the unregister record.
     pub async fn unregister_function(&self, name: &str) -> Result<u16> {

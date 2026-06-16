@@ -28,7 +28,7 @@
 //! No `unsafe`, no raw pointers, no generics.
 
 use crate::transactor::Computer;
-use std::cell::RefCell;
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
@@ -36,11 +36,14 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use storage::Storage;
-use storage::entities::FunctionRegistered;
+use storage::entities::{FailReason, FunctionRegistered, KV_CONSTANT_NAME_MAX};
 use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 /// The required export name on every registered function.
 pub const EXECUTE_FN: &str = "execute";
+/// Optional export (ADR-023 §6): defines the module's constants. Called once per
+/// instantiation; signature `() -> ()`.
+pub const REGISTER_FN: &str = "register";
 /// The required host module name for host imports.
 pub const HOST_MODULE: &str = "ledger";
 /// The fixed arity of the `execute` export (i64 × N).
@@ -52,16 +55,73 @@ pub const EXECUTE_ARITY: usize = 8;
 /// same standard-status pipeline.
 pub const INVALID_OPERATION_STATUS: u8 = 5;
 
+/// Status a host shim sets before trapping when the module calls a verb
+/// prohibited in the current phase (ADR-023 §6). Numerically equal to
+/// `FailReason::PROHIBITED_HOST_CALL`.
+pub const PROHIBITED_HOST_CALL_STATUS: u8 = 8;
+
 /// Typed handle to the WASM `execute` export. Used by both the shared
 /// signature check and the per-engine caller cache.
 type ExecTypedFunc = TypedFunc<(i64, i64, i64, i64, i64, i64, i64, i64), i32>;
 
+/// Typed handle to the optional `register` export (`() -> ()`).
+type RegisterTypedFunc = TypedFunc<(), ()>;
+
+/// Host-call phase (ADR-023 §6): `register()` runs in `Register` (only
+/// `kv_register_constant` callable); `execute` and other exports run in `Execute`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Phase {
+    Execute,
+    Register,
+}
+
 /// Store data threaded through wasmtime host calls: the shared mutable
-/// transactor state. The transactor writes its per-transaction id into
-/// the state via [`Computer::init`] before calling
-/// [`FunctionCaller::execute`], so no `tx_id` ever crosses the wasmtime
-/// boundary.
-pub type WasmStoreData = Rc<RefCell<Computer>>;
+/// transactor state plus the current host-call phase. Keeping the phase and its
+/// enforcement here (rather than scattered through `build_host_linker`) is what
+/// gates `kv_register_constant` to the register phase and every other verb to execute.
+pub struct WasmStoreData {
+    computer: Rc<RefCell<Computer>>,
+    phase: Cell<Phase>,
+}
+
+impl WasmStoreData {
+    pub fn new(computer: Rc<RefCell<Computer>>) -> Self {
+        Self {
+            computer,
+            phase: Cell::new(Phase::Execute),
+        }
+    }
+
+    pub fn borrow(&self) -> Ref<'_, Computer> {
+        self.computer.borrow()
+    }
+    pub fn borrow_mut(&self) -> RefMut<'_, Computer> {
+        self.computer.borrow_mut()
+    }
+
+    pub fn enter_register_phase(&self) {
+        self.phase.set(Phase::Register);
+    }
+    pub fn exit_register_phase(&self) {
+        self.phase.set(Phase::Execute);
+    }
+    pub fn in_register_phase(&self) -> bool {
+        self.phase.get() == Phase::Register
+    }
+
+    /// Guard for a data/balance verb: in the register phase it is prohibited —
+    /// record `PROHIBITED_HOST_CALL` (failing the tx) and report rejection.
+    fn reject_in_register(&self) -> bool {
+        if self.in_register_phase() {
+            self.computer
+                .borrow_mut()
+                .fail(FailReason::PROHIBITED_HOST_CALL);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmRuntime — shared compiled-module registry
@@ -117,6 +177,7 @@ impl WasmRuntime {
         let module = Module::from_binary(&self.engine, binary)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         check_execute_signature(&module)?;
+        check_register_signature(&module)?;
         Ok(())
     }
 
@@ -149,6 +210,7 @@ impl WasmRuntime {
         let module = Module::from_binary(&self.engine, binary)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         check_execute_signature(&module)?;
+        check_register_signature(&module)?;
 
         let mut guard = self
             .handlers
@@ -324,6 +386,33 @@ impl WasmRuntime {
         self.unload_function(name)
     }
 
+    /// Identity of the currently-loaded handler for `name` — its
+    /// `(version, crc32c)`, or `None` if unloaded. Captured before a
+    /// registration so [`Self::revert_registration`] can restore it.
+    pub fn handler_identity(&self, name: &str) -> Option<(u16, u32)> {
+        self.handlers
+            .read()
+            .expect("handlers lock poisoned")
+            .get(name)
+            .map(|r| (r.version, r.crc32c))
+    }
+
+    /// Undo a just-applied registration when its transaction rolls back
+    /// (e.g. the module's `register()` export failed, ADR-023 §6). Restores
+    /// the `prior` handler by reloading its binary from disk, or unloads the
+    /// function entirely if there was none — so the in-memory registry matches
+    /// the (uncommitted) WAL. Bumps `update_seq`, so every engine's next
+    /// `caller` lookup reconciles.
+    pub fn revert_registration(&self, name: &str, prior: Option<(u16, u32)>) -> io::Result<()> {
+        match prior {
+            Some((version, crc32c)) => {
+                let binary = self.storage.read_function(name, version)?;
+                self.load_function(name, &binary, version, crc32c)
+            }
+            None => self.unload_function(name),
+        }
+    }
+
     pub fn recover_function(&self, function_registered: &FunctionRegistered) -> io::Result<()> {
         let fn_name = std::str::from_utf8(&function_registered.name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -374,6 +463,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "credit",
             |caller: Caller<'_, WasmStoreData>, account_id: u64, amount: u64| {
+                if caller.data().reject_in_register() {
+                    return;
+                }
                 caller.data().borrow_mut().credit(account_id, amount);
             },
         )
@@ -383,6 +475,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "debit",
             |caller: Caller<'_, WasmStoreData>, account_id: u64, amount: u64| {
+                if caller.data().reject_in_register() {
+                    return;
+                }
                 caller.data().borrow_mut().debit(account_id, amount);
             },
         )
@@ -392,6 +487,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "get_balance",
             |caller: Caller<'_, WasmStoreData>, account_id: u64| -> i64 {
+                if caller.data().reject_in_register() {
+                    return 0;
+                }
                 caller.data().borrow().get_balance(account_id)
             },
         )
@@ -401,6 +499,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "linked_account",
             |caller: Caller<'_, WasmStoreData>, account_id: u64, type_id: u32| -> u64 {
+                if caller.data().reject_in_register() {
+                    return 0;
+                }
                 // Get-or-create the bucket linked to `account_id` under
                 // `type_id` (ADR-022 §6); returns the child account id.
                 caller
@@ -415,6 +516,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "get_flag",
             |caller: Caller<'_, WasmStoreData>, account_id: u64, lane: u32| -> u32 {
+                if caller.data().reject_in_register() {
+                    return 0;
+                }
                 caller
                     .data()
                     .borrow()
@@ -427,6 +531,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "has_flag",
             |caller: Caller<'_, WasmStoreData>, account_id: u64, lane: u32, value: u32| -> u32 {
+                if caller.data().reject_in_register() {
+                    return 0;
+                }
                 caller
                     .data()
                     .borrow()
@@ -439,6 +546,9 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "set_flag",
             |caller: Caller<'_, WasmStoreData>, account_id: u64, lane: u32, value: u32| {
+                if caller.data().reject_in_register() {
+                    return;
+                }
                 // ADR-022 §6: WASM may set any lane, including the status lane (0).
                 caller
                     .data()
@@ -448,12 +558,15 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
         )
         .expect("register ledger.set_flag");
 
-    // ── Programmable KV state (ADR-023) ──────────────────────────────────────
+    // ── Programmable KV state (ADR-023 §4) — single map, two verbs ───────────
     linker
         .func_wrap(
             HOST_MODULE,
             "kv_get",
             |caller: Caller<'_, WasmStoreData>, k0: u32, k1: u32, k2: u32, k3: u32| -> i64 {
+                if caller.data().reject_in_register() {
+                    return 0;
+                }
                 caller.data().borrow().kv_get([k0, k1, k2, k3])
             },
         )
@@ -463,163 +576,103 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
             HOST_MODULE,
             "kv_set",
             |caller: Caller<'_, WasmStoreData>, k0: u32, k1: u32, k2: u32, k3: u32, value: i64| {
+                if caller.data().reject_in_register() {
+                    return;
+                }
                 caller.data().borrow_mut().kv_set([k0, k1, k2, k3], value);
             },
         )
         .expect("register ledger.kv_set");
+
+    // Constants (ADR-023 §6). `kv_register_constant` declares a constant and is
+    // the ONLY verb allowed in the register phase; `kv_get_constant` resolves a
+    // name to its id at execute time (modules stay stateless — no globals). Both
+    // take a `name_ptr` to a null-terminated UTF-8 name in guest memory.
     linker
         .func_wrap(
             HOST_MODULE,
-            "kv_get_scoped",
-            |caller: Caller<'_, WasmStoreData>,
-             account_id: u64,
-             k0: u32,
-             k1: u32,
-             k2: u32,
-             k3: u32|
-             -> i64 {
-                caller
-                    .data()
-                    .borrow()
-                    .kv_get_scoped(account_id, [k0, k1, k2, k3])
-            },
-        )
-        .expect("register ledger.kv_get_scoped");
-    linker
-        .func_wrap(
-            HOST_MODULE,
-            "kv_set_scoped",
-            |caller: Caller<'_, WasmStoreData>,
-             account_id: u64,
-             k0: u32,
-             k1: u32,
-             k2: u32,
-             k3: u32,
-             value: i64| {
-                caller
-                    .data()
-                    .borrow_mut()
-                    .kv_set_scoped(account_id, [k0, k1, k2, k3], value);
-            },
-        )
-        .expect("register ledger.kv_set_scoped");
-    linker
-        .func_wrap(
-            HOST_MODULE,
-            "kv_add",
-            |caller: Caller<'_, WasmStoreData>,
-             account_id: u64,
-             k0: u32,
-             k1: u32,
-             k2: u32,
-             k3: u32,
-             delta: i64|
-             -> i64 {
-                caller
-                    .data()
-                    .borrow_mut()
-                    .kv_add(account_id, [k0, k1, k2, k3], delta)
-            },
-        )
-        .expect("register ledger.kv_add");
-    linker
-        .func_wrap(
-            HOST_MODULE,
-            "tree_get",
-            |caller: Caller<'_, WasmStoreData>,
-             account_id: u64,
-             k0: u32,
-             k1: u32,
-             k2: u32,
-             k3: u32|
-             -> i64 {
-                caller
-                    .data()
-                    .borrow()
-                    .tree_get(account_id, [k0, k1, k2, k3])
-            },
-        )
-        .expect("register ledger.tree_get");
-    linker
-        .func_wrap(
-            HOST_MODULE,
-            "tree_set",
-            |caller: Caller<'_, WasmStoreData>,
-             account_id: u64,
-             k0: u32,
-             k1: u32,
-             k2: u32,
-             k3: u32,
-             value: i64| {
-                caller
-                    .data()
-                    .borrow_mut()
-                    .tree_set(account_id, [k0, k1, k2, k3], value);
-            },
-        )
-        .expect("register ledger.tree_set");
-    linker
-        .func_wrap(
-            HOST_MODULE,
-            "tree_range",
-            |mut caller: Caller<'_, WasmStoreData>,
-             account_id: u64,
-             k0: u32,
-             k1: u32,
-             k2: u32,
-             lo: u32,
-             hi: u32,
-             out_ptr: u32,
-             cap: u32|
-             -> u32 {
-                // Collect first (drops the Computer borrow), then write each
-                // (k3: u32 @0, value: i64 @8) pair into guest memory at out_ptr.
-                let pairs = caller.data().borrow().tree_range(
-                    account_id,
-                    [k0, k1, k2],
-                    lo,
-                    hi,
-                    cap as usize,
-                );
-                let mem = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(m)) => m,
-                    _ => return 0,
-                };
-                let buf = mem.data_mut(&mut caller);
-                let mut written = 0u32;
-                for (i, (k3, value)) in pairs.iter().enumerate() {
-                    let base = out_ptr as usize + i * 16;
-                    if base + 16 > buf.len() {
-                        break;
-                    }
-                    buf[base..base + 4].copy_from_slice(&k3.to_le_bytes());
-                    buf[base + 8..base + 16].copy_from_slice(&value.to_le_bytes());
-                    written += 1;
+            "kv_register_constant",
+            |mut caller: Caller<'_, WasmStoreData>, name_ptr: u32| -> Result<(), wasmtime::Error> {
+                if !caller.data().in_register_phase() {
+                    caller
+                        .data()
+                        .borrow_mut()
+                        .fail(FailReason::PROHIBITED_HOST_CALL);
+                    return Err(wasmtime::Error::msg(
+                        "kv_register_constant is callable only during register()",
+                    ));
                 }
-                written
+                let name = read_guest_name(&mut caller, name_ptr)?;
+                if name.len() > KV_CONSTANT_NAME_MAX {
+                    caller
+                        .data()
+                        .borrow_mut()
+                        .fail(FailReason::CONSTANT_NAME_TOO_LONG);
+                    return Err(wasmtime::Error::msg(
+                        "constant name exceeds KV_CONSTANT_NAME_MAX bytes",
+                    ));
+                }
+                caller.data().borrow_mut().kv_register_constant(&name);
+                Ok(())
             },
         )
-        .expect("register ledger.tree_range");
+        .expect("register ledger.kv_register_constant");
     linker
         .func_wrap(
             HOST_MODULE,
-            "register_read",
-            |caller: Caller<'_, WasmStoreData>, id: u32| -> i64 {
-                caller.data().borrow().register_read(id)
+            "kv_get_constant",
+            |mut caller: Caller<'_, WasmStoreData>,
+             name_ptr: u32|
+             -> Result<u32, wasmtime::Error> {
+                if caller.data().reject_in_register() {
+                    return Err(wasmtime::Error::msg(
+                        "kv_get_constant is not callable during register()",
+                    ));
+                }
+                let name = read_guest_name(&mut caller, name_ptr)?;
+                // Resolve and drop the borrow before the not-found arm re-borrows
+                // mutably to set the fail reason.
+                let resolved = caller.data().borrow().kv_get_constant(&name);
+                match resolved {
+                    // Tag the id so a key component built from it packs as a
+                    // constant (`kv_key` strips the tag), not a plain integer.
+                    Some(id) => Ok(id | crate::transactor::kv::KV_CONST_TAG),
+                    None => {
+                        // Stop execution rather than let the module run with a bogus id.
+                        caller
+                            .data()
+                            .borrow_mut()
+                            .fail(FailReason::CONSTANT_NOT_FOUND);
+                        Err(wasmtime::Error::msg("kv_get_constant: unknown constant"))
+                    }
+                }
             },
         )
-        .expect("register ledger.register_read");
-    linker
-        .func_wrap(
-            HOST_MODULE,
-            "register_write",
-            |caller: Caller<'_, WasmStoreData>, id: u32, value: i64| {
-                caller.data().borrow_mut().register_write(id, value);
-            },
-        )
-        .expect("register ledger.register_write");
+        .expect("register ledger.kv_get_constant");
 
     linker
+}
+
+/// Read a null-terminated UTF-8 name from guest memory at `ptr` (the full name —
+/// length is bounded by the guest memory edge, not truncated). The caller
+/// enforces `KV_CONSTANT_NAME_MAX`; silently truncating here would alias two
+/// distinct names that share a prefix. Used by the constant verbs.
+fn read_guest_name(
+    caller: &mut Caller<'_, WasmStoreData>,
+    ptr: u32,
+) -> Result<Vec<u8>, wasmtime::Error> {
+    let mem = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return Err(wasmtime::Error::msg("module exports no `memory`")),
+    };
+    let bytes = mem.data(&*caller);
+    let start = ptr as usize;
+    if start > bytes.len() {
+        return Err(wasmtime::Error::msg("constant name_ptr out of bounds"));
+    }
+    let rest = &bytes[start..];
+    let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    Ok(rest[..len].to_vec())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -644,6 +697,8 @@ fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
 pub struct FunctionCaller {
     crc32c: u32,
     exec_fn: ExecTypedFunc,
+    /// Optional `register` export (ADR-023 §6), resolved at instantiation.
+    register_fn: Option<RegisterTypedFunc>,
     store: Rc<RefCell<Store<WasmStoreData>>>,
     verified_at_seq: u32,
 }
@@ -673,6 +728,36 @@ impl FunctionCaller {
             ),
         ) {
             Ok(r) => (r as u32 & 0xFF) as u8,
+            // A host shim that aborts the module (e.g. a prohibited-call phase
+            // violation) sets the fail reason before trapping; surface it, else
+            // map the bare trap to INVALID_OPERATION.
+            Err(_) => match store.data().borrow().status() {
+                0 => INVALID_OPERATION_STATUS,
+                reason => reason,
+            },
+        }
+    }
+
+    /// Invoke the optional `register` export (ADR-023 §6) to define the module's
+    /// constants. Returns the `u8` status: `0` = success or no `register` export;
+    /// otherwise a host-set fail reason (e.g. a prohibited-call phase violation),
+    /// falling back to `INVALID_OPERATION_STATUS` on a bare trap.
+    #[inline]
+    pub fn call_register(&self) -> u8 {
+        let Some(register_fn) = &self.register_fn else {
+            return 0;
+        };
+        let mut store = self.store.borrow_mut();
+        // Enter the register phase: only `kv_constant` is callable inside.
+        store.data().enter_register_phase();
+        let result = register_fn.call(&mut *store, ());
+        store.data().exit_register_phase();
+        // A prohibited verb sets the fail reason without trapping; surface it
+        // whether `register` returned Ok or trapped.
+        let status = store.data().borrow().status();
+        match result {
+            Ok(()) => status,
+            Err(_) if status != 0 => status,
             Err(_) => INVALID_OPERATION_STATUS,
         }
     }
@@ -707,7 +792,7 @@ impl WasmRuntimeEngine {
     pub fn new(runtime: Arc<WasmRuntime>, state: Rc<RefCell<Computer>>) -> Self {
         let store = Rc::new(RefCell::new(Store::new(
             runtime.engine(),
-            Rc::clone(&state),
+            WasmStoreData::new(Rc::clone(&state)),
         )));
         Self {
             runtime,
@@ -762,7 +847,7 @@ impl WasmRuntimeEngine {
                     // Instantiation needs the store temporarily; borrow
                     // mutably for the duration, then drop so the
                     // resulting `FunctionCaller` can share it.
-                    let exec_fn: ExecTypedFunc = {
+                    let (exec_fn, register_fn): (ExecTypedFunc, Option<RegisterTypedFunc>) = {
                         let mut store = self.store.borrow_mut();
                         let Ok(instance) = self.runtime.linker.instantiate(&mut *store, &module)
                         else {
@@ -771,13 +856,18 @@ impl WasmRuntimeEngine {
                         let Ok(f) = instance.get_typed_func(&mut *store, EXECUTE_FN) else {
                             return None;
                         };
-                        f
+                        // `register` is optional; absent modules define no constants.
+                        let r = instance
+                            .get_typed_func::<(), ()>(&mut *store, REGISTER_FN)
+                            .ok();
+                        (f, r)
                     };
                     self.cache.insert(
                         name.to_string(),
                         FunctionCaller {
                             crc32c: shared_crc,
                             exec_fn,
+                            register_fn,
                             store: Rc::clone(&self.store),
                             verified_at_seq: live_seq,
                         },
@@ -862,6 +952,30 @@ fn check_execute_signature(module: &Module) -> io::Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+/// Enforce the optional `register` ABI (ADR-023 §6): if a module exports
+/// `register`, it must be a function taking no params and returning nothing.
+/// Absent is fine — the export is optional.
+fn check_register_signature(module: &Module) -> io::Result<()> {
+    use wasmtime::ExternType;
+
+    let Some(export) = module.get_export(REGISTER_FN) else {
+        return Ok(());
+    };
+    let ExternType::Func(func_ty) = export else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("export `{REGISTER_FN}` is not a function"),
+        ));
+    };
+    if func_ty.params().len() != 0 || func_ty.results().len() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("`{REGISTER_FN}` must take no parameters and return nothing"),
+        ));
+    }
     Ok(())
 }
 

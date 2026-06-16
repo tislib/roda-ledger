@@ -2,15 +2,14 @@ use crate::config::LedgerConfig;
 use crate::pipeline::SealContext;
 use crate::recover::ActiveSnapshot;
 use crate::transactor::grow_capacity;
-use crate::transactor::kv::KvKey;
 use spdlog::{debug, error};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 use storage::SegmentStaus::SEALED;
-use storage::entities::WalEntry;
-use storage::{Segment, Storage};
+use storage::entities::{KvEntry, WalEntry};
+use storage::{KeyPath, Segment, Storage, Value};
 
 /// One-shot launcher for the seal thread. Holds exactly what `start` needs;
 /// `start` consumes `self`, recovers the runner's baseline from `active_snapshot`,
@@ -65,7 +64,10 @@ struct SealRunner {
     function_map: HashMap<String, (u16, u32)>,
     /// Programmable KV state (ADR-023): folded as segments seal and written into
     /// each snapshot so recovery loads it rather than replaying the whole WAL.
-    kv: HashMap<KvKey, i64>,
+    kv: HashMap<KeyPath, Value>,
+    /// Interned constants (ADR-023): `key → null-terminated value`, written into
+    /// the same KV snapshot file as `kv`.
+    constants: HashMap<u32, [u8; 32]>,
     seal_check_internal: Duration,
 }
 
@@ -98,6 +100,7 @@ impl SealRunner {
             resize_factor: config.resize_factor,
             function_map,
             kv: snap.kv.clone(),
+            constants: snap.constants.clone(),
             seal_check_internal: config.seal_check_internal,
         }
     }
@@ -229,12 +232,20 @@ impl SealRunner {
                 self.flags[a.account_id as usize] = a.new_flags;
             }
             WalEntry::Kv(k) => {
-                let key = KvKey::new(k.kv_scope, k.account_id, k.key);
-                if k.value == 0 {
-                    self.kv.remove(&key);
-                } else {
-                    self.kv.insert(key, k.value);
+                if let Ok((key, value)) = k.decode() {
+                    match value {
+                        Some(v) => {
+                            self.kv.insert(key, v);
+                        }
+                        None => {
+                            self.kv.remove(&key);
+                        }
+                    }
                 }
+            }
+            WalEntry::KvConstant(c) => {
+                // Immutable / create-once (ADR-023 §6): same key always re-folds the same value.
+                self.constants.insert(c.key, c.value);
             }
             _ => {}
         })
@@ -298,14 +309,22 @@ impl SealRunner {
             );
         }
 
-        // KV snapshot (ADR-023) — the full programmable KV state as-of this segment.
-        let mut kv_records: Vec<(u16, u64, [u32; 4], i64)> = self
+        // KV snapshot (ADR-023) — the full programmable KV state plus interned
+        // constants as-of this segment, in the one file.
+        let mut kv_records: Vec<([u8; 30], [u8; 9])> = self
             .kv
             .iter()
-            .map(|(k, &v)| (k.kv_scope, k.account_id, k.key, v))
+            .filter_map(|(k, v)| {
+                KvEntry::from_parts(k, Some(v))
+                    .ok()
+                    .map(|e| (e.key, e.value))
+            })
             .collect();
         kv_records.sort_unstable();
-        if let Err(e) = segment.save_kv_snapshot(&kv_records[..]) {
+        let mut kv_constants: Vec<(u32, [u8; 32])> =
+            self.constants.iter().map(|(&k, &v)| (k, v)).collect();
+        kv_constants.sort_unstable_by_key(|(k, _)| *k);
+        if let Err(e) = segment.save_kv_snapshot(&kv_records[..], &kv_constants[..]) {
             error!(
                 "Seal: failed to save kv snapshot for segment {}: {}",
                 segment.id(),

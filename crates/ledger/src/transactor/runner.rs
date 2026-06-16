@@ -429,6 +429,9 @@ impl Runner {
 
                     // Run the registry mutation against WasmRuntime.
                     let is_unregister = binary.is_empty();
+                    // Prior handler identity, captured so a failed `register()`
+                    // can revert the install when the tx rolls back (ADR-023 §6).
+                    let prior = self.wasm_engine.runtime().handler_identity(&name);
                     let outcome = if is_unregister {
                         self.wasm_engine
                             .runtime()
@@ -448,6 +451,26 @@ impl Runner {
                             self.state
                                 .borrow_mut()
                                 .push_follower(WalEntry::FunctionRegistered(record));
+                            // Run the module's optional `register` export to define its
+                            // constants in this same registration tx (ADR-023 §6). A
+                            // nonzero status (e.g. a prohibited-call phase violation)
+                            // fails the tx → rollback.
+                            if !is_unregister
+                                && let Some(caller) = self.wasm_engine.caller(&name).cloned()
+                            {
+                                let status = caller.call_register();
+                                if status != 0 {
+                                    // The tx rolls back, but the registry install +
+                                    // disk write already happened — revert them so
+                                    // the install commits atomically with the WAL
+                                    // record (ADR-023 §6), leaving no divergence.
+                                    let _ = self
+                                        .wasm_engine
+                                        .runtime()
+                                        .revert_registration(&name, prior);
+                                    self.state.borrow_mut().fail(FailReason::from_u8(status));
+                                }
+                            }
                         }
                         Err(_) => {
                             self.state.borrow_mut().fail(FailReason::INVALID_OPERATION);

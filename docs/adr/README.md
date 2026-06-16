@@ -24,6 +24,9 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-018](0018-fault-injection.md)               | Fault Injection Framework | Proposed |
 | [ADR-019](0019-transaction-ring.md)              | Transaction Ring | Accepted |
 | [ADR-020](0020-wal-trailer-metadata.md)          | Trailer Metadata — Commit-Record WAL Layout | Accepted |
-| [ADR-021](0021-wal-sole-releaser-snapshot-tails-wal.md) | WAL is the Sole Ring Releaser; Snapshot Tails the Durable WAL | Accepted |
+| [ADR-021](0021-wal-sole-releaser-snapshot-tails-wal.md) | WAL Sole Ring Releaser; Snapshot Tails the WAL | Accepted |
 | [ADR-022](0022-account-layouts-and-program-defined-accounts.md) | Account Layouts and Program-Defined Accounts | Proposed |
 | [ADR-023](0023-programmable-state.md)            | Programmable State — Typed KV Stores and the WASM State ABI | Proposed |
+| [ADR-024](0024-temporal-index.md)                | Temporal Index | Proposed |
+| [ADR-025](0025-point-in-time.md)                 | Point-in-Time | Proposed |
+| [ADR-026](0026-roda-wasm-abi.md)                 | roda-wasm-abi — Guest-Side ABI Crate | Proposed |

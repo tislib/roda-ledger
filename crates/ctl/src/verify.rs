@@ -203,6 +203,11 @@ fn verify_segment(storage: &storage::Storage, segment_id: u32) -> SegmentReport 
                     pending_sub_items.push(WalEntry::Kv(*k));
                 }
             }
+            WalEntry::KvConstant(c) => {
+                if pending_meta.is_some() {
+                    pending_sub_items.push(WalEntry::KvConstant(*c));
+                }
+            }
         }
     });
 

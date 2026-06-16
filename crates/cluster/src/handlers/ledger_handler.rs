@@ -356,6 +356,43 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         }))
     }
 
+    async fn get_kv(
+        &self,
+        request: Request<proto::GetKvRequest>,
+    ) -> Result<Response<proto::GetKvResponse>, Status> {
+        let key_proto = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("missing key"))?;
+        // Accept EITHER a "/"-joined `str` OR structured `items`, never both.
+        let has_str = !key_proto.str.is_empty();
+        let has_items = !key_proto.items.is_empty();
+        let key = match (has_str, has_items) {
+            (true, true) => {
+                return Err(Status::invalid_argument(
+                    "provide either key.str or key.items, not both",
+                ));
+            }
+            (true, false) => storage::KeyPath::from_string(&key_proto.str)
+                .map_err(|e| Status::invalid_argument(format!("invalid key string: {e}")))?,
+            (false, true) => crate::mapping::keypath_from_proto(key_proto),
+            (false, false) => {
+                return Err(Status::invalid_argument("key requires str or items"));
+            }
+        };
+        match self.query(QueryKind::GetKv { key: Box::new(key) }).await? {
+            QueryResponse::Kv(Some(v)) => Ok(Response::new(proto::GetKvResponse {
+                found: true,
+                value: Some(crate::mapping::value_to_proto(&v)),
+            })),
+            QueryResponse::Kv(None) => Ok(Response::new(proto::GetKvResponse {
+                found: false,
+                value: None,
+            })),
+            _ => Err(Status::internal("unexpected query response")),
+        }
+    }
+
     async fn get_transaction_status(
         &self,
         request: Request<proto::GetStatusRequest>,

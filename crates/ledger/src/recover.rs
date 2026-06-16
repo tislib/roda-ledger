@@ -1,11 +1,10 @@
 use crate::balance::Balance;
-use crate::transactor::kv::KvKey;
 use spdlog::{debug, warn};
 use std::collections::HashMap;
 use storage::entities::{
     CommittedTransaction, FailReason, FunctionRegistered, TxMetadata, WalEntry, WalEntryKind,
 };
-use storage::{Segment, Storage};
+use storage::{KeyPath, Segment, Storage, Value};
 
 const ENTRY_SIZE: usize = 40;
 
@@ -21,7 +20,10 @@ pub struct ActiveSnapshot {
     pub accounts: HashMap<u64, RecoverAccount>,
     pub functions: Vec<FunctionRegistered>,
     pub links: Vec<(u64, u16, u64)>,
-    pub kv: HashMap<KvKey, i64>,
+    pub kv: HashMap<KeyPath, Value>,
+    /// Interned constants (ADR-023): `key → null-terminated value`, checkpointed
+    /// in the same KV snapshot file as `kv`.
+    pub constants: HashMap<u32, [u8; 32]>,
     pub last_segment_user_ref_tx_id_map: HashMap<u64, u64>,
     pub active_segment_user_ref_tx_id_map: HashMap<u64, u64>,
     pub active_segment_transactions: Vec<CommittedTransaction>,
@@ -38,6 +40,7 @@ impl ActiveSnapshot {
             functions: Vec::new(),
             links: Vec::new(),
             kv: HashMap::new(),
+            constants: HashMap::new(),
             last_segment_user_ref_tx_id_map: HashMap::new(),
             active_segment_user_ref_tx_id_map: HashMap::new(),
             active_segment_transactions: Vec::new(),
@@ -446,10 +449,14 @@ impl<'r> Recover<'r> {
                 ),
             )
         })? {
-            for (kv_scope, account_id, key, value) in kvdata.entries {
-                snapshot
-                    .kv
-                    .insert(KvKey::new(kv_scope, account_id, key), value);
+            for (key, value) in kvdata.entries {
+                let entry = storage::entities::KvEntry::new(key, value);
+                if let Ok((kp, Some(v))) = entry.decode() {
+                    snapshot.kv.insert(kp, v);
+                }
+            }
+            for (key, value) in kvdata.constants {
+                snapshot.constants.insert(key, value);
             }
         }
         Ok(())
@@ -489,12 +496,19 @@ impl<'r> Recover<'r> {
                         match follower {
                             // KV (ADR-023): apply to the folded map (post-snapshot tail).
                             WalEntry::Kv(kv) => {
-                                let key = KvKey::new(kv.kv_scope, kv.account_id, kv.key);
-                                if kv.value == 0 {
-                                    snapshot.kv.remove(&key);
-                                } else {
-                                    snapshot.kv.insert(key, kv.value);
+                                if let Ok((key, value)) = kv.decode() {
+                                    match value {
+                                        Some(v) => {
+                                            snapshot.kv.insert(key, v);
+                                        }
+                                        None => {
+                                            snapshot.kv.remove(&key);
+                                        }
+                                    }
                                 }
+                            }
+                            WalEntry::KvConstant(c) => {
+                                snapshot.constants.insert(c.key, c.value);
                             }
                             WalEntry::Entry(entry) => {
                                 snapshot

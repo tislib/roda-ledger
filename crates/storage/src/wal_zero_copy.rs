@@ -11,8 +11,8 @@
 
 use crate::constants::WAL_RECORD_SIZE;
 use crate::entities::{
-    AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, KvEntry, TxEntry,
-    TxLink, TxMetadata, TxTerm, WalEntryKind,
+    AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, KvConstant, KvEntry,
+    TxEntry, TxLink, TxMetadata, TxTerm, WalEntryKind,
 };
 
 /// Borrowed view of a single WAL record. Lifetime is tied to the
@@ -28,6 +28,7 @@ pub enum WalEntryRef<'a> {
     AccountLinked(&'a AccountLinked),
     AccountFlagsUpdated(&'a AccountFlagsUpdated),
     Kv(&'a KvEntry),
+    KvConstant(&'a KvConstant),
 }
 
 /// Decode a single 40-byte WAL record without copying. The returned
@@ -69,6 +70,9 @@ pub fn read_entry(data: &[u8]) -> Result<WalEntryRef<'_>, std::io::Error> {
             Ok(WalEntryRef::AccountFlagsUpdated(bytemuck::from_bytes(rec)))
         }
         k if k == WalEntryKind::Kv as u8 => Ok(WalEntryRef::Kv(bytemuck::from_bytes(rec))),
+        k if k == WalEntryKind::KvConstant as u8 => {
+            Ok(WalEntryRef::KvConstant(bytemuck::from_bytes(rec)))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown WAL record kind={}", kind),
@@ -307,6 +311,7 @@ mod tests {
                 WalEntryRef::AccountLinked(_) => WalEntryKind::AccountLinked as u8,
                 WalEntryRef::AccountFlagsUpdated(_) => WalEntryKind::AccountFlagsUpdated as u8,
                 WalEntryRef::Kv(_) => WalEntryKind::Kv as u8,
+                WalEntryRef::KvConstant(_) => WalEntryKind::KvConstant as u8,
             })
             .collect();
         assert_eq!(

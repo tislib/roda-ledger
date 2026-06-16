@@ -34,6 +34,9 @@ service Ledger {
   // Like GetBalance but for many accounts; the same snapshot-lag caveat applies.
   rpc GetBalances(GetBalancesRequest) returns (GetBalancesResponse);
 
+  // Forward KV lookup: the value for a key (ADR-023).
+  rpc GetKv(GetKvRequest) returns (GetKvResponse);
+
   rpc GetTransactionStatus(GetStatusRequest) returns (GetStatusResponse);
 
   rpc GetTransactionStatuses(GetStatusesRequest) returns (GetStatusesResponse);
@@ -420,6 +423,7 @@ message WalEntry {
     WalAccountLinked      account_linked = 9;
     WalAccountFlagsUpdated account_flags_updated = 10;
     WalKvEntry            kv = 11;
+    WalKvConstant         kv_constant = 12;
   }
 }
 
@@ -479,15 +483,43 @@ message WalAccountFlagsUpdated {
   uint64 new_flags = 3;
 }
 
-// Programmable KV state record (ADR-023): one key→value mutation.
+// One typed KV unit (ADR-023), unpacked: a Constant string or a full i64.
+message WalKvValue {
+  oneof kind {
+    string constant = 1; // Constant: string
+    int64 integer = 2;   // Integer: full i64
+  }
+  string str = 3; // human-readable rendering of `kind`
+}
+
+// Unpacked KV key (ADR-023): an ordered run of Values.
+message WalKvKeyPath {
+  repeated WalKvValue items = 1;
+  string str = 2; // human-readable rendering, e.g. "products/123"
+}
+
+// Programmable KV state record (ADR-023): one key→value mutation, unpacked.
 message WalKvEntry {
-  uint32 kv_scope = 1;
-  uint64 account_id = 2;
-  uint32 key0 = 3;
-  uint32 key1 = 4;
-  uint32 key2 = 5;
-  uint32 key3 = 6;
-  int64 value = 7;
+  WalKvKeyPath key = 1;
+  WalKvValue value = 2; // absent = delete
+}
+
+// Forward KV lookup (ADR-023): value for a key. Provide the key EITHER as
+// `key.str` (a "/"-joined path, parsed server-side) OR as `key.items` — not
+// both; passing both is INVALID_ARGUMENT.
+message GetKvRequest {
+  WalKvKeyPath key = 1;
+}
+
+message GetKvResponse {
+  bool found = 1;
+  WalKvValue value = 2; // set iff found
+}
+
+// Constant-string definition (ADR-023): u32 key → fixed null-terminated value.
+message WalKvConstant {
+  uint32 key = 1;
+  string value = 2;
 }
 
 // ---- Terms / election history query ----

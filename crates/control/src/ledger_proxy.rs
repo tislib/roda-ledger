@@ -319,6 +319,21 @@ impl Ledger for LedgerProxy {
         .await
     }
 
+    async fn get_kv(
+        &self,
+        request: Request<pb::GetKvRequest>,
+    ) -> Result<Response<pb::GetKvResponse>, Status> {
+        let pinned = LedgerProxy::parse_node_selector(&self.handle, request.metadata())?;
+        let md = LedgerProxy::forward_metadata(&request);
+        let body = request.into_inner();
+        let cluster = self.handle.client();
+        Self::dispatch_read("get_kv", cluster, md, pinned, move |mut c, md| {
+            let body = body.clone();
+            async move { c.get_kv(outbound(md, body)).await }
+        })
+        .await
+    }
+
     async fn get_transaction_status(
         &self,
         request: Request<pb::GetStatusRequest>,

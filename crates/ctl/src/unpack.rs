@@ -75,6 +75,7 @@ pub fn run(segment_path: &Path, out: Option<&Path>, ignore_crc: bool) -> Result<
             | WalEntry::AccountLinked(_)
             | WalEntry::AccountFlagsUpdated(_)
             | WalEntry::Kv(_)
+            | WalEntry::KvConstant(_)
             | WalEntry::Term(_) => {
                 // follower records inherit tx_id from the pending
                 // TxMetadata; orphan records (no preceding metadata)

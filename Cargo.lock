@@ -424,6 +424,7 @@ dependencies = [
  "proto",
  "raft",
  "rand 0.8.5",
+ "roda-wasm-abi",
  "serde",
  "signal-hook",
  "spdlog-rs",
@@ -1259,6 +1260,7 @@ dependencies = [
  "rand 0.8.5",
  "ringbuf",
  "roda-latency-tracker",
+ "roda-wasm-abi",
  "rustc-hash",
  "serde",
  "spdlog-rs",
@@ -1924,6 +1926,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "roda-wasm-abi"
+version = "0.1.0"
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,6 +2223,7 @@ dependencies = [
  "lz4_flex",
  "proptest",
  "serde",
+ "smallvec",
  "spdlog-rs",
  "tempfile",
  "thiserror 1.0.69",

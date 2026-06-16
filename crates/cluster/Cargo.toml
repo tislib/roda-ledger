@@ -61,3 +61,6 @@ storage.workspace = true
 tokio-test.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+# Guest-side ABI + `compile_to_wasm`: the KV-over-cluster test writes its modules
+# in Rust and compiles them to wasm.
+roda-wasm-abi = { path = "../roda-wasm-abi", features = ["tools"] }

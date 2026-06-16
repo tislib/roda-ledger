@@ -1,6 +1,6 @@
 use crate::entities::{
-    AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, KvEntry, TxEntry,
-    TxLink, TxMetadata, TxTerm, WalEntry, WalEntryKind,
+    AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, KvConstant, KvEntry,
+    TxEntry, TxLink, TxMetadata, TxTerm, WalEntry, WalEntryKind,
 };
 
 pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
@@ -14,6 +14,7 @@ pub fn serialize_wal_records(entry: &WalEntry) -> &[u8] {
         WalEntry::AccountLinked(a) => bytemuck::bytes_of(a),
         WalEntry::AccountFlagsUpdated(a) => bytemuck::bytes_of(a),
         WalEntry::Kv(k) => bytemuck::bytes_of(k),
+        WalEntry::KvConstant(c) => bytemuck::bytes_of(c),
     }
 }
 
@@ -64,6 +65,10 @@ pub fn parse_wal_record(data: &[u8]) -> Result<WalEntry, std::io::Error> {
         k if k == WalEntryKind::Kv as u8 => {
             let kv: KvEntry = bytemuck::pod_read_unaligned(record_data);
             Ok(WalEntry::Kv(kv))
+        }
+        k if k == WalEntryKind::KvConstant as u8 => {
+            let c: KvConstant = bytemuck::pod_read_unaligned(record_data);
+            Ok(WalEntry::KvConstant(c))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

@@ -1,64 +1,119 @@
 //! Programmable KV state end-to-end tests (ADR-023).
 //!
-//! Drives the `ledger` host verbs from real WASM through the full pipeline and
-//! verifies persistence + recovery. KV state has no client read API in v1, so
-//! the modules turn KV reads into balance effects we can observe via
-//! `get_balance` (debit adds, credit subtracts; both keep the tx zero-sum).
+//! Modules are written in Rust against `roda-wasm-abi` and compiled to wasm via
+//! `compile_to_wasm` (no hand-written WAT). They drive the `ledger` host verbs
+//! through the full pipeline and verify persistence + recovery. Constants make
+//! KV keys readable, and `Ledger::get_kv` reads state back for assertions.
+//!
+//! The tests shell out to `cargo build --target wasm32-unknown-unknown`, so they
+//! self-skip when that target isn't installed (keeps CI green without it).
 
 use ledger::ledger::{Ledger, LedgerConfig};
 use ledger::transactor::transaction::Operation;
 use std::time::Duration;
-use storage::StorageConfig;
 use storage::entities::FailReason;
+use storage::{KeyPath, StorageConfig, Value};
 
-/// counter(account = param0): n = kv_add(global, key=[1,0,0,0], +1);
-///   debit(account, n); credit(SYSTEM, n)  →  account balance climbs by the
-///   running counter value (1, then 2, …), proving the merge resolves and
-///   persists across calls.
-const COUNTER_WAT: &str = r#"
-    (module
-      (import "ledger" "kv_add" (func $add (param i64 i32 i32 i32 i32 i64) (result i64)))
-      (import "ledger" "debit"  (func $debit  (param i64 i64)))
-      (import "ledger" "credit" (func $credit (param i64 i64)))
-      (func (export "execute")
-        (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
-        (local $n i64)
-        (local.set $n
-          (call $add (i64.const 0) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)
-                     (i64.const 1)))
-        (call $debit  (local.get 0) (local.get $n))
-        (call $credit (i64.const 0) (local.get $n))
-        (i32.const 0)))
+/// counter(account = p0): n = kv[1] + 1; store it; debit(account, n); credit(SYSTEM, n).
+const COUNTER_SRC: &str = r#"
+    use roda_wasm_abi::{credit, debit, execute, key, kv_get, kv_set, Status};
+    execute!(|p| {
+        let k = key!(1);
+        let n = kv_get(k) + 1;
+        kv_set(k, n);
+        debit(p.account(0), n as u64);
+        credit(0, n as u64);
+        Status::OK
+    });
 "#;
 
-/// reg_save(value = param1): register_write(0, value).
-const REG_SAVE_WAT: &str = r#"
-    (module
-      (import "ledger" "register_write" (func $rw (param i32 i64)))
-      (func (export "execute")
-        (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
-        (call $rw (i32.const 0) (local.get 1))
-        (i32.const 0)))
+/// kv_save(value = p1): kv[2] = value.
+const KV_SAVE_SRC: &str = r#"
+    use roda_wasm_abi::{execute, key, kv_set, Status};
+    execute!(|p| {
+        kv_set(key!(2), p.get(1));
+        Status::OK
+    });
 "#;
 
-/// reg_load(account = param0): v = register_read(0); debit(account, v); credit(SYSTEM, v)
-///   →  account balance jumps to the stored register value.
-const REG_LOAD_WAT: &str = r#"
-    (module
-      (import "ledger" "register_read" (func $rr (param i32) (result i64)))
-      (import "ledger" "debit"  (func $debit  (param i64 i64)))
-      (import "ledger" "credit" (func $credit (param i64 i64)))
-      (func (export "execute")
-        (param i64 i64 i64 i64 i64 i64 i64 i64) (result i32)
-        (local $v i64)
-        (local.set $v (call $rr (i32.const 0)))
-        (call $debit  (local.get 0) (local.get $v))
-        (call $credit (i64.const 0) (local.get $v))
-        (i32.const 0)))
+/// kv_load(account = p0): v = kv[2]; debit(account, v); credit(SYSTEM, v).
+const KV_LOAD_SRC: &str = r#"
+    use roda_wasm_abi::{credit, debit, execute, key, kv_get, Status};
+    execute!(|p| {
+        let v = kv_get(key!(2));
+        debit(p.account(0), v as u64);
+        credit(0, v as u64);
+        Status::OK
+    });
 "#;
 
-fn compile(wat_src: &str) -> Vec<u8> {
-    wat::parse_str(wat_src).expect("wat parse")
+/// registerer: register declares "probe_const"; execute stores p0 at that
+/// constant-keyed cell. If register never ran, kv_get_constant traps.
+const REGISTERER_SRC: &str = r#"
+    use roda_wasm_abi::{execute, key, kv_get_constant, kv_register_constant, kv_set, register, Status};
+    register!(|| { kv_register_constant(c"probe_const"); });
+    execute!(|p| {
+        kv_set(key!(kv_get_constant(c"probe_const")), p.get(0));
+        Status::OK
+    });
+"#;
+
+/// `register` with a bad signature (takes a param) — registration must reject it.
+const BAD_REGISTER_SRC: &str = r#"
+    use roda_wasm_abi::{execute, Status};
+    #[unsafe(no_mangle)]
+    pub extern "C" fn register(_x: i32) {}
+    execute!(|_p| { Status::OK });
+"#;
+
+/// `register` that calls a prohibited verb (`kv_set`) — only `kv_register_constant`
+/// is allowed in the register phase, so registration must fail at runtime.
+const PROHIBITED_REGISTER_SRC: &str = r#"
+    use roda_wasm_abi::{execute, key, kv_set, register, Status};
+    register!(|| { kv_set(key!(1), 5); });
+    execute!(|_p| { Status::OK });
+"#;
+
+/// `register` that declares a constant whose name exceeds the 32-byte budget
+/// (33 chars) — the host must reject it rather than silently truncate.
+const OVERLONG_CONST_SRC: &str = r#"
+    use roda_wasm_abi::{execute, kv_register_constant, register, Status};
+    register!(|| { kv_register_constant(c"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); });
+    execute!(|_p| { Status::OK });
+"#;
+
+/// store_alpha(value = p0): declares constant "alpha"; stores value at
+/// kv["alpha"/1].
+const STORE_ALPHA_SRC: &str = r#"
+    use roda_wasm_abi::{execute, key, kv_get_constant, kv_register_constant, kv_set, register, Status};
+    register!(|| { kv_register_constant(c"alpha"); });
+    execute!(|p| {
+        kv_set(key!(kv_get_constant(c"alpha"), 1), p.get(0));
+        Status::OK
+    });
+"#;
+
+/// store_beta(value = p0): declares constant "beta"; stores value at kv["beta"/1].
+const STORE_BETA_SRC: &str = r#"
+    use roda_wasm_abi::{execute, key, kv_get_constant, kv_register_constant, kv_set, register, Status};
+    register!(|| { kv_register_constant(c"beta"); });
+    execute!(|p| {
+        kv_set(key!(kv_get_constant(c"beta"), 1), p.get(0));
+        Status::OK
+    });
+"#;
+
+/// True if the wasm target is installed; skip the test otherwise.
+fn wasm_ready() -> bool {
+    std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-unknown-unknown"))
+        .unwrap_or(false)
+}
+
+fn compile(src: &str) -> Vec<u8> {
+    roda_wasm_abi::tools::compile_to_wasm(src).expect("compile module to wasm")
 }
 
 fn call(ledger: &Ledger, name: &str, p0: i64, p1: i64) -> FailReason {
@@ -73,18 +128,22 @@ fn call(ledger: &Ledger, name: &str, p0: i64, p1: i64) -> FailReason {
 
 fn register_all(ledger: &Ledger) {
     ledger
-        .register_function("counter", &compile(COUNTER_WAT), false)
+        .register_function("counter", &compile(COUNTER_SRC), false)
         .expect("register counter");
     ledger
-        .register_function("reg_save", &compile(REG_SAVE_WAT), false)
-        .expect("register reg_save");
+        .register_function("kv_save", &compile(KV_SAVE_SRC), false)
+        .expect("register kv_save");
     ledger
-        .register_function("reg_load", &compile(REG_LOAD_WAT), false)
-        .expect("register reg_load");
+        .register_function("kv_load", &compile(KV_LOAD_SRC), false)
+        .expect("register kv_load");
 }
 
 #[test]
 fn kv_counter_and_register_drive_balances() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
     let mut ledger = Ledger::new(LedgerConfig::temp());
     ledger.start().expect("start");
     ledger.open_accounts(10);
@@ -96,17 +155,333 @@ fn kv_counter_and_register_drive_balances() {
     }
     assert_eq!(ledger.get_balance(5), 6);
 
-    // Register round-trip: save 100, then load it onto account 6.
-    assert_eq!(call(&ledger, "reg_save", 0, 100), FailReason::NONE);
-    assert_eq!(call(&ledger, "reg_load", 6, 0), FailReason::NONE);
+    // KV round-trip: save 100, then load it onto account 6.
+    assert_eq!(call(&ledger, "kv_save", 0, 100), FailReason::NONE);
+    assert_eq!(call(&ledger, "kv_load", 6, 0), FailReason::NONE);
     assert_eq!(ledger.get_balance(6), 100);
 }
 
-// KV has no snapshot in v1 — state is rebuilt by pure WAL replay (ADR-023 §5).
-// After a restart the counter must *continue* (not reset) and the saved register
-// must still be readable.
+#[test]
+fn register_export_runs_at_registration() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    ledger.open_accounts(10);
+    ledger
+        .register_function("registerer", &compile(REGISTERER_SRC), false)
+        .expect("register");
+
+    // register() declared "probe_const"; execute stores 777 at [probe_const,0,0,0].
+    assert_eq!(call(&ledger, "registerer", 777, 0), FailReason::NONE);
+    // Reads back by constant NAME — proving it packed as a constant and resolved.
+    assert_eq!(
+        ledger.get_kv(KeyPath::from_string("probe_const/0/0/0").unwrap()),
+        Some(Value::Int(777)),
+        "register ran; constant key stored + resolvable by name"
+    );
+}
+
+#[test]
+fn register_wrong_signature_rejected() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    assert!(
+        ledger
+            .register_function("bad", &compile(BAD_REGISTER_SRC), false)
+            .is_err(),
+        "a `register` export with a non-`() -> ()` signature must be rejected"
+    );
+}
+
+#[test]
+fn register_prohibited_call_rejected() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    assert!(
+        ledger
+            .register_function("prohibited", &compile(PROHIBITED_REGISTER_SRC), false)
+            .is_err(),
+        "a data verb (kv_set) called from register() must fail registration"
+    );
+}
+
+// A registration whose `register()` export fails must roll back *completely*
+// (ADR-023 §6: constants commit atomically with the `FunctionRegistered`
+// record). The module is installed into the shared `WasmRuntime` registry
+// *before* `register()` runs, and `Computer::rollback` does not undo that
+// install — so a failed `register()` returns `Err` to the caller yet leaves the
+// module live in the registry, with no committed WAL record. This test pins the
+// invariant the rollback must restore.
+#[test]
+fn failed_register_leaves_no_trace_in_registry() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    ledger.open_accounts(10);
+
+    // register() calls a prohibited verb → the registration tx fails.
+    let res = ledger.register_function("prohibited", &compile(PROHIBITED_REGISTER_SRC), false);
+    assert!(
+        res.is_err(),
+        "registration must fail when register() is prohibited"
+    );
+
+    // The rolled-back tx must leave nothing behind: not in the registry listing…
+    assert!(
+        !ledger
+            .list_functions()
+            .iter()
+            .any(|f| f.name == "prohibited"),
+        "a rolled-back registration must not leave the module installed"
+    );
+    // …and not callable (no committed FunctionRegistered record exists).
+    assert_eq!(
+        call(&ledger, "prohibited", 0, 0),
+        FailReason::INVALID_OPERATION,
+        "a module whose registration was rolled back must not be callable"
+    );
+}
+
+// The concrete harm of an incomplete rollback: state divergence. Whatever the
+// live node reports for a failed registration must equal what a freshly
+// recovered node reports — the recovered node replays only committed WAL
+// records, so if the live registry kept the module the two disagree.
+#[test]
+fn failed_register_consistent_across_recovery() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = format!("temp_kv_failed_register_{}", nanos);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let make_config = || LedgerConfig {
+        storage: StorageConfig {
+            data_dir: temp_dir.clone(),
+            transaction_count_per_segment: 1000,
+            snapshot_frequency: 1,
+            ..Default::default()
+        },
+        seal_check_internal: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    let prohibited = compile(PROHIBITED_REGISTER_SRC);
+
+    // Phase 1: a failing registration on the live node; observe what it reports.
+    let (live_listed, live_callable);
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        ledger.open_accounts(10);
+        let res = ledger.register_function("prohibited", &prohibited, false);
+        assert!(
+            res.is_err(),
+            "registration must fail when register() is prohibited"
+        );
+
+        live_listed = ledger
+            .list_functions()
+            .iter()
+            .any(|f| f.name == "prohibited");
+        live_callable = call(&ledger, "prohibited", 0, 0) == FailReason::NONE;
+
+        // Roll past a seal so recovery exercises the full WAL replay path.
+        let mut last = 0;
+        for _ in 0..2000 {
+            last = ledger.submit(Operation::Deposit {
+                account: 2,
+                amount: 1,
+                user_ref: 0,
+            });
+        }
+        ledger.wait_for_transaction(last);
+        ledger.wait_for_seal();
+        drop(ledger);
+    }
+
+    // Phase 2: recover from the WAL; the recovered view is the source of truth.
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        let rec_listed = ledger
+            .list_functions()
+            .iter()
+            .any(|f| f.name == "prohibited");
+        let rec_callable = call(&ledger, "prohibited", 0, 0) == FailReason::NONE;
+
+        assert_eq!(
+            live_listed, rec_listed,
+            "live node and recovered node disagree on whether the module is registered"
+        );
+        assert_eq!(
+            live_callable, rec_callable,
+            "live node and recovered node disagree on whether the module is callable"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// A constant name longer than the 32-byte budget must be rejected at the host
+// boundary (ADR-023 §6), not silently truncated (which would alias distinct
+// names). Registration fails and leaves no module installed (via the revert).
+#[test]
+fn register_overlong_constant_name_rejected() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let mut ledger = Ledger::new(LedgerConfig::temp());
+    ledger.start().expect("start");
+    let res = ledger.register_function("longname", &compile(OVERLONG_CONST_SRC), false);
+    assert!(
+        res.is_err(),
+        "a constant name longer than 32 bytes must be rejected at registration"
+    );
+    assert!(
+        !ledger.list_functions().iter().any(|f| f.name == "longname"),
+        "the rejected registration must not leave the module installed"
+    );
+}
+
+// Constants must survive a restart (ADR-023 §6): their id↔name mapping is
+// recovered, values stay resolvable by name, and the id allocator resumes past
+// the recovered max so a fresh constant never collides with an existing one.
+#[test]
+fn constants_survive_restart() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = format!("temp_kv_const_recovery_{}", nanos);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let make_config = || LedgerConfig {
+        storage: StorageConfig {
+            data_dir: temp_dir.clone(),
+            transaction_count_per_segment: 1000,
+            snapshot_frequency: 1,
+            ..Default::default()
+        },
+        seal_check_internal: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    let store_alpha = compile(STORE_ALPHA_SRC);
+
+    // Phase 1: register "alpha", store 42 under it, then seal so the constant is
+    // checkpointed in the KV snapshot file.
+    let alpha_id;
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+        ledger.open_accounts(10);
+        ledger
+            .register_function("store_alpha", &store_alpha, false)
+            .unwrap();
+        assert_eq!(call(&ledger, "store_alpha", 42, 0), FailReason::NONE);
+        alpha_id = ledger.get_constant("alpha").expect("alpha interned");
+        assert_eq!(
+            ledger.get_kv(KeyPath::from_string("alpha/1/0/0").unwrap()),
+            Some(Value::Int(42))
+        );
+
+        let mut last = 0;
+        for _ in 0..2000 {
+            last = ledger.submit(Operation::Deposit {
+                account: 2,
+                amount: 1,
+                user_ref: 0,
+            });
+        }
+        ledger.wait_for_transaction(last);
+        ledger.wait_for_seal();
+        drop(ledger);
+    }
+
+    // Phase 2: recover and verify the constant survived and the allocator resumed.
+    {
+        let mut ledger = Ledger::new(make_config());
+        ledger.start().unwrap();
+
+        // Value + constant survived; still resolvable by name.
+        assert_eq!(
+            ledger.get_kv(KeyPath::from_string("alpha/1/0/0").unwrap()),
+            Some(Value::Int(42)),
+            "alpha value survived restart"
+        );
+        // Same id — not lost or renumbered.
+        assert_eq!(
+            ledger.get_constant("alpha"),
+            Some(alpha_id),
+            "alpha id preserved across restart"
+        );
+
+        // A NEW constant gets a FRESH id (allocator resumed past the recovered
+        // max); if it reset to 1 it would collide with the recovered alpha.
+        let store_beta = compile(STORE_BETA_SRC);
+        ledger
+            .register_function("store_beta", &store_beta, false)
+            .unwrap();
+        let beta_id = ledger.get_constant("beta").expect("beta interned");
+        assert_ne!(
+            beta_id, alpha_id,
+            "new constant must not collide with recovered one"
+        );
+        assert_eq!(
+            beta_id,
+            alpha_id + 1,
+            "allocator resumed past the recovered max"
+        );
+
+        // Writing under beta leaves alpha intact (not overridden).
+        assert_eq!(call(&ledger, "store_beta", 99, 0), FailReason::NONE);
+        assert_eq!(
+            ledger.get_kv(KeyPath::from_string("beta/1/0/0").unwrap()),
+            Some(Value::Int(99)),
+            "beta stored under its own id"
+        );
+        assert_eq!(
+            ledger.get_kv(KeyPath::from_string("alpha/1/0/0").unwrap()),
+            Some(Value::Int(42)),
+            "alpha intact after registering beta"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// KV is checkpointed in the snapshot + tail replay (ADR-023 §7). After a restart
+// the counter must *continue* (not reset) and the saved value must still be read.
 #[test]
 fn kv_state_survives_recovery() {
+    if !wasm_ready() {
+        eprintln!("skipping: wasm32-unknown-unknown target not installed");
+        return;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -125,17 +500,30 @@ fn kv_state_survives_recovery() {
         ..Default::default()
     };
 
-    // Phase 1: advance the counter to 3 and save register 0 = 250.
+    // Compile once, reuse the bytes across both phases.
+    let counter = compile(COUNTER_SRC);
+    let kv_save = compile(KV_SAVE_SRC);
+    let kv_load = compile(KV_LOAD_SRC);
+
+    // Phase 1: advance the counter to 3 and save kv[2] = 250.
     {
         let mut ledger = Ledger::new(make_config());
         ledger.start().unwrap();
         ledger.open_accounts(10);
-        register_all(&ledger);
+        ledger
+            .register_function("counter", &counter, false)
+            .unwrap();
+        ledger
+            .register_function("kv_save", &kv_save, false)
+            .unwrap();
+        ledger
+            .register_function("kv_load", &kv_load, false)
+            .unwrap();
         for _ in 0..3 {
             assert_eq!(call(&ledger, "counter", 5, 0), FailReason::NONE);
         }
         assert_eq!(ledger.get_balance(5), 6);
-        assert_eq!(call(&ledger, "reg_save", 0, 250), FailReason::NONE);
+        assert_eq!(call(&ledger, "kv_save", 0, 250), FailReason::NONE);
 
         // Roll past a seal so recovery exercises the sealed-segment KV fold too.
         let mut last = 0;
@@ -151,7 +539,7 @@ fn kv_state_survives_recovery() {
         drop(ledger);
     }
 
-    // Phase 2: recover from WAL (+snapshot for balances) and verify KV continued.
+    // Phase 2: recover and verify KV continued.
     {
         let mut ledger = Ledger::new(make_config());
         ledger.start().unwrap();
@@ -161,9 +549,9 @@ fn kv_state_survives_recovery() {
         assert_eq!(call(&ledger, "counter", 5, 0), FailReason::NONE);
         assert_eq!(ledger.get_balance(5), 10, "counter resumed at 4, not 1");
 
-        // Register survived: load 250 onto a fresh account.
-        assert_eq!(call(&ledger, "reg_load", 7, 0), FailReason::NONE);
-        assert_eq!(ledger.get_balance(7), 250, "register recovered from WAL");
+        // Saved value survived: load 250 onto a fresh account.
+        assert_eq!(call(&ledger, "kv_load", 7, 0), FailReason::NONE);
+        assert_eq!(ledger.get_balance(7), 250, "kv value recovered from WAL");
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);

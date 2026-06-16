@@ -22,11 +22,13 @@ The key insight: **parallelism around execution, not within it.** The Transactor
 
 ## Design principles
 
-Two named principles recur throughout the design and are referenced by name in code and ADRs. Both were introduced in [ADR-022](./adr/0022-account-layouts-and-program-defined-accounts.md).
+Three named principles recur throughout the design and are referenced by name in code and ADRs. P1 and P2 were introduced in [ADR-022](./adr/0022-account-layouts-and-program-defined-accounts.md); P3 in [ADR-023](./adr/0023-programmable-state.md).
 
 **P1 — WAL entry types are concrete and self-defining.** Each WAL entry type does exactly one concrete thing, and its named fields fully and unambiguously define it: no nested discriminators, no op-codes reinterpreting fields, no overloaded or union fields. A replayer, auditor, or human understands a record from its kind and fields alone. Every 40-byte WAL record follows it — including the programmable-state `KvEntry` ([ADR-023](./adr/0023-programmable-state.md)), which records a plain key→value mutation; which in-memory store it feeds is a transactor concern that never reaches the log.
 
 **P2 — Balances are eventually consistent on the read side.** The online read view (the Snapshotter's balance cache) may lag and need not be strictly ordered or point-in-time. This prioritises the snapshot write path and permits relaxed memory ordering and client-side caching. The durable WAL and sealed snapshot files remain the strongly-consistent source of truth.
+
+**P3 — The WAL and Snapshot are self-sufficient; derived computation lives in the consumer, not the Ledger.** The durable WAL is self-explanatory by design, and together with the Snapshot it carries enough to understand and surface *any* detail about the data with no external context — P1 carried from the single record to the whole. The Ledger therefore serves complete, typed reads of stored state — balances, entries, history, programmable state — but builds **no custom, analytical, or aggregate queries**: there is no plan and no need for an in-engine query language or programmable read path under the current design. Any later analytical or derived view is the consuming system's job — it reads the self-describing WAL/Snapshot and computes downstream. Holding computation outside the Ledger is what preserves the single-writer correctness and throughput this document is built on.
 
 ---
 
