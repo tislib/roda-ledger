@@ -45,6 +45,7 @@ import {
   GetBalanceRequestSchema,
   GetLogRequestSchema,
   GetStatusRequestSchema,
+  GetTransactionRequestSchema,
   ListFunctionsRequestSchema,
   RegisterFunctionRequestSchema,
   UnregisterFunctionRequestSchema,
@@ -79,15 +80,15 @@ import {
   logEntryFromPb,
   walRecordFromPb,
   membershipFromPb,
+  metaFailReasonFromPb,
   operationToPbRequest,
   runSummaryFromPb,
   scenarioStatusFromPb,
   scenarioToPb,
   snapshotFromPb,
   stringToU64,
-  txStatusFromPb,
+  txStateFromPb,
   u64ToString,
-  waitStatusFromPb,
 } from './proto-mappers';
 
 export class RealClusterClient implements ClusterClient {
@@ -291,7 +292,23 @@ export class RealClusterClient implements ClusterClient {
     const resp = await this.ledger.getTransactionStatus(
       create(GetStatusRequestSchema, { transactionId: stringToU64(txId) }),
     );
-    return txStatusFromPb(resp);
+    // Failed txs still advance to the snapshot; the reason lives in their
+    // metadata, readable only once they reach OnSnapshot (not via status).
+    if (txStateFromPb(resp) !== 'OnSnapshot') return { failReason: 0 };
+    return { failReason: await this.fetchFailReason(txId) };
+  }
+
+  // `GetStatusResponse` dropped `fail_reason`; read it from the committed tx's
+  // metadata. Returns 0 if the tx isn't on the snapshot index yet.
+  private async fetchFailReason(txId: string): Promise<FailReasonCode> {
+    try {
+      const resp = await this.ledger.getTransaction(
+        create(GetTransactionRequestSchema, { txId: stringToU64(txId) }),
+      );
+      return metaFailReasonFromPb(resp.transaction?.meta);
+    } catch {
+      return 0;
+    }
   }
 
   async waitForTransaction(
@@ -305,14 +322,15 @@ export class RealClusterClient implements ClusterClient {
         const resp = await this.ledger.getTransactionStatus(
           create(GetStatusRequestSchema, { transactionId: stringToU64(txId) }),
         );
-        const status = waitStatusFromPb(resp);
+        const state = txStateFromPb(resp);
+        const status: WaitStatus = { state, failReason: 0 };
         const reached =
-          (level === 'Computed' && status.state === 'Computed') ||
-          (level === 'Committed' &&
-            (status.state === 'Committed' || status.state === 'OnSnapshot')) ||
-          (level === 'OnSnapshot' && status.state === 'OnSnapshot') ||
+          (level === 'Computed' && state === 'Computed') ||
+          (level === 'Committed' && (state === 'Committed' || state === 'OnSnapshot')) ||
+          (level === 'OnSnapshot' && state === 'OnSnapshot') ||
           isWaitTerminal(status);
         if (reached || Date.now() - start >= timeoutMs) {
+          if (state === 'OnSnapshot') status.failReason = await this.fetchFailReason(txId);
           resolve(status);
           return;
         }

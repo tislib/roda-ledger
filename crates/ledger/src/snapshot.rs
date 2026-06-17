@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use storage::entities::{SYSTEM_ACCOUNT_ID, TxMetadata, WalEntry};
-use storage::{KeyPath, Storage, Value};
+use storage::{KeyPath, Storage, Value, WalEntryRef};
 
 /// A query to be executed by the Snapshot stage against the `TransactionIndexer`.
 ///
@@ -145,15 +145,15 @@ impl Snapshot {
         // Only account 0 (SYSTEM) is existent at genesis; ids 1.. stay absent.
         Self::mark_system_account(&accounts.load());
 
+        let index_size =
+            (config.storage.transaction_count_per_segment as usize).next_power_of_two();
+
         Self {
             accounts,
             links: Arc::new(SkipMap::new()),
             kv: HashMap::new(),
             constants: HashMap::new(),
-            indexer: Some(TransactionIndexer::new(
-                config.index_circle1_size(),
-                config.index_circle2_size(),
-            )),
+            indexer: Some(TransactionIndexer::new(index_size, index_size * 4)),
             storage,
             resize_factor: config.resize_factor,
         }
@@ -320,91 +320,80 @@ impl SnapshotRunner {
         let inbound = ctx.query();
         // Tail the durable WAL instead of the ring; the WAL owns ring release now.
         let mut tailer = self.storage.wal_tailer(self.from_tx_id);
-        // Trailer layout: buffer a transaction's followers until its TxMetadata clears
-        // the commit gate, then apply index + balances together (invisible until durable).
-        let mut group: Vec<WalEntry> = Vec::new();
         while ctx.is_running() {
-            group.clear();
-            let progressed = tailer.tail_entries(|wal_entry| {
-                match wal_entry {
-                    // Not durable yet: tail_entries retains this group; re-read once committed.
-                    WalEntry::Metadata(m) if m.tx_id > ctx.commit_index() => return false,
-                    WalEntry::Metadata(m) => {
-                        // Index the whole transaction: meta + all followers, stored as-is.
-                        self.indexer.insert_transaction(&m, &group);
-                        // Apply balances and status flags from the followers.
-                        // Iterate by reference (followers are `Copy` 40-byte
-                        // records): a `drain` would `ptr::read` every element out,
-                        // which dominated the snapshot profile. `clear()` after is
-                        // O(1) (no Drop).
-                        for follower in &group {
-                            match follower {
-                                WalEntry::Entry(e) => {
-                                    let acc = self.accounts.load();
-                                    if let Some(a) = acc.get(e.account_id as usize) {
-                                        a.balance.store(e.computed_balance, Ordering::Release);
-                                    }
-                                }
-                                WalEntry::AccountOpened(a) => {
-                                    // Grow to cover the opened range, then publish its flags.
-                                    let end = (a.begin_account_id + a.count as u64) as usize;
-                                    Snapshot::ensure_capacity(
-                                        &self.accounts,
-                                        end,
-                                        self.resize_factor,
-                                    );
-                                    let acc = self.accounts.load();
-                                    let begin = a.begin_account_id as usize;
-                                    for id in begin..end.min(acc.len()) {
-                                        acc[id].flags.store(a.flags, Ordering::Release);
-                                    }
-                                }
-                                WalEntry::AccountLinked(a) => {
-                                    self.links.insert((a.parent_id, a.type_id), a.child_id);
-                                }
-                                WalEntry::AccountFlagsUpdated(a) => {
-                                    let acc = self.accounts.load();
-                                    if let Some(slot) = acc.get(a.account_id as usize) {
-                                        slot.flags.store(a.new_flags, Ordering::Release);
-                                    }
-                                }
-                                WalEntry::Kv(k) => {
-                                    // ADR-023: mirror the mutation into the read-side KV map,
-                                    // keeping key and value in resolved shape.
-                                    if let Ok((key, value)) = k.decode() {
-                                        let key = resolve_key(&self.constants, key);
-                                        match value {
-                                            Some(v) => {
-                                                let v = resolve_value(&self.constants, v);
-                                                self.kv.insert(key, v);
-                                            }
-                                            None => {
-                                                self.kv.remove(&key);
-                                            }
-                                        }
-                                    }
-                                }
-                                WalEntry::KvConstant(c) => {
-                                    // ADR-023 §6: learn the constant so later values resolve.
-                                    let end = c
-                                        .value
-                                        .iter()
-                                        .position(|&b| b == 0)
-                                        .unwrap_or(c.value.len());
-                                    self.constants.insert(
-                                        c.key,
-                                        String::from_utf8_lossy(&c.value[..end]).into_owned(),
-                                    );
-                                }
-                                _ => {}
+            // tail_transactions groups each transaction's followers with its closing
+            // metadata for us (zero-copy): meta + an EntryBuf view, no owned `Vec`.
+            let progressed = tailer.tail_transactions(|tx| {
+                // Not durable yet: tail_transactions retains this tx; re-read once committed.
+                if tx.meta.tx_id > ctx.commit_index() {
+                    return false;
+                }
+                // Index the whole transaction straight from the zero-copy view; the
+                // ring copies each follower in as it decodes — no intermediate alloc.
+                self.indexer.insert_transaction_ref(tx.meta, tx.entries);
+                // Apply balances and status flags from the followers, decoded on the
+                // fly from the same borrowed buffer. Load the guard once per tx; only
+                // a grow (AccountOpened, rare) refreshes it.
+                let mut acc = self.accounts.load();
+                for follower in tx.entries.iter() {
+                    match follower {
+                        WalEntryRef::Entry(e) => {
+                            if let Some(a) = acc.get(e.account_id as usize) {
+                                a.balance.store(e.computed_balance, Ordering::Release);
                             }
                         }
-                        group.clear();
-                        ctx.set_processed_index(m.tx_id);
+                        WalEntryRef::AccountOpened(a) => {
+                            // Grow to cover the opened range, then publish its flags.
+                            let end = (a.begin_account_id + a.count as u64) as usize;
+                            Snapshot::ensure_capacity(&self.accounts, end, self.resize_factor);
+                            // ensure_capacity may have swapped in a larger generation;
+                            // refresh the guard so the writes below hit the live Vec.
+                            acc = self.accounts.load();
+                            let begin = a.begin_account_id as usize;
+                            for id in begin..end.min(acc.len()) {
+                                acc[id].flags.store(a.flags, Ordering::Release);
+                            }
+                        }
+                        WalEntryRef::AccountLinked(a) => {
+                            self.links.insert((a.parent_id, a.type_id), a.child_id);
+                        }
+                        WalEntryRef::AccountFlagsUpdated(a) => {
+                            if let Some(slot) = acc.get(a.account_id as usize) {
+                                slot.flags.store(a.new_flags, Ordering::Release);
+                            }
+                        }
+                        WalEntryRef::Kv(k) => {
+                            // ADR-023: mirror the mutation into the read-side KV map,
+                            // keeping key and value in resolved shape.
+                            if let Ok((key, value)) = k.decode() {
+                                let key = resolve_key(&self.constants, key);
+                                match value {
+                                    Some(v) => {
+                                        let v = resolve_value(&self.constants, v);
+                                        self.kv.insert(key, v);
+                                    }
+                                    None => {
+                                        self.kv.remove(&key);
+                                    }
+                                }
+                            }
+                        }
+                        WalEntryRef::KvConstant(c) => {
+                            // ADR-023 §6: learn the constant so later values resolve.
+                            let end = c
+                                .value
+                                .iter()
+                                .position(|&b| b == 0)
+                                .unwrap_or(c.value.len());
+                            self.constants.insert(
+                                c.key,
+                                String::from_utf8_lossy(&c.value[..end]).into_owned(),
+                            );
+                        }
+                        _ => {}
                     }
-                    // Buffer every follower as-is until its metadata clears the gate.
-                    other => group.push(other),
                 }
+                ctx.set_processed_index(tx.meta.tx_id);
                 true
             });
 

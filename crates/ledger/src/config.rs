@@ -59,18 +59,6 @@ impl LedgerConfig {
         Self::default()
     }
 
-    /// Index circle 1 size: covers the active segment (one active window).
-    /// Rounded up to the next power of two as required by `TransactionIndexer`.
-    pub fn index_circle1_size(&self) -> usize {
-        (self.storage.transaction_count_per_segment as usize).next_power_of_two()
-    }
-
-    /// Index circle 2 size: covers active + previous segment (matches dedup window).
-    /// Rounded up to the next power of two as required by `TransactionIndexer`.
-    pub fn index_circle2_size(&self) -> usize {
-        (self.storage.transaction_count_per_segment as usize * 2).next_power_of_two()
-    }
-
     pub fn temp() -> Self {
         let mut dir = std::env::current_dir().unwrap();
         let rand = rand::random::<u64>() % 1_000_000_000;

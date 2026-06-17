@@ -7,8 +7,8 @@
 //! Layout the suite uses:
 //!   - 10 000 000 logical transactions total
 //!   - 1 000 000 transactions per segment ⇒ 9 sealed segments + 1 active
-//!   - Each "transaction" is meta + 1 follower = 2 records = 80 bytes
-//!     ⇒ ~80 MB per segment, ~800 MB total
+//!   - Each "transaction" is 1 follower + its trailing meta = 2 records =
+//!     80 bytes (trailer layout, ADR-020) ⇒ ~80 MB per segment, ~800 MB total
 //!
 //! Four locate positions, each chosen to exercise a different code path:
 //!   - `active`: `tx_id = 9_500_000` — inside the active wal.bin
@@ -133,6 +133,19 @@ fn build() -> Dataset {
 }
 
 fn push_tx(buf: &mut Vec<WalEntry>, tx_id: u64) {
+    // Trailer layout (ADR-020): the follower(s) precede the closing
+    // TxMetadata, which is the commit record. `tail()`/`tail_transactions`
+    // group on this order, so the fixture must match it — meta-first would
+    // mis-group and the partial-tail trim would drop the final follower.
+    buf.push(WalEntry::Entry(TxEntry {
+        entry_type: WalEntryKind::TxEntry as u8,
+        kind: EntryKind::CREDIT,
+        _pad0: [0; 6],
+        _pad1: [0; 8],
+        account_id: 1,
+        amount: 10,
+        computed_balance: 10,
+    }));
     buf.push(WalEntry::Metadata(TxMetadata {
         entry_type: WalEntryKind::TxMetadata as u8,
         fail_reason: FailReason::NONE,
@@ -142,15 +155,6 @@ fn push_tx(buf: &mut Vec<WalEntry>, tx_id: u64) {
         timestamp: 0,
         user_ref: 0,
         tag: [0; 8],
-    }));
-    buf.push(WalEntry::Entry(TxEntry {
-        entry_type: WalEntryKind::TxEntry as u8,
-        kind: EntryKind::CREDIT,
-        _pad0: [0; 6],
-        _pad1: [0; 8],
-        account_id: 1,
-        amount: 10,
-        computed_balance: 10,
     }));
 }
 
@@ -237,6 +241,53 @@ fn tail_full_drain(c: &mut Criterion) {
     group.finish();
 }
 
+/// Drain the entire 10M-tx WAL from `from_tx_id = 1` via the
+/// transaction-oriented [`WalTailer::tail_transactions`] path and measure
+/// per-record throughput. Each iteration rebuilds the tailer (locate cost
+/// included) and counts every record delivered (meta + followers), so the
+/// number is directly comparable to [`tail_full_drain`], which counts the
+/// same raw records off `tail()`.
+///
+/// `tail_transactions` is fully zero-copy — the closing `TxMetadata` and the
+/// `EntryBuf` follower view both borrow the 4 MiB read buffer, no per-tx
+/// allocation — so this isolates the per-transaction grouping/decode cost
+/// layered on top of `tail()`'s raw byte streaming.
+fn tail_transactions_full_drain(c: &mut Criterion) {
+    let ds = dataset();
+    let storage = ds.storage.clone();
+    let mut group = c.benchmark_group("tail_transactions/full_drain");
+    group.throughput(Throughput::Elements(TOTAL_RECORDS));
+    // 800 MB drain per iter — match `tail_full_drain`'s low sample count.
+    group.sample_size(10);
+    group.bench_function("from_tx_id=1", |b| {
+        b.iter(|| {
+            let mut tailer = WalTailer::new(storage.clone(), 1);
+            let mut txs: u64 = 0;
+            let mut records: u64 = 0;
+            // One read per call (like the snapshot loop); pump until caught up.
+            // The gate always accepts (`true`), so this drains the whole WAL.
+            while tailer.tail_transactions(|tx| {
+                txs += 1;
+                records += 1 + tx.entries.len() as u64;
+                criterion::black_box(tx.meta.tx_id);
+                true
+            }) {}
+            // Sanity: every transaction (and thus every record) must surface;
+            // a mis-grouped boundary would make the throughput meaningless.
+            assert_eq!(
+                txs, TOTAL_TX,
+                "tail_transactions delivered {txs} txs; expected {TOTAL_TX}"
+            );
+            assert_eq!(
+                records, TOTAL_RECORDS,
+                "tail_transactions delivered {records} records; expected {TOTAL_RECORDS}"
+            );
+            criterion::black_box(records)
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(30);
@@ -245,6 +296,7 @@ criterion_group! {
         locate_near_beginning,
         locate_middle,
         locate_end_before_active,
-        tail_full_drain
+        tail_full_drain,
+        tail_transactions_full_drain
 }
 criterion_main!(benches);

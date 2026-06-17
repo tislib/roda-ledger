@@ -22,16 +22,20 @@ export function useTxStatus(txId: string | null): UseTxStatusResult {
   const stage = txId ? stageFromIndices(parseTxId(txId), indices) : 'Pending';
   const captured = txId ? (stickyFailReason.get(txId) ?? 0) : 0;
   const reachedSnapshot = stage === 'OnSnapshot';
+  // Pre-snapshot polling covers the mock (failed txs settle in an Error
+  // stage); the real backend only exposes the reason once the tx is on the
+  // snapshot, so re-key on `reachedSnapshot` to force one fetch there.
   const shouldPoll = txId != null && captured === 0 && !reachedSnapshot;
+  const enabled = txId != null && captured === 0;
 
   const q = useQuery({
-    queryKey: txId ? qk.tx.status(txId) : ['tx', 'status', null],
+    queryKey: txId ? [...qk.tx.status(txId), reachedSnapshot] : ['tx', 'status', null],
     queryFn: async (): Promise<{ failReason: FailReasonCode }> => {
       if (!txId) return { failReason: 0 };
       return client.getTransactionStatus(txId);
     },
     refetchInterval: shouldPoll ? 500 : false,
-    enabled: txId != null && shouldPoll,
+    enabled,
   });
 
   useEffect(() => {
