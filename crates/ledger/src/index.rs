@@ -179,7 +179,7 @@ impl TransactionIndexer {
 
 // ── compile-time size assertions ──────────────────────────────────────────────
 
-const _: () = assert!(std::mem::size_of::<TxSlot>() == 48);
+const _: () = assert!(size_of::<TxSlot>() == 48);
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
@@ -288,6 +288,61 @@ mod tests {
         idx.insert_transaction(&meta(5), &[entry(50, 1, EntryKind::CREDIT, 1)]);
 
         assert!(idx.get_transaction(1).is_none());
+    }
+
+    /// Regression: `circle2` must hold the followers for every transaction
+    /// `circle1` still retains. Production sizes (config.rs) make `circle1`
+    /// cover a segment of *transactions* but size `circle2` off the same
+    /// *transaction* count (× 2) — so `circle2` runs out of room the moment a
+    /// transaction averages more than 2 followers, and `get_transaction` misses
+    /// for transactions `circle1` is still holding.
+    ///
+    /// Expected to FAIL until `index_circle2_size` multiplies by entries-per-tx;
+    /// it pins the undersizing rather than the eviction mechanism itself.
+    #[test]
+    fn circle2_covers_every_transaction_circle1_retains() {
+        use crate::config::{LedgerConfig, StorageConfig};
+
+        // Size the index exactly as production does, with a tiny segment so the
+        // buffers stay small: circle1 = 16 slots, circle2 = 2 × 16 = 32 slots.
+        let cfg = LedgerConfig {
+            storage: StorageConfig {
+                transaction_count_per_segment: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let index_size = (cfg.storage.transaction_count_per_segment as usize).next_power_of_two();
+
+        let mut idx = TransactionIndexer::new(index_size, index_size * 4);
+
+        // Real transactions carry more than 2 followers (debit + credit + a link
+        // or term, or a WASM fan-out across accounts). Three entries each suffices.
+        const ENTRIES_PER_TX: u64 = 3;
+        let n = index_size as u64; // exactly circle1's capacity
+
+        for tx_id in 1..=n {
+            let followers: Vec<WalEntry> = (0..ENTRIES_PER_TX)
+                .map(|i| entry(tx_id * 10 + i, 1, EntryKind::CREDIT, 1))
+                .collect();
+            idx.insert_transaction(&meta(tx_id), &followers);
+        }
+
+        // tx_ids 1..=n map to n distinct circle1 slots (no collisions), so the
+        // index retains every one of them in circle1 and must return them all.
+        let retrievable = (1..=n)
+            .filter(|&id| idx.get_transaction(id).is_some())
+            .count();
+        assert_eq!(
+            retrievable,
+            n as usize,
+            "circle1 retains all {n} transactions but only {retrievable} are \
+             retrievable: circle2 ({} slots) covers just ~{} transactions at \
+             {ENTRIES_PER_TX} entries/tx",
+            index_size,
+            index_size * 4 / ENTRIES_PER_TX as usize,
+        );
     }
 
     #[test]

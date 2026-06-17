@@ -145,15 +145,15 @@ impl Snapshot {
         // Only account 0 (SYSTEM) is existent at genesis; ids 1.. stay absent.
         Self::mark_system_account(&accounts.load());
 
+        let index_size =
+            (config.storage.transaction_count_per_segment as usize).next_power_of_two();
+
         Self {
             accounts,
             links: Arc::new(SkipMap::new()),
             kv: HashMap::new(),
             constants: HashMap::new(),
-            indexer: Some(TransactionIndexer::new(
-                config.index_circle1_size(),
-                config.index_circle2_size(),
-            )),
+            indexer: Some(TransactionIndexer::new(index_size, index_size * 4)),
             storage,
             resize_factor: config.resize_factor,
         }
