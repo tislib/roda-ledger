@@ -17,10 +17,10 @@
 
 use crate::constants::{TX_ID_OFFSET, WAL_RECORD_SIZE};
 use crate::engine::Storage;
-use crate::entities::{WalEntry, WalEntryKind};
+use crate::entities::{CommittedTransactionRef, WalEntry, WalEntryKind};
 use crate::layout::{active_wal_path, segment_wal_path};
 use crate::wal_serializer::parse_wal_record;
-use crate::wal_zero_copy::{WalEntryRef, iter_records};
+use crate::wal_zero_copy::{EntryBuf, WalEntryRef, iter_records, read_entry};
 use spdlog::{debug, trace};
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -53,7 +53,8 @@ pub struct WalTailer {
     /// having to pass it again.
     from_tx_id: u64,
     cursor: Option<Cursor>,
-    /// Reusable read scratch for [`tail_entries`](Self::tail_entries); allocated lazily.
+    /// Reusable read scratch for [`tail_entries`](Self::tail_entries) /
+    /// [`tail_transactions`](Self::tail_transactions); allocated lazily.
     read_buf: Vec<u8>,
     /// Whole records read but not yet consumed by the handler (re-delivered next call).
     pending: Vec<u8>,
@@ -237,6 +238,50 @@ impl WalTailer {
             consumed > 0
         } else {
             let consumed = walk_groups(&self.pending, &mut handler);
+            if consumed > 0 {
+                self.pending.drain(..consumed);
+            }
+            consumed > 0
+        }
+    }
+
+    /// Stream committed WAL transactions through `handler`, each delivered as a
+    /// fully zero-copy [`CommittedTransactionRef`]: both the closing `TxMetadata`
+    /// and the [`EntryBuf`] view over its preceding followers borrow the read
+    /// buffer directly — no owned `Vec`, no per-transaction allocation. The
+    /// whole-transaction twin of [`tail_entries`](Self::tail_entries) for callers
+    /// that want a transaction at a time rather than entry-by-entry. Returns
+    /// `true` if any transaction was accepted (made progress), `false` on
+    /// idle/EOF (drives caller backoff).
+    ///
+    /// Returning `false` from `handler` stops the sweep and **retains the
+    /// rejected transaction** so it is re-delivered whole on the next call — the
+    /// snapshot's commit gate stops at a metadata whose `tx_id > commit_index`
+    /// and re-reads it once committed. Position only advances past
+    /// fully-accepted transactions. [`tail`](Self::tail) trims any partial
+    /// trailing group, so the handler only ever sees complete
+    /// `(followers… + meta)` transactions; same buffer-size contract — one
+    /// transaction must fit in the 4 MiB read buffer.
+    pub fn tail_transactions(
+        &mut self,
+        mut handler: impl FnMut(CommittedTransactionRef<'_>) -> bool,
+    ) -> bool {
+        // Only read new bytes once the retained transaction drains — we can't
+        // apply past a stopped (uncommitted) tx anyway, so don't read ahead.
+        if self.pending.is_empty() {
+            let mut buf = std::mem::take(&mut self.read_buf);
+            if buf.len() < TAIL_ENTRIES_BUF_BYTES {
+                buf.resize(TAIL_ENTRIES_BUF_BYTES, 0);
+            }
+            let n = self.tail(&mut buf) as usize;
+            let consumed = walk_transactions(&buf[..n], &mut handler);
+            if consumed < n {
+                self.pending.extend_from_slice(&buf[consumed..n]);
+            }
+            self.read_buf = buf;
+            consumed > 0
+        } else {
+            let consumed = walk_transactions(&self.pending, &mut handler);
             if consumed > 0 {
                 self.pending.drain(..consumed);
             }
@@ -442,6 +487,40 @@ fn walk_groups(bytes: &[u8], handler: &mut impl FnMut(WalEntry) -> bool) -> usiz
             consumed += group_len;
             group_len = 0;
         }
+    }
+    consumed
+}
+
+/// Deliver complete tx groups from `bytes` to `handler` as zero-copy
+/// [`CommittedTransactionRef`]s and return the byte length of the groups fully
+/// accepted (handler returned `true`). `tx_start` tracks where the in-flight
+/// transaction's followers begin; on its closing `TxMetadata` the followers are
+/// the slice `bytes[tx_start..meta]` wrapped as an [`EntryBuf`], handed out with
+/// the borrowed metadata — no copy. A `false` return stops the walk with that
+/// transaction left un-consumed, so the caller can retain and re-deliver it.
+/// `bytes` comes from [`WalTailer::tail`], which trims a partial trailing group,
+/// so a metadata always closes the final group. Trailer layout: followers
+/// precede their metadata; malformed records fold into the current group.
+fn walk_transactions(
+    bytes: &[u8],
+    handler: &mut impl FnMut(CommittedTransactionRef<'_>) -> bool,
+) -> usize {
+    let mut tx_start = 0usize;
+    let mut off = 0usize;
+    let mut consumed = 0usize;
+    while off + WAL_RECORD_SIZE <= bytes.len() {
+        let rec_end = off + WAL_RECORD_SIZE;
+        if let Ok(WalEntryRef::Metadata(meta)) = read_entry(&bytes[off..rec_end]) {
+            if !handler(CommittedTransactionRef {
+                meta,
+                entries: EntryBuf::new(&bytes[tx_start..off]),
+            }) {
+                break;
+            }
+            consumed = rec_end;
+            tx_start = rec_end;
+        }
+        off = rec_end;
     }
     consumed
 }
@@ -757,5 +836,158 @@ mod tests {
 
         // Nothing new appended → no progress.
         assert!(!tailer.tail_entries(|_| true));
+    }
+
+    #[test]
+    fn tail_transactions_groups_followers_with_their_metadata() {
+        // active: tx1 = entry + link + meta(sub=2); tx2 = entry + meta(sub=1).
+        // The handler must see two transactions, each carrying only its own
+        // followers (the closing metadata is delivered separately, not in entries).
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[entry(1), link(1), meta(1, 2), entry(2), meta(2, 1)],
+        );
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer(1);
+
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        tailer.tail_transactions(|tx| {
+            // EntryBuf reports its follower count without decoding…
+            assert_eq!(tx.entries.len(), tx.meta.sub_item_count as usize);
+            // …and decodes them zero-copy on demand via `iter()`.
+            let kinds: Vec<u8> = tx
+                .entries
+                .iter()
+                .map(|e| match e {
+                    WalEntryRef::Entry(_) => WalEntryKind::TxEntry as u8,
+                    WalEntryRef::Link(_) => WalEntryKind::Link as u8,
+                    _ => u8::MAX,
+                })
+                .collect();
+            match tx.meta.tx_id {
+                1 => assert_eq!(
+                    kinds,
+                    vec![WalEntryKind::TxEntry as u8, WalEntryKind::Link as u8]
+                ),
+                2 => assert_eq!(kinds, vec![WalEntryKind::TxEntry as u8]),
+                other => panic!("unexpected tx_id {other}"),
+            }
+            seen.push((tx.meta.tx_id, tx.entries.len()));
+            true
+        });
+        assert_eq!(seen, vec![(1, 2), (2, 1)]);
+
+        // Fully drained: a second call with nothing new appended makes no progress.
+        let mut again = 0;
+        let progressed = tailer.tail_transactions(|_| {
+            again += 1;
+            true
+        });
+        assert!(!progressed);
+        assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn tail_transactions_spans_sealed_to_active() {
+        // segment 1 (sealed): tx1 (entry + meta). active: tx2 (entry + term + meta).
+        // from_tx_id=1 must cross the boundary and deliver both in order.
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(&segment_wal_path(dir.path(), 1), &[entry(1), meta(1, 1)]);
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[entry(2), term(), meta(2, 2)],
+        );
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer(1);
+
+        let mut ids = Vec::new();
+        tailer.tail_transactions(|tx| {
+            ids.push(tx.meta.tx_id);
+            true
+        });
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn tail_transactions_holds_back_partial_group_until_complete() {
+        // tx1 complete; tx2's followers are written but its closing metadata
+        // hasn't landed. The partial group must not be delivered; once the
+        // metadata is appended, the next call delivers tx2 whole.
+        let dir = tempfile::tempdir().unwrap();
+        let active = active_wal_path(dir.path());
+        write_segment(&active, &[entry(1), meta(1, 1), entry(2), entry(2)]);
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer(1);
+
+        let mut ids = Vec::new();
+        tailer.tail_transactions(|tx| {
+            ids.push(tx.meta.tx_id);
+            true
+        });
+        assert_eq!(ids, vec![1], "partial tx2 must be held back");
+
+        // Append tx2's closing metadata (sub=2 matches the two followers).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap();
+        f.write_all(serialize_wal_records(&meta(2, 2))).unwrap();
+        f.sync_all().unwrap();
+
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        tailer.tail_transactions(|tx| {
+            seen.push((tx.meta.tx_id, tx.entries.len()));
+            true
+        });
+        assert_eq!(seen, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn tail_transactions_gates_and_redelivers_uncommitted() {
+        // tx1..tx3, each = entry + meta. A handler that rejects tx_id > limit
+        // (the snapshot's commit gate) delivers the committed prefix, retains the
+        // rejected transaction, and re-delivers it whole once the limit rises.
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(
+            &active_wal_path(dir.path()),
+            &[
+                entry(1),
+                meta(1, 1),
+                entry(2),
+                meta(2, 1),
+                entry(3),
+                meta(3, 1),
+            ],
+        );
+        let storage = open_storage(&dir);
+        let mut tailer = storage.wal_tailer(1);
+
+        // Gate at 2: tx1, tx2 apply; tx3 is rejected and its group retained.
+        let mut applied = Vec::new();
+        let progressed = tailer.tail_transactions(|tx| {
+            if tx.meta.tx_id > 2 {
+                return false;
+            }
+            applied.push((tx.meta.tx_id, tx.entries.len()));
+            true
+        });
+        assert!(progressed);
+        assert_eq!(applied, vec![(1, 1), (2, 1)]);
+
+        // Gate at 3: the retained tx3 transaction (entry + meta) is re-delivered whole.
+        let mut applied2 = Vec::new();
+        let progressed2 = tailer.tail_transactions(|tx| {
+            if tx.meta.tx_id > 3 {
+                return false;
+            }
+            applied2.push((tx.meta.tx_id, tx.entries.len()));
+            true
+        });
+        assert!(progressed2);
+        assert_eq!(applied2, vec![(3, 1)]);
+
+        // Nothing new appended → no progress.
+        assert!(!tailer.tail_transactions(|_| true));
     }
 }

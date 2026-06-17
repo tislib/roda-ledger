@@ -37,7 +37,7 @@ import {
 import type {
   GetStatusResponse as PbStatusResponse,
   SubmitOperationRequest,
-  WalLogRecord as PbWalLogRecord,
+  WalEntry as PbWalEntry,
 } from '@/gen/ledger_pb';
 import {
   EntryKind as PbEntryKind,
@@ -58,7 +58,7 @@ import type {
 } from '@/types/cluster';
 import type { LogEntry, LogEntryKind, WalLogRecord } from '@/types/log';
 import type { FailReasonCode, Operation } from '@/types/transaction';
-import type { WaitStatus, WaitStatusState } from '@/types/wait';
+import type { WaitStatusState } from '@/types/wait';
 import type {
   AvailableScenario,
   Scenario,
@@ -246,7 +246,7 @@ export function logEntryFromPb(pb: PbLogEntry): LogEntry {
   };
 }
 
-export function walRecordFromPb(pb: PbWalLogRecord): WalLogRecord | null {
+export function walRecordFromPb(pb: PbWalEntry): WalLogRecord | null {
   const e = pb.entry;
   if (!e) return null;
   switch (e.case) {
@@ -343,24 +343,16 @@ const WAIT_STATE_FROM: Record<PbTxStatus, WaitStatusState> = {
   [PbTxStatus.TX_NOT_FOUND]: 'NotFound',
 };
 
-export interface PerTxStatus {
-  failReason: FailReasonCode;
+/** Pipeline stage from a per-tx status poll. */
+export function txStateFromPb(pb: PbStatusResponse): WaitStatusState {
+  return WAIT_STATE_FROM[pb.status] ?? 'Pending';
 }
 
-/**
- * Live UI consumes only `fail_reason` from per-tx polling — pipeline stage
- * is derived from cluster pipeline indices, not from the per-tx response.
- */
-export function txStatusFromPb(pb: PbStatusResponse): PerTxStatus {
-  return { failReason: pb.failReason as FailReasonCode };
-}
-
-/** Used only by `waitForTransaction` blocking-poll loops. */
-export function waitStatusFromPb(pb: PbStatusResponse): WaitStatus {
-  return {
-    state: WAIT_STATE_FROM[pb.status] ?? 'Pending',
-    failReason: pb.failReason as FailReasonCode,
-  };
+// `GetStatusResponse` dropped `fail_reason`; read it from the committed tx's
+// metadata instead (0 = OK, or no metadata yet).
+export function metaFailReasonFromPb(meta?: PbWalEntry): FailReasonCode {
+  const rec = meta ? walRecordFromPb(meta) : null;
+  return rec?.kind === 'metadata' ? (rec.failReason as FailReasonCode) : 0;
 }
 
 // ---- Operation -> SubmitOperationRequest ----

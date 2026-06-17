@@ -1,3 +1,4 @@
+use crate::wal_zero_copy::EntryBuf;
 use bytemuck::{Pod, Zeroable};
 
 // Discriminants 2 and 3 are retired (formerly SegmentHeader / SegmentSealed);
@@ -448,6 +449,14 @@ impl CommittedTransaction {
     pub fn get_fail_reason(&self) -> FailReason {
         self.meta.fail_reason
     }
+}
+
+/// Borrowed twin of [`CommittedTransaction`]: the closing `TxMetadata` and a
+/// zero-copy [`EntryBuf`] view over its preceding followers — no owned `Vec`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedTransactionRef<'t> {
+    pub meta: &'t TxMetadata,
+    pub entries: EntryBuf<'t>,
 }
 
 // Hard compile-time guarantees: every WAL entry must be exactly 40 bytes.

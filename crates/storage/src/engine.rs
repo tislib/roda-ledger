@@ -181,15 +181,15 @@ impl Storage {
     /// - **Fully > `watermark`** (`first_tx > watermark`): delete
     ///   every artefact (`wal_{id}.{bin,crc,seal}`,
     ///   `wal_index_{id}.bin`, `account_index_{id}.bin`,
-    ///   `snapshot_{id}.{bin,crc}`,
-    ///   `function_snapshot_{id}.{bin,crc}`). The walk continues —
+    ///   `snapshot_{id}.{bin,crc}`, `function_snapshot_{id}.{bin,crc}`,
+    ///   `kv_snapshot_{id}.{bin,crc}`). The walk continues —
     ///   older segments may also be fully past or may straddle.
     /// - **Straddles `watermark`** (`first_tx ≤ watermark < last_tx`):
     ///   byte-truncate the file at the first `Metadata > watermark`
-    ///   offset and discard the balance + function snapshot pair (they
-    ///   captured state past the watermark and are no longer
-    ///   trustworthy). Walk terminates — older segments are entirely
-    ///   below by construction.
+    ///   offset and discard the balance, function, and KV snapshot
+    ///   triple (they captured state past the watermark and are no
+    ///   longer trustworthy). Walk terminates — older segments are
+    ///   entirely below by construction.
     ///
     /// **Sealed segments are immutable.** ADR-0016 §10's seal-watermark
     /// gate (`Ledger::set_seal_watermark`) guarantees a sealed segment

@@ -12,7 +12,7 @@
 use crate::constants::WAL_RECORD_SIZE;
 use crate::entities::{
     AccountFlagsUpdated, AccountLinked, AccountOpened, FunctionRegistered, KvConstant, KvEntry,
-    TxEntry, TxLink, TxMetadata, TxTerm, WalEntryKind,
+    TxEntry, TxLink, TxMetadata, TxTerm, WalEntry, WalEntryKind,
 };
 
 /// Borrowed view of a single WAL record. Lifetime is tied to the
@@ -29,6 +29,65 @@ pub enum WalEntryRef<'a> {
     AccountFlagsUpdated(&'a AccountFlagsUpdated),
     Kv(&'a KvEntry),
     KvConstant(&'a KvConstant),
+}
+
+impl WalEntryRef<'_> {
+    /// Copy this borrowed view into an owned [`WalEntry`]. Every inner record
+    /// is a `Copy` 40-byte POD, so this is a memcpy, not a re-parse — used when
+    /// a consumer must retain a record past the read buffer (e.g. the snapshot
+    /// index ring).
+    pub fn to_wal_entry(&self) -> WalEntry {
+        match *self {
+            WalEntryRef::Metadata(m) => WalEntry::Metadata(*m),
+            WalEntryRef::Entry(e) => WalEntry::Entry(*e),
+            WalEntryRef::Link(l) => WalEntry::Link(*l),
+            WalEntryRef::FunctionRegistered(f) => WalEntry::FunctionRegistered(*f),
+            WalEntryRef::Term(t) => WalEntry::Term(*t),
+            WalEntryRef::AccountOpened(a) => WalEntry::AccountOpened(*a),
+            WalEntryRef::AccountLinked(a) => WalEntry::AccountLinked(*a),
+            WalEntryRef::AccountFlagsUpdated(a) => WalEntry::AccountFlagsUpdated(*a),
+            WalEntryRef::Kv(k) => WalEntry::Kv(*k),
+            WalEntryRef::KvConstant(c) => WalEntry::KvConstant(*c),
+        }
+    }
+}
+
+/// Zero-copy view of a committed transaction's follower records: the raw
+/// 40-byte records that precede its closing `TxMetadata`. Borrows the read
+/// buffer directly and decodes lazily via [`iter_records`] — no owned `Vec`,
+/// no per-transaction allocation. Carried by
+/// [`crate::entities::CommittedTransactionRef`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryBuf<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> EntryBuf<'a> {
+    /// Wrap a whole-record follower byte range (length must be a multiple of
+    /// [`WAL_RECORD_SIZE`]; a trailing partial record is ignored on iteration).
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    /// Number of whole 40-byte follower records in view.
+    pub fn len(&self) -> usize {
+        self.bytes.len() / WAL_RECORD_SIZE
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.len() < WAL_RECORD_SIZE
+    }
+
+    /// Decode the followers left→right, zero-copy. `self` is `Copy`, so the
+    /// returned iterator borrows the underlying buffer for `'a`, not `self`.
+    pub fn iter(self) -> impl Iterator<Item = WalEntryRef<'a>> {
+        iter_records(self.bytes)
+    }
+
+    /// The raw follower bytes (whole records only).
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 /// Decode a single 40-byte WAL record without copying. The returned

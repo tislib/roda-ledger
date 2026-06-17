@@ -9,9 +9,9 @@
 //! `data_dir`, `segment_id`). That stays inside the `storage` module.
 
 use crate::layout::{
-    active_wal_path, function_snapshot_bin_path, function_snapshot_crc_path,
-    segment_account_index_path, segment_crc_path, segment_seal_path, segment_tx_index_path,
-    segment_wal_path, snapshot_bin_path, snapshot_crc_path,
+    active_wal_path, function_snapshot_bin_path, function_snapshot_crc_path, kv_snapshot_bin_path,
+    kv_snapshot_crc_path, segment_account_index_path, segment_crc_path, segment_seal_path,
+    segment_tx_index_path, segment_wal_path, snapshot_bin_path, snapshot_crc_path,
 };
 use crate::wal_reader::read_wal_data;
 use crate::{Segment, SegmentStaus};
@@ -65,7 +65,8 @@ impl Segment {
     /// `wal_{id}.bin`, `wal_{id}.crc`, `wal_{id}.seal`,
     /// `wal_index_{id}.bin`, `account_index_{id}.bin`,
     /// `snapshot_{id}.bin`, `snapshot_{id}.crc`,
-    /// `function_snapshot_{id}.bin`, `function_snapshot_{id}.crc`
+    /// `function_snapshot_{id}.bin`, `function_snapshot_{id}.crc`,
+    /// `kv_snapshot_{id}.bin`, `kv_snapshot_{id}.crc`
     /// (internal.md §23.5).
     ///
     /// Used by [`storage::Storage::truncate_wal_above`] when an
@@ -83,6 +84,9 @@ impl Segment {
             snapshot_crc_path(dir, segment_id),
             function_snapshot_bin_path(dir, segment_id),
             function_snapshot_crc_path(dir, segment_id),
+            // KV snapshot (ADR-023) captured state past the watermark too.
+            kv_snapshot_bin_path(dir, segment_id),
+            kv_snapshot_crc_path(dir, segment_id),
         ];
         for path in &candidates {
             if path.exists() {
@@ -94,12 +98,12 @@ impl Segment {
         Ok(())
     }
 
-    /// Removes the balance and function snapshot pairs
-    /// (`snapshot_{id}.{bin,crc}` and `function_snapshot_{id}.{bin,crc}`)
-    /// for this segment id. Used after truncating a *straddling*
-    /// segment — its existing snapshots captured state past the
-    /// watermark and are no longer trustworthy. Missing files are
-    /// tolerated.
+    /// Removes the balance, function, and KV snapshot triples
+    /// (`snapshot_{id}.{bin,crc}`, `function_snapshot_{id}.{bin,crc}`,
+    /// `kv_snapshot_{id}.{bin,crc}`) for this segment id. Used after
+    /// truncating a *straddling* segment — its existing snapshots
+    /// captured state past the watermark and are no longer
+    /// trustworthy. Missing files are tolerated.
     pub fn delete_snapshot_files_for_segment(data_dir: &str, segment_id: u32) -> Result<(), Error> {
         let dir = Path::new(data_dir);
         let candidates = [
@@ -107,6 +111,9 @@ impl Segment {
             snapshot_crc_path(dir, segment_id),
             function_snapshot_bin_path(dir, segment_id),
             function_snapshot_crc_path(dir, segment_id),
+            // KV snapshot (ADR-023) captured state past the watermark too.
+            kv_snapshot_bin_path(dir, segment_id),
+            kv_snapshot_crc_path(dir, segment_id),
         ];
         for path in &candidates {
             if path.exists() {
@@ -116,5 +123,53 @@ impl Segment {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::StorageConfig;
+    use crate::engine::Storage;
+
+    // A closed segment with a balance, function, and KV snapshot on disk.
+    fn temp_segment_with_snapshots() -> (Segment, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StorageConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..StorageConfig::default()
+        };
+        let storage = Storage::new(cfg).expect("storage");
+        let mut seg = storage.active_segment().expect("active segment");
+        seg.close().expect("close segment");
+        seg.save_snapshot(0, &[], &[])
+            .expect("save balance snapshot");
+        seg.save_function_snapshot(&[]).expect("save fn snapshot");
+        seg.save_kv_snapshot(&[], &[]).expect("save kv snapshot");
+        (seg, dir)
+    }
+
+    // Both delete helpers must drop the KV snapshot pair (ADR-023) so a
+    // reseed-truncated segment can't seed KV state past the watermark.
+    #[test]
+    fn delete_snapshot_files_removes_kv_snapshot() {
+        let (seg, dir) = temp_segment_with_snapshots();
+        let id = seg.id();
+        assert!(seg.has_kv_snapshot());
+        Segment::delete_snapshot_files_for_segment(&dir.path().to_string_lossy(), id)
+            .expect("delete snapshots");
+        assert!(!kv_snapshot_bin_path(dir.path(), id).exists());
+        assert!(!kv_snapshot_crc_path(dir.path(), id).exists());
+    }
+
+    #[test]
+    fn delete_all_files_removes_kv_snapshot() {
+        let (seg, dir) = temp_segment_with_snapshots();
+        let id = seg.id();
+        assert!(seg.has_kv_snapshot());
+        Segment::delete_all_files_for_segment(&dir.path().to_string_lossy(), id)
+            .expect("delete all");
+        assert!(!kv_snapshot_bin_path(dir.path(), id).exists());
+        assert!(!kv_snapshot_crc_path(dir.path(), id).exists());
     }
 }

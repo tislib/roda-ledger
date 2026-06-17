@@ -11,6 +11,7 @@
 //! Both circle sizes must be powers of two so modulo reduces to a bitmask.
 
 use bytemuck::Zeroable;
+use storage::EntryBuf;
 use storage::entities::{TxEntry, TxMetadata, WalEntry};
 
 // ── TxSlot (circle1) ──────────────────────────────────────────────────────────
@@ -111,19 +112,42 @@ impl TransactionIndexer {
     /// (stored as raw `WalEntry`). `WalEntry::Entry` followers are chained into
     /// the per-account `prev_link` history; all other followers are stored too.
     pub fn insert_transaction(&mut self, meta: &TxMetadata, followers: &[WalEntry]) {
+        self.insert_with(meta, followers.len(), followers.iter().copied());
+    }
+
+    /// Zero-copy twin of [`insert_transaction`](Self::insert_transaction): index
+    /// a transaction straight from a borrowed [`EntryBuf`] follower view, decoding
+    /// each record as it is copied into the ring — no intermediate `Vec`. The hot
+    /// path behind the snapshot's `tail_transactions` loop.
+    pub fn insert_transaction_ref(&mut self, meta: &TxMetadata, entries: EntryBuf) {
+        self.insert_with(
+            meta,
+            entries.len(),
+            entries.iter().map(|e| e.to_wal_entry()),
+        );
+    }
+
+    /// Shared core: write the `circle1` slot, then copy each follower into
+    /// `circle2`. `entry_count` must match the number of items `followers` yields.
+    fn insert_with(
+        &mut self,
+        meta: &TxMetadata,
+        entry_count: usize,
+        followers: impl Iterator<Item = WalEntry>,
+    ) {
         let tx_id = meta.tx_id;
         let slot_idx = (tx_id as usize) & self.circle1_mask;
         self.circle1[slot_idx] = TxSlot {
             meta: *meta,
             offset: (self.write_head2 & self.circle2_mask) as u32,
-            entry_count: followers.len() as u16,
+            entry_count: entry_count as u16,
             _pad: [0; 2],
         };
 
         for follower in followers {
             let idx = self.write_head2 & self.circle2_mask;
             self.circle2[idx] = IndexedTxEntry {
-                record: *follower,
+                record: follower,
                 tx_id,
             };
             self.write_head2 += 1;
