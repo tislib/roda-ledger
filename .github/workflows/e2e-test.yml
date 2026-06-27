@@ -19,106 +19,25 @@ jobs:
     name: Run E2E Test
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install hcloud CLI
-        run: |
-          curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz | tar xz
-          sudo mv hcloud /usr/local/bin/
+        run: scripts/util/hcloud-install.sh
 
-      - name: Create SSH key pair
-        run: |
-          ssh-keygen -t ed25519 -f ~/.ssh/e2e_test_key -N "" -q
-          echo "SSH_PUBLIC_KEY=$(cat ~/.ssh/e2e_test_key.pub)" >> $GITHUB_ENV
-
-      - name: Upload SSH key to Hetzner
+      # Provisions a server, runs the e2e suite on it, fetches results/, then destroys
+      # the server (the orchestrator traps EXIT). The always-destroy step below is a
+      # backstop in case the orchestrator is killed before its trap runs.
+      - name: Run E2E test on Hetzner
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          KEY_RESPONSE=$(hcloud ssh-key create \
-            --name "e2e-test-${{ github.run_id }}" \
-            --public-key "$SSH_PUBLIC_KEY" \
-            --output json)
-          echo "SSH_KEY_ID=$(echo "$KEY_RESPONSE" | jq -r '.id // .ssh_key.id')" >> $GITHUB_ENV
-
-      - name: Create Hetzner server
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          SERVER_RESPONSE=$(hcloud server create \
-            --name "$HETZNER_SERVER_NAME" \
-            --type "$HETZNER_SERVER_TYPE" \
-            --image "$HETZNER_IMAGE" \
-            --location "$HETZNER_LOCATION" \
-            --ssh-key "e2e-test-${{ github.run_id }}" \
-            --output json)
-          SERVER_IP=$(echo "$SERVER_RESPONSE" | jq -r '.server.public_net.ipv4.ip')
-          echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
-          echo "Server created at $SERVER_IP"
-
-      - name: Wait for server to be reachable
-        run: |
-          for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-              -i ~/.ssh/e2e_test_key root@$SERVER_IP "echo ok" 2>/dev/null; then
-              echo "Server is reachable"
-              exit 0
-            fi
-            echo "Waiting for server... ($i/30)"
-            sleep 10
-          done
-          echo "::error::Server not reachable after 5 minutes"
-          exit 1
-
-      - name: Setup server and run E2E tests
-        run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/e2e_test_key root@$SERVER_IP \
-            "BRANCH='$BRANCH' REPO='$REPO' NODES='$NODES' bash -s" << 'SETUP_EOF'
-          set -euo pipefail
-
-          # Install dependencies
-          apt-get update -qq
-          apt-get install -y -qq build-essential pkg-config libssl-dev protobuf-compiler git curl
-
-          # Install Rust
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q
-
-          # Clone repository
-          git clone --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" /root/roda-ledger
-          cd /root/roda-ledger
-
-          # Pre-build both bins so `scenario` can resolve its sibling
-          # `roda-server` via `current_exe()` on the first spawn —
-          # they land in the same target/release/ directory.
-          # `-p` is required: `--bin scenario` alone searches only the
-          # workspace's default-run packages, which doesn't include
-          # `control`.
-          /root/.cargo/bin/cargo build --release \
-            -p cluster --bin roda-server \
-            -p control --bin scenario
-
-          # Run every e2e scenario against a fresh N-node localhost
-          # cluster per scenario. Each scenario provisions its own
-          # cluster via the process provisioner, runs to completion,
-          # tears down. NODES defaults to 3 (set by the workflow
-          # input) — failover scenarios need ≥ 3 for quorum.
-          echo "::group::E2E Test Output"
-          /root/.cargo/bin/cargo run --release \
-            -p control --bin scenario \
-            -- --nodes "$NODES" run-all --group e2e 2>&1 \
-            | tee /root/e2e-test-output.txt
-          echo "::endgroup::"
-          SETUP_EOF
-        env:
-          BRANCH: ${{ github.ref_name }}
+          SERVER_NAME: ${{ env.HETZNER_SERVER_NAME }}
+          SERVER_TYPE: ${{ env.HETZNER_SERVER_TYPE }}
+          SERVER_IMAGE: ${{ env.HETZNER_IMAGE }}
+          SERVER_LOCATION: ${{ env.HETZNER_LOCATION }}
           REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
           NODES: ${{ inputs.nodes }}
-
-      - name: Retrieve results
-        if: always()
-        run: |
-          mkdir -p results
-          scp -o StrictHostKeyChecking=no -i ~/.ssh/e2e_test_key \
-            root@$SERVER_IP:/root/e2e-test-output.txt results/e2e-test-output.txt 2>/dev/null || \
-            echo "No output file to retrieve" > results/e2e-test-output.txt
+        run: scripts/deploy/e2e-test.sh
 
       - name: Upload results artifact
         if: always()
@@ -132,9 +51,5 @@ jobs:
         if: always()
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          echo "Destroying server $HETZNER_SERVER_NAME..."
-          hcloud server delete "$HETZNER_SERVER_NAME" || true
-          echo "Cleaning up SSH key..."
-          hcloud ssh-key delete "e2e-test-${{ github.run_id }}" || true
-          echo "Cleanup complete"
+          SERVER_NAME: ${{ env.HETZNER_SERVER_NAME }}
+        run: scripts/util/destroy-server.sh --name "$SERVER_NAME"

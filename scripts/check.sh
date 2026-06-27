@@ -1,25 +1,12 @@
 #!/usr/bin/env bash
-set -eu
+# Full local gate (matches CI). Delegates to scripts/ci/*; run those individually
+# for a single check. See scripts/ci/README.md.
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# Ensure we're in the project root
-cd "$(dirname "$0")/.."
-
-if ! command -v cargo-nextest >/dev/null 2>&1; then
-    echo "error: cargo-nextest not found. Install with:" >&2
-    echo "  cargo install cargo-nextest --locked" >&2
-    exit 1
-fi
-
-echo "Running rustfmt..."
-cargo fmt --all --check
-
-echo "Running clippy..."
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-echo "Running tests..."
-cargo nextest run --workspace --cargo-profile ci --all-features
-
-echo "Running doctests..."
-cargo test --doc --profile ci
+ci/fmt.sh
+ci/clippy.sh
+ci/test.sh
+ci/doctest.sh
 
 echo "All checks passed!"

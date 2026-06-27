@@ -27,7 +27,7 @@ jobs:
         with:
           components: rustfmt
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: scripts/ci/fmt.sh
 
   clippy:
     name: Clippy
@@ -48,7 +48,7 @@ jobs:
           shared-key: "ci"
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy check
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: scripts/ci/clippy.sh
 
   test:
     name: Test
@@ -69,6 +69,6 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - name: Run tests
-        run: cargo nextest run --workspace --cargo-profile ci --all-features
+        run: scripts/ci/test.sh
       - name: Doctests
-        run: cargo test --doc --profile ci
+        run: scripts/ci/doctest.sh

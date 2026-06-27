@@ -16,7 +16,8 @@ target
 .idea/
 **/wal.bin
 **/snapshot.bin
-dev/
+# Personal scratch dir at the repo root only — anchored so it does not match scripts/dev/.
+/dev/
 temp*
 data/
 
@@ -26,3 +27,6 @@ docs/book/
 .claude
 
 # UI artifacts are ignored by ui/.gitignore
+
+# Private dev-box config for scripts/dev (RODA_DEV_HOST / RODA_DEV_PATH)
+scripts/dev/.env
