@@ -62,126 +62,32 @@ jobs:
     name: Deploy to Hetzner
     needs: build-images
     runs-on: ubuntu-latest
-    env:
-      SERVER_NAME: ${{ inputs.server_name }}
-      SERVER_TYPE: ${{ inputs.server_type }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install hcloud CLI
-        run: |
-          curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz | tar xz
-          sudo mv hcloud /usr/local/bin/
+        run: scripts/util/hcloud-install.sh
 
-      - name: Create SSH key pair
-        run: |
-          ssh-keygen -t ed25519 -f ~/.ssh/demo_key -N "" -q
-          echo "SSH_PUBLIC_KEY=$(cat ~/.ssh/demo_key.pub)" >> $GITHUB_ENV
-
-      - name: Remove any prior server and SSH key with the same name
+      # Provision the server and bring up the stack. CONTROL_IMAGE/UI_IMAGE come from
+      # the workflow env above; deploy-demo.sh reads them and writes results/demo-info.env.
+      - name: Provision server & deploy demo stack
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          echo "Cleaning any prior demo named $SERVER_NAME..."
-          hcloud server delete "$SERVER_NAME" || true
-          hcloud ssh-key delete "$SERVER_NAME" || true
-
-      - name: Upload SSH key to Hetzner
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          hcloud ssh-key create \
-            --name "$SERVER_NAME" \
-            --public-key "$SSH_PUBLIC_KEY" \
-            --output json > /dev/null
-
-      - name: Create Hetzner server
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          if ! SERVER_RESPONSE=$(hcloud server create \
-                --name "$SERVER_NAME" \
-                --type "$SERVER_TYPE" \
-                --image "$HETZNER_IMAGE" \
-                --location "$HETZNER_LOCATION" \
-                --ssh-key "$SERVER_NAME" \
-                --output json 2>&1); then
-            echo "::error::hcloud server create failed:"
-            echo "$SERVER_RESPONSE"
-            echo "::group::Server types available in $HETZNER_LOCATION"
-            hcloud server-type list -o columns=name,cores,cpu_type,memory,disk || true
-            echo "::endgroup::"
-            exit 1
-          fi
-          SERVER_IP=$(echo "$SERVER_RESPONSE" | jq -r '.server.public_net.ipv4.ip')
-          echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
-          echo "Server created at $SERVER_IP"
-
-      - name: Wait for server to be reachable
-        run: |
-          for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-              -i ~/.ssh/demo_key root@$SERVER_IP "echo ok" 2>/dev/null; then
-              echo "Server is reachable"
-              exit 0
-            fi
-            echo "Waiting for server... ($i/30)"
-            sleep 10
-          done
-          echo "::error::Server not reachable after 5 minutes"
-          exit 1
-
-      - name: Install Docker and deploy demo stack
-        env:
-          BRANCH: ${{ github.ref_name }}
+          SERVER_NAME: ${{ inputs.server_name }}
+          SERVER_TYPE: ${{ inputs.server_type }}
+          SERVER_IMAGE: ${{ env.HETZNER_IMAGE }}
+          SERVER_LOCATION: ${{ env.HETZNER_LOCATION }}
           REPO: ${{ github.repository }}
-        run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/demo_key root@$SERVER_IP \
-            "BRANCH='$BRANCH' REPO='$REPO' SERVER_IP='$SERVER_IP' \
-             CONTROL_IMAGE='$CONTROL_IMAGE' UI_IMAGE='$UI_IMAGE' bash -s" << 'SETUP_EOF'
-          set -euo pipefail
-
-          apt-get update -qq
-          curl -fsSL https://get.docker.com | sh
-
-          mkdir -p /root/roda-demo && cd /root/roda-demo
-
-          # Fetch the same compose file end-users would download themselves.
-          curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/docker-compose.control.yml" \
-            -o docker-compose.yml
-
-          # Swap :latest for the demo-tagged images we just pushed.
-          # Anchor on `image:` so the comments referencing :latest stay intact.
-          sed -i "s|image: tislib/roda-ledger:control-latest|image: $CONTROL_IMAGE|" docker-compose.yml
-          sed -i "s|image: tislib/roda-ledger:ui-latest|image: $UI_IMAGE|" docker-compose.yml
-
-          # Override CONTROL_PLANE_URL so the UI calls the public IP, not localhost.
-          cat > docker-compose.override.yml <<OVERRIDE
-          services:
-            ui:
-              environment:
-                CONTROL_PLANE_URL: "http://$SERVER_IP:50051"
-          OVERRIDE
-
-          docker compose pull
-          docker compose up -d
-          docker compose ps
-          SETUP_EOF
-
-      - name: Smoke check UI
-        run: |
-          for i in $(seq 1 6); do
-            if ssh -o StrictHostKeyChecking=no -i ~/.ssh/demo_key root@$SERVER_IP \
-              "curl -fsS http://localhost:8080 >/dev/null"; then
-              echo "UI is responding"
-              exit 0
-            fi
-            echo "UI not ready, retrying... ($i/6)"
-            sleep 5
-          done
-          echo "::warning::UI did not respond on port 8080 — check 'docker compose logs' on the server"
+          BRANCH: ${{ github.ref_name }}
+        run: scripts/deploy/deploy-demo.sh
 
       - name: Write demo info to step summary
         run: |
-          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          set -a
+          # shellcheck source=/dev/null
+          . results/demo-info.env
+          set +a
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## Roda-Ledger Demo Deployed
 
           | | |

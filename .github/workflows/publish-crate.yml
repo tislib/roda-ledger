@@ -30,20 +30,7 @@ jobs:
         with:
           shared-key: "ci"
 
-      - name: Test (host, incl. the tools build helper)
-        run: cargo test -p roda-wasm-abi --features tools
-
-      - name: Build for wasm32
-        run: cargo build -p roda-wasm-abi --target wasm32-unknown-unknown
-
-      - name: Build examples for wasm32
-        run: |
-          for ex in transfer counter; do
-            cargo build --release --target wasm32-unknown-unknown \
-              --manifest-path "crates/roda-wasm-abi/examples/$ex/Cargo.toml"
-          done
-
-      - name: Publish to crates.io
-        run: cargo publish -p roda-wasm-abi
+      - name: Build, test & publish
+        run: scripts/ci/publish-wasm-abi.sh
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

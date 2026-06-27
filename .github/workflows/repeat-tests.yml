@@ -36,12 +36,4 @@ jobs:
       - name: Run tests ${{ inputs.repeat_count }} times
         env:
           REPEAT_COUNT: ${{ inputs.repeat_count }}
-        run: |
-          for i in $(seq 1 "$REPEAT_COUNT"); do
-            echo "::group::Iteration $i / $REPEAT_COUNT — nextest"
-            cargo nextest run --workspace --cargo-profile ci
-            echo "::endgroup::"
-            echo "::group::Iteration $i / $REPEAT_COUNT — doctests"
-            cargo test --doc --profile ci
-            echo "::endgroup::"
-          done
+        run: scripts/ci/repeat-tests.sh "$REPEAT_COUNT"
