@@ -1,69 +1,90 @@
-//! Load (throughput / soak) scenarios. The runner records latency and
-//! op counts during execution; assertions are minimal — these
-//! scenarios are about producing measurements, not pass/fail.
+//! Load (throughput / soak) scenarios. The runner records per-stage
+//! latency (via the leader probe) and `cluster_commit` movement during
+//! execution; assertions are minimal — these scenarios are about
+//! producing measurements, not pass/fail.
+//!
+//! ## Load levels & data budget
+//!
+//! All scenarios deposit (`amount = 1`) so disk is dominated by the WAL:
+//! ~120 bytes per op, per node. Budget is ideally a few GB / node, hard
+//! cap <10 GB (≈83M ops). Each scenario provisions a fresh cluster
+//! (temp dirs, removed on drop), so totals don't accumulate across runs.
+//!
+//! | scenario              | rate      | ops   | data/node |
+//! |-----------------------|-----------|-------|-----------|
+//! | deposit_burst_1k      | uncapped  | 1k    | ~0        |
+//! | concurrent_deposit    | uncapped  | 200k  | ~24 MB    |
+//! | sustained_2min        | 100k/s    | 12M   | ~1.4 GB   |
+//! | sustained_10min       | 500/s     | 300k  | ~36 MB    |
+//! | spike                 | 500k/s    | 5M    | ~600 MB   |
+//! | peak                  | uncapped  | 10M   | ~1.2 GB   |
+//!
+//! Drains: every measured scenario ends with `WaitForLevel(OnSnapshot)`
+//! on the last `user_ref`, so the report covers commit, not just submit.
+//! Deposits use a non-zero base `user_ref` so the runner's per-op
+//! `iter * stride` offset yields unique refs `1..=TOTAL_OPS` and the
+//! drain can resolve the last one (a zero base collapses every op to
+//! `user_ref = 0` and the drain never binds).
 
 use std::time::Duration;
 
 use crate::scenario::{
     Action, AsyncBranch, BatchKind, NodeSelector, PipelineLevel, RetryConfig, Scenario, Step,
-    Submit, SubmitBatch, SubmitOp, TxRef, Wait, WaitForLevel, WaitLevel,
+    SubmitBatch, SubmitOp, TxRef, Wait, WaitForLevel, WaitLevel,
 };
 
 pub fn all() -> Vec<Scenario> {
     vec![
         deposit_burst_1k(),
-        sustained_transfer_load(),
+        concurrent_deposit_load(),
         load_sustained_2min(),
         load_sustained_10min(),
         load_spike(),
+        load_peak(),
     ]
 }
 
-/// 10-minute sustained deposit stream at the same rate as
-/// `load_sustained_2min` (500 ops/s). Used to give CPU profilers a
-/// long, steady-state target so per-thread cost stabilises.
-fn load_sustained_10min() -> Scenario {
-    const RATE_OPS_PER_SEC: u32 = 500;
-    const DURATION_SECS: u32 = 600;
-    const TOTAL_OPS: u64 = (RATE_OPS_PER_SEC as u64) * (DURATION_SECS as u64);
-
-    Scenario::new("load_sustained_10min")
-        .with_description(
-            "500 ops/s deposit stream sustained for 10 minutes — long-running target for CPU profiling.",
-        )
-        .with_steps(vec![
-            Step::new(Action::SubmitBatch(SubmitBatch {
-                wait: WaitLevel::None,
-                retry: None,
-                rate: RATE_OPS_PER_SEC,
-                kind: BatchKind::Dynamic {
-                    base: vec![SubmitOp::Deposit {
-                        account: 1,
-                        amount: 1,
-                        user_ref: 1,
-                    }],
-                    repeat: TOTAL_OPS as u32,
-                    batch_size: 0,
-                },
-            }))
-            .with_label("300k deposits at 500 ops/s over 10 min"),
-            Step::new(Action::WaitForLevel(WaitForLevel {
-                node: NodeSelector::Leader,
-                tx: TxRef::UserRef(TOTAL_OPS),
-                level: PipelineLevel::OnSnapshot,
-            })),
-        ])
+/// One fire-and-forget deposit stream into `account`. `base_user_ref`
+/// must be non-zero so the offset scheme produces unique refs and the
+/// caller can drain on `base_user_ref + total - 1`.
+fn deposit_stream(
+    account: u64,
+    base_user_ref: u64,
+    total: u32,
+    chunk: u32,
+    rate: u32,
+) -> SubmitBatch {
+    SubmitBatch {
+        wait: WaitLevel::None,
+        retry: None,
+        rate,
+        kind: BatchKind::Dynamic {
+            base: vec![SubmitOp::Deposit {
+                account,
+                amount: 1,
+                user_ref: base_user_ref,
+            }],
+            repeat: total,
+            batch_size: chunk,
+        },
+    }
 }
 
-/// 1000 deposits driven from a single async branch with retry. Cheap
-/// enough to run in CI; heavy enough to surface obvious latency
-/// regressions. Expressed as one `SubmitBatch::Dynamic` so the
-/// scenario stays compact regardless of repeat count.
+/// Block until the deposit with `user_ref` lands on the leader's
+/// snapshot — drains the pipeline so the report measures commit.
+fn drain_to_snapshot(user_ref: u64) -> Step {
+    Step::new(Action::WaitForLevel(WaitForLevel {
+        node: NodeSelector::Leader,
+        tx: TxRef::UserRef(user_ref),
+        level: PipelineLevel::OnSnapshot,
+    }))
+}
+
+/// 1000 deposits from one async branch with retry. Cheap enough for CI,
+/// heavy enough to surface obvious latency regressions.
 fn deposit_burst_1k() -> Scenario {
     Scenario::new("load_deposit_burst_1k")
-        .with_description(
-            "Fire 1000 deposits from one async branch, then assert the final balance.",
-        )
+        .with_description("Fire 1000 deposits from one async branch (CI smoke).")
         .with_steps(vec![
             Step::new(Action::AsyncBranch(AsyncBranch {
                 name: Some("burst".into()),
@@ -88,153 +109,119 @@ fn deposit_burst_1k() -> Scenario {
                     .with_label("1k deposits"),
                 ],
             })),
-            // Implicit join at end-of-scenario; small grace period so
-            // the cluster has settled before asserting.
+            // Implicit join at end-of-scenario; small grace period.
             Step::new(Action::Wait(Wait {
                 duration: Duration::from_millis(500),
             })),
         ])
 }
 
-/// Two account ranges transferring back and forth. Lighter workload
-/// than the burst — runs longer wall-clock for soak-style observation.
-fn sustained_transfer_load() -> Scenario {
-    Scenario::new("load_sustained_transfer")
+/// Two concurrent branches each streaming 100k deposits into a distinct
+/// account — exercises fan-out submission across `AsyncBranch`es.
+/// (Was the transfer scenario; batched non-deposit ops aren't wired, so
+/// it now deposits.)
+fn concurrent_deposit_load() -> Scenario {
+    const PER_BRANCH: u32 = 100_000;
+    const CHUNK: u32 = 1_000;
+
+    let branch = |name: &str, account: u64, base_ref: u64| {
+        Step::new(Action::AsyncBranch(AsyncBranch {
+            name: Some(name.into()),
+            steps: vec![Step::new(Action::SubmitBatch(deposit_stream(
+                account, base_ref, PER_BRANCH, CHUNK, 0,
+            )))],
+        }))
+    };
+
+    Scenario::new("load_concurrent_deposit")
         .with_description(
-            "Two concurrent branches transferring between two accounts; final balances net to zero.",
+            "Two concurrent branches each streaming 100k deposits (fan-out, 200k total).",
         )
         .with_steps(vec![
-            Step::new(Action::Submit(Submit {
-                op: SubmitOp::Deposit {
-                    account: 10,
-                    amount: 10_000,
-                    user_ref: 0,
-                },
-                wait: WaitLevel::Committed,
-                retry: None,
-            })),
-            Step::new(Action::AsyncBranch(AsyncBranch {
-                name: Some("a_to_b".into()),
-                steps: vec![Step::new(Action::SubmitBatch(SubmitBatch {
-                    wait: WaitLevel::None,
-                    retry: None,
-                    rate: 0,
-                    kind: BatchKind::Dynamic {
-                        base: vec![SubmitOp::Transfer {
-                            from: 10,
-                            to: 11,
-                            amount: 1,
-                            user_ref: 1_000,
-                        }],
-                        repeat: 200,
-                        batch_size: 0,
-                    },
-                }))],
-            })),
-            Step::new(Action::AsyncBranch(AsyncBranch {
-                name: Some("b_to_a".into()),
-                steps: vec![Step::new(Action::SubmitBatch(SubmitBatch {
-                    wait: WaitLevel::None,
-                    retry: None,
-                    rate: 0,
-                    kind: BatchKind::Dynamic {
-                        base: vec![SubmitOp::Transfer {
-                            from: 11,
-                            to: 10,
-                            amount: 1,
-                            user_ref: 2_000,
-                        }],
-                        repeat: 200,
-                        batch_size: 0,
-                    },
-                }))],
-            })),
+            branch("branch_a", 10, 1),
+            branch("branch_b", 11, 1_000_000),
+            // Implicit join at end-of-scenario; grace period to settle.
             Step::new(Action::Wait(Wait {
                 duration: Duration::from_millis(500),
             })),
         ])
 }
 
-/// Sustain ~500 ops/s for 2 minutes (60_000 deposits total). Rate-
-/// limited at the runner; the cluster's actual achieved throughput
-/// shows up in the report's `cluster_commit` movement. Drains
-/// explicitly via `WaitForLevel(OnSnapshot)` on the last user_ref so
-/// the report reflects all ops landing, not just being submitted.
+/// Sustain 100k ops/s for 2 minutes (12M deposits). Rate-limited at the
+/// runner; the cluster's achieved throughput shows up in the report's
+/// `cluster_commit` movement and the per-stage latency probe.
 fn load_sustained_2min() -> Scenario {
-    const RATE_OPS_PER_SEC: u32 = 500;
+    const RATE: u32 = 100_000;
     const DURATION_SECS: u32 = 120;
-    const TOTAL_OPS: u64 = (RATE_OPS_PER_SEC as u64) * (DURATION_SECS as u64);
+    const TOTAL_OPS: u32 = RATE * DURATION_SECS;
+    const CHUNK: u32 = 1_000;
 
     Scenario::new("load_sustained_2min")
-        .with_description(
-            "500 ops/s deposit stream sustained for 2 minutes; report throughput from cluster_commit, latencies if any, per-node lag.",
-        )
+        .with_description("100k ops/s deposit stream sustained for 2 minutes (12M ops).")
         .with_steps(vec![
-            Step::new(Action::SubmitBatch(SubmitBatch {
-                wait: WaitLevel::None,
-                retry: None,
-                rate: RATE_OPS_PER_SEC,
-                kind: BatchKind::Dynamic {
-                    base: vec![SubmitOp::Deposit {
-                        account: 1,
-                        amount: 1,
-                        user_ref: 0,
-                    }],
-                    repeat: TOTAL_OPS as u32,
-                    batch_size: 0,
-                },
-            }))
-            .with_label("60k deposits at 500 ops/s"),
-            // Drain: block until the last submitted tx lands on
-            // snapshot. Ensures the throughput report covers commit
-            // (not just submit) over the full window.
-            Step::new(Action::WaitForLevel(WaitForLevel {
-                node: NodeSelector::Leader,
-                tx: TxRef::UserRef(TOTAL_OPS),
-                level: PipelineLevel::OnSnapshot,
-            })),
+            Step::new(Action::SubmitBatch(deposit_stream(
+                1, 1, TOTAL_OPS, CHUNK, RATE,
+            )))
+            .with_label("12M deposits at 100k ops/s"),
+            drain_to_snapshot(TOTAL_OPS as u64),
         ])
 }
 
-/// 1M deposits, dispatched as 1000 batches of 1000 ops each. The
-/// runner's `submit_batch` chunking groups `CHUNK_SIZE` ops per RPC,
-/// so per-RPC gRPC framing is amortized across 1000 ops and the run
-/// exercises the cluster's commit path, not tonic round-trip cost.
+/// 500 ops/s sustained for 10 minutes (300k deposits). Deliberately low:
+/// a long, steady-state target for CPU profilers, where per-thread cost
+/// stabilises. The only scenario where low load is the point.
+fn load_sustained_10min() -> Scenario {
+    const RATE: u32 = 500;
+    const DURATION_SECS: u32 = 600;
+    const TOTAL_OPS: u32 = RATE * DURATION_SECS;
+
+    Scenario::new("load_sustained_10min")
+        .with_description(
+            "500 ops/s deposit stream sustained for 10 minutes — CPU-profiling target.",
+        )
+        .with_steps(vec![
+            Step::new(Action::SubmitBatch(deposit_stream(
+                1, 1, TOTAL_OPS, 0, RATE,
+            )))
+            .with_label("300k deposits at 500 ops/s over 10 min"),
+            drain_to_snapshot(TOTAL_OPS as u64),
+        ])
+}
+
+/// A short, high-rate spike: 500k ops/s for ~10s (5M deposits), the top
+/// of the rate-capped range. Batched at 5k ops/chunk so 100 RPCs/s carry
+/// the rate.
 fn load_spike() -> Scenario {
-    // Total ops = base.len() * TOTAL_OPS = 1 * 1_000_000 = 1_000_000.
-    // CHUNK_SIZE is the on-wire chunk: 1M ops / 1000 ops-per-chunk =
-    // 1000 `submit_batch` RPCs.
-    const CHUNK_SIZE: u32 = 1_000;
-    const TOTAL_OPS: u32 = 1_000_000;
+    const RATE: u32 = 500_000;
+    const DURATION_SECS: u32 = 10;
+    const TOTAL_OPS: u32 = RATE * DURATION_SECS;
+    const CHUNK: u32 = 5_000;
 
     Scenario::new("load_spike")
-        .with_description("1M-op spike at full speed via 1000 batches of 1000 deposits.")
+        .with_description("500k ops/s deposit spike for ~10s (5M ops).")
         .with_steps(vec![
-            Step::new(Action::SubmitBatch(SubmitBatch {
-                wait: WaitLevel::None,
-                retry: None,
-                rate: 0,
-                kind: BatchKind::Dynamic {
-                    // user_ref: 1 (non-zero) so the runner's per-base
-                    // `iter * stride` offset produces unique user_refs
-                    // 1..=TOTAL_OPS and the drain step below can
-                    // resolve the last one.
-                    base: vec![SubmitOp::Deposit {
-                        account: 1,
-                        amount: 1,
-                        user_ref: 1,
-                    }],
-                    repeat: TOTAL_OPS,
-                    batch_size: CHUNK_SIZE,
-                },
-            }))
-            .with_label("1k batches × 1k deposits"),
-            // Drain so the report measures the full burst settling,
-            // not just submission.
-            Step::new(Action::WaitForLevel(WaitForLevel {
-                node: NodeSelector::Leader,
-                tx: TxRef::UserRef(TOTAL_OPS as u64),
-                level: PipelineLevel::OnSnapshot,
-            })),
+            Step::new(Action::SubmitBatch(deposit_stream(
+                1, 1, TOTAL_OPS, CHUNK, RATE,
+            )))
+            .with_label("5M deposits at 500k ops/s"),
+            drain_to_snapshot(TOTAL_OPS as u64),
+        ])
+}
+
+/// Full load, uncapped: 10M deposits as fast as the runner + cluster
+/// allow, batched 1k ops/chunk. Measures peak commit throughput; 10M
+/// gives a multi-second window the 100ms poller can resolve.
+fn load_peak() -> Scenario {
+    const TOTAL_OPS: u32 = 10_000_000;
+    const CHUNK: u32 = 1_000;
+
+    Scenario::new("load_peak")
+        .with_description("Uncapped 10M-deposit peak — full speed, batched 1k/chunk.")
+        .with_steps(vec![
+            Step::new(Action::SubmitBatch(deposit_stream(
+                1, 1, TOTAL_OPS, CHUNK, 0,
+            )))
+            .with_label("10M deposits at full speed"),
+            drain_to_snapshot(TOTAL_OPS as u64),
         ])
 }

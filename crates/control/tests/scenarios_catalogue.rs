@@ -34,8 +34,13 @@ fn list_returns_seed_catalogue() {
         names
     );
     assert!(
-        names.contains(&"load_sustained_transfer"),
-        "missing load_sustained_transfer; got {:?}",
+        names.contains(&"load_concurrent_deposit"),
+        "missing load_concurrent_deposit; got {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"load_peak"),
+        "missing load_peak; got {:?}",
         names
     );
 }
