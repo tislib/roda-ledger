@@ -1391,6 +1391,40 @@ impl ClusterTestingControl {
             })
     }
 
+    /// Run the latency probe against slot `slot`'s node **in-process**
+    /// (`latency-probe` feature). The probe measures inside the node, so
+    /// this bypasses the derived `client_port + 2000` gRPC socket — that
+    /// port can overflow `u16` under the harness's OS-assigned ports, the
+    /// same reason the fault injector is driven in-process.
+    #[cfg(feature = "latency-probe")]
+    pub async fn probe_latency_at(
+        &self,
+        slot: usize,
+        wait_level: ::proto::latency::WaitLevel,
+        probe_count: u32,
+        probe_interval_ms: u64,
+    ) -> Result<::proto::latency::ProbeResponse, ClusterTestingError> {
+        use ::proto::latency::latency_probe_server::LatencyProbe;
+        let node = self
+            .slot(slot)?
+            .node
+            .as_ref()
+            .ok_or(ClusterTestingError::NotStarted { idx: slot })?;
+        let resp = node
+            .latency_probe_handler()
+            .probe(tonic::Request::new(::proto::latency::ProbeRequest {
+                wait_level: wait_level as i32,
+                probe_count,
+                probe_interval_ms,
+            }))
+            .await
+            .map_err(|source| ClusterTestingError::Rpc {
+                op: "probe",
+                source,
+            })?;
+        Ok(resp.into_inner())
+    }
+
     /// Read slot `slot`'s pipeline status (`TransactionStatus as i32`) for
     /// `tx_id` without catch-up or assertion.
     pub async fn get_transaction_status_on(

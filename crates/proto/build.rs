@@ -19,4 +19,8 @@ fn main() {
         .file_descriptor_set_path(out_dir.join("control_descriptor.bin"))
         .compile_protos(&["proto/control.proto"], &["proto"])
         .unwrap();
+    tonic_build::configure()
+        .file_descriptor_set_path(out_dir.join("latency_descriptor.bin"))
+        .compile_protos(&["proto/latency.proto"], &["proto"])
+        .unwrap();
 }

@@ -21,3 +21,9 @@ pub mod control {
     pub const FILE_DESCRIPTOR_SET: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/control_descriptor.bin"));
 }
+
+pub mod latency {
+    tonic::include_proto!("roda.latency.v1");
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/latency_descriptor.bin"));
+}
