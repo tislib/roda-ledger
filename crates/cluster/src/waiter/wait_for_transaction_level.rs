@@ -82,7 +82,7 @@ impl Waiter {
             // is well below typical cluster-commit latency (a few ms
             // on LAN, fdatasync-bound) so the latency hit is
             // negligible while CPU drops by orders of magnitude.
-            tokio::time::sleep(Duration::from_micros(100)).await;
+            tokio::time::sleep(Duration::from_micros(1)).await;
 
             if start_time.elapsed() >= timeout {
                 warn!(

@@ -38,7 +38,7 @@ struct Args {
     warmup_ms: u64,
 
     /// Pipeline stage the probe waits for before stopping the timer.
-    #[arg(short = 'l', long, value_enum, default_value_t = Stage::Commit)]
+    #[arg(short = 'l', long, value_enum, default_value_t = Stage::Compute)]
     wait_level: Stage,
 }
 

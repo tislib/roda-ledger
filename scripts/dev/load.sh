@@ -8,6 +8,8 @@ case ${1:-} in
   -h|--help) echo "Usage: $(basename "$0") [scenario-name] [extra scenario args]" >&2; exit 0 ;;
 esac
 
+cargo build -p cluster --bin roda-server --release --all-features
+
 # A leading non-flag arg names a single scenario; otherwise run the whole group.
 if [ -n "${1:-}" ] && [ "${1#-}" = "$1" ]; then
   name=$1; shift
