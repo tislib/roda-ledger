@@ -168,7 +168,7 @@ async fn run_one(server_bin: &Path, name: &str, nodes: u32, verbose: bool) -> Ex
         println!("  description: {}", scenario.description);
     }
     println!("  steps:       {}", scenario.steps.len());
-    println!("  nodes:       {nodes}");
+    println!("  nodes:       {}", if is_load { 1 } else { nodes });
     println!();
 
     let outcome = run_scenario(server_bin, &scenario, nodes, verbose, is_load).await;
@@ -206,10 +206,7 @@ async fn run_many(
     }
 
     let total = scenarios.len();
-    println!(
-        "=== running {total} scenarios ({} nodes/cluster) ===",
-        nodes
-    );
+    println!("=== running {total} scenarios (e2e: {nodes} nodes, load: 1 node) ===");
     println!();
 
     let label_width: usize = 70;
@@ -304,9 +301,23 @@ async fn run_scenario(
     verbose: bool,
     streaming: bool,
 ) -> Outcome {
-    let provisioner = Arc::new(ProcessProvisioner::new(server_bin.to_path_buf()).quiet(!verbose));
+    // Load scenarios run on a single leader node with the spinning
+    // (`low_latency`) wait strategy: that measures the ledger pipeline
+    // itself — no replication, and no `balanced` 1ms idle-sleep stall on
+    // the transactor. e2e keeps the requested node count + `balanced`
+    // (multi-node, low idle CPU).
+    let (node_count, wait_strategy) = if streaming {
+        (1, "low_latency")
+    } else {
+        (nodes, "balanced")
+    };
+    let provisioner = Arc::new(
+        ProcessProvisioner::new(server_bin.to_path_buf())
+            .quiet(!verbose)
+            .with_wait_strategy(wait_strategy),
+    );
     let runner = ScenarioRunner::new(provisioner);
-    let config = default_config(nodes);
+    let config = default_config(node_count);
 
     // The latency probe runs inside the runner (a 1ms-paced side task over the
     // execute window), so its samples land mid-load. Results arrive in

@@ -29,13 +29,16 @@ impl LatencyProbeHandler {
     /// timed_out)` — `timed_out` when the waiter hit its internal timeout.
     async fn probe_once(&self, level: ::proto::ledger::WaitLevel) -> (Duration, bool) {
         let target = self.ledger.current().last_sequenced_id();
-        let start = Instant::now();
-        let timed_out = self
-            .waiter
-            .wait_for_transaction_level(target, level)
-            .await
-            .is_err();
-        (start.elapsed(), timed_out)
+        let wait_result = self.waiter.wait_for_transaction_level(target, level).await;
+        match wait_result {
+            Ok(duration) => (duration, false),
+            Err(e) => {
+                return (
+                    Duration::from_secs(0),
+                    e.kind() == std::io::ErrorKind::TimedOut,
+                );
+            }
+        }
     }
 }
 
