@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+// Per-node latency probe surface — server-side measurement of pipeline
+// stage latency (the cluster analog of the in-process `load_latency` bin).
+//
+// **Why server-side.** Measuring latency from a client over gRPC bakes
+// the request/response round-trip into every sample, which dominates the
+// signal on a fast pipeline. This service measures *inside* the node:
+// capture the current sequencer head, then time how long the chosen
+// `wait_level` stage takes to reach it.
+//
+// **Ambient.** A probe does not submit a transaction — it samples the
+// latency experienced by whatever traffic is already in flight. With no
+// background load it reads ~0 (nothing to wait for); under load it is the
+// real per-tx transit latency to that stage. Drive load separately (e.g.
+// the control load harness) while probing.
+//
+// Available **only** when the server is compiled with the workspace
+// `latency-probe` Cargo feature. Production binaries omit the service
+// entirely.
+package roda.latency.v1;
+
+service LatencyProbe {
+  // Take `probe_count` ambient latency samples to `wait_level`, sleeping
+  // `probe_interval_ms` between them. Returns one latency per probe.
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+}
+
+// The pipeline stage a probe waits for. Mirrors `roda.ledger.v1.WaitLevel`
+// value-for-value; duplicated here so this proto stays self-contained.
+enum WaitLevel {
+  WAIT_LEVEL_COMPUTED = 0;        // executed by the transactor (in-memory)
+  WAIT_LEVEL_COMMITTED = 1;       // fdatasync'd to the WAL (durable)
+  WAIT_LEVEL_SNAPSHOT = 2;        // applied to the snapshot (readable)
+  WAIT_LEVEL_CLUSTER_COMMIT = 3;  // quorum-committed across the cluster
+}
+
+message ProbeRequest {
+  // Stage each probe waits for before stopping its timer.
+  WaitLevel wait_level = 1;
+  // Number of samples to take. 0 is treated as 1.
+  uint32 probe_count = 2;
+  // Delay before the next probe, in milliseconds. 0 = back-to-back. Spacing
+  // lets the sequencer advance so each probe captures a fresh head.
+  uint64 probe_interval_ms = 3;
+}
+
+message ProbeResponse {
+  // One measured latency per probe, in nanoseconds. A probe that hits the
+  // per-probe timeout still contributes its capped elapsed.
+  repeated uint64 latencies_ns = 1;
+  // Number of probes that timed out before the stage reached the captured
+  // head (pipeline stalled or making no progress).
+  uint64 timeouts = 2;
+}

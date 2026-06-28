@@ -1,23 +1,28 @@
 use crate::consensus::state::Consensus;
 use crate::ledger_slot::LedgerSlot;
+use crate::waiter::Waiter;
 use ::proto::ledger as proto;
 use ledger::snapshot::{QueryKind, QueryRequest, QueryResponse};
 use ledger::transactor::STATUS_PROGRAMMED;
 use ledger::transactor::transaction::Operation;
-use spdlog::{trace, warn};
+use spdlog::warn;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tonic::{Request, Response, Status};
 
 pub struct LedgerHandler {
     ledger: Arc<LedgerSlot>,
     consensus: Arc<Consensus>,
+    waiter: Arc<Waiter>,
 }
 
 impl LedgerHandler {
-    pub fn new(ledger: Arc<LedgerSlot>, consensus: Arc<Consensus>) -> Self {
-        Self { ledger, consensus }
+    pub fn new(ledger: Arc<LedgerSlot>, consensus: Arc<Consensus>, waiter: Arc<Waiter>) -> Self {
+        Self {
+            ledger,
+            consensus,
+            waiter,
+        }
     }
 
     /// Convenience — current term as observed by the raft driver.
@@ -138,7 +143,7 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         let op = crate::mapping::submit_and_wait_request_to_op(req)?;
 
         let tx_id = self.ledger.current().submit(op);
-        self.wait_for_transaction_level(tx_id, level).await?;
+        self.waiter.wait_for_transaction_level(tx_id, level).await?;
 
         Ok(Response::new(proto::SubmitAndWaitResponse {
             transaction_id: tx_id,
@@ -158,7 +163,7 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         let tx_id = self.ledger.current().submit(op);
         // Wait for the requested durability, then read the committed result from
         // the snapshot index (CLUSTER_COMMIT implies SNAPSHOT, so it's present).
-        self.wait_for_transaction_level(tx_id, level).await?;
+        self.waiter.wait_for_transaction_level(tx_id, level).await?;
 
         let transaction = match self.query(QueryKind::GetTransaction { tx_id }).await? {
             QueryResponse::Transaction(Some(tx)) => crate::mapping::transaction_to_proto(tx),
@@ -228,7 +233,9 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)
         let last_tx_id = start_transaction_id + (len - 1) as u64;
-        self.wait_for_transaction_level(last_tx_id, level).await?;
+        self.waiter
+            .wait_for_transaction_level(last_tx_id, level)
+            .await?;
 
         let results = (start_transaction_id..=last_tx_id)
             .map(|tx_id| proto::SubmitAndWaitResponse {
@@ -270,7 +277,9 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         // tx_ids are monotonic — once the last one reaches the requested
         // durability, every earlier tx is indexed too, so one wait covers all.
         let last_tx_id = start_transaction_id + (len - 1) as u64;
-        self.wait_for_transaction_level(last_tx_id, level).await?;
+        self.waiter
+            .wait_for_transaction_level(last_tx_id, level)
+            .await?;
 
         let tx_ids: Vec<u64> = (start_transaction_id..=last_tx_id).collect();
         let mut found: std::collections::HashMap<u64, _> = match self
@@ -456,7 +465,7 @@ impl proto::ledger_server::Ledger for LedgerHandler {
         }
 
         let level = proto::WaitLevel::try_from(req.wait_level).unwrap();
-        self.wait_for_transaction_level(tx_id, level).await?;
+        self.waiter.wait_for_transaction_level(tx_id, level).await?;
 
         let (tx_term, tx_term_start) = self.term_for_tx(tx_id);
         Ok(Response::new(proto::WaitForTransactionResponse {
@@ -790,100 +799,5 @@ fn map_registry_err(e: std::io::Error) -> Status {
         ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
         ErrorKind::TimedOut => Status::deadline_exceeded(e.to_string()),
         _ => Status::internal(e.to_string()),
-    }
-}
-
-impl LedgerHandler {
-    pub async fn wait_for_transaction_level(
-        &self,
-        transaction_id: u64,
-        level: proto::WaitLevel,
-    ) -> std::io::Result<()> {
-        let start_time = std::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-        let mut iter = 0u32;
-        trace!(
-            "wait_for_transaction_level: tx_id={} level={:?} timeout={:?} starting",
-            transaction_id, level, timeout
-        );
-
-        loop {
-            iter += 1;
-            let ledger = self.ledger.current();
-            let compute = ledger.last_compute_id();
-            let commit = ledger.last_commit_id();
-            let snapshot = ledger.last_snapshot_id();
-            self.consensus.self_advance();
-            let cluster_commit = self.consensus.cluster_commit_index();
-            let reached = match level {
-                proto::WaitLevel::Computed => compute >= transaction_id,
-                proto::WaitLevel::Committed => commit >= transaction_id,
-                proto::WaitLevel::Snapshot => snapshot >= transaction_id,
-                proto::WaitLevel::ClusterCommit => {
-                    // Require all three watermarks to have passed the tx.
-                    // `cluster_commit_index` reflects the leader's view of
-                    // quorum replication; the local `commit_index` and
-                    // `snapshot_index` ensure the tx is also durably
-                    // stored and queryable on this node.
-                    snapshot >= transaction_id
-                        && commit >= transaction_id
-                        && cluster_commit >= transaction_id
-                }
-            };
-
-            if reached {
-                trace!(
-                    "wait_for_transaction_level: tx_id={} level={:?} reached after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
-                    transaction_id,
-                    level,
-                    start_time.elapsed().as_millis(),
-                    iter,
-                    compute,
-                    commit,
-                    snapshot,
-                    cluster_commit
-                );
-                return Ok(());
-            }
-
-            // Periodic progress log so multi-second waits aren't silent.
-            // With a 100µs poll a 2 s wait can hit ~20 000 iters, so
-            // bump the log cadence to keep it once-per-second-ish.
-            if iter.is_multiple_of(10_000) {
-                trace!(
-                    "wait_for_transaction_level: tx_id={} level={:?} still waiting after {}ms — compute={} commit={} snapshot={} cluster_commit={}",
-                    transaction_id,
-                    level,
-                    start_time.elapsed().as_millis(),
-                    compute,
-                    commit,
-                    snapshot,
-                    cluster_commit
-                );
-            }
-
-            // Poll, don't spin. `yield_now` only re-queues the task —
-            // when many `*_and_wait` handlers are in flight, that
-            // produces a CPU storm of raft-mutex acquisitions. 100µs
-            // is well below typical cluster-commit latency (a few ms
-            // on LAN, fdatasync-bound) so the latency hit is
-            // negligible while CPU drops by orders of magnitude.
-            tokio::time::sleep(Duration::from_micros(100)).await;
-
-            if start_time.elapsed() >= timeout {
-                warn!(
-                    "wait_for_transaction_level: tx_id={} level={:?} TIMED OUT after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
-                    transaction_id,
-                    level,
-                    start_time.elapsed().as_millis(),
-                    iter,
-                    compute,
-                    commit,
-                    snapshot,
-                    cluster_commit
-                );
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
-            }
-        }
     }
 }

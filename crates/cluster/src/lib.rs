@@ -8,6 +8,7 @@ mod ledger_slot;
 mod mapping;
 mod node;
 pub mod testing;
+mod waiter;
 
 pub use config::{ClusterNodeSection, ClusterSection, Config, PeerConfig, ServerSection};
 pub use entry::run;

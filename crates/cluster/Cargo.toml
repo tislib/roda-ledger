@@ -23,6 +23,12 @@ default = []
 # layer's hooks. Production builds compile this surface out
 # entirely. See ADR-018.
 fault-injection = ["ledger/fault-injection"]
+# Enables the `LatencyProbe` gRPC service on this node (client_port + 2000).
+# Server-side, ambient pipeline-latency measurement — the cluster analog of
+# the in-process `load_latency` bin. Uses only existing public `Ledger` /
+# `Consensus` APIs, so no cross-crate feature chaining is needed. Production
+# builds compile the service out entirely.
+latency-probe = []
 
 [dependencies]
 proto.workspace = true
