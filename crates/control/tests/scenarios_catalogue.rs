@@ -5,7 +5,7 @@
 
 #[test]
 fn list_returns_seed_catalogue() {
-    let scenarios = testing::scenarios::list();
+    let scenarios = control::scenarios::list();
     assert!(!scenarios.is_empty(), "scenario catalogue is empty");
 
     let names: Vec<&str> = scenarios.iter().map(|s| s.name.as_str()).collect();
@@ -42,7 +42,7 @@ fn list_returns_seed_catalogue() {
 
 #[test]
 fn list_entries_are_well_formed() {
-    for scenario in testing::scenarios::list() {
+    for scenario in control::scenarios::list() {
         assert!(!scenario.name.is_empty(), "blank scenario name");
         assert!(
             !scenario.description.is_empty(),

@@ -6,12 +6,6 @@
 //! scenarios prove ledger correctness without re-implementing
 //! transactor logic — every checkpoint compares the live balance to
 //! a deterministic function of grid position and iteration count.
-//!
-//! Ported from the legacy `crates/testing/src/e2e/matrix_grid.rs`;
-//! the legacy `e2e/` tree is no longer wired into the runner.
-//!
-//! See `crates/testing/src/e2e/matrix-testing-scenario.md` for the
-//! full specification.
 
 /// Precomputed grid topology for matrix transfer scenarios.
 ///

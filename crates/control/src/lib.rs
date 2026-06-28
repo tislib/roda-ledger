@@ -29,6 +29,9 @@ pub mod event_store;
 pub mod ledger_proxy;
 pub mod provisioner;
 pub mod runner;
+// Pure-Rust scenario primitives + built-in catalogue (formerly the `testing` crate).
+pub mod scenario;
+pub mod scenarios;
 pub mod server;
 pub mod service;
 

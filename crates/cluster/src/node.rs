@@ -78,9 +78,6 @@ impl ClusterNode {
         #[cfg(feature = "fault-injection")]
         self.start_fault_server()?;
 
-        #[cfg(feature = "latency-probe")]
-        self.start_latency_probe_server()?;
-
         Ok(self)
     }
 
@@ -100,10 +97,14 @@ impl ClusterNode {
                     .expect("build dedicated gRPC runtime");
                 rt.block_on(async {
                     let ledger_handler =
-                        LedgerHandler::new(ledger.clone(), consensus.clone(), waiter);
+                        LedgerHandler::new(ledger.clone(), consensus.clone(), waiter.clone());
+                    #[cfg(feature = "latency-probe")]
+                    let latency_handler = LatencyProbeHandler::new(ledger.clone(), waiter.clone());
                     let client_server = ClusterNode::run_ledger_server(
                         config,
                         ledger_handler,
+                        #[cfg(feature = "latency-probe")]
+                        latency_handler,
                         cancellation_token.clone(),
                     );
                     if let Err(e) = client_server.await {
@@ -215,40 +216,6 @@ impl ClusterNode {
         self.fault_injector.clone()
     }
 
-    #[cfg(feature = "latency-probe")]
-    fn start_latency_probe_server(&mut self) -> Result<(), String> {
-        let config = self.config.clone();
-        let cancellation_token = self.cancellation_token.clone();
-        let ledger = self.ledger.clone();
-        let waiter = self.waiter.clone();
-        let handle = thread::Builder::new()
-            .name("latency-grpc".into())
-            .spawn(move || {
-                let rt = runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .thread_name("latency-grpc")
-                    .build()
-                    .expect("build dedicated latency gRPC runtime");
-                rt.block_on(async {
-                    let handler = LatencyProbeHandler::new(ledger, waiter);
-                    let server =
-                        ClusterNode::run_latency_probe_server(config, handler, cancellation_token);
-                    // Optional debug-only infra — never load-bearing, same
-                    // reasoning as the fault server: the derived port can
-                    // alias another node's ephemeral port under the test
-                    // harness, so a bind failure degrades to "no probe
-                    // server on this node" (logged), it must NOT `exit(1)`.
-                    if let Err(e) = server.await {
-                        error!("latency gRPC server exited (continuing without it): {}", e);
-                    }
-                });
-            })
-            .map_err(|e| format!("{}", e))?;
-        self.handles.push(handle);
-
-        Ok(())
-    }
-
     /// In-process latency probe handler, for tests that drive the probe
     /// directly rather than over the gRPC surface. Mirrors
     /// [`fault_injector`](Self::fault_injector).
@@ -285,19 +252,31 @@ impl ClusterNode {
     pub async fn run_ledger_server(
         config: Config,
         handler: LedgerHandler,
+        // The `LatencyProbe` service rides on the ledger port (not a derived
+        // one): callers reach it at the node's client address with no extra
+        // discovery, and `ProcessProvisioner`'s ephemeral ports make a
+        // `+offset` scheme unreliable.
+        #[cfg(feature = "latency-probe")] latency: LatencyProbeHandler,
         cancellation_token: CancellationToken,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let addr = config.server.socket_addr()?;
 
         debug!("Ledger gRPC server listening on {}", addr);
 
-        let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(proto::ledger::FILE_DESCRIPTOR_SET)
-            .build_v1()?;
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(proto::ledger::FILE_DESCRIPTOR_SET);
+        #[cfg(feature = "latency-probe")]
+        let reflection =
+            reflection.register_encoded_file_descriptor_set(proto::latency::FILE_DESCRIPTOR_SET);
+        let reflection = reflection.build_v1()?;
 
-        TonicServer::builder()
-            .add_service(LedgerServer::new(handler))
-            .add_service(reflection_service)
+        let router = TonicServer::builder().add_service(LedgerServer::new(handler));
+        #[cfg(feature = "latency-probe")]
+        let router = router
+            .add_service(proto::latency::latency_probe_server::LatencyProbeServer::new(latency));
+
+        router
+            .add_service(reflection)
             .serve_with_shutdown(addr, async move {
                 cancellation_token.cancelled().await;
             })
@@ -355,46 +334,6 @@ impl ClusterNode {
             .await?;
 
         debug!("Fault gRPC server shut down cleanly");
-
-        Ok(())
-    }
-
-    /// Run the `LatencyProbe` gRPC service on `client_port + 2000` (the
-    /// fault server uses `+1000`). Server-side, ambient pipeline-latency
-    /// measurement; see `latency.proto`. Same non-load-bearing / overflow
-    /// handling as the fault server.
-    #[cfg(feature = "latency-probe")]
-    pub async fn run_latency_probe_server(
-        config: Config,
-        handler: LatencyProbeHandler,
-        cancellation_token: CancellationToken,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use proto::latency::latency_probe_server::LatencyProbeServer;
-        let mut addr = config.server.socket_addr()?;
-        let Some(probe_port) = addr.port().checked_add(2000) else {
-            debug!(
-                "Latency gRPC server skipped: client_port {} + 2000 overflows u16",
-                addr.port()
-            );
-            return Ok(());
-        };
-        addr.set_port(probe_port);
-
-        debug!("Latency gRPC server listening on {}", addr);
-
-        let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(proto::latency::FILE_DESCRIPTOR_SET)
-            .build_v1()?;
-
-        TonicServer::builder()
-            .add_service(LatencyProbeServer::new(handler))
-            .add_service(reflection_service)
-            .serve_with_shutdown(addr, async move {
-                cancellation_token.cancelled().await;
-            })
-            .await?;
-
-        debug!("Latency gRPC server shut down cleanly");
 
         Ok(())
     }
