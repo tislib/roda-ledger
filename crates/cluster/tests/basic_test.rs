@@ -19,7 +19,6 @@ use storage::entities::SYSTEM_ACCOUNT_ID;
 async fn cluster_leader_replicates_to_follower() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "basic".to_string(),
-        replication_poll_ms: 2,
         append_entries_max_bytes: 256 * 1024,
         transaction_count_per_segment: 20_000,
         snapshot_frequency: 2,

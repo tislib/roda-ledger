@@ -161,7 +161,6 @@ async fn cluster_commit_advances_under_burst() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wal_is_byte_exact_across_replicas() {
     let ctl = ClusterTestingControl::start(ClusterTestingConfig {
-        replication_poll_ms: 5,
         ..ClusterTestingConfig::cluster(3)
     })
     .await

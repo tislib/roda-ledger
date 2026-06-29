@@ -78,6 +78,7 @@ impl Consensus {
             d
         };
         self.notify_role();
+        self.publish_cluster_commit();
 
         // ADR-0016 §9 supervisor: when raft signals a divergent
         // uncommitted tail, reseed the ledger BEFORE we report the

@@ -59,7 +59,6 @@ async fn cluster_commit_index_advances_under_replication() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn quorum_majority_never_regresses_under_follower_restart() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
-        replication_poll_ms: 5,
         ..ClusterTestingConfig::cluster(3)
     })
     .await

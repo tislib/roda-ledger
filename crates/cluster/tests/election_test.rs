@@ -45,7 +45,6 @@ async fn ping_role(node_port: u16) -> Option<(nproto::NodeRole, u64)> {
 async fn three_nodes_elect_a_unique_leader_from_cold_boot() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "election".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
     })

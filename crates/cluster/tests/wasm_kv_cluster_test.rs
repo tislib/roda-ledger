@@ -86,7 +86,6 @@ async fn kv_constants_replicate_and_resolve_across_cluster() {
 
     let ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "kv-cluster".to_string(),
-        replication_poll_ms: 2,
         append_entries_max_bytes: 256 * 1024,
         transaction_count_per_segment: 20_000,
         snapshot_frequency: 2,

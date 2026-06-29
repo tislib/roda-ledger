@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::consensus::durable::DurablePersistence;
 use crate::consensus::replication::ReplicationInputStream;
 use crate::ledger_slot::LedgerSlot;
+use crate::waiter::Waiter;
 use proto::node::{NodeRole, PingRequest, PingResponse, RequestVoteRequest, RequestVoteResponse};
 use raft::{NodeId, RaftConfig, RaftNode, RequestVote, Role, Term, TxId};
 use spdlog::{debug, trace};
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use storage::{TermRecord, VoteRecord};
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 pub(super) struct HandshakeSnapshot {
     pub self_id: NodeId,
@@ -33,18 +35,30 @@ pub struct Consensus {
     // role watcher
     pub(super) role_tx: watch::Sender<Role>,
     node_id: u64,
+
+    // Shared reactive index watches (owned by the Waiter). Read by the
+    // replication sender / cluster-commit driver; fed by `record_cluster_commit`.
+    waiter: Arc<Waiter>,
 }
 
 impl Consensus {
-    pub fn new(config: Config, ledger: Arc<LedgerSlot>) -> Result<Self, String> {
+    pub fn new(
+        config: Config,
+        ledger: Arc<LedgerSlot>,
+        waiter: Arc<Waiter>,
+    ) -> Result<Self, String> {
         if config.is_clustered() {
-            Consensus::new_clustered(config, ledger)
+            Consensus::new_clustered(config, ledger, waiter)
         } else {
-            Consensus::new_singleton(config, ledger)
+            Consensus::new_singleton(config, ledger, waiter)
         }
     }
 
-    pub fn new_clustered(config: Config, ledger: Arc<LedgerSlot>) -> Result<Self, String> {
+    pub fn new_clustered(
+        config: Config,
+        ledger: Arc<LedgerSlot>,
+        waiter: Arc<Waiter>,
+    ) -> Result<Self, String> {
         let cluster = config
             .cluster
             .as_ref()
@@ -82,10 +96,15 @@ impl Consensus {
             replication_input_rx: Mutex::new(Some(replication_input_rx)),
             role_tx,
             node_id: self_id,
+            waiter,
         })
     }
 
-    pub fn new_singleton(config: Config, ledger: Arc<LedgerSlot>) -> Result<Self, String> {
+    pub fn new_singleton(
+        config: Config,
+        ledger: Arc<LedgerSlot>,
+        waiter: Arc<Waiter>,
+    ) -> Result<Self, String> {
         let self_id = 1;
         let durable = DurablePersistence::open(&config.ledger.storage.data_dir, self_id)
             .map_err(|e| format!("{}", e))?;
@@ -124,6 +143,7 @@ impl Consensus {
             replication_input_rx: Mutex::new(Some(replication_input_rx)),
             role_tx,
             node_id: self_id,
+            waiter,
         })
     }
 
@@ -249,6 +269,29 @@ impl Consensus {
             .cluster_commit_index()
     }
 
+    /// Leader heartbeat cadence, sourced from the raft config (derived from the
+    /// election timeout, not separately configurable). The replication sender
+    /// paces idle keepalives off this.
+    pub(crate) fn heartbeat_interval(&self) -> std::time::Duration {
+        self.raft_node
+            .lock()
+            .expect("raft mutex poisoned")
+            .heartbeat_interval()
+    }
+
+    /// Shared index watches (owned by the Waiter), used by the replication
+    /// sender and the cluster-commit driver.
+    pub(crate) fn waiter(&self) -> &Arc<Waiter> {
+        &self.waiter
+    }
+
+    /// Push the current raft `cluster_commit_index` into the waiter's watch.
+    /// Call at every site the RaftNode advances it. Non-blocking.
+    pub(crate) fn publish_cluster_commit(&self) {
+        self.waiter
+            .record_cluster_commit(self.cluster_commit_index());
+    }
+
     pub fn self_advance(&self) {
         let ledger_index = self.ledger.current().last_snapshot_id();
         let moved = self
@@ -261,6 +304,28 @@ impl Consensus {
                 "consensus[{}]: self_advance to {}",
                 self.node_id, ledger_index
             );
+        }
+        // Local progress may have advanced quorum (self-slot); publish either way.
+        self.publish_cluster_commit();
+    }
+
+    /// Reactive driver: on every snapshot-index advance, feed the leader's own
+    /// progress into quorum via `self_advance` (which publishes cluster_commit).
+    /// This is what advances cluster_commit for a singleton (no peers) and keeps
+    /// the leader's self-slot fresh without polling. Runs for every role; on a
+    /// follower `self_advance` is a no-op on quorum.
+    pub async fn run_cluster_commit_driver(self: Arc<Self>, cancel: CancellationToken) {
+        let waiter = self.waiter.clone();
+        let mut seen = waiter.snapshot().get();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = waiter.snapshot().wait_reach(seen + 1) => {
+                    seen = waiter.snapshot().get();
+                    self.self_advance();
+                }
+            }
         }
     }
 
