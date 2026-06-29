@@ -30,3 +30,4 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-024](0024-temporal-index.md)                | Temporal Index | Proposed |
 | [ADR-025](0025-point-in-time.md)                 | Point-in-Time | Proposed |
 | [ADR-026](0026-roda-wasm-abi.md)                 | roda-wasm-abi — Guest-Side ABI Crate | Proposed |
+| [ADR-027](0027-reactive-index-propagation.md)    | Reactive Index Propagation — One Ledger Index Hook Drives Replication and Waiters | Proposed |
