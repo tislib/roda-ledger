@@ -27,6 +27,19 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// `tx_id` of the last complete transaction in a buffer returned by
+/// [`WalTailer::tail`]. Zero-copy: iterates records (no allocation) and returns
+/// the last `TxMetadata`'s `tx_id` — every tx group closes with one (ADR-020
+/// trailer layout). `None` if the slice carries no metadata record.
+pub fn last_tx_id_in(bytes: &[u8]) -> Option<u64> {
+    iter_records(bytes)
+        .filter_map(|e| match e {
+            WalEntryRef::Metadata(m) => Some(m.tx_id),
+            _ => None,
+        })
+        .last()
+}
+
 /// Decode a buffer returned by [`WalTailer::tail`] into `WalEntry` values.
 /// Malformed 40-byte records are skipped; extra trailing bytes are ignored.
 pub fn decode_records(bytes: &[u8]) -> Vec<WalEntry> {

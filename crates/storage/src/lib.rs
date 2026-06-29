@@ -30,5 +30,5 @@ pub use syncer::*;
 pub use term::{TERM_MAGIC, TERM_RECORD_SIZE, TermRecord, TermStorage};
 pub use vote::{VOTE_MAGIC, VOTE_RECORD_SIZE, VoteRecord, VoteStorage};
 pub use wal_scan::WalScanner;
-pub use wal_tail::{WalTailer, decode_records};
+pub use wal_tail::{WalTailer, decode_records, last_tx_id_in};
 pub use wal_zero_copy::*;
