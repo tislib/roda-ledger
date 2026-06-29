@@ -47,13 +47,18 @@ impl LedgerSlot {
     /// replication-handshake path when raft returns
     /// `Reject { LogMismatch, truncate_after: Some(_) }`.
     pub fn reseed(&self, watermark: u64) -> io::Result<()> {
+        // The hook must already be registered: a reseeded Ledger with none would
+        // silently never wake its reactive waiters. Fail loud before rebuilding.
+        let Some(hook) = self.index_hook.get() else {
+            return Err(io::Error::other(
+                "ledger_slot: reseed with no index hook registered — reactive waiters would hang",
+            ));
+        };
         debug!("ledger_slot: reseed begin watermark={}", watermark);
         let mut fresh = Ledger::new(self.config.clone());
         fresh.start_with_recovery_until(watermark)?;
         // Re-apply the hook before publishing so no advance on the new Ledger is lost.
-        if let Some(hook) = self.index_hook.get() {
-            fresh.set_index_hook(hook.clone());
-        }
+        fresh.set_index_hook(hook.clone());
         let prev = self.inner.swap(Arc::new(fresh));
         debug!(
             "ledger_slot: reseed complete watermark={} (prev_strong={})",
