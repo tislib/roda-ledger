@@ -455,11 +455,6 @@ fn render_config_toml(node: &NodePlan, all: &[NodePlan], cluster: &ClusterConfig
     } else {
         2
     };
-    let repl_poll = if cluster.replication_poll_ms > 0 {
-        cluster.replication_poll_ms
-    } else {
-        5
-    };
     let ae_max = if cluster.append_entries_max_bytes > 0 {
         cluster.append_entries_max_bytes
     } else {
@@ -474,7 +469,6 @@ max_connections = 1000
 max_message_size_bytes = {ae_max}
 
 [cluster]
-replication_poll_ms = {repl_poll}
 append_entries_max_bytes = {ae_max}
 
 [cluster.node]

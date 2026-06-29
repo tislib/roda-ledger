@@ -818,9 +818,6 @@ fn validate_cluster_config(cfg: &proto::control::ClusterConfig) -> Option<String
     if cfg.transaction_count_per_segment == 0 {
         return Some("transaction_count_per_segment must be > 0".into());
     }
-    if cfg.replication_poll_ms == 0 {
-        return Some("replication_poll_ms must be > 0".into());
-    }
     if cfg.append_entries_max_bytes == 0 {
         return Some("append_entries_max_bytes must be > 0".into());
     }
