@@ -106,7 +106,6 @@ fn default_cluster_config() -> ClusterConfig {
         queue_size: 16_384,
         transaction_count_per_segment: 1_000_000,
         snapshot_frequency: 2,
-        replication_poll_ms: 5,
         append_entries_max_bytes: 4 * 1024 * 1024,
     }
 }

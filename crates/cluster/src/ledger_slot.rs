@@ -8,14 +8,16 @@
 
 use arc_swap::ArcSwap;
 use ledger::config::LedgerConfig;
-use ledger::ledger::Ledger;
+use ledger::ledger::{IndexHook, Ledger};
 use spdlog::debug;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub struct LedgerSlot {
     inner: ArcSwap<Ledger>,
     config: LedgerConfig,
+    // Re-applied to every reseeded Ledger so reactive consumers survive a swap.
+    index_hook: OnceLock<IndexHook>,
 }
 
 impl LedgerSlot {
@@ -23,6 +25,7 @@ impl LedgerSlot {
         Self {
             inner: ArcSwap::new(Arc::new(initial)),
             config,
+            index_hook: OnceLock::new(),
         }
     }
 
@@ -31,14 +34,31 @@ impl LedgerSlot {
         self.inner.load_full()
     }
 
+    /// Register the ledger index hook. Applied to the live Ledger and stored so
+    /// `reseed` re-applies it to the rebuilt Ledger. First registration wins.
+    pub fn set_index_hook(&self, hook: IndexHook) {
+        if self.index_hook.set(hook.clone()).is_ok() {
+            self.inner.load().set_index_hook(hook);
+        }
+    }
+
     /// Drop the current Ledger and reconstruct via
     /// `Ledger::start_with_recovery_until(watermark)`. Called from the
     /// replication-handshake path when raft returns
     /// `Reject { LogMismatch, truncate_after: Some(_) }`.
     pub fn reseed(&self, watermark: u64) -> io::Result<()> {
+        // The hook must already be registered: a reseeded Ledger with none would
+        // silently never wake its reactive waiters. Fail loud before rebuilding.
+        let Some(hook) = self.index_hook.get() else {
+            return Err(io::Error::other(
+                "ledger_slot: reseed with no index hook registered — reactive waiters would hang",
+            ));
+        };
         debug!("ledger_slot: reseed begin watermark={}", watermark);
         let mut fresh = Ledger::new(self.config.clone());
         fresh.start_with_recovery_until(watermark)?;
+        // Re-apply the hook before publishing so no advance on the new Ledger is lost.
+        fresh.set_index_hook(hook.clone());
         let prev = self.inner.swap(Arc::new(fresh));
         debug!(
             "ledger_slot: reseed complete watermark={} (prev_strong={})",

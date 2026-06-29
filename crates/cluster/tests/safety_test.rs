@@ -47,7 +47,6 @@ async fn wait_leader(ctl: &ClusterTestingControl, timeout: Duration) -> usize {
 async fn idempotent_retry_across_failover() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_idempotent".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
     })
@@ -156,7 +155,6 @@ async fn balance_state_in_sync_after_failover() {
 
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_balance_failover".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
     })
@@ -227,7 +225,6 @@ async fn balance_state_in_sync_after_failover() {
 async fn acked_cluster_commit_survives_full_restart() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_full_restart".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
     })
@@ -293,7 +290,6 @@ async fn acked_cluster_commit_survives_full_restart() {
 async fn rotational_restart_resilience() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_rotational".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
     })
@@ -365,7 +361,6 @@ async fn rotational_restart_resilience() {
 async fn no_leader_blocks_writes() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_no_leader".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         auto_open_accounts: 0, // no leader to open against; test only checks write rejection
         ..ClusterTestingConfig::cluster(3)
@@ -462,7 +457,6 @@ async fn no_leader_blocks_writes() {
 async fn mid_election_cluster_commit_not_lost() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
         label: "safety_mid_election".to_string(),
-        replication_poll_ms: 5,
         append_entries_max_bytes: 256 * 1024,
         ..ClusterTestingConfig::cluster(3)
     })

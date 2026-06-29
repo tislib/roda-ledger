@@ -28,16 +28,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
-use testing::scenario::{
+use crate::scenario::{
     Action, AssertBalance, AssertBalanceSum, AssertLeader, AssertPipelineCaughtUp, AssertTxStatus,
-    AsyncBranch, BatchKind, Concurrent, GetBalance, GetPipelineIndex, HealPartition, NodeSelector,
-    PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit, SubmitBatch, SubmitOp,
-    TxRef, TxStatus, WaitForLevel, WaitLevel,
+    AsyncBranch, BatchKind, Concurrent, ConcurrentSubmit, GetBalance, GetPipelineIndex,
+    HealPartition, NodeSelector, PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit,
+    SubmitBatch, SubmitOp, TxRef, TxStatus, WaitForLevel, WaitLevel,
 };
 
 pub use crate::provisioner::{Capabilities, ProvisionConfig, Provisioner, ProvisionerError};
 pub use metrics::{
-    LatencyPoint, MetricsCollector, NodePipelineSnap, PerSecondStats, Sample, Snapshot,
+    CLUSTER_COMMIT_LEVEL, MetricsCollector, NodePipelineSnap, ProbeLevelStats, Sample, Snapshot,
 };
 
 /// Per-`run` state. Each top-level `run()` and each spawned branch
@@ -226,12 +226,16 @@ impl ScenarioRunner {
         // between two periodic samples otherwise.
         metrics.snapshot_now(&client).await;
         let poller = metrics::spawn_poller(client.clone(), metrics.clone(), POLL_INTERVAL);
+        // Side task: probe the leader's per-stage latency at 1ms cadence
+        // for the whole execute window, so samples land mid-load.
+        let probe = metrics::spawn_latency_probe(client.clone(), metrics.clone());
 
         let started = metrics.start();
         let exec_result = self.execute(&client, scenario, &metrics).await;
         let elapsed = started.elapsed();
 
         poller.abort();
+        probe.abort();
         metrics.snapshot_now(&client).await;
 
         RunReport {
@@ -268,14 +272,15 @@ impl ScenarioRunner {
         step: &Step,
     ) -> Result<(), RunError> {
         match &step.action {
-            Action::Submit(s) => self.run_submit(client, metrics, ctx, s).await,
-            Action::SubmitBatch(s) => self.run_submit_batch(client, metrics, ctx, s).await,
+            Action::Submit(s) => self.run_submit(client, ctx, s).await,
+            Action::SubmitBatch(s) => self.run_submit_batch(client, ctx, s).await,
             Action::AsyncBranch(b) => {
                 let handle = self.spawn_branch(client, metrics, b);
                 ctx.branches.push(handle);
                 Ok(())
             }
             Action::Concurrent(c) => self.run_concurrent(client, metrics, ctx, c).await,
+            Action::ConcurrentSubmit(c) => self.run_concurrent_submit(client, c).await,
             Action::Wait(w) => {
                 tokio::time::sleep(w.duration).await;
                 Ok(())
@@ -329,11 +334,6 @@ impl ScenarioRunner {
                     .map_err(client_err)?;
                 Ok(())
             }
-            // Action is `#[non_exhaustive]`. Adding a variant upstream
-            // without updating this dispatch lands here at runtime.
-            _ => Err(RunError::Client(
-                "scenario step variant not handled by ScenarioRunner".into(),
-            )),
         }
     }
 
@@ -344,14 +344,11 @@ impl ScenarioRunner {
     async fn run_submit(
         &self,
         client: &ClusterClient,
-        metrics: &Arc<MetricsCollector>,
         ctx: &mut RunCtx,
         s: &Submit,
     ) -> Result<(), RunError> {
         let user_ref = user_ref_of(&s.op);
-        let started = Instant::now();
         let tx_id = self.do_submit(client, &s.op, s.wait, s.retry).await?;
-        metrics.record_submit_latency(started.elapsed());
         ctx.bindings.insert(user_ref, tx_id);
         ctx.last_tx_id = tx_id;
         Ok(())
@@ -360,7 +357,6 @@ impl ScenarioRunner {
     async fn run_submit_batch(
         &self,
         client: &ClusterClient,
-        metrics: &Arc<MetricsCollector>,
         ctx: &mut RunCtx,
         s: &SubmitBatch,
     ) -> Result<(), RunError> {
@@ -373,11 +369,11 @@ impl ScenarioRunner {
                 if batch_size == 0 {
                     batch_size = base.len() as u32;
                 }
-                self.run_submit_batched(client, metrics, ctx, s, &base, repeat, batch_size)
+                self.run_submit_batched(client, ctx, s, &base, repeat, batch_size)
                     .await
             }
             BatchKind::Static(base) => {
-                self.run_submit_batched(client, metrics, ctx, s, &base, 1, base.len() as u32)
+                self.run_submit_batched(client, ctx, s, &base, 1, base.len() as u32)
                     .await
             }
         }
@@ -392,7 +388,6 @@ impl ScenarioRunner {
     async fn run_submit_batched(
         &self,
         client: &ClusterClient,
-        metrics: &Arc<MetricsCollector>,
         ctx: &mut RunCtx,
         s: &SubmitBatch,
         base: &[SubmitOp],
@@ -436,11 +431,7 @@ impl ScenarioRunner {
                 chunk.push(with_user_ref_offset(base[base_idx].clone(), offset));
             }
 
-            let started = Instant::now();
             let tx_ids = submit_batch_once(client, &chunk, s.wait).await?;
-            if s.wait != WaitLevel::None {
-                metrics.record_submit_latency(started.elapsed());
-            }
             for (op, tx_id) in chunk.iter().zip(tx_ids.iter()) {
                 ctx.bindings.insert(user_ref_of(op), *tx_id);
                 ctx.last_tx_id = *tx_id;
@@ -588,6 +579,59 @@ impl ScenarioRunner {
                 None => Ok(()),
             }
         })
+    }
+
+    /// Connection-concurrency fan-out: spawn `tasks` workers on the
+    /// shared client, each issuing `ops_per_task` single deposits with
+    /// unique `user_ref`s. Bindings aren't recorded — at 500k ops that
+    /// would be pure overhead, and load scenarios drain by grace, not by
+    /// `user_ref`. Every task is awaited before the first error
+    /// propagates, so nothing escapes the step.
+    async fn run_concurrent_submit(
+        &self,
+        client: &ClusterClient,
+        c: &ConcurrentSubmit,
+    ) -> Result<(), RunError> {
+        let mut handles: Vec<JoinHandle<Result<(), RunError>>> =
+            Vec::with_capacity(c.tasks as usize);
+        for t in 0..c.tasks {
+            let client = client.clone();
+            let wait = c.wait;
+            let ops = c.ops_per_task;
+            let base = t as u64 * ops as u64;
+            handles.push(tokio::spawn(async move {
+                for i in 0..ops as u64 {
+                    let op = SubmitOp::Deposit {
+                        account: 1,
+                        amount: 1,
+                        user_ref: base + i + 1,
+                    };
+                    submit_once(&client, &op, wait).await?;
+                }
+                Ok(())
+            }));
+        }
+
+        let mut first_error: Option<RunError> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    if first_error.is_none() {
+                        first_error = Some(RunError::Client(format!("task panicked: {join_err}")));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     // ============================================================
@@ -1183,7 +1227,7 @@ async fn submit_batch_once(
 
 #[cfg(test)]
 mod tests {
-    use testing::scenario::{
+    use crate::scenario::{
         Action, AsyncBranch, HealPartition, KillNode, NodeSelector as Sel, PartitionPair, Scenario,
         Step, StopNode,
     };

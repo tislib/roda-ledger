@@ -386,8 +386,7 @@ fn crash_recovery_concurrent_multi() -> Scenario {
         .with_steps(steps)
 }
 
-/// Matrix grid transfer correctness — port of the legacy
-/// `crates/testing/src/e2e/matrix-testing-scenario.md`.
+/// Matrix grid transfer correctness.
 ///
 /// An N×M grid of accounts; each cell transfers `TRANSFER_AMOUNT` to
 /// its right and down neighbors every iteration. The topology produces

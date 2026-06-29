@@ -8,7 +8,7 @@
 //! - [`EventStore`] for ephemeral history (faults, scenario runs,
 //!   recent submissions) — none of this is produced by the cluster
 //!   itself.
-//! - The seed scenario catalogue in `testing::scenarios` for
+//! - The seed scenario catalogue in `crate::scenarios` for
 //!   `RunScenario`, looked up by name.
 
 use std::pin::Pin;
@@ -658,9 +658,9 @@ impl Control for ControlService {
         _req: Request<ListAvailableScenariosRequest>,
     ) -> Result<Response<ListAvailableScenariosResponse>, Status> {
         // Hand back the server's built-in catalogue grouped by category.
-        // E2E first, then Load — same order as `testing::scenarios::list`.
+        // E2E first, then Load — same order as `crate::scenarios::list`.
         let mut scenarios: Vec<AvailableScenario> = Vec::new();
-        for s in testing::scenarios::e2e::all() {
+        for s in crate::scenarios::e2e::all() {
             scenarios.push(AvailableScenario {
                 name: s.name.clone(),
                 description: s.description.clone(),
@@ -668,7 +668,7 @@ impl Control for ControlService {
                 step_count: s.steps.len() as u32,
             });
         }
-        for s in testing::scenarios::load::all() {
+        for s in crate::scenarios::load::all() {
             scenarios.push(AvailableScenario {
                 name: s.name.clone(),
                 description: s.description.clone(),
@@ -818,9 +818,6 @@ fn validate_cluster_config(cfg: &proto::control::ClusterConfig) -> Option<String
     if cfg.transaction_count_per_segment == 0 {
         return Some("transaction_count_per_segment must be > 0".into());
     }
-    if cfg.replication_poll_ms == 0 {
-        return Some("replication_poll_ms must be > 0".into());
-    }
     if cfg.append_entries_max_bytes == 0 {
         return Some("append_entries_max_bytes must be > 0".into());
     }
@@ -830,10 +827,10 @@ fn validate_cluster_config(cfg: &proto::control::ClusterConfig) -> Option<String
 /// Look up a scenario by name from the seed catalogues. Mirrors the
 /// CLI's `find_scenario` so the server and the CLI surface the same
 /// catalogue.
-fn lookup_scenario(name: &str) -> Option<testing::scenario::Scenario> {
-    let mut all: Vec<testing::scenario::Scenario> = Vec::new();
-    all.extend(testing::scenarios::e2e::all());
-    all.extend(testing::scenarios::load::all());
+fn lookup_scenario(name: &str) -> Option<crate::scenario::Scenario> {
+    let mut all: Vec<crate::scenario::Scenario> = Vec::new();
+    all.extend(crate::scenarios::e2e::all());
+    all.extend(crate::scenarios::load::all());
     all.into_iter().find(|s| s.name == name)
 }
 

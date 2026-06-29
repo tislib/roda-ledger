@@ -1,9 +1,11 @@
 use clap::Parser;
 use ledger::config::LedgerConfig;
-use ledger::ledger::Ledger;
+use ledger::ledger::{Ledger, PipelineIndexKind};
 use ledger::transactor::transaction::{Operation, WaitLevel};
 use roda_latency_tracker::latency_measurer::LatencyMeasurer;
 use spdlog::Level::Info;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -48,6 +50,19 @@ fn main() {
         log_level: Info,
         ..LedgerConfig::bench()
     });
+    // Realistic mutex-free consumer: mirror each index into a local atomic.
+    let hook_state: Arc<[AtomicU64; 3]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+    {
+        let s = hook_state.clone();
+        ledger.set_index_hook(Arc::new(move |kind: PipelineIndexKind, value: u64| {
+            let slot = match kind {
+                PipelineIndexKind::Compute => 0,
+                PipelineIndexKind::Commit => 1,
+                PipelineIndexKind::Snapshot => 2,
+            };
+            s[slot].store(value, Ordering::Relaxed);
+        }));
+    }
     ledger.start().unwrap();
     // Existence enforcement (ADR-022): open the accounts the load hits (1..=N).
     ledger.open_accounts(account_count.max(1) as u32);

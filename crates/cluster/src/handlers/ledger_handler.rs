@@ -227,8 +227,7 @@ impl proto::ledger_server::Ledger for LedgerHandler {
             operations.push(op);
         }
 
-        let ledger = self.ledger.current();
-        let start_transaction_id = ledger.submit_batch(operations);
+        let start_transaction_id = self.ledger.current().submit_batch(operations);
 
         // tx_ids are monotonic — waiting for the last one guarantees all
         // earlier transactions have reached the same level (or were rejected)

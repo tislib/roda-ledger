@@ -81,7 +81,6 @@ export interface ClusterConfig {
   queueSize: string;
   transactionCountPerSegment: string;
   snapshotFrequency: number;
-  replicationPollMs: string;
   appendEntriesMaxBytes: string;
 }
 

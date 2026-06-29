@@ -15,12 +15,34 @@ use crate::transactor::transaction::TransactionInput;
 use crate::wait_strategy::WaitStrategy;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use storage::entities::WalEntry;
 
 /// Callback fired by the WAL stage whenever `commit_index` advances.
 pub type CommitHandler = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+/// Which observable progress index advanced, reported to an [`IndexHook`].
+/// The sequencer index is intentionally absent: waiters never block on it, so
+/// firing per-submit would be pure hot-path cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineIndexKind {
+    Compute,
+    Commit,
+    Snapshot,
+}
+
+/// Hook invoked from a stage thread whenever a progress index advances, with
+/// the kind that moved and its new value. Runs inline on the publishing
+/// thread — keep it fast and lock-free.
+pub type IndexHook = Arc<dyn Fn(PipelineIndexKind, u64) + Send + Sync + 'static>;
+
+/// No-op hook. The fire site already skips entirely when no hook is registered
+/// (see [`Pipeline::fire_index_hook`]); this exists for callers that want to
+/// install an explicit "do nothing" sentinel rather than leave it unset.
+pub fn null_index_hook() -> IndexHook {
+    Arc::new(|_, _| {})
+}
 
 /// Owns every inter-stage queue and every global progress index in the ledger.
 ///
@@ -72,6 +94,12 @@ pub struct Pipeline {
 
     /// Shared wait strategy used by every stage's idle/backpressure loops.
     wait_strategy: WaitStrategy,
+
+    /// Optional hook fired whenever any progress index advances. Set once via
+    /// [`Pipeline::set_index_hook`] before the stages start; read lock-free on
+    /// the hot path. `None` (the default) makes [`Self::fire_index_hook`] a
+    /// single relaxed-ish load + branch.
+    index_hook: OnceLock<IndexHook>,
 }
 
 impl Pipeline {
@@ -99,7 +127,23 @@ impl Pipeline {
             seal_watermark: CachePadded::new(AtomicU64::new(u64::MAX)),
             running: CachePadded::new(AtomicBool::new(true)),
             wait_strategy,
+            index_hook: OnceLock::new(),
         })
+    }
+
+    /// Register the index hook. First registration wins; intended to be called
+    /// once before the stages start.
+    pub fn set_index_hook(&self, hook: IndexHook) {
+        let _ = self.index_hook.set(hook);
+    }
+
+    /// Fire the registered index hook with the index that advanced and its new
+    /// value. No-op (one load + branch) when none is registered.
+    #[inline]
+    fn fire_index_hook(&self, kind: PipelineIndexKind, value: u64) {
+        if let Some(hook) = self.index_hook.get() {
+            hook(kind, value);
+        }
     }
 
     #[inline(always)]
@@ -293,6 +337,8 @@ impl TransactorContext {
     #[inline(always)]
     pub fn set_processed_index(&self, id: u64) {
         self.pipeline.compute_index.store(id, Ordering::Relaxed);
+        self.pipeline
+            .fire_index_hook(PipelineIndexKind::Compute, id);
     }
 
     /// Follower path: when a replicated batch with `max_tx_id_seen` is
@@ -334,6 +380,7 @@ impl WalContext {
     #[inline]
     pub fn set_commit_index(&self, id: u64) {
         self.pipeline.commit_index.store(id, Ordering::Release);
+        self.pipeline.fire_index_hook(PipelineIndexKind::Commit, id);
     }
 
     #[inline]
@@ -389,6 +436,8 @@ impl SnapshotContext {
     #[inline(always)]
     pub fn set_processed_index(&self, id: u64) {
         self.pipeline.snapshot_index.store(id, Ordering::Release);
+        self.pipeline
+            .fire_index_hook(PipelineIndexKind::Snapshot, id);
     }
 
     #[inline(always)]

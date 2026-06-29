@@ -29,11 +29,12 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use control::provisioner::process::ProcessProvisioner;
 use control::runner::{
-    LatencyPoint, MetricsCollector, ProvisionConfig, Sample, ScenarioRunner, Snapshot,
+    CLUSTER_COMMIT_LEVEL, MetricsCollector, ProbeLevelStats, ProvisionConfig, Sample,
+    ScenarioRunner, Snapshot,
 };
+use control::scenario::Scenario;
+use control::scenarios;
 use proto::control::ClusterConfig;
-use testing::scenario::Scenario;
-use testing::scenarios;
 
 #[derive(Parser)]
 #[command(
@@ -177,6 +178,8 @@ async fn run_one(server_bin: &Path, name: &str, nodes: u32, verbose: bool) -> Ex
         print_summary_box(&outcome);
         println!();
         print_node_lag_block(&outcome.metrics);
+        println!();
+        print_latency_probe_block(&outcome.metrics);
     } else {
         print_report_blocks(&outcome.metrics);
     }
@@ -203,10 +206,7 @@ async fn run_many(
     }
 
     let total = scenarios.len();
-    println!(
-        "=== running {total} scenarios ({} nodes/cluster) ===",
-        nodes
-    );
+    println!("=== running {total} scenarios ({nodes} nodes/cluster) ===");
     println!();
 
     let label_width: usize = 70;
@@ -228,6 +228,8 @@ async fn run_many(
             print_summary_box(&outcome);
             println!();
             print_node_lag_block(&outcome.metrics);
+            println!();
+            print_latency_probe_block(&outcome.metrics);
             println!();
             results.push((scenario.name.clone(), outcome));
             continue;
@@ -299,10 +301,24 @@ async fn run_scenario(
     verbose: bool,
     streaming: bool,
 ) -> Outcome {
-    let provisioner = Arc::new(ProcessProvisioner::new(server_bin.to_path_buf()).quiet(!verbose));
+    // Load scenarios spin (`low_latency`) so the transactor never
+    // idle-sleeps under bursty load; e2e uses `balanced` (low idle CPU).
+    // Both use the requested node count. `RODA_WAIT_STRATEGY` overrides
+    // the default so wait strategies can be A/B'd without a rebuild.
+    let default_ws = "balanced";
+    let wait_strategy =
+        std::env::var("RODA_WAIT_STRATEGY").unwrap_or_else(|_| default_ws.to_string());
+    let provisioner = Arc::new(
+        ProcessProvisioner::new(server_bin.to_path_buf())
+            .quiet(!verbose)
+            .with_wait_strategy(wait_strategy),
+    );
     let runner = ScenarioRunner::new(provisioner);
     let config = default_config(nodes);
 
+    // The latency probe runs inside the runner (a 1ms-paced side task over the
+    // execute window), so its samples land mid-load. Results arrive in
+    // `report.metrics`.
     let metrics = Arc::new(MetricsCollector::new());
     let ticker = if streaming {
         print_table_header();
@@ -360,18 +376,7 @@ fn print_report_blocks(metrics: &Snapshot) {
     }
 
     println!();
-    println!("submit latency (waiting submits only):");
-    match metrics.latency_stats() {
-        None => println!("  (no waiting submits in this scenario)"),
-        Some(l) => {
-            println!("  samples:    {}", l.samples);
-            println!("  min:        {:>10.2}ms", l.min.as_secs_f64() * 1000.0);
-            println!("  avg:        {:>10.2}ms", l.avg.as_secs_f64() * 1000.0);
-            println!("  p50:        {:>10.2}ms", l.p50.as_secs_f64() * 1000.0);
-            println!("  p99:        {:>10.2}ms", l.p99.as_secs_f64() * 1000.0);
-            println!("  max:        {:>10.2}ms", l.max.as_secs_f64() * 1000.0);
-        }
-    }
+    print_latency_probe_block(metrics);
 
     let lags = metrics.node_lag_stats();
     println!();
@@ -413,7 +418,6 @@ fn default_config(node_count: u32) -> ProvisionConfig {
             queue_size: 1024,
             transaction_count_per_segment: 1_000_000,
             snapshot_frequency: 2,
-            replication_poll_ms: 5,
             append_entries_max_bytes: 4 * 1024 * 1024,
         },
     }
@@ -483,7 +487,6 @@ struct ProgressRow {
     total_committed: u64,
     p50: Duration,
     p99: Duration,
-    in_flight: u64,
 }
 
 fn compute_progress_row(snap: &Snapshot, sec: u32, prev_committed: u64) -> ProgressRow {
@@ -496,64 +499,43 @@ fn compute_progress_row(snap: &Snapshot, sec: u32, prev_committed: u64) -> Progr
     };
     let total_committed = snap.samples.last().map(cc).unwrap_or(prev_committed);
 
+    // Live latency columns = cluster_commit probe samples taken this second.
     let window_start = Duration::from_secs((sec - 1) as u64);
     let window_end = Duration::from_secs(sec as u64);
-
-    let mut window: Vec<Duration> = snap
-        .submit_latencies
-        .iter()
-        .filter(|p: &&LatencyPoint| p.at >= window_start && p.at < window_end)
-        .map(|p| p.latency)
-        .collect();
-    window.sort();
-    let (p50, p99) = if window.is_empty() {
-        (Duration::ZERO, Duration::ZERO)
-    } else {
-        let n = window.len();
-        let p_idx = |q: usize| ((n * q) / 100).min(n - 1);
-        (window[p_idx(50)], window[p_idx(99)])
-    };
-
-    let submitted_so_far = snap
-        .submit_latencies
-        .iter()
-        .filter(|p| p.at < window_end)
-        .count() as u64;
+    let (p50, p99) = snap.probe_window(CLUSTER_COMMIT_LEVEL, window_start, window_end);
 
     ProgressRow {
         second: sec,
         tps: total_committed.saturating_sub(prev_committed),
         total_committed,
-        p50,
-        p99,
-        in_flight: submitted_so_far.saturating_sub(total_committed),
+        p50: p50.unwrap_or(Duration::ZERO),
+        p99: p99.unwrap_or(Duration::ZERO),
     }
 }
 
 fn print_table_header() {
     println!();
-    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!("  +-----+--------+------------+------------+----------+----------+");
     println!(
-        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} |",
-        "#", "time", "TPS", "TPC", "P50", "P99", "in-flight"
+        "  | {:>3} | {:>6} | {:>10} | {:>10} | {:>8} | {:>8} |",
+        "#", "time", "TPS", "TPC", "cc P50", "cc P99"
     );
-    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!("  +-----+--------+------------+------------+----------+----------+");
 }
 
 fn print_table_footer() {
-    println!("  +-----+--------+------------+------------+----------+----------+------------+");
+    println!("  +-----+--------+------------+------------+----------+----------+");
 }
 
 fn print_table_row(row: &ProgressRow) {
     println!(
-        "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>8} | {:>8} | {:>10} |",
+        "  | {:>3} | {:>5}s | {:>10} | {:>10} | {:>8} | {:>8} |",
         row.second,
         row.second,
         row.tps,
         row.total_committed,
         fmt_dur(row.p50),
         fmt_dur(row.p99),
-        row.in_flight,
     );
 }
 
@@ -575,7 +557,6 @@ fn fmt_dur(d: Duration) -> String {
 
 fn print_summary_box(outcome: &Outcome) {
     let tput = outcome.metrics.throughput_stats();
-    let lat = outcome.metrics.latency_stats();
     // Report the active-commit window, not the full scenario wall-clock.
     // `tput.duration` runs from the last pre-movement metrics sample to
     // the first post-movement sample (i.e., it covers exactly the
@@ -586,7 +567,6 @@ fn print_summary_box(outcome: &Outcome) {
     // by provisioner setup, runner startup, and the post-burst
     // OnSnapshot drain wait).
     let active_secs = tput.duration.as_secs_f64();
-    let total_submitted = outcome.metrics.submit_latencies.len();
 
     println!("  ╔══════════════════════════════════════════════╗");
     println!("  ║              LOAD TEST SUMMARY               ║");
@@ -600,10 +580,6 @@ fn print_summary_box(outcome: &Outcome) {
         active_secs
     );
     println!(
-        "  ║  Submitted     : {:>10}                  ║",
-        total_submitted
-    );
-    println!(
         "  ║  Committed     : {:>10}                  ║",
         tput.ops_total
     );
@@ -615,32 +591,6 @@ fn print_summary_box(outcome: &Outcome) {
         "  ║  Peak TPS      : {:>10.0}                  ║",
         tput.max_ops_per_sec
     );
-    println!("  ╠══════════════════════════════════════════════╣");
-    if let Some(l) = lat {
-        println!(
-            "  ║  P50  Latency  : {:>10}                  ║",
-            fmt_dur(l.p50)
-        );
-        println!(
-            "  ║  P99  Latency  : {:>10}                  ║",
-            fmt_dur(l.p99)
-        );
-        println!(
-            "  ║  P999 Latency  : {:>10}                  ║",
-            fmt_dur(l.p999)
-        );
-        println!(
-            "  ║  Min  Latency  : {:>10}                  ║",
-            fmt_dur(l.min)
-        );
-        println!(
-            "  ║  Max  Latency  : {:>10}                  ║",
-            fmt_dur(l.max)
-        );
-        println!("  ║  Samples       : {:>10}                  ║", l.samples);
-    } else {
-        println!("  ║  No submit latencies captured              ║");
-    }
     println!("  ╚══════════════════════════════════════════════╝");
 }
 
@@ -659,6 +609,37 @@ fn print_node_lag_block(metrics: &Snapshot) {
     }
 }
 
+/// Per-wait-level latency measured on the leader, probed server-side at
+/// 1ms cadence during the load (see `runner::metrics`). One row per stage.
+fn print_latency_probe_block(metrics: &Snapshot) {
+    let stats: Vec<ProbeLevelStats> = metrics.probe_level_stats();
+    println!("latency probe (leader, server-side, per wait level):");
+    if stats.iter().all(|s| s.samples == 0) {
+        println!("  (no samples — build roda-server with `--features latency-probe`)");
+        return;
+    }
+
+    let border = "  +----------------+---------+----------+----------+----------+----------+";
+    println!("{border}");
+    println!(
+        "  | {:<14} | {:>7} | {:>8} | {:>8} | {:>8} | {:>8} |",
+        "stage", "samples", "p50", "p99", "p999", "max"
+    );
+    println!("{border}");
+    for s in &stats {
+        println!(
+            "  | {:<14} | {:>7} | {:>8} | {:>8} | {:>8} | {:>8} |",
+            s.name,
+            s.samples,
+            fmt_dur(s.p50),
+            fmt_dur(s.p99),
+            fmt_dur(s.p999),
+            fmt_dur(s.max),
+        );
+    }
+    println!("{border}");
+}
+
 /// Default the in-process `spdlog-rs` output (used by `client` /
 /// `cluster`) to `Debug`. The scenario harness is the e2e entry
 /// point — debug-level logs are the right baseline for diagnosing
@@ -670,7 +651,7 @@ fn configure_logging() {
     let level = std::env::var("RODA_SCENARIO_LOG_LEVEL")
         .ok()
         .and_then(|s| parse_log_level(&s))
-        .unwrap_or(spdlog::Level::Debug);
+        .unwrap_or(spdlog::Level::Warn);
     spdlog::default_logger().set_level_filter(spdlog::LevelFilter::MoreSevereEqual(level));
 }
 

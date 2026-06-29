@@ -11,7 +11,7 @@ use raft::{AppendResult, Role};
 use spdlog::{debug, error, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage::{WalTailer, decode_records};
+use storage::{WalTailer, decode_records, last_tx_id_in};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tokio::task::{JoinSet, yield_now};
@@ -219,6 +219,35 @@ async fn run_follower_session(
         return;
     }
 
+    // Split the session into two parallel tasks so applying never blocks on the
+    // ack and the ack reflects the follower's true applied index:
+    //  - receiver (Loop 1): apply leader messages to the ledger, no inline ack;
+    //  - acker (Loop 2): report the follower's snapshot index whenever it moves.
+    let session_cancel = cancel.child_token();
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    tasks.spawn({
+        let c = consensus.clone();
+        let ct = session_cancel.clone();
+        async move { run_follower_receiver(c, inbound, ct).await }
+    });
+    tasks.spawn({
+        let c = consensus.clone();
+        let ct = session_cancel.clone();
+        async move { run_follower_acker(c, tx, ct).await }
+    });
+    let _ = tasks.join_next().await;
+    session_cancel.cancel();
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Loop 1: receive leader messages and apply them to the ledger. No ack — the
+/// follower's progress is reported reactively by [`run_follower_acker`].
+async fn run_follower_receiver(
+    consensus: Arc<Consensus>,
+    mut inbound: Streaming<ReplicationLeaderMessage>,
+    cancel: CancellationToken,
+) {
+    let nid = consensus.node_id();
     loop {
         tokio::select! {
             biased;
@@ -226,10 +255,10 @@ async fn run_follower_session(
             msg = inbound.message() => match msg {
                 Ok(Some(ReplicationLeaderMessage { message: Some(m) })) => match m {
                     replication_leader_message::Message::WalUpdate(u) => {
-                        if !apply_wal_update(&consensus, &tx, u).await { return; }
+                        if !apply_wal_update(&consensus, u) { return; }
                     }
                     replication_leader_message::Message::Heartbeat(h) => {
-                        if !apply_heartbeat(&consensus, &tx, h).await { return; }
+                        apply_heartbeat(&consensus, h);
                     }
                     replication_leader_message::Message::Handshake(_) => {
                         error!("replication_follower[{}]: unexpected mid-stream handshake", nid);
@@ -246,11 +275,44 @@ async fn run_follower_session(
     }
 }
 
-async fn apply_wal_update(
-    c: &Arc<Consensus>,
-    tx: &Sender<Result<ReplicationFollowerMessage, Status>>,
-    u: ReplicationLeaderMessageWalUpdate,
-) -> bool {
+/// Loop 2: park on the follower's snapshot index and send an `IndexUpdate` to
+/// the leader each time it advances — the reactive replacement for the inline
+/// per-message ack. Reports the *true* applied index (post-fsync), not the
+/// stale read the old code took right after enqueue.
+async fn run_follower_acker(
+    consensus: Arc<Consensus>,
+    tx: Sender<Result<ReplicationFollowerMessage, Status>>,
+    cancel: CancellationToken,
+) {
+    let nid = consensus.node_id();
+    let snapshot = consensus.waiter().snapshot();
+    let mut last_acked = snapshot.get();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = snapshot.wait_reach(last_acked + 1) => {
+                let current = snapshot.get();
+                let sent = tx
+                    .send(Ok(ReplicationFollowerMessage {
+                        message: Some(replication_follower_message::Message::IndexUpdate(
+                            ReplicationFollowerMessageIndexUpdate {
+                                local_commit_id: current,
+                            },
+                        )),
+                    }))
+                    .await;
+                if sent.is_err() {
+                    debug!("replication_follower[{}]: ack channel closed", nid);
+                    return;
+                }
+                last_acked = current;
+            }
+        }
+    }
+}
+
+fn apply_wal_update(c: &Arc<Consensus>, u: ReplicationLeaderMessageWalUpdate) -> bool {
     let nid = c.node_id();
     let entries = decode_records(&u.wal_binary);
     let count = entries.len();
@@ -262,7 +324,7 @@ async fn apply_wal_update(
         );
         return false;
     }
-    let local_index = ledger.last_snapshot_id();
+    let local_index = ledger.last_commit_id();
     debug!(
         "replication_follower[{}]: WAL update applied bytes={} records={} local_commit={} leader_cluster_commit={}",
         nid,
@@ -277,24 +339,13 @@ async fn apply_wal_update(
         node.advance_local_index(local_index);
         node.advance_cluster_index(u.cluster_commit_id);
     }
-    tx.send(Ok(ReplicationFollowerMessage {
-        message: Some(replication_follower_message::Message::IndexUpdate(
-            ReplicationFollowerMessageIndexUpdate {
-                local_commit_id: local_index,
-            },
-        )),
-    }))
-    .await
-    .is_ok()
+    c.publish_cluster_commit();
+    true
 }
 
-async fn apply_heartbeat(
-    c: &Arc<Consensus>,
-    tx: &Sender<Result<ReplicationFollowerMessage, Status>>,
-    h: ReplicationLeaderMessageHeartBeat,
-) -> bool {
+fn apply_heartbeat(c: &Arc<Consensus>, h: ReplicationLeaderMessageHeartBeat) {
     let nid = c.node_id();
-    let local_index = c.ledger.current().last_snapshot_id();
+    let local_index = c.ledger.current().last_commit_id();
     {
         let mut node = c.raft_node.lock().expect("raft mutex poisoned");
         node.note_leader_activity(Instant::now());
@@ -303,19 +354,11 @@ async fn apply_heartbeat(
         node.advance_local_index(local_index);
         node.advance_cluster_index(h.cluster_commit_id);
     }
+    c.publish_cluster_commit();
     debug!(
         "replication_follower[{}]: heartbeat received cluster_commit={} local_index={}",
         nid, h.cluster_commit_id, local_index
     );
-    tx.send(Ok(ReplicationFollowerMessage {
-        message: Some(replication_follower_message::Message::IndexUpdate(
-            ReplicationFollowerMessageIndexUpdate {
-                local_commit_id: local_index,
-            },
-        )),
-    }))
-    .await
-    .is_ok()
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -341,6 +384,9 @@ enum PushOutcome {
     /// the loop doesn't spin between trivial pushes when load is light.
     Sent {
         drained: bool,
+        /// Highest `tx_id` in the batch just shipped (resolved from the WAL
+        /// bytes). The sender tracks this to park on `commit.wait_reach(+1)`.
+        last_tx_id: u64,
     },
     Idle,
     StreamClosed,
@@ -577,13 +623,19 @@ async fn run_peer_sender(
         .cluster
         .as_ref()
         .expect("run_peer_sender requires a clustered config");
-    let idle_sleep = Duration::from_millis(cluster.replication_poll_ms);
+    // Heartbeat cadence comes from raft (election-timeout-derived), not config.
+    let heartbeat = consensus.heartbeat_interval();
     let max_bytes = cluster.append_entries_max_bytes;
     // Tailer is pre-positioned at `start_tx_id + 1`; subsequent
     // `tail()` calls just stream forward from that cursor.
     let next_tx = start_tx_id + 1;
     let mut tailer = consensus.ledger.current().wal_tailer(next_tx);
     let mut buffer = vec![0u8; max_bytes];
+    // Highest tx_id shipped so far, tracked across iterations from the bytes the
+    // tailer actually streamed. The idle park waits for `commit` to reach
+    // `last_sent_tx_id + 1`; a value re-read from the watch each pass would race
+    // with concurrent advances and skip a transaction.
+    let mut last_sent_tx_id = start_tx_id;
     debug!(
         "replication_leader[{} peer={}]: sender started next_tx={}",
         nid, pid, next_tx
@@ -605,24 +657,21 @@ async fn run_peer_sender(
             // don't artificially cap leader→follower throughput. A
             // `yield_now` returns control to the runtime so other
             // peer tasks (and the receiver) get a fair turn.
-            PushOutcome::Sent { drained: false } => yield_now().await,
-            // Either drained the WAL with a partial buffer, or sent
-            // a heartbeat on an empty WAL. Same backoff in both
-            // cases — no point re-asking immediately when we just
-            // learned there's nothing more.
-            PushOutcome::Sent { drained: true } | PushOutcome::Idle => {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        debug!(
-                            "replication_leader[{} peer={}]: sender exiting (cancelled)",
-                            nid, pid
-                        );
-                        return;
-                    }
-                    _ = sleep(idle_sleep) => {}
-                }
+            PushOutcome::Sent {
+                drained: false,
+                last_tx_id,
+            } => {
+                last_sent_tx_id = last_sent_tx_id.max(last_tx_id);
+                yield_now().await;
+                continue;
             }
+            // Drained the WAL with a partial buffer — fall through to the park.
+            PushOutcome::Sent {
+                drained: true,
+                last_tx_id,
+            } => last_sent_tx_id = last_sent_tx_id.max(last_tx_id),
+            // Heartbeat sent on an empty WAL — nothing new shipped.
+            PushOutcome::Idle => {}
             PushOutcome::StreamClosed => {
                 debug!(
                     "replication_leader[{} peer={}]: sender: stream closed",
@@ -630,6 +679,24 @@ async fn run_peer_sender(
                 );
                 return;
             }
+        }
+        // Drained the WAL (partial buffer) or sent a heartbeat on an empty WAL.
+        // Park until `commit` reaches the tx after the last one we shipped
+        // (reactive — new durable bytes to replicate). `heartbeat` is the only
+        // periodic wake, firing an idle keepalive every raft heartbeat interval;
+        // it re-arms each idle pass, so a data send resets it (Raft: a data
+        // AppendEntries counts as the heartbeat).
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!(
+                    "replication_leader[{} peer={}]: sender exiting (cancelled)",
+                    nid, pid
+                );
+                return;
+            }
+            _ = consensus.waiter().commit().wait_reach(last_sent_tx_id + 1) => {}
+            _ = sleep(heartbeat) => {}
         }
     }
 }
@@ -733,6 +800,10 @@ async fn push_one(
         "replication_leader[{} peer={}]: WalUpdate bytes={} cluster_commit={}",
         nid, peer_id, n, cluster_commit_id
     );
+    // Resolve the highest tx_id shipped from the bytes themselves (zero-copy):
+    // the tailer streams *written* WAL, which may run ahead of `commit`, so the
+    // commit watch alone can't tell the sender where it is — the bytes can.
+    let last_tx_id = last_tx_id_in(&buffer[..n]).unwrap_or(0);
     if out_tx
         .send(wal_update_msg(&buffer[..n], cluster_commit_id))
         .await
@@ -746,6 +817,7 @@ async fn push_one(
     // and the caller should back off instead of spinning.
     PushOutcome::Sent {
         drained: n < buffer.len(),
+        last_tx_id,
     }
 }
 

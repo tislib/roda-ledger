@@ -1,103 +1,77 @@
-//! [`Waiter::wait_for_transaction_level`] — block until a transaction
-//! reaches a pipeline wait level (Computed / Committed / Snapshot /
-//! ClusterCommit).
+//! [`Waiter::wait_for_transaction_level`] — block until a transaction reaches a
+//! pipeline wait level. All levels are reactive: each parks on an [`IndexWatch`]
+//! fed by the ledger index hook (compute/commit/snapshot) or the raft advance
+//! sites (cluster_commit). No polling.
+//!
+//! Returns the round-trip `Duration`, or `Duration::ZERO` when the stage was
+//! already caught up at capture (nothing in flight) — the latency probe uses
+//! that to exclude non-samples.
 
 use super::Waiter;
 use ::proto::ledger as proto;
-use spdlog::{trace, warn};
-use std::time::Duration;
+use spdlog::warn;
+use std::io;
+use std::time::{Duration, Instant};
+
+const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Waiter {
     pub async fn wait_for_transaction_level(
         &self,
         transaction_id: u64,
         level: proto::WaitLevel,
-    ) -> std::io::Result<()> {
-        let start_time = std::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-        let mut iter = 0u32;
-        trace!(
-            "wait_for_transaction_level: tx_id={} level={:?} timeout={:?} starting",
-            transaction_id, level, timeout
-        );
-
-        loop {
-            iter += 1;
-            let ledger = self.ledger.current();
-            let compute = ledger.last_compute_id();
-            let commit = ledger.last_commit_id();
-            let snapshot = ledger.last_snapshot_id();
-            self.consensus.self_advance();
-            let cluster_commit = self.consensus.cluster_commit_index();
-            let reached = match level {
-                proto::WaitLevel::Computed => compute >= transaction_id,
-                proto::WaitLevel::Committed => commit >= transaction_id,
-                proto::WaitLevel::Snapshot => snapshot >= transaction_id,
-                proto::WaitLevel::ClusterCommit => {
-                    // Require all three watermarks to have passed the tx.
-                    // `cluster_commit_index` reflects the leader's view of
-                    // quorum replication; the local `commit_index` and
-                    // `snapshot_index` ensure the tx is also durably
-                    // stored and queryable on this node.
-                    snapshot >= transaction_id
-                        && commit >= transaction_id
-                        && cluster_commit >= transaction_id
-                }
-            };
-
-            if reached {
-                trace!(
-                    "wait_for_transaction_level: tx_id={} level={:?} reached after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
-                    transaction_id,
-                    level,
-                    start_time.elapsed().as_millis(),
-                    iter,
-                    compute,
-                    commit,
-                    snapshot,
-                    cluster_commit
-                );
-                return Ok(());
+    ) -> io::Result<Duration> {
+        let start = Instant::now();
+        // Already at/past the target ⇒ nothing was in flight: not a real wait.
+        // Return ZERO so the latency probe excludes it as a non-sample.
+        if self.level_reached(level, transaction_id) {
+            return Ok(Duration::ZERO);
+        }
+        let waited = match level {
+            proto::WaitLevel::Computed => {
+                tokio::time::timeout(WAIT_TIMEOUT, self.compute().wait_reach(transaction_id)).await
             }
-
-            // Periodic progress log so multi-second waits aren't silent.
-            // With a 100µs poll a 2 s wait can hit ~20 000 iters, so
-            // bump the log cadence to keep it once-per-second-ish.
-            if iter.is_multiple_of(10_000) {
-                trace!(
-                    "wait_for_transaction_level: tx_id={} level={:?} still waiting after {}ms — compute={} commit={} snapshot={} cluster_commit={}",
-                    transaction_id,
-                    level,
-                    start_time.elapsed().as_millis(),
-                    compute,
-                    commit,
-                    snapshot,
-                    cluster_commit
-                );
+            proto::WaitLevel::Committed => {
+                tokio::time::timeout(WAIT_TIMEOUT, self.commit().wait_reach(transaction_id)).await
             }
-
-            // Poll, don't spin. `yield_now` only re-queues the task —
-            // when many `*_and_wait` handlers are in flight, that
-            // produces a CPU storm of raft-mutex acquisitions. 100µs
-            // is well below typical cluster-commit latency (a few ms
-            // on LAN, fdatasync-bound) so the latency hit is
-            // negligible while CPU drops by orders of magnitude.
-            tokio::time::sleep(Duration::from_micros(100)).await;
-
-            if start_time.elapsed() >= timeout {
+            proto::WaitLevel::Snapshot => {
+                tokio::time::timeout(WAIT_TIMEOUT, self.snapshot().wait_reach(transaction_id)).await
+            }
+            proto::WaitLevel::ClusterCommit => {
+                tokio::time::timeout(WAIT_TIMEOUT, self.wait_cluster_commit(transaction_id)).await
+            }
+        };
+        match waited {
+            Ok(()) => Ok(start.elapsed()),
+            Err(_) => {
                 warn!(
-                    "wait_for_transaction_level: tx_id={} level={:?} TIMED OUT after {}ms ({} iterations) — compute={} commit={} snapshot={} cluster_commit={}",
-                    transaction_id,
-                    level,
-                    start_time.elapsed().as_millis(),
-                    iter,
-                    compute,
-                    commit,
-                    snapshot,
-                    cluster_commit
+                    "wait_for_transaction_level: tx_id={transaction_id} level={level:?} TIMED OUT after {WAIT_TIMEOUT:?}"
                 );
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"))
             }
         }
+    }
+
+    /// Whether `level` is already at/past `tx` (no real wait needed).
+    fn level_reached(&self, level: proto::WaitLevel, tx: u64) -> bool {
+        match level {
+            proto::WaitLevel::Computed => self.compute().get() >= tx,
+            proto::WaitLevel::Committed => self.commit().get() >= tx,
+            proto::WaitLevel::Snapshot => self.snapshot().get() >= tx,
+            proto::WaitLevel::ClusterCommit => {
+                self.commit().get() >= tx
+                    && self.snapshot().get() >= tx
+                    && self.cluster_commit().get() >= tx
+            }
+        }
+    }
+
+    /// ClusterCommit requires the tx to be locally durable + queryable *and*
+    /// quorum-replicated. Awaiting all three watches in sequence waits for the
+    /// last to arrive (each returns immediately once already reached).
+    async fn wait_cluster_commit(&self, tx: u64) {
+        self.commit().wait_reach(tx).await;
+        self.snapshot().wait_reach(tx).await;
+        self.cluster_commit().wait_reach(tx).await;
     }
 }

@@ -2,6 +2,7 @@ use crate::balance::Balance;
 pub use crate::config::{LedgerConfig, StorageConfig};
 pub use crate::pipeline::CommitHandler;
 use crate::pipeline::Pipeline;
+pub use crate::pipeline::{IndexHook, PipelineIndexKind, null_index_hook};
 use crate::recover::Recover;
 use crate::seal::Seal;
 use crate::sequencer::Sequencer;
@@ -88,6 +89,12 @@ impl Ledger {
 
     pub fn submit(&self, operation: Operation) -> u64 {
         self.sequencer.submit(operation)
+    }
+
+    /// Register a hook fired whenever a pipeline progress index advances.
+    /// Call before `start()`. See [`PipelineIndexKind`] / [`IndexHook`].
+    pub fn set_index_hook(&self, hook: IndexHook) {
+        self.pipeline.set_index_hook(hook);
     }
 
     pub fn submit_batch(&self, operations: Vec<Operation>) -> u64 {

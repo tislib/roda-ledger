@@ -10,7 +10,9 @@ use crate::handlers::ledger_handler::LedgerHandler;
 use crate::handlers::node_handler::NodeHandler;
 use crate::ledger_slot::LedgerSlot;
 use crate::waiter::Waiter;
-use ledger::ledger::Ledger;
+use ledger::ledger::{IndexHook, Ledger};
+use ledger::transactor::transaction::Operation;
+use proto::ledger::WaitLevel;
 use proto::ledger::ledger_server::LedgerServer;
 use proto::node::node_server::NodeServer;
 use spdlog::{debug, error};
@@ -48,8 +50,31 @@ impl ClusterNode {
         ledger.start().map_err(|e| format!("{}", e))?;
         let ledger = Arc::new(LedgerSlot::new(ledger, config.ledger.clone()));
 
-        let consensus = Arc::new(Consensus::new(config.clone(), ledger.clone())?);
-        let waiter = Arc::new(Waiter::new(ledger.clone(), consensus.clone()));
+        // Waiter owns the reactive index watches; seed from the live ledger
+        // (cluster_commit starts at 0). Shared into Consensus so the replication
+        // sender / cluster-commit driver read the same watches.
+        let waiter = {
+            let l = ledger.current();
+            Arc::new(Waiter::new(
+                l.last_compute_id(),
+                l.last_commit_id(),
+                l.last_snapshot_id(),
+                0,
+            ))
+        };
+        let consensus = Arc::new(Consensus::new(
+            config.clone(),
+            ledger.clone(),
+            waiter.clone(),
+        )?);
+
+        // The cluster owns the single ledger index hook: feed the waiter's
+        // compute/commit/snapshot watches. Registered via LedgerSlot so it
+        // survives reseed.
+        {
+            let w = waiter.clone();
+            ledger.set_index_hook(Arc::new(move |kind, value| w.record(kind, value)));
+        }
 
         #[cfg(feature = "fault-injection")]
         let fault_injector = ClusterFaultInjector::new(ledger.clone());
@@ -78,9 +103,6 @@ impl ClusterNode {
         #[cfg(feature = "fault-injection")]
         self.start_fault_server()?;
 
-        #[cfg(feature = "latency-probe")]
-        self.start_latency_probe_server()?;
-
         Ok(self)
     }
 
@@ -93,17 +115,34 @@ impl ClusterNode {
         let handle = thread::Builder::new()
             .name("ledger-grpc".into())
             .spawn(move || {
-                let rt = runtime::Builder::new_current_thread()
+                // Client-facing runtime is multi-threaded so concurrent
+                // client RPCs, in-flight `*_and_wait` calls, and the latency
+                // probe (kept on this runtime on purpose, to reflect
+                // client-observed latency) don't starve each other on one
+                // thread. Submit *ordering* is preserved by a lock in
+                // `LedgerHandler`, not by single-threading.
+                // `RODA_CLIENT_WORKER_THREADS` overrides the worker count.
+                let workers = std::env::var("RODA_CLIENT_WORKER_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(4);
+                let rt = runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
                     .enable_all()
                     .thread_name("ledger-grpc")
                     .build()
                     .expect("build dedicated gRPC runtime");
                 rt.block_on(async {
                     let ledger_handler =
-                        LedgerHandler::new(ledger.clone(), consensus.clone(), waiter);
+                        LedgerHandler::new(ledger.clone(), consensus.clone(), waiter.clone());
+                    #[cfg(feature = "latency-probe")]
+                    let latency_handler = LatencyProbeHandler::new(ledger.clone(), waiter.clone());
                     let client_server = ClusterNode::run_ledger_server(
                         config,
                         ledger_handler,
+                        #[cfg(feature = "latency-probe")]
+                        latency_handler,
                         cancellation_token.clone(),
                     );
                     if let Err(e) = client_server.await {
@@ -158,10 +197,18 @@ impl ClusterNode {
                     .build()
                     .expect("build dedicated consensus runtime");
                 rt.block_on(async {
+                    // Reactive cluster-commit driver: advances quorum on each
+                    // snapshot-index advance (drives singleton cluster_commit).
+                    let cc_driver = tokio::spawn({
+                        let c = consensus.clone();
+                        let ct = cancellation_token.clone();
+                        async move { c.run_cluster_commit_driver(ct).await }
+                    });
                     if let Err(e) = consensus.run_loop(cancellation_token).await {
                         error!("consensus loop exited: {}", e);
                         exit(1);
                     }
+                    let _ = cc_driver.await;
                 });
             })
             .map_err(|e| format!("{}", e))?;
@@ -215,40 +262,6 @@ impl ClusterNode {
         self.fault_injector.clone()
     }
 
-    #[cfg(feature = "latency-probe")]
-    fn start_latency_probe_server(&mut self) -> Result<(), String> {
-        let config = self.config.clone();
-        let cancellation_token = self.cancellation_token.clone();
-        let ledger = self.ledger.clone();
-        let waiter = self.waiter.clone();
-        let handle = thread::Builder::new()
-            .name("latency-grpc".into())
-            .spawn(move || {
-                let rt = runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .thread_name("latency-grpc")
-                    .build()
-                    .expect("build dedicated latency gRPC runtime");
-                rt.block_on(async {
-                    let handler = LatencyProbeHandler::new(ledger, waiter);
-                    let server =
-                        ClusterNode::run_latency_probe_server(config, handler, cancellation_token);
-                    // Optional debug-only infra — never load-bearing, same
-                    // reasoning as the fault server: the derived port can
-                    // alias another node's ephemeral port under the test
-                    // harness, so a bind failure degrades to "no probe
-                    // server on this node" (logged), it must NOT `exit(1)`.
-                    if let Err(e) = server.await {
-                        error!("latency gRPC server exited (continuing without it): {}", e);
-                    }
-                });
-            })
-            .map_err(|e| format!("{}", e))?;
-        self.handles.push(handle);
-
-        Ok(())
-    }
-
     /// In-process latency probe handler, for tests that drive the probe
     /// directly rather than over the gRPC surface. Mirrors
     /// [`fault_injector`](Self::fault_injector).
@@ -257,13 +270,77 @@ impl ClusterNode {
         LatencyProbeHandler::new(self.ledger.clone(), self.waiter.clone())
     }
 
+    // ── In-process load surface ──────────────────────────────────────────
+    // Thin wrappers over the active `Ledger` and the shared `Waiter`, used by
+    // the in-process `cluster_load` / `cluster_load_latency` bins to drive a
+    // single-node cluster without the gRPC hop. Mirrors `Ledger`'s own bins.
+
+    /// Submit one operation in-process (bypassing gRPC). Goes through the same
+    /// `Ledger::submit` the `LedgerHandler` uses.
+    pub fn submit(&self, op: Operation) -> u64 {
+        self.ledger.current().submit(op)
+    }
+
+    /// Open accounts `1..=count` on the active ledger.
+    pub fn open_accounts(&self, count: u32) {
+        self.ledger.current().open_accounts(count);
+    }
+
+    /// Register an index hook (see `Ledger::set_index_hook`). Routed through
+    /// `LedgerSlot` so it survives reseed; first registration wins, so this is a
+    /// no-op once the node's own waiter hook is installed in `new`.
+    pub fn set_index_hook(&self, hook: IndexHook) {
+        self.ledger.set_index_hook(hook);
+    }
+
+    pub fn last_sequenced_id(&self) -> u64 {
+        self.ledger.current().last_sequenced_id()
+    }
+    pub fn last_compute_id(&self) -> u64 {
+        self.ledger.current().last_compute_id()
+    }
+    pub fn last_commit_id(&self) -> u64 {
+        self.ledger.current().last_commit_id()
+    }
+    pub fn last_snapshot_id(&self) -> u64 {
+        self.ledger.current().last_snapshot_id()
+    }
+    pub fn cluster_commit_index(&self) -> u64 {
+        self.consensus.cluster_commit_index()
+    }
+
+    /// Wait until `tx_id` reaches `level` via the shared `Waiter`. Returns
+    /// `true` if reached, `false` on the waiter's internal timeout.
+    pub async fn wait_for_level(&self, tx_id: u64, level: WaitLevel) -> bool {
+        self.waiter
+            .wait_for_transaction_level(tx_id, level)
+            .await
+            .is_ok()
+    }
+
     fn start_replication_driver(&mut self) -> Result<(), String> {
         let consensus = self.consensus.clone();
         let cancellation_token = self.cancellation_token.clone();
         let handle = thread::Builder::new()
             .name("replication".into())
             .spawn(move || {
-                let rt = runtime::Builder::new_current_thread()
+                // Single-threaded by default; `RODA_REPL_WORKER_THREADS > 1`
+                // switches to a multi-threaded runtime so the per-peer
+                // sender/receiver tasks run in parallel instead of queueing
+                // on one thread (which starves the ack receiver and inflates
+                // the cluster_commit tail).
+                let workers = std::env::var("RODA_REPL_WORKER_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let mut builder = if workers > 1 {
+                    let mut b = runtime::Builder::new_multi_thread();
+                    b.worker_threads(workers);
+                    b
+                } else {
+                    runtime::Builder::new_current_thread()
+                };
+                let rt = builder
                     .enable_all()
                     .thread_name("replication_driver")
                     .build()
@@ -285,19 +362,31 @@ impl ClusterNode {
     pub async fn run_ledger_server(
         config: Config,
         handler: LedgerHandler,
+        // The `LatencyProbe` service rides on the ledger port (not a derived
+        // one): callers reach it at the node's client address with no extra
+        // discovery, and `ProcessProvisioner`'s ephemeral ports make a
+        // `+offset` scheme unreliable.
+        #[cfg(feature = "latency-probe")] latency: LatencyProbeHandler,
         cancellation_token: CancellationToken,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let addr = config.server.socket_addr()?;
 
         debug!("Ledger gRPC server listening on {}", addr);
 
-        let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(proto::ledger::FILE_DESCRIPTOR_SET)
-            .build_v1()?;
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(proto::ledger::FILE_DESCRIPTOR_SET);
+        #[cfg(feature = "latency-probe")]
+        let reflection =
+            reflection.register_encoded_file_descriptor_set(proto::latency::FILE_DESCRIPTOR_SET);
+        let reflection = reflection.build_v1()?;
 
-        TonicServer::builder()
-            .add_service(LedgerServer::new(handler))
-            .add_service(reflection_service)
+        let router = TonicServer::builder().add_service(LedgerServer::new(handler));
+        #[cfg(feature = "latency-probe")]
+        let router = router
+            .add_service(proto::latency::latency_probe_server::LatencyProbeServer::new(latency));
+
+        router
+            .add_service(reflection)
             .serve_with_shutdown(addr, async move {
                 cancellation_token.cancelled().await;
             })
@@ -355,46 +444,6 @@ impl ClusterNode {
             .await?;
 
         debug!("Fault gRPC server shut down cleanly");
-
-        Ok(())
-    }
-
-    /// Run the `LatencyProbe` gRPC service on `client_port + 2000` (the
-    /// fault server uses `+1000`). Server-side, ambient pipeline-latency
-    /// measurement; see `latency.proto`. Same non-load-bearing / overflow
-    /// handling as the fault server.
-    #[cfg(feature = "latency-probe")]
-    pub async fn run_latency_probe_server(
-        config: Config,
-        handler: LatencyProbeHandler,
-        cancellation_token: CancellationToken,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use proto::latency::latency_probe_server::LatencyProbeServer;
-        let mut addr = config.server.socket_addr()?;
-        let Some(probe_port) = addr.port().checked_add(2000) else {
-            debug!(
-                "Latency gRPC server skipped: client_port {} + 2000 overflows u16",
-                addr.port()
-            );
-            return Ok(());
-        };
-        addr.set_port(probe_port);
-
-        debug!("Latency gRPC server listening on {}", addr);
-
-        let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(proto::latency::FILE_DESCRIPTOR_SET)
-            .build_v1()?;
-
-        TonicServer::builder()
-            .add_service(LatencyProbeServer::new(handler))
-            .add_service(reflection_service)
-            .serve_with_shutdown(addr, async move {
-                cancellation_token.cancelled().await;
-            })
-            .await?;
-
-        debug!("Latency gRPC server shut down cleanly");
 
         Ok(())
     }

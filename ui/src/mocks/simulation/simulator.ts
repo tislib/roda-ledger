@@ -93,7 +93,6 @@ const DEFAULT_CONFIG: ClusterConfig = {
   queueSize: '16384',
   transactionCountPerSegment: '10000000',
   snapshotFrequency: 4,
-  replicationPollMs: '5',
   appendEntriesMaxBytes: '4194304',
 };
 
@@ -710,8 +709,6 @@ export class Simulator {
     const segCount = BigInt(next.transactionCountPerSegment || '0');
     if (segCount <= 0n) return { accepted: false, error: 'transaction_count_per_segment must be > 0' };
     if (next.snapshotFrequency < 0) return { accepted: false, error: 'snapshot_frequency must be >= 0' };
-    const pollMs = BigInt(next.replicationPollMs || '0');
-    if (pollMs <= 0n) return { accepted: false, error: 'replication_poll_ms must be > 0' };
     const maxBytes = BigInt(next.appendEntriesMaxBytes || '0');
     if (maxBytes <= 0n) return { accepted: false, error: 'append_entries_max_bytes must be > 0' };
 

@@ -14,7 +14,7 @@
 use ::proto::ledger as proto;
 use ::proto::ledger::ledger_client::LedgerClient as TonicLedgerClient;
 use ledger::tools::backoff::{Backoff, BackoffPolicy};
-use spdlog::{trace, warn};
+use spdlog::{debug, trace, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tonic::transport::Channel;
@@ -298,7 +298,7 @@ impl NodeClient {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     if attempt == max {
-                        warn!(
+                        debug!(
                             "client::{}: failed after {} retries, giving up: {} (code={:?})",
                             op_name,
                             attempt,

@@ -280,7 +280,6 @@ async fn election_completes_with_one_node_silent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn slow_follower_does_not_block_majority() {
     let mut ctl = ClusterTestingControl::start(ClusterTestingConfig {
-        replication_poll_ms: 5,
         ..ClusterTestingConfig::cluster(3)
     })
     .await
