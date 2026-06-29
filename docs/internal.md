@@ -2192,8 +2192,9 @@ acknowledged). Nothing else is shared between peer tasks.
 
 Each iteration: call `tailer.tail(from_tx_id, &mut buf)`; if it
 returns zero bytes, send an empty `AppendEntries` heartbeat carrying
-only `leader_commit_tx_id` and sleep for `replication_poll_ms`; if it
-returns bytes, call the ship-until-accepted path which retries on
+only `leader_commit_tx_id`, then park until the commit index advances
+(reactive) or the raft heartbeat interval elapses, whichever comes
+first; if it returns bytes, call the ship-until-accepted path which retries on
 transport failures and observes higher-term replies. On a successful
 non-empty reply the task advances `from_tx_id` past the shipped
 batch's last `tx_id`, updates `peer_last_tx`, and calls
@@ -2216,7 +2217,7 @@ Without idle heartbeats, the leader's last knowledge of a peer's
 commit progress would be the reply to the previous shipment — itself
 one batch stale. After the writer goes idle, the peer's true commit
 watermark would never be observed. Sending an empty `AppendEntries`
-every `replication_poll_ms` fixes this: the reply carries the peer's
+every raft heartbeat interval fixes this: the reply carries the peer's
 now-fsynced `last_commit_id`, which advances the peer's quorum slot.
 Transport errors on heartbeats are intentionally swallowed — the
 next interval retries; a heartbeat is purely observational, not a

@@ -101,13 +101,16 @@ tasks own. The notifier is the sync→async bridge — the ledger fires from a s
 notifier wake (`tokio::sync::Notify::notify_waiters`, or a `watch`) is sync-callable and
 non-blocking, with no `.await` and no lock on the fast path.
 
-The per-peer sender (`run_peer_sender`) stops polling: instead of `sleep(idle_sleep)` on an
-idle tailer, it `await`s the notifier and re-tails the instant `Commit` advances. The
+The per-peer sender (`run_peer_sender`) stops polling: instead of an idle-poll sleep on an
+idle tailer, it `await`s the `Commit` watch and re-tails the instant it advances. The
 leader's self-quorum feed (`self_advance` → `Quorum::advance`) is driven by `Snapshot`
-advances rather than re-read every tick. The 5 ms idle tail disappears; replication latency
-collapses to wake + send. `replication_poll_ms` is retained only as a **safety heartbeat**
-(a long fallback so a missed wake cannot wedge a peer), not the primary cadence — matching
-the house rule "event-driven freshness over periodic tickers."
+advances rather than re-read every tick. The old 5 ms `replication_poll_ms` idle tail is
+**removed entirely**; replication latency collapses to wake + send. The only remaining
+periodic wake is a true **Raft heartbeat**, fired every `RaftConfig.heartbeat_interval`
+(50 ms by default — derived from and validated against the election timeout,
+`heartbeat_interval * 2 < election_timer.min_ms`; **not** separately configurable). A data
+send re-arms the heartbeat timer, so heartbeats only flow when genuinely idle — matching the
+house rule "event-driven freshness over periodic tickers."
 
 ### D3 — Reactive waits replace polling (goal 2)
 
@@ -147,7 +150,7 @@ cluster-owned notifier" and does not expand the ledger's runtime surface.
 
 ### Positive
 - **Replication latency loses the 5 ms tail.** At low/bursty rates a commit is replicated on
-  the next wake (microseconds) instead of up to `replication_poll_ms`. Quorum advance is
+  the next wake (microseconds) instead of up to the old 5 ms idle poll. Quorum advance is
   reactive, not poll-gated.
 - **Far fewer tokio cycles.** Idle senders and blocked client waits stop busy-polling
   (5 ms sender ticks, 100 µs waiter spins). Threads sleep until there is real work, reducing
@@ -189,8 +192,10 @@ when the wait target is fast, neutral when it is inherently slow, and never a re
   and tested.
 
 ### Neutral
-- `replication_poll_ms` changes role from primary cadence to safety heartbeat; its config
-  shape is unchanged.
+- `replication_poll_ms` is **removed** from the config (cluster `ClusterSection`, the control
+  `ClusterConfig` proto field — reserved #5 — and the UI). The replication cadence is no
+  longer a knob: the only periodic wake is the Raft heartbeat, sourced from
+  `RaftConfig.heartbeat_interval`.
 - The ledger-internal `wait_for_*` waiters keep their `WaitStrategy` spin/sleep until the
   follow-up ADR; standalone-ledger behavior is unchanged by this ADR.
 - The notifier lives in the cluster (tokio); the ledger stays non-tokio. The hook is the
