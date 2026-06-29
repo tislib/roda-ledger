@@ -21,7 +21,7 @@ use crate::node_client::{
 };
 use ::proto::ledger as proto;
 use ledger::tools::backoff::Backoff;
-use spdlog::warn;
+use spdlog::debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -215,7 +215,7 @@ impl ClusterClient {
                         return Err(e); // deterministic rejection — retrying can't help
                     }
                     if attempt == max {
-                        warn!(
+                        debug!(
                             "cluster::{}: failed after {} retries (last node[{}]): {} (code={:?})",
                             op_name,
                             attempt,
@@ -227,7 +227,7 @@ impl ClusterClient {
                     }
                     let retry_num = attempt + 1;
                     let next = backoff.peek_delay();
-                    warn!(
+                    debug!(
                         "cluster::{}: error '{}' (code={:?}) on node[{}] — retrying ({}/{}) on next node after {}ms",
                         op_name,
                         e.message(),
@@ -483,7 +483,7 @@ impl ClusterClient {
                         return Err(e);
                     }
                     let next = (idx + 1) % n;
-                    warn!(
+                    debug!(
                         "cluster::get_balance_at: error '{}' (code={:?}) on node[{}] — rotating to node[{}]",
                         e.message(),
                         e.code(),
@@ -638,7 +638,7 @@ impl ClusterLeaderClient {
                         return Err(e); // deterministic rejection — retrying can't help
                     }
                     if attempt == max {
-                        warn!(
+                        debug!(
                             "leader::{}: failed after {} retries (last node[{}]): {} (code={:?})",
                             op_name,
                             attempt,
@@ -672,7 +672,7 @@ impl ClusterLeaderClient {
                             Ordering::Release,
                             Ordering::Acquire,
                         );
-                        warn!(
+                        debug!(
                             "leader::{}: node[{}] cannot serve writes (code={:?}, msg='{}') — switching to node[{}] and retrying ({}/{}) after {}ms",
                             op_name,
                             idx,
@@ -684,7 +684,7 @@ impl ClusterLeaderClient {
                             next.as_millis()
                         );
                     } else {
-                        warn!(
+                        debug!(
                             "leader::{}: error '{}' (code={:?}) on node[{}] — retrying ({}/{}) after {}ms",
                             op_name,
                             e.message(),

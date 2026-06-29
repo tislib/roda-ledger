@@ -1,7 +1,7 @@
 //! Basic smoke tests for the scenario RPCs the UI uses on the Testing
 //! page. Per the test plan, scenario coverage is deliberately shallow —
-//! the underlying scenario subsystem is tested in `crates/testing` and
-//! `process_provisioner_smoke.rs`.
+//! the underlying scenario subsystem is tested in the `scenario` /
+//! `scenarios` modules and `process_provisioner_smoke.rs`.
 
 use std::time::Duration;
 

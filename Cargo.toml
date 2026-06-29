@@ -9,7 +9,6 @@ members = [
     "crates/cluster",
     "crates/control",
     "crates/ctl",
-    "crates/testing",
     "crates/roda-wasm-abi",
 ]
 
@@ -79,7 +78,6 @@ client = { path = "crates/client" }
 cluster = { path = "crates/cluster" }
 control = { path = "crates/control" }
 ctl = { path = "crates/ctl" }
-testing = { path = "crates/testing" }
 
 [profile.release]
 opt-level = 3

@@ -29,6 +29,11 @@ fault-injection = ["ledger/fault-injection"]
 # `Consensus` APIs, so no cross-crate feature chaining is needed. Production
 # builds compile the service out entirely.
 latency-probe = []
+# Scheduler-starvation detector spawned on the ledger-gRPC runtime — times how
+# long a bare `yield_now()` takes to round-trip, exposing a thread monopolized
+# by a no-`await` handler. Diagnostic only; busy-polls, so enable just for
+# probing. See `crates/cluster/src/bottleneck.rs`.
+bottleneck-detector = []
 
 [dependencies]
 proto.workspace = true

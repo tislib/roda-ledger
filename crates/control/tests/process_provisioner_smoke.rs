@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use control::provisioner::process::ProcessProvisioner;
 use control::runner::{MetricsCollector, ProvisionConfig, ScenarioRunner};
-use testing::scenarios;
+use control::scenarios;
 
 mod common;
 

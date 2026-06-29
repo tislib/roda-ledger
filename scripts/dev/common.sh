@@ -28,7 +28,7 @@ dev_sync() {
   rsync -a --delete \
     --exclude target --exclude "temp_*" --exclude node_modules \
     --exclude .claude --exclude data --exclude .git \
-    "$REPO_ROOT/" "$RODA_DEV_HOST:$RODA_DEV_PATH/"
+    "$REPO_ROOT/" "root@$RODA_DEV_HOST:$RODA_DEV_PATH/"
 }
 
 # dev_exec CMD... — run CMD on the dev box, in the repo, with cargo on PATH.

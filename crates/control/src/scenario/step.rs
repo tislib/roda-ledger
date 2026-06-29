@@ -64,6 +64,7 @@ pub enum Action {
     // ---- Concurrency ----
     AsyncBranch(AsyncBranch),
     Concurrent(Concurrent),
+    ConcurrentSubmit(ConcurrentSubmit),
 
     // ---- Synchronization ----
     Wait(Wait),
@@ -102,6 +103,7 @@ impl Action {
             Action::SubmitBatch(_) => "submit_batch",
             Action::AsyncBranch(_) => "async_branch",
             Action::Concurrent(_) => "concurrent",
+            Action::ConcurrentSubmit(_) => "concurrent_submit",
             Action::Wait(_) => "wait",
             Action::WaitForLevel(_) => "wait_for_level",
             Action::GetBalance(_) => "get_balance",
@@ -218,6 +220,21 @@ pub struct Concurrent {
     /// Optional per-branch labels for trace output. Length must
     /// equal `branches.len()` if set.
     pub labels: Option<Vec<String>>,
+}
+
+/// Parameterized fan-out for connection-concurrency load: spawn `tasks`
+/// workers over the *shared* connection, each issuing `ops_per_task`
+/// single-op `submit` RPCs (one-op-per-RPC, not batched) to account `1`.
+/// With `wait >= Committed` every worker holds its stream open until the
+/// op settles, so up to `tasks` HTTP/2 streams are in flight at once —
+/// the point is to stress stream concurrency, not throughput. Each op
+/// gets a unique non-zero `user_ref` (`1..=tasks*ops_per_task`) so none
+/// are deduped. Expanded by the runner; no per-op `Step` is materialized.
+#[derive(Clone, Debug)]
+pub struct ConcurrentSubmit {
+    pub tasks: u32,
+    pub ops_per_task: u32,
+    pub wait: WaitLevel,
 }
 
 // ============================================================
@@ -397,6 +414,11 @@ mod tests {
             Action::Concurrent(Concurrent {
                 branches: vec![],
                 labels: None,
+            }),
+            Action::ConcurrentSubmit(ConcurrentSubmit {
+                tasks: 1,
+                ops_per_task: 1,
+                wait: WaitLevel::None,
             }),
             Action::Wait(Wait {
                 duration: Duration::from_millis(0),

@@ -20,14 +20,15 @@ Export them in your shell, or copy [`.env.example`](.env.example) → `.env` (gi
 | `check.sh` | `scripts/check.sh` |
 | `test.sh [args]` | `cargo nextest run --workspace --cargo-profile ci` |
 | `bench.sh [NAME]` | `cargo bench -p ledger [--bench NAME]` (default `transaction_runner_bench`) |
-| `load.sh [args]` | `cargo run -p ledger --release --bin load_latency -- args` |
+| `ledger-load.sh [args]` | `cargo run -p ledger --release --bin load_latency -- args` |
 
 ## Local
 
 | Script | Does |
 |---|---|
-| `e2e.sh [args]` | run the e2e scenario suite locally |
-| `load-profile.sh` | build `load` with a dSYM (macOS) and run it |
+| `load.sh [scenario-name] [args]` | run a load scenario by name, or the whole load group if none given |
+| `e2e.sh [scenario-name] [args]` | run an e2e scenario by name, or the whole e2e group if none given |
+| `ledger-load-profile.sh` | build `load` with a dSYM (macOS) and run it |
 | `test-loop.sh [args]` | loop a test until it fails |
 
 Run any with `--help`.

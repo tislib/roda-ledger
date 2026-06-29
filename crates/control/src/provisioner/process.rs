@@ -54,6 +54,9 @@ pub struct ProcessProvisioner {
     /// bound until `Ledger::start()` returns. Default 60s — comfortable
     /// for the 1M-tx crash-recovery scenario on a CI worker.
     readiness_timeout: Duration,
+    /// Ledger pipeline wait strategy written into each node's TOML
+    /// (`low_latency` | `balanced` | `low_cpu`). Default `balanced`.
+    wait_strategy: String,
     state: Mutex<State>,
 }
 
@@ -99,6 +102,7 @@ impl ProcessProvisioner {
             base_temp_dir: std::env::temp_dir(),
             quiet: false,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
+            wait_strategy: "balanced".to_string(),
             state: Mutex::new(State::default()),
         }
     }
@@ -135,6 +139,15 @@ impl ProcessProvisioner {
 
     pub fn quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
+        self
+    }
+
+    /// Set the ledger pipeline wait strategy for spawned nodes.
+    /// `low_latency` spins (lowest latency, pegs a core per stage);
+    /// `balanced` sleeps when idle (low CPU, ~1ms idle wakeup). Default
+    /// `balanced`.
+    pub fn with_wait_strategy(mut self, strategy: impl Into<String>) -> Self {
+        self.wait_strategy = strategy.into();
         self
     }
 }
@@ -191,7 +204,7 @@ impl Provisioner for ProcessProvisioner {
 
         // Render configs against the fully-populated peer list.
         for plan in &plans {
-            let toml = render_config_toml(plan, &plans, &config.cluster);
+            let toml = render_config_toml(plan, &plans, &config.cluster, &self.wait_strategy);
             let config_path = plan.data_dir.join("config.toml");
             std::fs::write(&config_path, &toml).map_err(|e| {
                 ProvisionerError::ProvisionFailed(format!(
@@ -427,7 +440,12 @@ async fn wait_all_ready(urls: &[String], timeout: Duration) -> Result<(), Provis
 /// Always emits a `[cluster]` block — even single-node clusters take
 /// the clustered code path so `is_leader` and `current_leader_index`
 /// behave consistently.
-fn render_config_toml(node: &NodePlan, all: &[NodePlan], cluster: &ClusterConfig) -> String {
+fn render_config_toml(
+    node: &NodePlan,
+    all: &[NodePlan],
+    cluster: &ClusterConfig,
+    wait_strategy: &str,
+) -> String {
     let mut peers = String::new();
     for p in all {
         peers.push_str(&format!(
@@ -478,7 +496,7 @@ port = {cluster_port}
 {peers}
 [ledger]
 max_accounts = {max_accounts}
-wait_strategy = "balanced"
+wait_strategy = "{wait_strategy}"
 
 [ledger.storage]
 data_dir = "{data_dir}"

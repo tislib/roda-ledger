@@ -33,7 +33,7 @@ atomic op — the only extension point). Accounts are `u64`, balances `i64`, acc
 source/sink. WASM host API is deliberately narrow (`credit`, `debit`, `get_balance`) and fully
 deterministic so followers can replay entries without re-running code. See `docs/wasm-runtime.md`.
 
-## Repository map (9-crate Cargo workspace)
+## Repository map (8-crate Cargo workspace)
 
 | Crate | Path | Role |
 |---|---|---|
@@ -43,9 +43,8 @@ deterministic so followers can replay entries without re-running code. See `docs
 | `cluster` | `crates/cluster` | Multi-node node: wires ledger + raft + storage; gRPC servers; election + replication drivers. Builds `roda-server` (default bin). |
 | `proto`   | `crates/proto`   | tonic/prost gRPC defs: `ledger`, `node`, `fault`, `control` services (`.proto` under `crates/proto/proto`). |
 | `client`  | `crates/client`  | gRPC client library. |
-| `control` | `crates/control` | Control plane (web/gRPC) for multi-node scenarios; drives the `ui/`. |
+| `control` | `crates/control` | Control plane (web/gRPC) for multi-node scenarios; drives the `ui/`. Owns the scenario primitives + catalogue (`scenario`/`scenarios` modules). |
 | `ctl`     | `crates/ctl`     | Offline CLI (`roda-ctl`): pack/unpack/validate WAL segments. |
-| `testing` | `crates/testing` | Lightweight test-scenario primitives (feature-gated). |
 
 `cluster` is the default workspace member, so `cargo run` starts `roda-server`.
 

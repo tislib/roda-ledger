@@ -324,7 +324,7 @@ fn apply_wal_update(c: &Arc<Consensus>, u: ReplicationLeaderMessageWalUpdate) ->
         );
         return false;
     }
-    let local_index = ledger.last_snapshot_id();
+    let local_index = ledger.last_commit_id();
     debug!(
         "replication_follower[{}]: WAL update applied bytes={} records={} local_commit={} leader_cluster_commit={}",
         nid,
@@ -345,7 +345,7 @@ fn apply_wal_update(c: &Arc<Consensus>, u: ReplicationLeaderMessageWalUpdate) ->
 
 fn apply_heartbeat(c: &Arc<Consensus>, h: ReplicationLeaderMessageHeartBeat) {
     let nid = c.node_id();
-    let local_index = c.ledger.current().last_snapshot_id();
+    let local_index = c.ledger.current().last_commit_id();
     {
         let mut node = c.raft_node.lock().expect("raft mutex poisoned");
         node.note_leader_activity(Instant::now());

@@ -9,13 +9,15 @@
 //!    reports as leader at sample time. These samples drive
 //!    throughput and per-node lag stats.
 //!
-//! 2. **Submit latencies** — every `Submit` / `SubmitBatch` op that
-//!    waits at a non-`None` level pushes its observed elapsed time
-//!    into a flat list. Fire-and-forget submits (`WaitLevel::None`)
-//!    contribute nothing here; their throughput shows up in the
-//!    pipeline samples.
+//! 2. **Latency probes** — one task per wait level streams the leader's
+//!    batched `LatencyProbe.Probe` RPC (the server runs many probes per
+//!    call at a 1ms cadence) until each level has its target sample
+//!    count, recording the server-measured latency here. The measurement
+//!    happens *inside* the node, so client→server RTT never pollutes it.
+//!    Requires `roda-server` built with the `latency-probe` feature;
+//!    absent it, no samples are recorded.
 //!
-//! Aggregation (avg / min / max / p50 / p99 / lag-per-node) is the
+//! Aggregation (per-level p50 / p99 / p999 / max, lag-per-node) is the
 //! caller's job. Keeping the collector raw keeps it cheap and gives
 //! the CLI flexibility to render whatever shape it wants.
 
@@ -24,7 +26,10 @@ use std::time::{Duration, Instant};
 
 use client::ClusterClient;
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use proto::latency::latency_probe_client::LatencyProbeClient;
+use proto::latency::{ProbeRequest, WaitLevel};
+use tokio::task::{JoinHandle, JoinSet};
+use tonic::transport::Channel;
 
 /// One probe of every node's pipeline indices, taken `at` after the
 /// run started.
@@ -51,21 +56,34 @@ pub struct NodePipelineSnap {
     pub is_leader: bool,
 }
 
-/// One observed submit-RPC round-trip time, stamped with when the
-/// submit call returned (relative to the collector's start). The
-/// timestamp lets the CLI bucket latencies into per-second windows
-/// for the streaming progress table; without it we'd only know the
-/// run-wide distribution.
+/// Wait levels probed each tick, shallow → deep. The index into this
+/// array is the `level` stamped on every [`ProbeSample`]; the name
+/// labels the report row. `CLUSTER_COMMIT_LEVEL` indexes the last one.
+pub const PROBE_LEVELS: [(&str, WaitLevel); 4] = [
+    ("compute", WaitLevel::Computed),
+    ("commit", WaitLevel::Committed),
+    ("snapshot", WaitLevel::Snapshot),
+    ("cluster_commit", WaitLevel::ClusterCommit),
+];
+
+/// Index of `cluster_commit` in [`PROBE_LEVELS`] — the full end-to-end
+/// level the live progress table reports.
+pub const CLUSTER_COMMIT_LEVEL: usize = 3;
+
+/// One server-measured latency sample for a wait level, stamped with
+/// when it was taken (relative to the collector's start) so the CLI can
+/// bucket samples into per-second windows for the streaming table.
 #[derive(Clone, Copy, Debug)]
-pub struct LatencyPoint {
+pub struct ProbeSample {
     pub at: Duration,
-    pub latency: Duration,
+    pub level: usize,
+    pub latency_ns: u64,
 }
 
 #[derive(Default)]
 struct CollectorInner {
     samples: Vec<Sample>,
-    submit_latencies: Vec<LatencyPoint>,
+    probes: Vec<ProbeSample>,
 }
 
 /// Shared metrics sink. The runner clones the `Arc` into spawned
@@ -84,18 +102,15 @@ impl MetricsCollector {
         }
     }
 
-    /// Push one observed submit latency. Stamped with `now -
-    /// collector.start` so the CLI can bucket latencies into the
-    /// per-second progress table. Recorded for every submit
-    /// (waiting or fire-and-forget) — for fire-and-forget it
-    /// captures the submission RPC's round-trip time; for waiting
-    /// submits it captures the round-trip plus pipeline-stage wait.
-    pub fn record_submit_latency(&self, latency: Duration) {
+    /// Record one server-measured latency sample for `level`, stamped
+    /// with `now - collector.start`. Called from the latency-probe task.
+    pub fn record_probe(&self, level: usize, latency_ns: u64) {
         let at = self.start.elapsed();
-        self.inner
-            .lock()
-            .submit_latencies
-            .push(LatencyPoint { at, latency });
+        self.inner.lock().probes.push(ProbeSample {
+            at,
+            level,
+            latency_ns,
+        });
     }
 
     /// Push one pipeline sample. Called from the background poller.
@@ -108,7 +123,7 @@ impl MetricsCollector {
         let inner = self.inner.lock();
         Snapshot {
             samples: inner.samples.clone(),
-            submit_latencies: inner.submit_latencies.clone(),
+            probes: inner.probes.clone(),
         }
     }
 
@@ -145,7 +160,7 @@ impl Default for MetricsCollector {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub samples: Vec<Sample>,
-    pub submit_latencies: Vec<LatencyPoint>,
+    pub probes: Vec<ProbeSample>,
 }
 
 /// Throughput aggregate computed from `cluster_commit` deltas
@@ -169,37 +184,16 @@ pub struct ThroughputStats {
     pub max_ops_per_sec: f64,
 }
 
-/// Per-call latency aggregate, populated from waiting submits only.
-/// Fire-and-forget submits contribute nothing here.
+/// Per-wait-level latency aggregate over a run's probe samples. One per
+/// entry in [`PROBE_LEVELS`].
 #[derive(Clone, Debug)]
-pub struct LatencyStats {
+pub struct ProbeLevelStats {
+    pub name: &'static str,
     pub samples: usize,
-    pub min: Duration,
-    pub max: Duration,
-    pub avg: Duration,
     pub p50: Duration,
     pub p99: Duration,
     pub p999: Duration,
-}
-
-/// One row of the streaming progress table. Mirrors the columns of
-/// `crates/ledger/src/bin/load.rs`'s output: per-1-second TPS, TPC,
-/// latency percentiles, in-flight count.
-#[derive(Clone, Copy, Debug)]
-pub struct PerSecondStats {
-    /// 1-based second index since run start.
-    pub second: u32,
-    /// `cluster_commit` advanced by this many ops in the window.
-    pub tps: f64,
-    /// `cluster_commit` watermark at the end of the window.
-    pub total_committed: u64,
-    /// Latency distribution restricted to submits that *returned*
-    /// during this window.
-    pub p50_latency: Option<Duration>,
-    pub p99_latency: Option<Duration>,
-    pub latency_samples: u64,
-    /// `submitted_count - committed` at window close.
-    pub in_flight: u64,
+    pub max: Duration,
 }
 
 /// Per-node lag relative to the cluster-wide `cluster_commit`
@@ -327,110 +321,53 @@ impl Snapshot {
         }
     }
 
-    /// Per-call latency stats. `None` when no waiting submits ran.
-    pub fn latency_stats(&self) -> Option<LatencyStats> {
-        if self.submit_latencies.is_empty() {
-            return None;
-        }
-        let mut sorted: Vec<Duration> = self.submit_latencies.iter().map(|p| p.latency).collect();
-        sorted.sort();
-        let n = sorted.len();
-        let total: Duration = sorted.iter().sum();
-        let avg = if n > 0 {
-            total / n as u32
-        } else {
-            Duration::ZERO
-        };
-        let p_index = |q: usize| -> usize { ((n * q) / 100).min(n - 1) };
-        Some(LatencyStats {
-            samples: n,
-            min: sorted[0],
-            max: sorted[n - 1],
-            avg,
-            p50: sorted[p_index(50)],
-            p99: sorted[p_index(99)],
-            p999: sorted[((n * 999) / 1000).min(n - 1)],
-        })
+    /// Per-wait-level latency aggregates over every probe sample.
+    pub fn probe_level_stats(&self) -> Vec<ProbeLevelStats> {
+        PROBE_LEVELS
+            .iter()
+            .enumerate()
+            .map(|(level, (name, _))| {
+                let mut v: Vec<u64> = self
+                    .probes
+                    .iter()
+                    .filter(|p| p.level == level)
+                    .map(|p| p.latency_ns)
+                    .collect();
+                v.sort_unstable();
+                ProbeLevelStats {
+                    name,
+                    samples: v.len(),
+                    p50: quantile_ns(&v, 50, 100),
+                    p99: quantile_ns(&v, 99, 100),
+                    p999: quantile_ns(&v, 999, 1000),
+                    max: Duration::from_nanos(v.last().copied().unwrap_or(0)),
+                }
+            })
+            .collect()
     }
 
-    /// Bucket samples + latencies into 1-second windows for the live
-    /// progress table. One row per elapsed second. Returns an empty
-    /// vec for runs shorter than a second.
-    pub fn per_second_stats(&self) -> Vec<PerSecondStats> {
-        let mut out = Vec::new();
-        if self.samples.is_empty() {
-            return out;
+    /// `(p50, p99)` of `level`'s probe samples in `[start, end)`, for the
+    /// live progress table. `None`s when the window saw no samples.
+    pub fn probe_window(
+        &self,
+        level: usize,
+        start: Duration,
+        end: Duration,
+    ) -> (Option<Duration>, Option<Duration>) {
+        let mut v: Vec<u64> = self
+            .probes
+            .iter()
+            .filter(|p| p.level == level && p.at >= start && p.at < end)
+            .map(|p| p.latency_ns)
+            .collect();
+        if v.is_empty() {
+            return (None, None);
         }
-
-        let cc = |s: &Sample| {
-            s.per_node
-                .iter()
-                .map(|n| n.cluster_commit)
-                .max()
-                .unwrap_or(0)
-        };
-
-        let total_secs = self.samples.last().unwrap().at.as_secs();
-        let mut prev_committed: u64 = self.samples.first().map(cc).unwrap_or(0);
-
-        for sec in 1..=total_secs {
-            let window_start = Duration::from_secs(sec - 1);
-            let window_end = Duration::from_secs(sec);
-
-            // Last cluster_commit watermark observed in this window.
-            // Falls back to the previous tick's value if no sample
-            // happened to land in this second (e.g. cluster paused).
-            let committed = self
-                .samples
-                .iter()
-                .rfind(|s| s.at >= window_start && s.at < window_end)
-                .map(cc)
-                .unwrap_or(prev_committed);
-
-            let tps = committed.saturating_sub(prev_committed) as f64;
-
-            // Latency distribution within this 1-sec window.
-            let mut window_latencies: Vec<Duration> = self
-                .submit_latencies
-                .iter()
-                .filter(|p| p.at >= window_start && p.at < window_end)
-                .map(|p| p.latency)
-                .collect();
-            window_latencies.sort();
-
-            let (p50, p99) = if window_latencies.is_empty() {
-                (None, None)
-            } else {
-                let n = window_latencies.len();
-                let p_idx = |q: usize| ((n * q) / 100).min(n - 1);
-                (
-                    Some(window_latencies[p_idx(50)]),
-                    Some(window_latencies[p_idx(99)]),
-                )
-            };
-
-            // Submitted by end of this window — count of latency
-            // points stamped at < window_end.
-            let submitted_by_end = self
-                .submit_latencies
-                .iter()
-                .filter(|p| p.at < window_end)
-                .count() as u64;
-            let in_flight = submitted_by_end.saturating_sub(committed);
-
-            out.push(PerSecondStats {
-                second: sec as u32,
-                tps,
-                total_committed: committed,
-                p50_latency: p50,
-                p99_latency: p99,
-                in_flight,
-                latency_samples: window_latencies.len() as u64,
-            });
-
-            prev_committed = committed;
-        }
-        out
+        v.sort_unstable();
+        (
+            Some(quantile_ns(&v, 50, 100)),
+            Some(quantile_ns(&v, 99, 100)),
+        )
     }
 
     /// One entry per node observed in any sample, with worst-seen
@@ -557,4 +494,124 @@ async fn probe_once(client: &ClusterClient, start: Instant) -> Option<Sample> {
         leader_idx,
         per_node,
     })
+}
+
+// ============================================================
+// Latency probe — server-side, leader-only, one task per wait level
+// ============================================================
+
+/// Per-level target sample count. Enough for a solid p99 and a meaningful
+/// (~10-sample) p999; `p9999`/`max` stay single-sample. Each level stops
+/// probing once it reaches this.
+const PROBE_TARGET_SAMPLES: usize = 10_000;
+
+/// Probes the server runs per `Probe` RPC. Amortizes the gRPC round-trip
+/// across the whole batch — paid once per batch, not per sample. The
+/// cadence lives server-side in `probe_interval_ms`.
+const PROBE_BATCH: u32 = 500;
+
+/// Spawn one task per wait level, each streaming batched
+/// `LatencyProbe.Probe` RPCs against the leader until it has
+/// [`PROBE_TARGET_SAMPLES`] (or the runner aborts it). The server batches
+/// [`PROBE_BATCH`] probes per RPC at a 1ms cadence, so the round-trip is
+/// paid once per batch and all four levels are sampled continuously in
+/// parallel — the clients share the leader's Channel, so HTTP/2
+/// multiplexes the four streams over one connection. Returns early if no
+/// leader appears or the server lacks the `latency-probe` feature.
+pub fn spawn_latency_probe(
+    client: ClusterClient,
+    collector: Arc<MetricsCollector>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(probe) = wait_for_leader_probe(&client, Duration::from_secs(10)).await else {
+            return;
+        };
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        for (level, (_, wait_level)) in PROBE_LEVELS.iter().enumerate() {
+            let mut probe = probe.clone();
+            let wait_level = *wait_level;
+            let collector = collector.clone();
+            let client = client.clone();
+            tasks.spawn(async move {
+                let mut collected = 0usize;
+                while collected < PROBE_TARGET_SAMPLES {
+                    let req = ProbeRequest {
+                        wait_level: wait_level as i32,
+                        probe_count: PROBE_BATCH,
+                        probe_interval_ms: 1,
+                    };
+                    match probe.probe(req).await {
+                        Ok(resp) => {
+                            for ns in resp.into_inner().latencies_ns {
+                                collector.record_probe(level, ns);
+                                collected += 1;
+                            }
+                        }
+                        // Service absent (server built without the feature) — give up.
+                        Err(s) if s.code() == tonic::Code::Unimplemented => return,
+                        // Leader moved / transient — re-resolve + reconnect.
+                        Err(_) => {
+                            match wait_for_leader_probe(&client, Duration::from_secs(5)).await {
+                                Some(p) => probe = p,
+                                None => return,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+    })
+}
+
+/// Poll for a leader and connect a `LatencyProbe` client to its ledger
+/// port (the probe service rides that port). `None` past `timeout`.
+async fn wait_for_leader_probe(
+    client: &ClusterClient,
+    timeout: Duration,
+) -> Option<LatencyProbeClient<Channel>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(leader) = resolve_leader(client).await {
+            let url = probe_url(client.node(leader).url());
+            if let Ok(c) = LatencyProbeClient::connect(url).await {
+                return Some(c);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Index of the node currently reporting `is_leader`, or `None`.
+async fn resolve_leader(client: &ClusterClient) -> Option<usize> {
+    for i in 0..client.node_count() {
+        if let Ok(pi) = client.node(i).get_pipeline_index().await
+            && pi.is_leader
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Normalize a `NodeClient` URL to an `http://` endpoint tonic accepts.
+fn probe_url(url: &str) -> String {
+    if url.starts_with("http") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    }
+}
+
+/// `((n * num) / den)`-th element of a pre-sorted ns slice, as a
+/// Duration. Clamped to the last index; zero for an empty slice.
+fn quantile_ns(sorted: &[u64], num: usize, den: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let n = sorted.len();
+    Duration::from_nanos(sorted[((n * num) / den).min(n - 1)])
 }

@@ -1,3 +1,5 @@
+#[cfg(feature = "bottleneck-detector")]
+pub mod bottleneck;
 pub mod config;
 mod consensus;
 mod entry;
