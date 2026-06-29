@@ -82,8 +82,13 @@ fn main() {
     let mut last_committed = 0u64;
 
     println!();
-    println!("  single-node cluster throughput | accounts={account_count} dur={}s", args.duration);
-    println!("  (cluster_commit advances on the 50ms singleton self-advance when no waiter is active)");
+    println!(
+        "  single-node cluster throughput | accounts={account_count} dur={}s",
+        args.duration
+    );
+    println!(
+        "  (cluster_commit advances on the 50ms singleton self-advance when no waiter is active)"
+    );
     println!();
 
     loop {
@@ -109,8 +114,8 @@ fn main() {
             if now.duration_since(last_tick) >= Duration::from_secs(1) {
                 let committed = node.last_commit_id();
                 let cc = node.cluster_commit_index();
-                let tps =
-                    (committed - last_committed) as f64 / now.duration_since(last_tick).as_secs_f64();
+                let tps = (committed - last_committed) as f64
+                    / now.duration_since(last_tick).as_secs_f64();
                 println!(
                     "  t={:>2}s  TPS={:>10.0}  commit={:>11}  cluster_commit={:>11}  cc_lag={:>9}",
                     start.elapsed().as_secs(),

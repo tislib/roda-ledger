@@ -50,11 +50,27 @@ impl ClusterNode {
         ledger.start().map_err(|e| format!("{}", e))?;
         let ledger = Arc::new(LedgerSlot::new(ledger, config.ledger.clone()));
 
-        let consensus = Arc::new(Consensus::new(config.clone(), ledger.clone())?);
-        let waiter = Arc::new(Waiter::new(ledger.clone(), consensus.clone()));
+        // Waiter owns the reactive index watches; seed from the live ledger
+        // (cluster_commit starts at 0). Shared into Consensus so the replication
+        // sender / cluster-commit driver read the same watches.
+        let waiter = {
+            let l = ledger.current();
+            Arc::new(Waiter::new(
+                l.last_compute_id(),
+                l.last_commit_id(),
+                l.last_snapshot_id(),
+                0,
+            ))
+        };
+        let consensus = Arc::new(Consensus::new(
+            config.clone(),
+            ledger.clone(),
+            waiter.clone(),
+        )?);
 
         // The cluster owns the single ledger index hook: feed the waiter's
-        // reactive index watches. Registered via LedgerSlot so it survives reseed.
+        // compute/commit/snapshot watches. Registered via LedgerSlot so it
+        // survives reseed.
         {
             let w = waiter.clone();
             ledger.set_index_hook(Arc::new(move |kind, value| w.record(kind, value)));
@@ -167,10 +183,18 @@ impl ClusterNode {
                     .build()
                     .expect("build dedicated consensus runtime");
                 rt.block_on(async {
+                    // Reactive cluster-commit driver: advances quorum on each
+                    // snapshot-index advance (drives singleton cluster_commit).
+                    let cc_driver = tokio::spawn({
+                        let c = consensus.clone();
+                        let ct = cancellation_token.clone();
+                        async move { c.run_cluster_commit_driver(ct).await }
+                    });
                     if let Err(e) = consensus.run_loop(cancellation_token).await {
                         error!("consensus loop exited: {}", e);
                         exit(1);
                     }
+                    let _ = cc_driver.await;
                 });
             })
             .map_err(|e| format!("{}", e))?;

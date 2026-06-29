@@ -137,9 +137,6 @@ pub struct PeerConfig {
 pub struct ClusterSection {
     pub node: ClusterNodeSection,
     pub peers: Vec<PeerConfig>,
-    /// How often the per-peer replication thread ticks when its
-    /// `WalTailer` returns no new bytes (idle heartbeat cadence).
-    pub replication_poll_ms: u64,
     /// Max WAL bytes shipped per `AppendEntries` RPC.
     pub append_entries_max_bytes: usize,
 }
@@ -158,7 +155,6 @@ impl Default for ClusterSection {
         Self {
             node,
             peers,
-            replication_poll_ms: 5,
             append_entries_max_bytes: 4 * 1024 * 1024,
         }
     }
@@ -176,9 +172,9 @@ pub struct Config {
     /// machine, term bumping, and peer replication all engage. Even
     /// a single-node-cluster (one self-peer) takes this path.
     ///
-    /// Replication-shaped knobs (`replication_poll_ms`,
-    /// `append_entries_max_bytes`) live inside [`ClusterSection`] —
-    /// they're meaningless in standalone mode.
+    /// Replication-shaped knobs (`append_entries_max_bytes`) live inside
+    /// [`ClusterSection`] — they're meaningless in standalone mode. The
+    /// heartbeat cadence is sourced from raft, not configured here.
     pub cluster: Option<ClusterSection>,
     pub ledger: LedgerConfig,
 }
@@ -320,7 +316,6 @@ mod tests {
             port = 50051
 
             [cluster]
-            replication_poll_ms = 5
             append_entries_max_bytes = 4194304
 
             [cluster.node]
@@ -349,7 +344,6 @@ mod tests {
         let cluster = cfg.cluster.as_ref().unwrap();
         assert_eq!(cluster.peers[1].peer_id, 2);
         assert_eq!(cluster.node.port, 50061);
-        assert_eq!(cluster.replication_poll_ms, 5);
         assert_eq!(cluster.append_entries_max_bytes, 4_194_304);
         // Self filtered out for fan-out.
         let others: Vec<u64> = cfg.other_peers().map(|p| p.peer_id).collect();

@@ -163,7 +163,6 @@ pub struct ClusterTestingConfig {
     pub phantom_peer_count: usize,
     /// Label embedded in the temp data dir name + log lines.
     pub label: String,
-    pub replication_poll_ms: u64,
     pub append_entries_max_bytes: usize,
     pub transaction_count_per_segment: u64,
     pub snapshot_frequency: u32,
@@ -194,7 +193,6 @@ impl Default for ClusterTestingConfig {
             mode: ClusterTestingMode::Cluster { nodes: 1 },
             phantom_peer_count: 0,
             label: "cluster".to_string(),
-            replication_poll_ms: 5,
             append_entries_max_bytes: 256 * 1024,
             transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,
@@ -368,7 +366,6 @@ impl ClusterTestingControl {
                         port: a.node_port,
                     },
                     peers: all_peers.clone(),
-                    replication_poll_ms: config.replication_poll_ms,
                     append_entries_max_bytes: config.append_entries_max_bytes,
                 }),
             };
