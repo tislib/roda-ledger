@@ -267,6 +267,13 @@ impl<P: Persistence> RaftNode<P> {
         self.self_id
     }
 
+    /// Leader heartbeat cadence. Single source of truth (validated against the
+    /// election timeout: `heartbeat_interval * 2 < election_timer.min_ms`).
+    /// The replication driver paces idle keepalives off this.
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        self.cfg.heartbeat_interval
+    }
+
     pub fn peers(&self) -> &[NodeId] {
         &self.peers
     }
