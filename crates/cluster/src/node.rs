@@ -10,7 +10,9 @@ use crate::handlers::ledger_handler::LedgerHandler;
 use crate::handlers::node_handler::NodeHandler;
 use crate::ledger_slot::LedgerSlot;
 use crate::waiter::Waiter;
-use ledger::ledger::Ledger;
+use ledger::ledger::{IndexHook, Ledger};
+use ledger::transactor::transaction::Operation;
+use proto::ledger::WaitLevel;
 use proto::ledger::ledger_server::LedgerServer;
 use proto::node::node_server::NodeServer;
 use spdlog::{debug, error};
@@ -50,6 +52,13 @@ impl ClusterNode {
 
         let consensus = Arc::new(Consensus::new(config.clone(), ledger.clone())?);
         let waiter = Arc::new(Waiter::new(ledger.clone(), consensus.clone()));
+
+        // The cluster owns the single ledger index hook: feed the waiter's
+        // reactive index watches. Registered via LedgerSlot so it survives reseed.
+        {
+            let w = waiter.clone();
+            ledger.set_index_hook(Arc::new(move |kind, value| w.record(kind, value)));
+        }
 
         #[cfg(feature = "fault-injection")]
         let fault_injector = ClusterFaultInjector::new(ledger.clone());
@@ -255,6 +264,54 @@ impl ClusterNode {
     #[cfg(feature = "latency-probe")]
     pub fn latency_probe_handler(&self) -> LatencyProbeHandler {
         LatencyProbeHandler::new(self.ledger.clone(), self.waiter.clone())
+    }
+
+    // ── In-process load surface ──────────────────────────────────────────
+    // Thin wrappers over the active `Ledger` and the shared `Waiter`, used by
+    // the in-process `cluster_load` / `cluster_load_latency` bins to drive a
+    // single-node cluster without the gRPC hop. Mirrors `Ledger`'s own bins.
+
+    /// Submit one operation in-process (bypassing gRPC). Goes through the same
+    /// `Ledger::submit` the `LedgerHandler` uses.
+    pub fn submit(&self, op: Operation) -> u64 {
+        self.ledger.current().submit(op)
+    }
+
+    /// Open accounts `1..=count` on the active ledger.
+    pub fn open_accounts(&self, count: u32) {
+        self.ledger.current().open_accounts(count);
+    }
+
+    /// Register an index hook (see `Ledger::set_index_hook`). Routed through
+    /// `LedgerSlot` so it survives reseed; first registration wins, so this is a
+    /// no-op once the node's own waiter hook is installed in `new`.
+    pub fn set_index_hook(&self, hook: IndexHook) {
+        self.ledger.set_index_hook(hook);
+    }
+
+    pub fn last_sequenced_id(&self) -> u64 {
+        self.ledger.current().last_sequenced_id()
+    }
+    pub fn last_compute_id(&self) -> u64 {
+        self.ledger.current().last_compute_id()
+    }
+    pub fn last_commit_id(&self) -> u64 {
+        self.ledger.current().last_commit_id()
+    }
+    pub fn last_snapshot_id(&self) -> u64 {
+        self.ledger.current().last_snapshot_id()
+    }
+    pub fn cluster_commit_index(&self) -> u64 {
+        self.consensus.cluster_commit_index()
+    }
+
+    /// Wait until `tx_id` reaches `level` via the shared `Waiter`. Returns
+    /// `true` if reached, `false` on the waiter's internal timeout.
+    pub async fn wait_for_level(&self, tx_id: u64, level: WaitLevel) -> bool {
+        self.waiter
+            .wait_for_transaction_level(tx_id, level)
+            .await
+            .is_ok()
     }
 
     fn start_replication_driver(&mut self) -> Result<(), String> {

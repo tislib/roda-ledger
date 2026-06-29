@@ -118,10 +118,21 @@ poll period. One notifier is the single source of all index movement, so it serv
 replication (D2) and client waits from the same signal.
 
 **Lost-wakeup discipline (required):** a waiter registers its interest *before* the final
-predicate check (`Notify` stores a permit / `watch` carries the latest value), then re-reads
-the atomic mirror; `shutdown()` must wake the notifier so parked waiters observe `!running`
-and exit. These are the standard correctness conditions for any park primitive and are
-non-negotiable.
+predicate check — `notify_waiters()` keeps no permit, so a concurrent advance must not slip
+between the check and the await (`tokio::Notify::notified` + `enable()`). It then re-reads
+the atomic mirror.
+
+**No close path — teardown is owned by the node, not the notifier.** A reactive waiter does
+*not* need the notifier to wake it on shutdown. Every `wait_reach` is awaited under the node
+`CancellationToken` (`ClusterNode` owns it and cancels it in its `Drop`, `node.rs`) — via a
+`select!` on `cancelled()`, or implicitly under tonic's `serve_with_shutdown`. On shutdown
+the owning task's future is dropped from the outside, which unregisters the parked waiter.
+So the notifier carries no `close()`/shutdown flag. This is deliberate: the things that
+would need waking are exactly the `Arc<Waiter>` holders, so a `Drop for Waiter` could never
+fire while any waiter is parked (refcount paradox) — shutdown signalling must come from a
+singularly-owned token, never the shared notifier. The single invariant for every call site:
+**never bare-await `wait_reach` — always under the node cancellation (or tonic graceful
+shutdown).**
 
 **Out of scope (noted for a future ADR):** the ledger-internal `wait_for_transaction_*`
 1 ms-sleep floor. The hook can't drive a *cluster* notifier from inside the standalone
@@ -146,6 +157,24 @@ cluster-owned notifier" and does not expand the ledger's runtime surface.
 - **Resurrects a narrow, intended extension point.** `CommitHandler` dead code is removed;
   the ledger surface gains observability without new responsibilities.
 
+### Measured (D3 client waiter)
+
+A/B on `cluster_load_latency` (single-node, 12-core Debian, `bench()` config, 3 runs each),
+isolating *only* the waiter — HEAD's 100 µs poll vs the reactive `IndexWatch` — with the
+index hook firing in both arms so its cost cancels out:
+
+| Wait level | A — 100 µs poll (p50 / p99) | B — reactive (p50 / p99) |
+|---|---|---|
+| **Compute** (in-memory) | **1.1 ms / 2.1 ms** | **~7–9 µs / ~10 µs** |
+| **Commit** (fsync) | ~6.4 ms / ~10 ms | ~2.7–6.2 ms / ~9 ms |
+
+Compute is **~150× faster** reactive — and A's p50 is *flat at 1.1 ms across every load level*,
+which is the tell: it measures the runtime timer tick, not the work. `tokio::time::sleep(100 µs)`
+rounds **up** to the ~1 ms timer-wheel granularity, so the poll loop paid a full millisecond per
+iteration while the transaction was ready in microseconds. Commit is fsync-bound (milliseconds),
+so the ~1 ms poll tick is lost in disk variance and A ≈ B there. Net: reactivity is a large win
+when the wait target is fast, neutral when it is inherently slow, and never a regression.
+
 ### Negative
 - **A blocking or slow hook stalls the pipeline.** The non-blocking invariant (D1.3) is a
   load-bearing contract enforced only by review and documentation, not the type system. A
@@ -154,9 +183,10 @@ cluster-owned notifier" and does not expand the ledger's runtime surface.
 - **Single-hook limit.** Only one consumer can register. If a second subsystem ever needs
   index events, it must multiplex behind the cluster's hook (or a later ADR widens the
   mechanism). Chosen deliberately for simplicity over a subscriber list on the hot path.
-- **Lost-wakeup surface.** Reactive waiting is correct only with the register-before-check +
-  shutdown-wake discipline (D3); a polling loop is harder to get subtly wrong. This shifts a
-  class of bugs from "slow" to "hung," so the discipline is mandatory and tested.
+- **Lost-wakeup surface.** Reactive waiting is correct only with the register-before-check
+  discipline and cancellation-owned teardown (D3); a polling loop is harder to get subtly
+  wrong. This shifts a class of bugs from "slow" to "hung," so the discipline is mandatory
+  and tested.
 
 ### Neutral
 - `replication_poll_ms` changes role from primary cadence to safety heartbeat; its config

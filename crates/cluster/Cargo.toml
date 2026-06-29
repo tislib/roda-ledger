@@ -36,6 +36,7 @@ storage.workspace = true
 ledger.workspace = true
 raft.workspace = true
 client.workspace = true
+roda-latency-tracker.workspace = true
 
 tokio.workspace = true
 tonic.workspace = true

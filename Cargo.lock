@@ -424,6 +424,7 @@ dependencies = [
  "proto",
  "raft",
  "rand 0.8.5",
+ "roda-latency-tracker",
  "roda-wasm-abi",
  "serde",
  "signal-hook",
