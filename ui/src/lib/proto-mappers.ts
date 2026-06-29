@@ -305,7 +305,6 @@ export function clusterConfigFromPb(pb: PbClusterConfig) {
     queueSize: u64ToString(pb.queueSize),
     transactionCountPerSegment: u64ToString(pb.transactionCountPerSegment),
     snapshotFrequency: pb.snapshotFrequency,
-    replicationPollMs: u64ToString(pb.replicationPollMs),
     appendEntriesMaxBytes: u64ToString(pb.appendEntriesMaxBytes),
   };
 }
@@ -317,7 +316,6 @@ export function clusterConfigToPb(c: ReturnType<typeof clusterConfigFromPb>): Pb
     queueSize: stringToU64(c.queueSize),
     transactionCountPerSegment: stringToU64(c.transactionCountPerSegment),
     snapshotFrequency: c.snapshotFrequency,
-    replicationPollMs: stringToU64(c.replicationPollMs),
     appendEntriesMaxBytes: stringToU64(c.appendEntriesMaxBytes),
   };
 }

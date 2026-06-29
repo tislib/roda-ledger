@@ -163,12 +163,6 @@ export function ClusterSettings() {
               hint="snapshot every N segments (0 = off)"
             />
             <ConfigField
-              label="replication_poll_ms"
-              value={draft.replicationPollMs}
-              onChange={(v) => setDraft({ ...draft, replicationPollMs: v })}
-              hint="idle replication cadence (ms)"
-            />
-            <ConfigField
               label="append_entries_max_bytes"
               value={draft.appendEntriesMaxBytes}
               onChange={(v) => setDraft({ ...draft, appendEntriesMaxBytes: v })}
