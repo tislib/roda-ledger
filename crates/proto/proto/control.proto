@@ -477,10 +477,9 @@ message ClusterConfig {
   uint32 snapshot_frequency = 4;
 
   // ---- Replication ----
-
-  // Idle replication poll cadence in ms (heartbeat-equivalent when no
-  // new WAL bytes are pending).
-  uint64 replication_poll_ms = 5;
+  // (heartbeat cadence is sourced from raft, not configurable)
+  reserved 5;
+  reserved "replication_poll_ms";
 
   // Maximum WAL bytes per AppendEntries RPC.
   uint64 append_entries_max_bytes = 6;
