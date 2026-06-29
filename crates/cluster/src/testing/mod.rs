@@ -194,7 +194,7 @@ impl Default for ClusterTestingConfig {
             mode: ClusterTestingMode::Cluster { nodes: 1 },
             phantom_peer_count: 0,
             label: "cluster".to_string(),
-            replication_poll_ms: 5,
+            replication_poll_ms: 1,
             append_entries_max_bytes: 256 * 1024,
             transaction_count_per_segment: 10_000,
             snapshot_frequency: 2,

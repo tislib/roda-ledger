@@ -30,9 +30,9 @@ use tokio::task::JoinHandle;
 
 use crate::scenario::{
     Action, AssertBalance, AssertBalanceSum, AssertLeader, AssertPipelineCaughtUp, AssertTxStatus,
-    AsyncBranch, BatchKind, Concurrent, GetBalance, GetPipelineIndex, HealPartition, NodeSelector,
-    PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit, SubmitBatch, SubmitOp,
-    TxRef, TxStatus, WaitForLevel, WaitLevel,
+    AsyncBranch, BatchKind, Concurrent, ConcurrentSubmit, GetBalance, GetPipelineIndex,
+    HealPartition, NodeSelector, PartitionPair, PipelineLevel, RetryConfig, Scenario, Step, Submit,
+    SubmitBatch, SubmitOp, TxRef, TxStatus, WaitForLevel, WaitLevel,
 };
 
 pub use crate::provisioner::{Capabilities, ProvisionConfig, Provisioner, ProvisionerError};
@@ -280,6 +280,7 @@ impl ScenarioRunner {
                 Ok(())
             }
             Action::Concurrent(c) => self.run_concurrent(client, metrics, ctx, c).await,
+            Action::ConcurrentSubmit(c) => self.run_concurrent_submit(client, c).await,
             Action::Wait(w) => {
                 tokio::time::sleep(w.duration).await;
                 Ok(())
@@ -578,6 +579,59 @@ impl ScenarioRunner {
                 None => Ok(()),
             }
         })
+    }
+
+    /// Connection-concurrency fan-out: spawn `tasks` workers on the
+    /// shared client, each issuing `ops_per_task` single deposits with
+    /// unique `user_ref`s. Bindings aren't recorded — at 500k ops that
+    /// would be pure overhead, and load scenarios drain by grace, not by
+    /// `user_ref`. Every task is awaited before the first error
+    /// propagates, so nothing escapes the step.
+    async fn run_concurrent_submit(
+        &self,
+        client: &ClusterClient,
+        c: &ConcurrentSubmit,
+    ) -> Result<(), RunError> {
+        let mut handles: Vec<JoinHandle<Result<(), RunError>>> =
+            Vec::with_capacity(c.tasks as usize);
+        for t in 0..c.tasks {
+            let client = client.clone();
+            let wait = c.wait;
+            let ops = c.ops_per_task;
+            let base = t as u64 * ops as u64;
+            handles.push(tokio::spawn(async move {
+                for i in 0..ops as u64 {
+                    let op = SubmitOp::Deposit {
+                        account: 1,
+                        amount: 1,
+                        user_ref: base + i + 1,
+                    };
+                    submit_once(&client, &op, wait).await?;
+                }
+                Ok(())
+            }));
+        }
+
+        let mut first_error: Option<RunError> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    if first_error.is_none() {
+                        first_error = Some(RunError::Client(format!("task panicked: {join_err}")));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     // ============================================================

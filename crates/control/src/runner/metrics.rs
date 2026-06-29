@@ -9,12 +9,13 @@
 //!    reports as leader at sample time. These samples drive
 //!    throughput and per-node lag stats.
 //!
-//! 2. **Latency probes** — a side task calls the leader's
-//!    `LatencyProbe.Probe` RPC once per millisecond (one sample per
-//!    wait level) and records the server-measured latency here. The
-//!    measurement happens *inside* the node, so client→server RTT
-//!    never pollutes it. Requires `roda-server` built with the
-//!    `latency-probe` feature; absent it, no samples are recorded.
+//! 2. **Latency probes** — one task per wait level streams the leader's
+//!    batched `LatencyProbe.Probe` RPC (the server runs many probes per
+//!    call at a 1ms cadence) until each level has its target sample
+//!    count, recording the server-measured latency here. The measurement
+//!    happens *inside* the node, so client→server RTT never pollutes it.
+//!    Requires `roda-server` built with the `latency-probe` feature;
+//!    absent it, no samples are recorded.
 //!
 //! Aggregation (per-level p50 / p99 / p999 / max, lag-per-node) is the
 //! caller's job. Keeping the collector raw keeps it cheap and gives
@@ -27,7 +28,7 @@ use client::ClusterClient;
 use parking_lot::Mutex;
 use proto::latency::latency_probe_client::LatencyProbeClient;
 use proto::latency::{ProbeRequest, WaitLevel};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tonic::transport::Channel;
 
 /// One probe of every node's pipeline indices, taken `at` after the
@@ -496,50 +497,70 @@ async fn probe_once(client: &ClusterClient, start: Instant) -> Option<Sample> {
 }
 
 // ============================================================
-// Latency probe — server-side, leader-only, 1ms cadence
+// Latency probe — server-side, leader-only, one task per wait level
 // ============================================================
 
-/// Spawn a task that calls the leader's `LatencyProbe.Probe` RPC once
-/// per millisecond — one sample per wait level — recording each into
-/// `collector`. Runs until the runner aborts it. Returns early (no
-/// samples) if no leader appears or the server lacks the `latency-probe`
-/// feature. The 1ms pacing keeps probing from skewing the load it
-/// measures.
+/// Per-level target sample count. Enough for a solid p99 and a meaningful
+/// (~10-sample) p999; `p9999`/`max` stay single-sample. Each level stops
+/// probing once it reaches this.
+const PROBE_TARGET_SAMPLES: usize = 10_000;
+
+/// Probes the server runs per `Probe` RPC. Amortizes the gRPC round-trip
+/// across the whole batch — paid once per batch, not per sample. The
+/// cadence lives server-side in `probe_interval_ms`.
+const PROBE_BATCH: u32 = 500;
+
+/// Spawn one task per wait level, each streaming batched
+/// `LatencyProbe.Probe` RPCs against the leader until it has
+/// [`PROBE_TARGET_SAMPLES`] (or the runner aborts it). The server batches
+/// [`PROBE_BATCH`] probes per RPC at a 1ms cadence, so the round-trip is
+/// paid once per batch and all four levels are sampled continuously in
+/// parallel — the clients share the leader's Channel, so HTTP/2
+/// multiplexes the four streams over one connection. Returns early if no
+/// leader appears or the server lacks the `latency-probe` feature.
 pub fn spawn_latency_probe(
     client: ClusterClient,
     collector: Arc<MetricsCollector>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(mut probe) = wait_for_leader_probe(&client, Duration::from_secs(10)).await else {
+        let Some(probe) = wait_for_leader_probe(&client, Duration::from_secs(10)).await else {
             return;
         };
-        loop {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            for (level, (_, wait_level)) in PROBE_LEVELS.iter().enumerate() {
-                let req = ProbeRequest {
-                    wait_level: *wait_level as i32,
-                    probe_count: 1,
-                    probe_interval_ms: 0,
-                };
-                match probe.probe(req).await {
-                    Ok(resp) => {
-                        for ns in resp.into_inner().latencies_ns {
-                            collector.record_probe(level, ns);
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        for (level, (_, wait_level)) in PROBE_LEVELS.iter().enumerate() {
+            let mut probe = probe.clone();
+            let wait_level = *wait_level;
+            let collector = collector.clone();
+            let client = client.clone();
+            tasks.spawn(async move {
+                let mut collected = 0usize;
+                while collected < PROBE_TARGET_SAMPLES {
+                    let req = ProbeRequest {
+                        wait_level: wait_level as i32,
+                        probe_count: PROBE_BATCH,
+                        probe_interval_ms: 1,
+                    };
+                    match probe.probe(req).await {
+                        Ok(resp) => {
+                            for ns in resp.into_inner().latencies_ns {
+                                collector.record_probe(level, ns);
+                                collected += 1;
+                            }
+                        }
+                        // Service absent (server built without the feature) — give up.
+                        Err(s) if s.code() == tonic::Code::Unimplemented => return,
+                        // Leader moved / transient — re-resolve + reconnect.
+                        Err(_) => {
+                            match wait_for_leader_probe(&client, Duration::from_secs(5)).await {
+                                Some(p) => probe = p,
+                                None => return,
+                            }
                         }
                     }
-                    // Service absent (server built without the feature) — give up.
-                    Err(s) if s.code() == tonic::Code::Unimplemented => return,
-                    // Leader moved / transient — re-resolve + reconnect.
-                    Err(_) => match wait_for_leader_probe(&client, Duration::from_secs(5)).await {
-                        Some(p) => {
-                            probe = p;
-                            break;
-                        }
-                        None => return,
-                    },
                 }
-            }
+            });
         }
+        while tasks.join_next().await.is_some() {}
     })
 }
 

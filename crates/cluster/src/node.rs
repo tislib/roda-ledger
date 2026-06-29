@@ -90,7 +90,20 @@ impl ClusterNode {
         let handle = thread::Builder::new()
             .name("ledger-grpc".into())
             .spawn(move || {
-                let rt = runtime::Builder::new_current_thread()
+                // Client-facing runtime is multi-threaded so concurrent
+                // client RPCs, in-flight `*_and_wait` calls, and the latency
+                // probe (kept on this runtime on purpose, to reflect
+                // client-observed latency) don't starve each other on one
+                // thread. Submit *ordering* is preserved by a lock in
+                // `LedgerHandler`, not by single-threading.
+                // `RODA_CLIENT_WORKER_THREADS` overrides the worker count.
+                let workers = std::env::var("RODA_CLIENT_WORKER_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(4);
+                let rt = runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
                     .enable_all()
                     .thread_name("ledger-grpc")
                     .build()
@@ -230,7 +243,23 @@ impl ClusterNode {
         let handle = thread::Builder::new()
             .name("replication".into())
             .spawn(move || {
-                let rt = runtime::Builder::new_current_thread()
+                // Single-threaded by default; `RODA_REPL_WORKER_THREADS > 1`
+                // switches to a multi-threaded runtime so the per-peer
+                // sender/receiver tasks run in parallel instead of queueing
+                // on one thread (which starves the ack receiver and inflates
+                // the cluster_commit tail).
+                let workers = std::env::var("RODA_REPL_WORKER_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let mut builder = if workers > 1 {
+                    let mut b = runtime::Builder::new_multi_thread();
+                    b.worker_threads(workers);
+                    b
+                } else {
+                    runtime::Builder::new_current_thread()
+                };
+                let rt = builder
                     .enable_all()
                     .thread_name("replication_driver")
                     .build()

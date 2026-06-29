@@ -158,7 +158,7 @@ impl Default for ClusterSection {
         Self {
             node,
             peers,
-            replication_poll_ms: 5,
+            replication_poll_ms: 1,
             append_entries_max_bytes: 4 * 1024 * 1024,
         }
     }

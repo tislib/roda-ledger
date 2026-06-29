@@ -5,7 +5,7 @@ max_connections = 1000
 max_message_size_bytes = 4194304  # 4 MiB
 
 [cluster]
-replication_poll_ms = 5
+replication_poll_ms = 1
 append_entries_max_bytes = 4194304  # 4 MiB
 
 [cluster.node]

@@ -14,6 +14,7 @@
 //! |-----------------------|-----------|-------|-----------|
 //! | deposit_burst_1k      | uncapped  | 1k    | ~0        |
 //! | concurrent_deposit    | uncapped  | 200k  | ~24 MB    |
+//! | concurrent_streams    | 50k conns | 500k  | ~60 MB    |
 //! | sustained_2min        | 100k/s    | 12M   | ~1.4 GB   |
 //! | sustained_10min       | 500/s     | 300k  | ~36 MB    |
 //! | spike                 | 500k/s    | 5M    | ~600 MB   |
@@ -29,14 +30,16 @@
 use std::time::Duration;
 
 use crate::scenario::{
-    Action, AsyncBranch, BatchKind, NodeSelector, PipelineLevel, RetryConfig, Scenario, Step,
-    SubmitBatch, SubmitOp, TxRef, Wait, WaitForLevel, WaitLevel,
+    Action, AsyncBranch, BatchKind, ConcurrentSubmit, NodeSelector, PipelineLevel, RetryConfig,
+    Scenario, Step, SubmitBatch, SubmitOp, TxRef, Wait, WaitForLevel, WaitLevel,
 };
 
 pub fn all() -> Vec<Scenario> {
     vec![
         deposit_burst_1k(),
         concurrent_deposit_load(),
+        load_concurrent_commit(),
+        load_concurrent(),
         load_sustained_2min(),
         load_sustained_10min(),
         load_spike(),
@@ -141,6 +144,55 @@ fn concurrent_deposit_load() -> Scenario {
             branch("branch_a", 10, 1),
             branch("branch_b", 11, 1_000_000),
             // Implicit join at end-of-scenario; grace period to settle.
+            Step::new(Action::Wait(Wait {
+                duration: Duration::from_millis(500),
+            })),
+        ])
+}
+
+/// Connection-concurrency stress: 50k concurrent workers, each issuing
+/// 10 single-op `submit` RPCs (500k deposits total) over the *one*
+/// shared gRPC connection. With `wait = Committed` every worker holds
+/// its HTTP/2 stream open until commit, so the test measures how the
+/// node copes with tens of thousands of simultaneous in-flight streams —
+/// the gRPC/tokio edge, not batch throughput. No drain by `user_ref`
+/// (none are bound); a grace `Wait` lets snapshot settle for the report.
+fn load_concurrent_commit() -> Scenario {
+    const TASKS: u32 = 30_000;
+    const OPS_PER_TASK: u32 = 10;
+
+    Scenario::new("load_concurrent_commit")
+        .with_description(
+            "50k concurrent workers × 10 single deposits each over one connection (500k ops, HTTP/2 stream concurrency).",
+        )
+        .with_steps(vec![
+            Step::new(Action::ConcurrentSubmit(ConcurrentSubmit {
+                tasks: TASKS,
+                ops_per_task: OPS_PER_TASK,
+                wait: WaitLevel::Committed,
+            }))
+            .with_label("50k×10 concurrent committed deposits"),
+            Step::new(Action::Wait(Wait {
+                duration: Duration::from_millis(500),
+            })),
+        ])
+}
+
+fn load_concurrent() -> Scenario {
+    const TASKS: u32 = 30_000;
+    const OPS_PER_TASK: u32 = 10;
+
+    Scenario::new("load_concurrent")
+        .with_description(
+            "50k concurrent workers × 10 single deposits each over one connection (500k ops, HTTP/2 stream concurrency).",
+        )
+        .with_steps(vec![
+            Step::new(Action::ConcurrentSubmit(ConcurrentSubmit {
+                tasks: TASKS,
+                ops_per_task: OPS_PER_TASK,
+                wait: WaitLevel::None,
+            }))
+            .with_label("50k×10 concurrent committed deposits"),
             Step::new(Action::Wait(Wait {
                 duration: Duration::from_millis(500),
             })),

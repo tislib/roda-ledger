@@ -95,6 +95,15 @@ impl Simulator {
                 }
                 Ok(())
             }
+            Action::ConcurrentSubmit(c) => {
+                // `tasks * ops_per_task` deposits of amount 1 into
+                // account 1 (mirrors the runner). Closed-form so the
+                // simulator stays O(1) even at 500k ops.
+                let total = c.tasks as i64 * c.ops_per_task as i64;
+                *self.accounts.entry(1).or_insert(0) += total;
+                *self.accounts.entry(SYSTEM_ACCOUNT).or_insert(0) -= total;
+                Ok(())
+            }
             Action::AssertBalance(a) => {
                 let actual = self.balance(a.account);
                 if actual != a.expected {

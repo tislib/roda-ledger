@@ -40,7 +40,15 @@ impl Waiter {
             };
 
             if reached {
-                return Ok(start_time.elapsed());
+                // Reached on the first check ⇒ the stage was already at/past
+                // the target: nothing was in flight, so there was no real
+                // wait. Return zero so the latency probe can exclude it as a
+                // non-sample rather than polluting the median with ~0s.
+                return Ok(if iter == 1 {
+                    Duration::ZERO
+                } else {
+                    start_time.elapsed()
+                });
             }
             tokio_yield_now().await;
             if start_time.elapsed() >= timeout {

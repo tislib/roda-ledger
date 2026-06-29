@@ -168,7 +168,7 @@ async fn run_one(server_bin: &Path, name: &str, nodes: u32, verbose: bool) -> Ex
         println!("  description: {}", scenario.description);
     }
     println!("  steps:       {}", scenario.steps.len());
-    println!("  nodes:       {}", if is_load { 1 } else { nodes });
+    println!("  nodes:       {nodes}");
     println!();
 
     let outcome = run_scenario(server_bin, &scenario, nodes, verbose, is_load).await;
@@ -206,7 +206,7 @@ async fn run_many(
     }
 
     let total = scenarios.len();
-    println!("=== running {total} scenarios (e2e: {nodes} nodes, load: 1 node) ===");
+    println!("=== running {total} scenarios ({nodes} nodes/cluster) ===");
     println!();
 
     let label_width: usize = 70;
@@ -301,23 +301,20 @@ async fn run_scenario(
     verbose: bool,
     streaming: bool,
 ) -> Outcome {
-    // Load scenarios run on a single leader node with the spinning
-    // (`low_latency`) wait strategy: that measures the ledger pipeline
-    // itself — no replication, and no `balanced` 1ms idle-sleep stall on
-    // the transactor. e2e keeps the requested node count + `balanced`
-    // (multi-node, low idle CPU).
-    let (node_count, wait_strategy) = if streaming {
-        (1, "low_latency")
-    } else {
-        (nodes, "balanced")
-    };
+    // Load scenarios spin (`low_latency`) so the transactor never
+    // idle-sleeps under bursty load; e2e uses `balanced` (low idle CPU).
+    // Both use the requested node count. `RODA_WAIT_STRATEGY` overrides
+    // the default so wait strategies can be A/B'd without a rebuild.
+    let default_ws = "balanced";
+    let wait_strategy =
+        std::env::var("RODA_WAIT_STRATEGY").unwrap_or_else(|_| default_ws.to_string());
     let provisioner = Arc::new(
         ProcessProvisioner::new(server_bin.to_path_buf())
             .quiet(!verbose)
             .with_wait_strategy(wait_strategy),
     );
     let runner = ScenarioRunner::new(provisioner);
-    let config = default_config(node_count);
+    let config = default_config(nodes);
 
     // The latency probe runs inside the runner (a 1ms-paced side task over the
     // execute window), so its samples land mid-load. Results arrive in
@@ -414,6 +411,12 @@ fn collect(group: Option<Group>) -> Vec<Scenario> {
 }
 
 fn default_config(node_count: u32) -> ProvisionConfig {
+    // `RODA_REPL_POLL_MS` overrides the replication idle-poll so its
+    // latency contribution can be A/B'd without a rebuild.
+    let replication_poll_ms = std::env::var("RODA_REPL_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     ProvisionConfig {
         node_count,
         cluster: ClusterConfig {
@@ -421,7 +424,7 @@ fn default_config(node_count: u32) -> ProvisionConfig {
             queue_size: 1024,
             transaction_count_per_segment: 1_000_000,
             snapshot_frequency: 2,
-            replication_poll_ms: 5,
+            replication_poll_ms,
             append_entries_max_bytes: 4 * 1024 * 1024,
         },
     }
