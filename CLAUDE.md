@@ -5,8 +5,9 @@ transaction logic as sandboxed WebAssembly, ~5.7M tx/s. Rust, edition 2024, MSRV
 
 > **Status nuance (read this):** The public `README.md` describes a *single-node* engine and marks
 > cluster/raft as "planned." The code is ahead — the `cluster`, `raft`, `client`, and `control`
-> crates implement Raft consensus + replication and are under **active development**. Recovery is
-> mid-redesign on branch `feature/redesign-recover-process` (ADR-019/020/021 + ActiveSnapshot).
+> crates implement Raft consensus + replication and are under **active development**. The
+> `ActiveSnapshot`-based recovery redesign (ADR-019/020/021) is **merged** and lives in
+> `crates/ledger/src/recover.rs`.
 > Treat README's "single node" claims as marketing-lag, not ground truth — check the code.
 
 ## Mental model
@@ -30,10 +31,11 @@ transaction logic as sandboxed WebAssembly, ~5.7M tx/s. Rust, edition 2024, MSRV
 
 `Deposit`, `Withdrawal`, `Transfer`, and `Function` (invoke a registered WASM module as a first-class
 atomic op — the only extension point). Accounts are `u64`, balances `i64`, account `0` is the system
-source/sink. WASM host API is deliberately narrow (`credit`, `debit`, `get_balance`) and fully
-deterministic so followers can replay entries without re-running code. See `docs/wasm-runtime.md`.
+source/sink. WASM host API is a small set of deterministic verbs — balance ops (`credit`/`debit`/`get_balance`),
+account-layout/flag ops, and typed KV/constant ops (ADR-022/023/026) — so followers can replay entries
+without re-running code. See `docs/wasm-runtime.md`.
 
-## Repository map (8-crate Cargo workspace)
+## Repository map (9-crate Cargo workspace)
 
 | Crate | Path | Role |
 |---|---|---|
@@ -45,6 +47,7 @@ deterministic so followers can replay entries without re-running code. See `docs
 | `client`  | `crates/client`  | gRPC client library. |
 | `control` | `crates/control` | Control plane (web/gRPC) for multi-node scenarios; drives the `ui/`. Owns the scenario primitives + catalogue (`scenario`/`scenarios` modules). |
 | `ctl`     | `crates/ctl`     | Offline CLI (`roda-ctl`): pack/unpack/validate WAL segments. |
+| `roda-wasm-abi` | `crates/roda-wasm-abi` | Guest-side WASM SDK/ABI: `execute!`/`register!` macros, typed `Params`, `key!` builder, safe host-verb wrappers — how WASM modules are written (ADR-026). |
 
 `cluster` is the default workspace member, so `cargo run` starts `roda-server`.
 
@@ -111,10 +114,11 @@ Docker quick start: `docker run -p 50051:50051 -v $(pwd)/data:/app/data tislib/r
 
 Read in order: `README.md` → `docs/01-concepts.md` → `docs/02-api.md` → `docs/03-architecture.md`
 → `docs/internal.md` → `docs/wasm-runtime.md`. Perf numbers: `docs/load.md`.
-(Note: README links `docs/04-internals.md`, but the file on disk is `docs/internal.md`.)
 
-ADRs live in `docs/adr/` (`docs/adr/README.md` indexes them, though the index table lags behind disk —
-ADRs 021/022 exist but aren't listed). Status ≠ implementation state; the most load-bearing
+ADRs live in `docs/adr/` (`docs/adr/README.md` indexes them, though that index lists two **phantom**
+rows — ADR-024 `0024-temporal-index.md` / ADR-025 `0025-point-in-time.md` — that don't exist on disk
+(numbering jumps 0023→0026→0027); `docs/adr.md` is a stale duplicate stopping at ADR-010). Status ≠
+implementation state; the most load-bearing
 **implemented** ones:
 
 - **001** entries-based execution · **002** Vec balance storage · **006** WAL/snapshot/seal durability

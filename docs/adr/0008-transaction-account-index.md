@@ -6,6 +6,14 @@
 
 ---
 
+> **⚠️ Superseded in part (2026-06).** The in-memory account-history design described
+> below — the `account_heads` table and the `circle2` `prev_link` chain — was later
+> removed. `GetTransaction` is still served from the `circle1`/`circle2` indexer, but
+> **account history is now a backward WAL scan** (`Ledger::get_account_history` →
+> `wal_scanner().scan`; no `account_heads`, no `prev_link`). This ADR is retained as the
+> original decision record; for the current design see `docs/internal.md` §9–§10.3 and
+> `crates/ledger/src/index.rs`. A follow-up ADR should formally amend this one.
+
 ## Context
 
 roda-ledger currently has no way to retrieve a specific transaction by ID or retrieve
