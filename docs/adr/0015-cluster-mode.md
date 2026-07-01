@@ -3,6 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-04-20
 **Last-Updated:** 2026-05-26
+**Author:** Taleh Ibrahimli
 
 ## 2026-05-26 Decisions
 

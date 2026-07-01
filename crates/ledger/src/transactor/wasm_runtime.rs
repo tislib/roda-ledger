@@ -451,10 +451,9 @@ impl WasmRuntime {
     }
 }
 
-/// Build the shared [`Linker`] with the three host imports
-/// (`ledger.credit` / `ledger.debit` / `ledger.get_balance`) routed
-/// directly to the transactor state. Called exactly once per
-/// `WasmRuntime`.
+/// Build the shared [`Linker`] with the `ledger` host verbs — balances,
+/// account flags, and KV/constants (ADR-022/023) — routed to the
+/// transactor state. Called once per `WasmRuntime`.
 fn build_host_linker(engine: &Engine) -> Linker<WasmStoreData> {
     let mut linker: Linker<WasmStoreData> = Linker::new(engine);
 
