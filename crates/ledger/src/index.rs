@@ -1,14 +1,13 @@
-//! In-memory transaction and account index — ADR-008 / ADR-022.
+//! In-memory transaction index — ADR-008 / ADR-022.
 //!
-//! Three pre-allocated, fixed-size structures; zero heap allocation after
+//! Two pre-allocated, fixed-size buffers; zero heap allocation after
 //! construction, no cold start on segment rotation:
 //!
-//!   `circle1`       — maps `tx_id → (TxMetadata, location in circle2)` (direct-mapped)
-//!   `circle2`       — `IndexedTxEntry` storage: each follower's raw `WalEntry`
-//!                     stored as-is, plus the per-account `prev_link` chain
-//!   `account_heads` — maps `account_id → latest circle2 index` (direct-mapped)
+//!   `circle1` — maps `tx_id → (TxMetadata, location in circle2)` (direct-mapped)
+//!   `circle2` — `IndexedTxEntry` storage: each follower's raw `WalEntry` as-is
 //!
-//! Both circle sizes must be powers of two so modulo reduces to a bitmask.
+//! Both sizes must be powers of two so modulo reduces to a bitmask. Account
+//! history is served by a backward WAL scan, not this index (see `ledger.rs`).
 
 use bytemuck::Zeroable;
 use storage::EntryBuf;
@@ -42,11 +41,8 @@ impl Default for TxSlot {
 // ── IndexedTxEntry (circle2) ──────────────────────────────────────────────────
 
 /// One slot in `circle2`: a follower's raw `WalEntry`, stored as-is, wrapped
-/// with the bookkeeping the index needs.
-///
-/// - `tx_id` groups the slot with its transaction and detects eviction.
-/// - `prev_link` is the 1-based per-account history chain pointer — set only
-///   for `WalEntry::Entry` followers; `0` otherwise and at chain ends.
+/// with the bookkeeping the index needs. `tx_id` groups the slot with its
+/// transaction and detects eviction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IndexedTxEntry {
     pub record: WalEntry,
@@ -108,9 +104,8 @@ impl TransactionIndexer {
         }
     }
 
-    /// Index a committed transaction: its `TxMetadata` and all followers
-    /// (stored as raw `WalEntry`). `WalEntry::Entry` followers are chained into
-    /// the per-account `prev_link` history; all other followers are stored too.
+    /// Index a committed transaction: its `TxMetadata` and all followers,
+    /// each stored as a raw `WalEntry` in `circle2`.
     pub fn insert_transaction(&mut self, meta: &TxMetadata, followers: &[WalEntry]) {
         self.insert_with(meta, followers.len(), followers.iter().copied());
     }
@@ -189,7 +184,7 @@ mod tests {
     use storage::entities::{EntryKind, FailReason, WalEntryKind};
 
     fn small() -> TransactionIndexer {
-        // circle1=16, circle2=64, account_heads=16 — small enough for fast tests
+        // circle1=16, circle2=64 — small enough for fast tests
         TransactionIndexer::new(16, 64)
     }
 

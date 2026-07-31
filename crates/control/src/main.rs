@@ -69,14 +69,12 @@ async fn main() -> anyhow::Result<()> {
     let events = Arc::new(EventStore::new());
     let shutdown = CancellationToken::new();
 
-    // Wire SIGINT to the cancellation token.
+    // Wire SIGINT/SIGTERM to the cancellation token so `kill` (containers
+    // send SIGTERM) tears the cluster down via RAII instead of orphaning it.
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!("failed to install SIGINT handler: {e}");
-            return;
-        }
-        info!("received SIGINT; initiating shutdown");
+        wait_for_shutdown_signal().await;
+        info!("received shutdown signal; initiating shutdown");
         signal_shutdown.cancel();
     });
 
@@ -94,6 +92,38 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Resolve on the first SIGINT or SIGTERM so shutdown is cooperative
+/// whether the process is Ctrl+C'd or `kill`ed.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to install SIGTERM handler: {e}");
+            return wait_for_ctrl_c().await;
+        }
+    };
+    tokio::select! {
+        _ = wait_for_ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    wait_for_ctrl_c().await;
+}
+
+/// Never resolve if the handler can't be installed, so a failure can't
+/// masquerade as a shutdown request.
+async fn wait_for_ctrl_c() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!("failed to install SIGINT handler: {e}");
+        std::future::pending::<()>().await;
     }
 }
 

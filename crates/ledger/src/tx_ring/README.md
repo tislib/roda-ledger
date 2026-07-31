@@ -40,12 +40,12 @@ let (writer, reader) = TxRing::new(capacity);
 | Handle | Count | Role |
 |---|---|---|
 | `TxRingWriter` | exactly one | the **only** producer; drives `reserve` / `push` / `commit` / `rollback` |
-| `TxRingReader` | exactly one | the **only** consumer; reads (`walk` / `get`) **and** moves the release index (`release_to`) |
+| `TxRingReader` | exactly one | the **only** consumer; reads (`walk`) **and** moves the release index (`release_to`) |
 
-- Both handles hold an `Arc<TxRing>`; the ring drops when both do.
+- Both handles hold an `Arc<TxRing>`; the ring is never exposed and drops when both do.
 - `TxRingWriter` / `TxRingReader` are **not `Clone`** and are yielded once from `new()`.
-- The reader holds its own local release cursor and reads any index inside the readable
-  window and read any element or sub-range.
+- The reader holds its own local release cursor and walks the readable window
+  `[released, write_index)`.
 
 ---
 
@@ -54,7 +54,7 @@ let (writer, reader) = TxRing::new(capacity);
 The ring **never blocks or sleeps internally**. Capacity pressure is expressed as a
 *clamped grant*:
 
-1. `writer.reserve()` grants *all* currently-free slots — everything the releaser has
+1. `writer.reserve()` grants *all* currently-free slots — everything the reader has
    freed: `granted = capacity − (write − release)` — and returns the new `capacity()`.
 2. `writer.capacity()` reports how many slots you may still `push` — possibly `0` when the
    ring is full.
@@ -75,17 +75,17 @@ unsynchronized slot write, and a cursor bump.
 
 - **Capacity is a power of two.** Enforced by an assert in `new()` (slot indexing is
   `cursor & (capacity − 1)`).
-- **One writer, one releaser.** Guaranteed by construction — don't smuggle extra producers
-  in by other means.
-- **Readers stay in the window.** A reader's cursor must remain within
-  `[release_index(), write_index())`. Reading below `release_index` races a writer
-  overwrite; reading at/above `write_index` reads unpublished data. **`get()` enforces this
-  at runtime** (see below) — a violation panics instead of returning stale or torn data.
-- **The releaser only moves forward, and never past the writer.** `release` / `advance_to`
-  are monotonic and must not exceed `write_index()`. Both are checked with `debug_assert!`.
-- **The releaser must coordinate all readers.** Because the ring has one mover but many
-  readers, the application is responsible for advancing the release index only once *every*
-  reader is done with those slots (typically the slowest/last stage drives it).
+- **One writer, one reader.** Guaranteed by construction — `new()` yields exactly one of each
+  and neither is `Clone`; don't smuggle extra producers or consumers in by other means.
+- **The reader stays in the window.** The reader's cursor must remain within
+  `[release_index(), write_index())`. Reading below `release_index` races a writer overwrite;
+  reading at/above `write_index` reads unpublished data. `walk` stops at the `write_index`
+  snapshot it takes on entry and `debug_assert!`s `from >= released`.
+- **The reader only releases forward, and never past the writer.** `release_to` is monotonic
+  and must not exceed `write_index()`; both are checked with `debug_assert!`.
+- **The reader gates the writer.** Because the reader is the sole release mover, it advances
+  the release index only once it is done with those slots — that is what frees them back to
+  the writer.
 
 **Element type:** the ring stores `WalEntry`. It is `Copy`, so `get()` returns a value and
 no reference into a slot ever escapes (hence no `Sync` requirement on the element). Slots
@@ -97,15 +97,11 @@ window.
 
 ## API
 
-### `TxRing` (via `Arc<TxRing>`, used by readers)
+### `TxRing` (constructor only; the ring itself is never exposed)
 
 | Method | Ordering | Description |
 |---|---|---|
-| `new(capacity) -> (Arc<Self>, TxRingWriter, TxRingReleaser)` | — | allocate; assert power-of-two |
-| `write_index() -> usize` | `Acquire` | exclusive upper bound of the readable window |
-| `release_index() -> usize` | `Acquire` | lower bound; slots below may be overwritten |
-| `capacity() -> usize` | — | ring size (slot count) |
-| `get(idx) -> WalEntry` | read → `Acquire` fence → load | copy of slot `idx`; **panics if `idx` was outside the live window** |
+| `TxRing::new(capacity) -> (TxRingWriter, TxRingReader)` | — | allocate (assert power-of-two) and hand out the writer + reader; the `Arc<TxRing>` lives behind them |
 
 ### `TxRingWriter` (the single producer)
 
@@ -117,7 +113,7 @@ window.
 | `writer.cursor() -> usize` | — | the next `ring_index` this writer will write to (the head) |
 | `writer.push(entry: WalEntry) -> usize` | — | write at the head, return the `ring_index` written; **panics if `capacity() == 0`** |
 | `writer.walk(start, end, handler)` | — | visit `ring_index` range `[start, end)` (wrapping) lending each `&WalEntry` — no copy |
-| `writer.commit()` | `Release` | publish the head so readers/releaser observe it |
+| `writer.commit()` | `Release` | publish the head so the reader observes it |
 | `writer.rollback_to(ring_index)` | — | move the head back to `ring_index`, discarding the uncommitted tail |
 | `drop(writer)` | `Release` | auto-`commit()` of whatever was pushed |
 
@@ -128,12 +124,19 @@ physical slots only on access.
 > its target `[commit, cursor)` is pushed-but-unpublished, so no reader's window (`[release,
 > write)`) overlaps it and the borrow cannot race. The reference never escapes the call.
 
-### `TxRingReleaser` (the single consume-index mover)
+### `TxRingReader` (the single consumer — reads *and* releases)
 
 | Method | Ordering | Description |
 |---|---|---|
-| `advance_to(index)` | `Release` | advance the release index to an absolute logical index (monotonic; debug-asserted) |
-| `released() -> usize` | — | current release index (local) |
+| `reader.walk(from, handler)` | `Acquire` | visit published entries from `from` up to the `write_index` snapshot taken on entry, handing each a **copy** to `handler`; stop early when it returns `false`. `from` must be `>= released` |
+| `reader.release_to(index)` | `Release` | advance the release index to an absolute logical index, freeing those slots back to the writer (monotonic, `≤ write_index()`; debug-asserted) |
+| `reader.released() -> usize` | — | current release index (local) |
+| `reader.write_index() -> usize` | `Acquire` | exclusive upper bound of the readable window |
+| `reader.capacity() -> usize` | — | ring size (slot count) |
+
+> `walk` hands `handler` a `WalEntry` **by value** — the reader copies out of the slot and never
+> lends a reference into a live one, so the borrow can't race the writer. (`get(idx)`, a random-access
+> copy, exists only behind `#[cfg(test)]`.)
 
 ---
 
@@ -144,7 +147,7 @@ physical slots only on access.
 ```rust
 use storage::entities::WalEntry;
 
-let (ring, mut writer, mut releaser) = TxRing::new(1024);
+let (mut writer, mut reader) = TxRing::new(1024);
 
 // Push a slice of entries, honoring backpressure with the long-lived writer.
 let batch: &[WalEntry] = &entries;
@@ -152,9 +155,9 @@ writer.reserve();
 let mut i = 0;
 while i < batch.len() {
     if writer.capacity() == 0 {
-        // Re-grant space the releaser has freed (also commits prior pushes).
+        // Re-grant space the reader has freed (also commits prior pushes).
         if writer.reserve() == 0 {
-            std::hint::spin_loop(); // ring full — let a reader/releaser catch up
+            std::hint::spin_loop(); // ring full — let the reader catch up
             continue;
         }
     }
@@ -164,28 +167,22 @@ while i < batch.len() {
 // drop(writer) commits the tail
 ```
 
-### Reader (any number, each with its own cursor)
+### Reader (the single consumer — reads, then releases)
 
 ```rust
-let ring = Arc::clone(&ring);
-let mut cursor = 0usize;
+let mut consumed = 0usize;
 loop {
-    let w = ring.write_index();      // Acquire: see all slots written before this point
-    while cursor < w {
-        let entry = ring.get(cursor); // copy out; panics if cursor left the window
+    // walk copies out every published entry from `consumed` to the current
+    // write_index; the reader never lends a slot reference.
+    reader.walk(consumed, |entry| {
         handle(entry);
-        cursor += 1;
-    }
+        consumed += 1;
+        true
+    });
+    // Done with those slots — free them back to the writer.
+    reader.release_to(consumed);
     std::hint::spin_loop();
 }
-```
-
-### Releaser (single mover — e.g. the last/slowest stage)
-
-```rust
-// Once every reader is done up to an absolute consumed position, free those
-// slots back to the writer.
-releaser.advance_to(global_consumed);
 ```
 
 ---
@@ -195,46 +192,32 @@ releaser.advance_to(global_consumed);
 Slots live in `Box<[UnsafeCell<WalEntry>]>`; correctness rests on a release/acquire edge on
 each cursor:
 
-- **Publish:** the writer fully writes a slot, then `write.store(Release)` in `flush`. A
+- **Publish:** the writer fully writes a slot, then `write.store(Release)` in `commit`. A
   reader's `write_index()` (`Acquire`) that observes the new value is guaranteed to see the
   slot write.
-- **Free:** the releaser publishes freed space with `release.store(Release)`; the writer
-  observes it via an `Acquire` load in the `reserve` gate before reusing those slots.
+- **Free:** the reader publishes freed space with `release.store(Release)` in `release_to`; the
+  writer observes it via an `Acquire` load in the `reserve` gate before reusing those slots.
 - **`unsafe impl Send/Sync for TxRing`** is sound because the writer gates on `release`
-  (never overwrites a readable slot) and readers only ever take a *copy*.
+  (never overwrites a readable slot) and the reader only ever takes a *copy*.
 
-### Why `get()` reads before it checks
+### Why reads need no per-slot window check
 
-`get()` reads the slot value **first**, then — after an `Acquire` fence — loads `release`
-and `write` and asserts `release ≤ idx < write`:
+`walk` takes the `write_index` (`Acquire`) on entry and only reads `[from, write_index)`. Because
+the single reader is also the sole release mover, the writer is gated on a release index that this
+reader has already advanced past those slots — so an in-window slot is never overwritten mid-read,
+and the read copies out by value with no per-entry fence-and-assert. The caller upholds the window
+(`from >= released`), checked by a `debug_assert!`. Reading out of the window is a data race, not a
+guarded panic.
 
-```rust
-let value = unsafe { *slot(idx) };          // read first
-fence(Acquire);
-let (release, write) = (load(release), load(write));
-assert!(release <= idx && idx < write);     // validate after
-value
-```
-
-Checking *before* reading would be a TOCTOU race: the writer could advance `release` and
-overwrite the slot between the check and the read. Reading first makes the check meaningful.
-`release` is monotonic, so observing `release ≤ idx` *after* the read proves it was `≤ idx`
-*throughout* the read — i.e. the writer had not been cleared to overwrite this slot, so the
-value is not torn. If `idx` left the window, `get()` panics instead of returning stale data.
-
-> A genuine concurrent overwrite (a caller that ignores the window) is still a data race;
-> the in-`get()` check is a guard that turns most window violations into a panic rather than
-> a silent stale/torn read, not a license to read out of range.
-
-> The whole module currently carries `#![allow(dead_code)]`: it is finished, tested
-> infrastructure that is **not yet wired into the pipeline**. Remove the allow once a stage
-> consumes it.
+> The module still carries `#![allow(dead_code)]` because not every handle method has a caller yet
+> (e.g. the test-only `get`); the ring itself **is** wired into the pipeline — the WAL stage holds
+> the `TxRingReader` and the transactor holds the `TxRingWriter` (ADR-021).
 
 ---
 
 ## Tests
 
 `cargo test -p ledger --lib tx_ring` covers grant clamping, full-ring → zero grant,
-release-then-reserve, monotonic-release panics, wrap-around, the read-window guards
-(`get` at/above `write_index` and below `release_index` both panic), and a multi-threaded
-multi-reader broadcast. See [tests.rs](tests.rs).
+release-then-reserve, monotonic-release debug-asserts (release backward / past the write
+cursor both panic), the power-of-two assert, in-window reads, wrap-around, `push`'s returned
+ring index, half-open `walk` ranges, and `rollback_to`. See [tests.rs](tests.rs).

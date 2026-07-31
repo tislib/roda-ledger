@@ -134,7 +134,7 @@ Stages 5–7 are the atomicity boundary. Nothing is published to the transaction
 - **Single-writer correctness.** A function executes on the Transactor thread, in strict sequence, with the same in-memory balance cache native operations use. Two functions cannot race; a function cannot race with a native operation.
 - **No new persistence path.** Function-produced entries are normal `TxEntry` records. WAL segmentation, sealing, snapshotting, and replay treat them identically to entries from a `Transfer`.
 - **No new failure mode.** A WASM trap, an unbalanced credit/debit set, or a domain-specific reject all use the existing transaction-rollback machinery.
-- **Determinism for replication.** The host API is intentionally narrow: no clocks, no randomness, no I/O, no atomics, no threads. The leader executes a function; any future Raft follower can apply the resulting WAL entries directly without re-running the WASM code.
+- **Determinism for replication.** The host API is intentionally narrow: no clocks, no randomness, no I/O, no atomics, no threads. The leader executes a function; a Raft follower applies the resulting WAL entries directly without re-running the WASM code.
 
 ### Registration as a first-class WAL event
 
@@ -170,7 +170,7 @@ The WAL runs as **two concurrent threads** communicating through shared atomics:
 - **WAL Writer** — reads published records from the transaction ring, writes them to the active segment file, advances `last_written_tx_id`, and rotates segments when full.
 - **WAL Committer** — runs independently, calls `fdatasync` whenever `last_written_tx_id > last_committed_tx_id`, then advances `last_committed_tx_id` (which the pipeline exposes as `commit_index`).
 
-The Writer never blocks waiting for `fdatasync` — it continues writing while the Committer syncs. The WAL forwards nothing: the Snapshotter reads the same ring independently and gates itself on `commit_index`, so a transaction becomes visible to readers only after it is durable. This decoupling is why the WAL sustains high write throughput despite the inherent latency of `fdatasync` (~100s µs, disk-bound).
+The Writer never blocks waiting for `fdatasync` — it continues writing while the Committer syncs. The Snapshotter does not read the ring: it tails the durable WAL and gates itself on `commit_index`, so a transaction becomes visible to readers only after it is durable ([ADR-021](./adr/0021-wal-sole-releaser-snapshot-tails-wal.md)). This decoupling is why the WAL sustains high write throughput despite the inherent latency of `fdatasync` (~100s µs, disk-bound).
 
 The WAL is **segmented** — divided into files based on transaction count (`transaction_count_per_segment`). When the transaction count in the active segment reaches the configured limit, the Writer rotates to a new one. Segment files are dynamically sized on disk — a segment with many complex (multi-entry) transactions will be larger than one with simple deposits — but the transaction count per segment is always fixed and predictable. Sealed segments are complete, consistent units used for recovery.
 
@@ -238,7 +238,7 @@ The Snapshotter draws from two independent sources:
 
 <img src="./resources/snapshotter-flow.png" style="width: 100%;" />
 
-- **The transaction ring** — it reads published records, buffering a transaction's entries until the trailing metadata arrives and its `tx_id` is at or below `commit_index` (the durability gate). Only then does it apply the entries to the indexes and balance cache together, advance `snapshot_index`, and — as the ring's sole releaser — reclaim the consumed slots. Readers therefore never see a partially-applied or not-yet-durable transaction.
+- **The durable WAL** — it tails the WAL rather than the transaction ring ([ADR-021](./adr/0021-wal-sole-releaser-snapshot-tails-wal.md)), buffering a transaction's entries until the trailing metadata arrives and its `tx_id` is at or below `commit_index` (the durability gate). Only then does it apply the entries to the indexes and balance cache together and advance `snapshot_index`. Because it reads from already-durable storage, it never sees a partially-applied or not-yet-durable transaction — and it no longer touches the ring or its reclamation point.
 - **A query-only queue** — `GetTransaction` / `GetAccountHistory` requests execute inline against current state and call the response callback.
 
 The Snapshotter does no computation — balances are pre-computed by the Transactor and stored in entries. The gap between `COMMITTED` and `ON_SNAPSHOT` is typically nanoseconds.
@@ -247,11 +247,11 @@ The Snapshotter does no computation — balances are pre-computed by the Transac
 
 ## The transaction ring
 
-The Transactor, WAL, and Snapshotter share a single lock-free **transaction ring** — the one transport for the record stream, replacing the former transactor→WAL and WAL→snapshot queues ([ADR-019](./adr/0019-transaction-ring.md)).
+The Transactor and the WAL share a single lock-free **transaction ring** — the transport that carries the record stream from execution to durability, replacing the former transactor→WAL queue ([ADR-019](./adr/0019-transaction-ring.md)). The Snapshotter no longer sits on the ring: it tails the durable WAL instead ([ADR-021](./adr/0021-wal-sole-releaser-snapshot-tails-wal.md)).
 
 - **One producer.** The Transactor appends records into ring slots and publishes them. It also builds each transaction *in place* in the uncommitted region, so the ring doubles as its per-transaction scratch space — no separate staging buffer.
-- **Independent copy-out readers.** The WAL and Snapshotter each track their own absolute cursor and copy records out at their own pace. A slot may be reused once released, so readers copy rather than borrow.
-- **One releaser, durability-gated.** The Snapshotter is the only party that advances the reclamation point, and only up to the durability watermark. A slot is reused only after the record it held is durable on disk *and* consumed by every reader — making "never overwrite an undurable record" a structural property of the transport.
+- **One reader.** The WAL is the only consumer of the ring. It tracks an absolute cursor and copies records out into its active segment as fast as it can write them.
+- **One releaser, write-gated.** The WAL is also the sole releaser: it advances the reclamation point right after it has written a batch into the active segment's page cache, *not* after `fdatasync` ([ADR-021](./adr/0021-wal-sole-releaser-snapshot-tails-wal.md)). Decoupling release from the commit fence keeps the writer from blocking on the disk while still back-pressuring the Transactor whenever writes stall. Durability is enforced downstream by the independent WAL Committer, and the Snapshotter — which reads the durable WAL — never gets ahead of `commit_index`.
 
 Positions are absolute, monotonically increasing indices (mapped to physical slots on access), so progress and ordering stay unambiguous across wraps. Because a transaction is published atomically, the ring capacity (`ring_size`) must be at least the largest possible single transaction.
 
@@ -261,7 +261,7 @@ Positions are absolute, monotonically increasing indices (mapped to physical slo
 
 The record stream rides the transaction ring described above; the **submit and query paths** use lock-free **SPSC queues** (`sequencer → transactor`, and the Snapshotter's query queue) — one producer, one consumer, no locks. Each stage owns its data completely.
 
-**Backpressure** propagates naturally. The Snapshotter releases ring slots only up to the durability watermark, so if durability or indexing stalls, the ring fills and the Transactor stops finding free slots; that stalls the Transactor, which fills the `sequencer → transactor` queue, which eventually stalls `submit()`. No explicit flow control is needed, and the producer never blocks inside the ring — it retries under the shared wait strategy.
+**Backpressure** propagates naturally. The WAL releases ring slots only after writing them to the active segment, so if disk writes stall, the ring fills and the Transactor stops finding free slots; that stalls the Transactor, which fills the `sequencer → transactor` queue, which eventually stalls `submit()`. No explicit flow control is needed, and the producer never blocks inside the ring — it retries under the shared wait strategy.
 
 The wait strategy under backpressure is controlled by the `wait_strategy` config field (see [API → Setup](./02-api.md#grpc-server)): `low_latency` (spin forever), `balanced` (spin → yield → park), `low_cpu` (park quickly).
 
@@ -282,9 +282,9 @@ Because every committed transaction is in the WAL, and the WAL is always replaye
 
 ## Design boundaries
 
-**Single node.** All pipeline stages run on one machine. Raft-based multi-node replication is planned — the segmented, append-only WAL is a natural fit for log replication.
+**Single node is the zero-peer case.** All pipeline stages run on one machine, and a single node is a complete deployment. Cluster mode — Raft consensus plus streaming WAL replication — is implemented and under active development across the `raft`, `cluster`, `client`, and `control` crates; the segmented, append-only WAL is a natural fit for log replication. See [ADR-0015](./adr/0015-cluster-mode.md), [ADR-0016](./adr/0016-leader-election.md), [ADR-0017](./adr/0017-roda-raft.md), and [ADR-0027](./adr/0027-reactive-index-propagation.md).
 
-**Pre-allocated account space.** Balances are stored in a structure sized to `max_accounts`. O(1) reads and writes always, but memory is committed at startup — a capacity planning decision.
+**Growable account array.** Balances live in a flat `Vec` of account cells indexed directly by account id, so reads and writes are O(1). There is no fixed `max_accounts`: the array starts at `initial_account_size` and grows geometrically (by `resize_factor`) on demand as `OpenAccount` and program-defined sub-accounts allocate new ids — no startup capacity planning ([ADR-022](./adr/0022-account-layouts-and-program-defined-accounts.md)). Each cell holds the `i64` balance plus an 8-lane `flags` word (lane 0 = status/existence).
 
 **Disk-bound durability throughput.** `fdatasync` latency determines `COMMITTED` throughput. On NVMe this is hundreds of µs per batch. `COMPUTED` throughput (in-memory only) reaches millions of transactions per second.
 

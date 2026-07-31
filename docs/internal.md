@@ -121,10 +121,11 @@ wrapping is purely for type-level encapsulation; there is no runtime cost.
 ### §2.4 Inter-stage transport
 
 The record stream rides a single lock-free **transaction ring** (§13.4): the
-Transactor is the sole producer; the WAL and Snapshotter are independent
-copy-out readers; the Snapshotter is the sole releaser. The former
-`transactor → wal` and `wal → snapshot` queues are gone — both stages now read
-the same ring ([ADR-0019]).
+Transactor is the sole producer and the **WAL is the sole consumer** — it both
+walks the ring and releases the slots it has consumed ([ADR-0021]). The
+Snapshotter no longer touches the ring at all; it tails the *durable WAL* via a
+`WalTailer` (§8.4). The former `transactor → wal` and `wal → snapshot` queues
+are gone ([ADR-0019]).
 
 Two lock-free, fixed-capacity, single-producer / single-consumer queues
 remain, for the paths that are not the record stream:
@@ -132,20 +133,31 @@ remain, for the paths that are not the record stream:
 - `sequencer → transactor` — submitted operations awaiting execution.
 - `snapshot query` — `GetTransaction` / `GetAccountHistory` requests (§8.4).
 
-Queue capacity is fixed at construction from `queue_size` (§15.2); ring
-capacity from `ring_size` (§15.10). A full queue or a full ring is the only
-backpressure signal; producers spin/yield until space exists. There is no
+Queue capacity is a fixed internal constant (`1024`, §15.2); ring
+capacity comes from `ring_size` (§15.10). A full queue or a full ring is the
+only backpressure signal; producers spin/yield until space exists. There is no
 other flow-control mechanism.
 
 ### §2.5 Global progress indexes
 
-The pipeline holds five monotonic atomic counters and one shutdown flag:
+The pipeline holds six monotonic progress counters plus a seal-progress
+counter, a cluster seal gate, and a shutdown flag:
 
 - `sequencer_index` — next `tx_id` to be handed out.
 - `compute_index` — last `tx_id` executed by the Transactor.
-- `commit_index` — last `tx_id` durably written by the WAL.
+- `write_index` — last `tx_id` the WAL Writer wrote to the active segment's
+  *page cache* — buffered only, **not yet fsynced** (that gate is
+  `commit_index`). It is the high-water mark the ring's release is keyed to
+  (§13.5) and lets callers observe pipeline transit minus the fsync.
+- `commit_index` — last `tx_id` *durably* written by the WAL (post-`fdatasync`).
 - `snapshot_index` — last `tx_id` reflected in the Snapshotter.
-- `seal_index` — last segment id sealed.
+- `seal_index` — last segment id sealed (a `u32` segment id, not a `tx_id`).
+- `seal_step_id` — monotonic counter the seal stage bumps each pass, so
+  `wait_for_seal` can observe progress without holding the `Seal`.
+- `seal_watermark` — cluster-commit seal gate (§34, [ADR-0016 §10]): a segment
+  may be sealed only once every transaction it contains is `≤ seal_watermark`.
+  Defaults to `u64::MAX` ("no gate") for standalone ledgers; the cluster
+  supervisor drives it from the raft cluster-commit index.
 - `running` — global shutdown flag.
 
 The indexes are padded to separate cache lines so that a publication on one
@@ -158,10 +170,10 @@ threshold check on a single counter resolves any wait.
 ### §2.6 Backpressure and shutdown
 
 Backpressure is implicit and propagates through ring and queue saturation: a
-slow Snapshotter stops releasing ring slots (it releases only up to the
-durability watermark, §13.5), so the ring fills and the Transactor stops
-finding free slots; the stalled Transactor fills the sequencer→transactor
-queue, which stalls `submit()`. There is no rate limiter, leaky bucket, or
+slow WAL Writer (the ring's sole consumer) stops releasing ring slots (it
+releases right after the page-cache `write`, §13.5), so the ring fills and the
+Transactor stops finding free slots; the stalled Transactor fills the
+sequencer→transactor queue, which stalls `submit()`. There is no rate limiter, leaky bucket, or
 admission control. Shutdown is the inverse signal:
 `Pipeline::shutdown()` clears `running`; every stage's idle loop checks the
 flag and exits. The shutdown signal does not need to be observed
@@ -231,19 +243,25 @@ mutate the same state through interior mutability with no contention.
 ### §4.3 Balance cache layout
 
 The Transactor's balance cache is a flat array indexed directly by
-`account_id`. Lookups and updates are O(1) array accesses with no hashing,
-no probing, no resizing. The array is pre-allocated to `max_accounts` at
-construction and never grows. [ADR-0002]
+`account_id`. Lookups and updates are O(1) array accesses with no hashing
+and no probing. The array is seeded to `initial_account_size` at construction
+and **grows on demand** as higher account ids are referenced — it is not a
+fixed ceiling. [ADR-0002, ADR-0022]
 
-### §4.4 The `max_accounts` ceiling
+### §4.4 The growable account array
 
-Any operation referencing an `account_id ≥ max_accounts` is rejected with
-`ACCOUNT_LIMIT_EXCEEDED` before the operation can mutate any state.
-This is the price of the direct-indexed array layout (§4.3) — the
-account-ID space must be sized at startup. Resizing would require pausing
-the Transactor and reallocating every read-side cache (§8.3), which is not
-worth the complexity given how rarely a deployed ledger needs to grow its
-ceiling. [ADR-0002]
+There is no `max_accounts` ceiling. When an operation references an
+`account_id` beyond the current array length, the Transactor grows the array
+before mutating any state: `grow_capacity` computes the next capacity
+geometrically — `new_cap = ceil(cap × (1 + resize_factor))`, clamped up to
+cover the requested id — and the array is resized in place, defaulting the new
+slots. Growth is amortised O(1); the geometric factor keeps reallocations rare
+even under a sparse id space. The `u64` id space is effectively inexhaustible
+(`u32::MAX` accounts already exceeds 50 GB of state), so exhaustion is treated
+as a bug and the allocator panics rather than returning a status. The retired
+`ACCOUNT_LIMIT_EXCEEDED` reason (former status `6`) no longer exists. The same
+geometric growth is applied symmetrically to the read-side cache (§8.3) and the
+seal-side balance vector. [ADR-0002, ADR-0022]
 
 ### §4.5 Linearizability of the write path
 
@@ -647,26 +665,31 @@ There is no other coordination — no condvars, no channels.
 The Writer copies records out of the ring into a bounded pending-write buffer,
 batched so a whole iteration's worth of records reaches disk in one `write`
 syscall. The buffer is sized in advance — never resized — so the WAL stage's
-memory footprint is fixed. It forwards records nowhere: the Snapshotter reads
-the ring independently (§8.4).
+memory footprint is fixed. As the **sole ring consumer**, the Writer releases
+the ring slots it has copied out (§13.5) immediately after that buffered
+`write`. It forwards records nowhere: the Snapshotter tails the durable WAL
+independently (§8.4).
 
 ### §7.4 Writer per-iteration loop
 
 Each iteration the Writer copies the newly published ring records into the
 active segment's pending-write buffer, performs a single buffered `write`
-syscall (one per iteration, not per record), advances *last-written*, and
-rotates the segment if the transaction-count threshold is met (§7.6). It does
-not gate or forward anything to the Snapshotter — durability visibility is the
-Snapshotter's own concern (§7.5). As records are written and the Committer
-syncs them, `commit_index` (§2.5) advances.
+syscall (one per iteration, not per record), advances *last-written*
+(`write_index`, §2.5), **releases the consumed ring slots** (§13.5), and rotates
+the segment if the transaction-count threshold is met (§7.6). The release
+happens right after the page-cache `write`, gated on `write_index` — not on
+`fdatasync` — so a stalled Writer back-pressures the Transactor while the fsync
+stays decoupled. It does not gate or forward anything to the Snapshotter —
+durability visibility is the Snapshotter's own concern (§7.5). As records are
+synced by the Committer, `commit_index` (§2.5) advances.
 
 ### §7.5 Durability rule, enforced reader-side
 
 The durability rule still holds: the Snapshotter — and therefore `get_balance`,
 queries, and the snapshot wait level — never sees a transaction that is not yet
 on disk. But the WAL no longer enforces it by forwarding only durable records.
-Instead the Snapshotter reads the ring and gates *itself*: it applies a
-transaction only once the trailing `TxMetadata`'s `tx_id ≤ commit_index`
+Instead the Snapshotter **tails the durable WAL** and gates *itself*: it applies
+a transaction only once the trailing `TxMetadata`'s `tx_id ≤ commit_index`
 (§8.4). The Writer therefore keeps no per-transaction "expected record count"
 bookkeeping; it writes whatever the ring publishes, and a transaction is
 recognised as complete at its trailing metadata. A transaction may span a
@@ -696,13 +719,16 @@ Writer's buffer, and never inspects any queue — its single
 responsibility is moving *last-committed* forward as fast as storage
 allows.
 
-### §7.8 Backpressure from a slow reader
+### §7.8 Backpressure from a slow WAL
 
-There is no outbound queue to fill. A persistently slow Snapshotter stops
-releasing ring slots (it releases only up to the durability watermark, §13.5),
-so the ring eventually fills and the Transactor — the sole producer — stalls
-for want of free slots (§2.6). The WAL Writer, an independent reader, is never
-itself blocked by the Snapshotter; the two consume the ring at their own pace.
+There is no outbound queue to fill. Because the WAL Writer is the ring's **sole
+consumer and sole releaser** (§13.5), a persistently slow Writer stops releasing
+ring slots, so the ring eventually fills and the Transactor — the sole producer
+— stalls for want of free slots (§2.6). The Snapshotter is not on this path at
+all: it tails the durable WAL (§8.4) rather than the ring, so a slow Snapshotter
+can fall behind on read-side visibility but never throttles the ring or the
+Transactor. Snapshotter slowness only bounds how stale `get_balance` is, not
+ingest throughput.
 
 ### §7.9 Failure handling
 
@@ -736,18 +762,25 @@ threads.
 
 ### §8.3 Read-side balance cache
 
-The read-side cache is a flat array of atomic balances, sized to
-`max_accounts`. The Snapshotter writes; many readers can load
-concurrently without locks. The array is pre-allocated at startup and
-never resized. [ADR-0002]
+The read-side cache is a flat array of atomic balances, seeded to
+`initial_account_size`. The Snapshotter writes; many readers can load
+concurrently without locks. Like the write-side array (§4.4) it **grows on
+demand** rather than sitting at a fixed ceiling: when an `AccountOpened`
+follower covers an id beyond the current length, the Snapshotter grows the
+array geometrically (`resize_factor`) via `ensure_capacity`, swapping in a
+larger generation through the `ArcSwap` so concurrent readers never see a
+torn vector. [ADR-0002, ADR-0022]
 
-### §8.4 Ring entries and the query queue
+### §8.4 The durable-WAL tailer and the query queue
 
 The Snapshotter draws from two independent sources, in a fixed order each
 iteration:
 
-- **The transaction ring** — the published record stream (§13.4), buffering a
-  transaction's followers until the trailing `TxMetadata` (§8.5).
+- **A `WalTailer` over the durable WAL** — *not* the transaction ring. The
+  tailer streams the on-disk segments forward from a cursor and, via
+  `tail_transactions`, groups each transaction's followers with its closing
+  `TxMetadata` for the apply step (zero-copy: a borrowed view, no owned `Vec`).
+  The ring is the WAL's private input (§2.4); the Snapshotter never reads it.
 - **A query-only SPSC queue** — `GetTransaction` / `GetAccountHistory` requests
   enqueued by callers (§10).
 
@@ -761,15 +794,17 @@ issued without that wait races the apply loop — the same trade-off a
 
 ### §8.5 Apply algorithm
 
-The Snapshotter walks the ring from its cursor, buffering a transaction's
-`TxEntry` / `TxLink` followers. When the trailing `TxMetadata` arrives it checks
-the durability gate: if `tx_id > commit_index` the transaction is not yet
-durable, so the walk stops and resumes next iteration. Otherwise it applies the
+The Snapshotter tails the durable WAL from its cursor; `tail_transactions`
+hands it each transaction as its `TxEntry` / `TxLink` followers grouped with the
+trailing `TxMetadata`. It first checks the durability gate: if
+`meta.tx_id > commit_index` the transaction is not yet fsynced, so the tailer
+retains it and the walk resumes once it commits. Otherwise it applies the
 buffered followers together — updating the hot index (§9.4) and publishing each
 `TxEntry`'s `computed_balance` to the read-side balance cache — then advances
-`snapshot_index` (§2.5) to this `tx_id` and, as the ring's sole releaser,
-reclaims the consumed slots (§13.5). Applying at the trailer is the *only* point
-the read-side index advances, so readers never observe a partially-applied or
+`snapshot_index` (§2.5) to this `tx_id`. The Snapshotter does **not** release
+any ring slots: that is the WAL's job, as the ring's sole consumer (§13.5).
+Applying at the trailer is the *only* point the read-side index advances, so
+readers never observe a partially-applied or
 not-yet-durable transaction. `FunctionRegistered` takes the registry path of
 §8.7.
 
@@ -809,24 +844,22 @@ thread.
 
 ## §9 Hot indexes — `TransactionIndexer`
 
-### §9.1 Three buffers, all pre-allocated
+### §9.1 Two buffers, all pre-allocated
 
-The hot transaction index is a single in-memory structure with three
+The hot transaction index is a single in-memory structure with two
 pre-allocated buffers, sized at construction and never resized:
 
 - **circle1** — for each `tx_id`, a pointer to that transaction's
-  entries in circle2.
-- **circle2** — entry storage with per-account chain links.
-- **account_heads** — for each account, a pointer to that account's
-  latest entry in circle2.
+  followers in circle2.
+- **circle2** — follower storage: each transaction's followers (entries
+  and links alike) stored as raw `WalEntry` records, as-is.
 
-A separate map keyed by `tx_id` holds link records (sparse — most
-transactions have none — so a hash map is acceptable here). All three
-array sizes must be powers of two. [ADR-0008]
+Both array sizes must be powers of two. The index is a `tx_id`-keyed
+cache only; account history is *not* served from here (§10.3). [ADR-0008]
 
 ### §9.2 Why power-of-two
 
-All three lookups reduce to "id AND mask" to find a slot, where mask is
+Both lookups reduce to "id AND mask" to find a slot, where mask is
 `size − 1`. The power-of-two requirement turns the lookup into a single
 bitwise operation. The cost is at most ~2× memory in the worst case
 (desired size just above a power of two); the alternative (modulo)
@@ -845,49 +878,21 @@ eviction queue, no cleanup pass. Lookups detect eviction by comparing
 the slot's `tx_id` to the queried one and falling back to disk on
 mismatch (§10.2).
 
-### §9.4 circle2 — entry storage and per-account chains
+### §9.4 circle2 — follower storage
 
-Each circle2 slot stores one `TxEntry`'s payload (`tx_id`, `account_id`,
-`amount`, `kind`, `computed_balance`) plus a *previous-link* — the
-circle2 index of the same account's previous entry, or zero if there
-is no previous. circle2 is written sequentially with a write head that
-advances on every insert and wraps modulo circle2's size. On insert,
-the indexer reads the account's head from `account_heads`; if the head
-is for the same account, the new entry's previous-link is set to it,
-otherwise the link is empty. Then the entry is written, `account_heads`
-is updated to point at the new slot, and the write head advances.
-Account history walks (§10.3) follow the previous-link chain backwards
-in time until the chain ends, an evicted slot is detected (account-id
-mismatch), the transaction predates the requested lower bound, or the
-caller's limit is reached.
+Each circle2 slot stores one follower record as a raw `WalEntry` (a
+`TxEntry`'s `tx_id`, `account_id`, `amount`, `kind`, `computed_balance`,
+or a link record — stored as-is), tagged with the owning `tx_id` so a
+colliding overwrite is detectable. circle2 is written sequentially with
+a write head that advances on every insert and wraps modulo circle2's
+size. On insert, the indexer writes the transaction's followers into
+consecutive slots from the current write head and records the start
+offset and follower count in that transaction's circle1 slot. There is
+no per-account chaining and no per-account head table — circle2 is a
+flat, `tx_id`-keyed follower store. Per-account history is reconstructed
+on demand by scanning the WAL (§10.3), independent of this index.
 
-### §9.5 account_heads — direct-mapped account head table
-
-Each `account_heads` slot stores `(account_id, circle2_idx)`. The slot
-index is the account id masked by the account_heads size. The slot
-stores the account id it belongs to so a colliding lookup can detect
-eviction the same way circle1 does: a mismatch means the head was
-overwritten and the chain head is gone, and the caller must fall back
-to disk for any history older than the current chain. The size is
-`next_power_of_two(max_accounts)`, which means in practice every
-account has its own slot; collisions only occur if the account-id space
-is sparser than the table.
-
-### §9.6 Sizing rule
-
-The three sizes are derived from `transaction_count_per_segment` and
-`max_accounts`:
-
-- circle1 — one slot per transaction in the active window, rounded up
-  to a power of two.
-- circle2 — enough entry slots for the active window assuming roughly
-  two entries per transaction (transfers), rounded up.
-- account_heads — one slot per account, rounded up.
-
-Changing the active window changes the hot indexes and the dedup window
-in lockstep; there are no separate knobs. [ADR-0013]
-
-### §9.7 Recovery seeding
+### §9.5 Recovery seeding
 
 The recovery sequence (§12) seeds the indexer directly: as it walks
 WAL records from the last snapshot through the active segment's tail,
@@ -895,6 +900,18 @@ each metadata, entry, and link record is replayed into the indexer
 through the Snapshotter's recovery hooks. By the time the Snapshotter
 thread starts, the indexer is already populated for everything in the
 active window.
+
+### §9.6 Sizing rule
+
+Both sizes are derived from `transaction_count_per_segment` (§15.1):
+
+- circle1 — one slot per transaction in the active window, rounded up
+  to a power of two.
+- circle2 — `4 ×` the circle1 size, giving headroom for several
+  followers per transaction (entries plus any links).
+
+Changing the active window changes the hot index and the dedup window
+in lockstep; there are no separate knobs. [ADR-0013]
 
 ---
 
@@ -931,27 +948,30 @@ read from disk via the on-disk transaction index (Stage 2).
 
 ### §10.3 `GetAccountHistory` resolution
 
-`GetAccountHistory` reads `account_heads[account_id & mask]`; if the
-stored account_id does not match, returns an empty vec (account head
-evicted). Otherwise walks `prev_link` backwards through `circle2`,
-stopping on `account_id` mismatch (chain broken by eviction),
-`tx_id < from_tx_id` (past the requested window), `limit` reached, or
-`prev_link == 0` (chain head). Results are returned newest-first. An
-empty vec from a query that should have had results is the
-caller's signal to fall back to the on-disk account index (Stage 2).
+`GetAccountHistory` does not consult the in-memory transaction index at
+all — there is no per-account head table or link chain.
+`Ledger::get_account_history` runs a backward WAL scan
+(`wal_scanner().scan(from_tx_id, …)`), sweeping transactions
+newest→oldest from `from_tx_id` and keeping those whose entries
+reference the account (`entry_references_account`: a matching
+`TxEntry.account_id`, an account-open range, a link, or a flag update).
+Results are returned newest-first, bounded by the requested window and
+`limit`. Because it reads the durable WAL directly, it is uniform across
+recent and sealed history — there is no hot-miss/cold-fallback step.
 
 ### §10.4 Hot tier vs cold tier
 
-The hot tier is everything currently in the indexer; the cold tier is
-everything sealed to disk. The boundary is not a function of `tx_id`
-absolute value but of how recently each `tx_id`'s slot has been
-overwritten — a low-traffic account's chain can survive deep into
-history, while a hot account's chain may be evicted within one segment.
+Hot/cold tiering applies to `get_transaction` lookups, not to account
+history. The hot tier is whatever `tx_id`s are currently resident in the
+indexer; the cold tier is everything sealed to disk. The boundary is not
+the absolute `tx_id` value but how recently each slot has been
+overwritten — a `tx_id` from a quiet period can survive deep into
+history, while a busy stretch may be evicted within one segment.
 Cold-tier reads are sealed-segment lookups (the on-disk transaction
-index and the on-disk account index built by Seal — §11.4). The
-mechanism by which the caller routes a hot miss to the cold tier is
-the same for both query types: the hot result returns `None` / empty,
-and the caller reissues against the cold-tier API.
+index built by Seal — §11.4); on a hot miss the indexer returns `None`
+and the caller reissues against the cold-tier API. `GetAccountHistory`
+is tier-agnostic: it always scans the durable WAL (§10.3), so it has no
+hot-miss/cold-fallback path.
 
 ### §10.5 Synchronous response via callback
 
@@ -1019,7 +1039,8 @@ segment is left unsealed and retried on the next poll.
 
 Seal holds two pieces of state separate from the rest of the pipeline:
 
-- A balance array sized to `max_accounts`, updated from each entry's
+- A balance array seeded from `initial_account_size` (and grown on demand the
+  same way as the other account arrays, §4.4), updated from each entry's
   `computed_balance` as Seal walks the segment. This is the source
   for the balance snapshot (§11.5); it is *not* the read-side cache
   (§8.3).
@@ -1090,9 +1111,14 @@ sealed segment. Production must always have it `false`.
 `Ledger::start` calls into `Recover` before spawning Sequencer,
 Transactor, WAL, Snapshotter, or Seal threads. Recovery is therefore
 single-threaded and observes a quiescent disk; nothing else is reading
-or writing the data directory. Once recovery returns, the pipeline is
-in a state that is observationally identical to the state that existed
-at `last_committed_tx_id` immediately before the previous shutdown.
+or writing the data directory. `Recover` builds a single `ActiveSnapshot`
+struct — the reconstructed `last_tx_id`, account/flag map, function set, links,
+KV/constants, dedup `user_ref → tx_id` maps, and the active segment's
+transactions — and threads it into each stage's `recover_from`/seed step, so
+every stage starts from one consistent reconstructed baseline. Once recovery
+returns, the pipeline is in a state that is observationally identical to the
+state that existed at `last_committed_tx_id` immediately before the previous
+shutdown.
 
 ### §12.2 Pre-seal of unsealed segments
 
@@ -1162,8 +1188,8 @@ a known-good state.
 The record stream uses a single lock-free **transaction ring** (§13.4); the
 submit and query paths use lock-free, fixed-capacity, single-producer /
 single-consumer queues (§2.4). Each stage owns its data completely; no shared
-mutable state crosses stage boundaries. Queue capacity is sized at construction
-from `queue_size` (§15.2), the ring from `ring_size` (§15.10).
+mutable state crosses stage boundaries. Queue capacity is a fixed internal
+constant (`1024`, §15.2); the ring is sized from `ring_size` (§15.10).
 
 ### §13.2 Wait strategies
 
@@ -1185,27 +1211,31 @@ is no per-stage override.
 ### §13.3 Backpressure as ring and queue saturation
 
 There is no rate limiter, leaky bucket, or admission control. Slowness anywhere
-propagates upstream: a stalled Snapshotter stops releasing ring slots (§13.5),
-filling the ring and stalling the Transactor, which fills the
-sequencer→transactor queue and eventually stalls `submit()` (§2.6). This is
-intentional — the ring and queues are the only place stages observe each other's
-progress, and using them as the backpressure mechanism keeps the design free of
-explicit coordination.
+propagates upstream: a stalled WAL Writer (the ring's sole consumer) stops
+releasing ring slots (§13.5), filling the ring and stalling the Transactor,
+which fills the sequencer→transactor queue and eventually stalls `submit()`
+(§2.6). This is intentional — the ring and queues are the only place stages
+observe each other's progress, and using them as the backpressure mechanism
+keeps the design free of explicit coordination.
 
 ### §13.4 Transaction ring transport
 
 The transaction ring is a fixed-capacity, lock-free buffer that is the sole
-transport for the record stream between the Transactor and the read stages
-([ADR-0019]). It is single-producer, multi-reader:
+transport for the record stream between the Transactor and the WAL
+([ADR-0019], [ADR-0021]). It is single-producer, **single-consumer**:
 
 - The **Transactor** is the only writer. It writes records into the ring's
   uncommitted region (slots above the *write frontier*), builds each transaction
-  in place there (§4.6), and publishes by advancing the write frontier — so
-  readers only ever observe whole, committed transactions.
-- The **WAL** and **Snapshotter** are independent copy-out readers, each
-  tracking its own absolute cursor. They copy records out (a slot may be reused
-  once released, so they cannot hold borrows across reclamation).
-- The **Snapshotter** is the sole releaser (§13.5).
+  in place there (§4.6), and publishes by advancing the write frontier — so the
+  consumer only ever observes whole, committed transactions.
+- The **WAL** is the only reader, *and* the only releaser. It walks the ring,
+  copies each record out (a slot may be reused once released, so it never holds
+  a borrow across reclamation), and advances the release frontier itself
+  (§13.5). The read window is `[released, write)`; because the writer is gated
+  on the release index that only the WAL advances, in-window slots are never
+  overwritten, so reads copy out directly with no per-entry window check.
+- The **Snapshotter is not a ring reader.** It tails the durable WAL (§8.4),
+  decoupled from the ring entirely.
 
 Positions are absolute, monotonically increasing indices mapped to physical
 slots on access; the capacity (`ring_size`, §15.10) is a power of two and must
@@ -1215,18 +1245,22 @@ blocks inside the ring: when no free slots exist it backs off under the shared
 wait strategy (§13.2) and retries — backpressure is caller-driven, not hidden in
 the transport.
 
-### §13.5 Durability-gated reclamation
+### §13.5 Write-gated reclamation
 
-A ring slot may be reused only after the record it held is durable on disk *and*
-consumed by every reader. The Snapshotter, as sole releaser, advances the
-reclamation point (the *release frontier*) only up to what it has applied, and
-it applies a transaction only once its trailing `TxMetadata.tx_id ≤
-commit_index` (§8.5). The frontiers therefore stay ordered
-`write ≥ persisted ≥ durable ≥ applied = released`. This makes "never overwrite
-a record that is not yet durable" a single structural property of the transport,
-rather than something each stage enforces separately. If durability stalls,
-reclamation stalls and the producer eventually blocks once the ring fills — the
-explicit, durability-coupled form of bounded-transport backpressure.
+A ring slot may be reused once the record it held has been **written to the
+active segment's page cache** — *not* once it is fsynced ([ADR-0021]). The WAL,
+as the ring's sole consumer and sole releaser, advances the reclamation point
+(the *release frontier*) right after each buffered `write` syscall, in lockstep
+with `write_index`: it publishes `write_index` and then calls `release_to` on
+the same batch. The frontiers stay ordered `write_index ≥ released`, and
+reclamation is therefore **write-gated, not durability-gated** — the
+`fdatasync`/`commit_index` step is fully decoupled and runs on the Committer's
+own schedule (§7.7). Durability is instead enforced *reader-side*: the
+Snapshotter applies a transaction only once `TxMetadata.tx_id ≤ commit_index`
+(§8.5), and it reads the durable WAL, not the ring, so the read side never
+depends on a slot still being live. If the WAL Writer stalls (slow disk
+`write`s), reclamation stalls with it and the producer eventually blocks once
+the ring fills — the bounded-transport form of backpressure.
 
 ---
 
@@ -1246,12 +1280,22 @@ The caller picks one of four wait levels per submission:
 
 [ADR-0010]
 
-### §14.2 Implementation
+### §14.2 Implementation — reactive index hook
 
-A wait is a poll of the relevant pipeline index against the requested
-`tx_id`, driven by the shared wait strategy (§13.2). When the index
-passes the threshold, the wait completes and synchronises with every
-store that produced the advance.
+A wait is **edge-triggered, not a poll** ([ADR-0027]). The pipeline exposes a
+single `IndexHook` — `Fn(PipelineIndexKind, u64)` — fired inline on the
+publishing thread each time `compute_index`, `commit_index`, or `snapshot_index`
+advances (the sequencer index is deliberately *not* hooked: waiters never block
+on it, so firing per-submit would be pure hot-path cost). A consumer registers
+one hook via `set_index_hook` (first registration wins) and routes each
+`(kind, value)` into a per-index reactive watch. The network wait path (§36.4,
+the cluster `Waiter`) does exactly this: each watch is a `u64` plus a `Notify`,
+and an async waiter calls `wait_reach(target)` — it registers interest, checks
+the value, and parks on the `Notify` edge with no spinning. When the index
+crosses the threshold the parked future is woken and synchronises with the store
+that produced the advance. The legacy `CommitHandler` / `on_commit` callback
+(a `Fn(u64)` fired only on commit) is **superseded and dead** — it has no
+production caller; the unified `IndexHook` replaced it.
 
 ### §14.3 Per-call dial
 
@@ -1274,20 +1318,25 @@ reads.
 
 ## §15 Configuration — ledger-side knobs
 
-### §15.1 `max_accounts`
+### §15.1 `initial_account_size` and `resize_factor`
 
-Pre-allocated capacity of every balance vector and read-side atomic
-vector. Fixed at startup; cannot grow at runtime (§4.4). Accounts
-referencing IDs ≥ this value are rejected with
-`ACCOUNT_LIMIT_EXCEEDED`. Sized so the balance vector fits comfortably
-in L2/L3 even with read-side and seal-side duplicates.
+The account arrays are **growable**, not fixed (§4.4). `initial_account_size`
+is the seed capacity of every balance vector and read-side atomic vector at
+construction; `resize_factor` is the geometric growth increment applied when a
+higher id is referenced — `new_cap = ceil(cap × (1 + resize_factor))`. Both are
+exposed via `config.toml`. There is no `max_accounts` ceiling and no
+`ACCOUNT_LIMIT_EXCEEDED` rejection. Size the seed so the common-case balance
+vector fits comfortably in L2/L3 even with read-side and seal-side duplicates;
+growth past it is amortised and rare. [ADR-0022]
 
-### §15.2 `queue_size`
+### §15.2 Inter-stage queue capacity
 
-Capacity of the inter-stage queues. Not exposed via `config.toml`; an internal
-tuning knob. The two remaining queues — sequencer→transactor and the
-Snapshotter's query queue (§2.4) — are both sized from this single value. The
-record-stream ring is sized separately (`ring_size`, §15.10).
+The two inter-stage queues — sequencer→transactor and the Snapshotter's query
+queue (§2.4) — are **not** sized from a config field. Their capacity is a fixed
+internal constant (`1024`) set in `Pipeline::new`. `queue_size` is only a
+test/bench parameter (`Pipeline::with_sizes`), not a `LedgerConfig` knob. The
+record-stream ring is sized separately (`ring_size`, §15.10), which *is* a real
+field.
 
 ### §15.3 `wait_strategy`
 
@@ -1332,14 +1381,14 @@ the cost of more snapshot I/O during operation.
 ### §15.9 Hot-index sizes are derived
 
 Hot-index sizes (§9.6) are derived from `transaction_count_per_segment`
-(§15.5) and `max_accounts` (§15.1). There are no separate knobs;
-changing the active window changes both the hot indexes and the dedup
+(§15.5) and the current account-array length (§15.1). There are no separate
+knobs; changing the active window changes both the hot indexes and the dedup
 window in lockstep.
 
 ### §15.10 `ring_size`
 
 Capacity of the transaction ring (§13.4). A power of two; not exposed via
-`config.toml`, an internal tuning knob like `queue_size`. Because a transaction
+`config.toml`, an internal tuning knob. Because a transaction
 is published atomically and assembled in place, the ring must be at least as
 large as the biggest possible single transaction (`sub_item_count ≤ u16::MAX`
 followers plus the trailing metadata); otherwise the Transactor cannot make
@@ -1910,15 +1959,16 @@ surface:
   that bypasses the Transactor and feeds pre-validated bytes directly
   to the WAL stage.
 - `wal_tailer()` — produces a stateful raw-WAL byte cursor (§23.1)
-  used by the leader to ship bytes to followers.
-- An `on_commit` hook fired when the local commit index advances,
-  used by the leader to feed its own slot of the quorum tracker
-  (§30.4).
+  used by the leader to ship bytes to followers and by the Snapshotter
+  to tail the durable WAL (§8.4).
+- `set_index_hook()` — registers the single `IndexHook` (§14.2) the cluster
+  uses to drive its reactive index watches (compute/commit/snapshot), which in
+  turn feed the cluster-commit driver (§30.3) and the client wait paths.
 - `start_with_recovery_until(watermark)` — an alternative to `start()`
   invoked only by the runtime divergence path (§33).
 
 Nothing else changes inside the Ledger. A standalone Ledger ignores
-all four. [ADR-0015, ADR-0016 §10]
+all four. [ADR-0017, ADR-0027, ADR-0016 §10]
 
 ### §26.3 Two gRPC surfaces
 
@@ -1950,10 +2000,11 @@ served by another transport without renaming the role types.
 A node is in exactly one of four roles at any time: `Initializing`
 (post-boot or post-teardown, awaiting a signal), `Candidate` (running
 an election round), `Leader` (writable), or `Follower` (read-only,
-receiving `AppendEntries`). The role is encoded as a `u8` inside a
-single atomic; reads use `Acquire`, writes use `Release`. The atomic
-is shared by every gRPC handler so the writability check on every
-submit RPC is one cache-line read.
+receiving the replication stream, §35.2). The role is published through a
+`tokio::sync::watch` channel that tasks subscribe to (`role_subscribe`); reads
+of the underlying atomic use `Acquire`, writes use `Release`. The role is shared
+by every gRPC handler so the writability check on every submit RPC is one
+cache-line read.
 
 ### §27.2 The supervisor is the sole writer
 
@@ -1964,36 +2015,36 @@ role cannot leave handlers observing a half-applied state: the
 supervisor publishes the new role only after the old role's tasks
 have been torn down and the new role's tasks have been brought up.
 
-### §27.3 Drop-and-rebuild on every transition
+### §27.3 Cancel-and-respawn on every transition
 
-Role-specific state — peer replication tasks, the Quorum tracker,
-the gRPC handler's posture — lives inside a `LeaderHandles` or
-`FollowerHandles` struct. A transition drops the outgoing struct
-(which joins or aborts every owned task) before constructing the new
-one. There is no "modify role in place" path; a node that goes
-Leader → Follower → Leader has fully re-instantiated its peer tasks,
-fresh quorum slots, and a freshly-bound writable handler each time.
-The discipline is what eliminates stale-state bugs during failover.
+There is no `LeaderHandles`/`FollowerHandles` struct. Role-specific work — the
+leader's per-peer pusher tasks — is governed by `CancellationToken`s, not an
+RAII bundle. The long-lived `replication_push_loop` (§31.1) watches the role
+channel: on `→ Leader` it spawns the peer pushers under a child token; on
+`Leader →` anything it cancels that token and joins the tasks. There is no
+"modify role in place" path; a node that goes Leader → Follower → Leader has
+fully re-spawned its peer tasks, re-seeded each peer's match index from a fresh
+handshake (§30.4), and flipped the handler's writable posture each time. The
+discipline is what eliminates stale-state bugs during failover.
 
 ### §27.4 What survives a transition
 
-Three pieces of state are deliberately carried across a role
-boundary: the `Arc<Ledger>` (so the node's data does not have to be
-recovered on every transition), the `Arc<Term>` (so the durable term
-log keeps a single owner), and the `Arc<Vote>` (same reason for vote
-durability). Every other piece of state is owned by a `Handles`
-struct and dies with it. The one exception to even the Ledger
-surviving a transition is divergence (§33), in which case the Arc is
-dropped and rebuilt via `start_with_recovery_until`.
+The durable, node-lifetime state is deliberately carried across role
+boundaries: the `Arc<Ledger>` slot (so the node's data does not have to be
+recovered on every transition), the durable `term.log` and `vote.log` (so each
+keeps a single owner), the shared `Waiter` (§14.2), and the `RaftNode` itself
+(its quorum/cluster-commit state, §30). Only the cancellable per-role tasks die
+on a transition. The one exception to even the Ledger surviving is divergence
+(§33), in which case the slot's Arc is reseeded via `start_with_recovery_until`.
 
 ### §27.5 `Initializing` is the post-boot and post-teardown state
 
 `Initializing` is the role a node is in immediately after the
 supervisor starts (before the first election timer fires) and
-immediately after any `Handles` is dropped (before the next role's
-bring-up). The Node gRPC server is already running so the node can
-participate in elections and receive `AppendEntries`, but neither the
-writable client handler nor any peer-replication task is up. The
+immediately after a teardown (before the next role's bring-up). The Node gRPC
+server is already running so the node can participate in elections and accept a
+replication stream (§35.2), but neither the writable client handler nor any
+peer-pusher task is up. The
 client-facing handler in this state behaves like a follower's
 read-only handler: queries succeed; submits return
 `FAILED_PRECONDITION`. [ADR-0016 §2, §3]
@@ -2054,8 +2105,8 @@ to the cold path more often but still see correct answers.
 Every node not in `Leader` role runs an election timer with a
 randomised deadline in `[election_timer_min_ms,
 election_timer_max_ms]`. The deadline is re-randomised on every
-reset. Reset triggers: any valid
-`AppendEntries` from a current leader (empty heartbeat included), and
+reset. Reset triggers: any valid leader activity on the replication stream
+(`WalUpdate` or `Heartbeat`, §35.2) noted via `note_leader_activity`, and
 the granting of a `RequestVote`. Without a reset, the timer fires and
 the node transitions to `Candidate`. The randomisation defeats split
 votes: two nodes that timed out at exactly the same instant would
@@ -2079,7 +2130,7 @@ deadline.
 Majority counts the candidate itself: a 5-node cluster needs 3 votes
 (of which 1 is the self-vote, so 2 peer grants suffice). A single-node
 cluster trivially wins by self-vote with no RPCs sent. The arithmetic
-matches `Quorum`'s majority calculation (§30.1) but is computed
+matches the RaftNode's cluster-commit majority (§30.1) but is computed
 independently — the election's vote count is not the running quorum.
 
 ### §29.4 `RequestVote` grant rule
@@ -2105,133 +2156,138 @@ term high enough to depose the current leader.
 
 ### §29.6 Step-down on higher term
 
-Any RPC in any direction (request or response, `RequestVote` or
-`AppendEntries` or even a `Ping`) that carries a term higher than the
-node's current term triggers an immediate step-down: `Term::observe`
-durably records the new term, `voted_for` is cleared, and the node
-transitions to `Initializing`. A node in `Leader` role drops its
-`LeaderHandles` (which drains all peer tasks); a node in `Follower`
-or `Candidate` drops the equivalent. The step-down is the universal
-correctness anchor — no Raft node ever continues operating in an old
+Any term observed in any direction (a `RequestVote`, a replication
+handshake/frame, or even a `Ping`) that is higher than the node's current term
+triggers an immediate step-down: `Term::observe` durably records the new term,
+`voted_for` is cleared, and the node transitions to `Initializing`. The
+role-change watch then cancels whatever per-role tasks were running — a leader's
+peer pushers (§31.1, §31.6), a follower's session. The step-down is the
+universal correctness anchor — no Raft node ever continues operating in an old
 term once it has seen a higher one. [ADR-0016 §5, §6, §13]
 
 ---
 
-## §30 Quorum tracker
+## §30 Cluster-commit in the pure RaftNode
 
-### §30.1 One slot per node
+### §30.1 Quorum lives in the consensus state machine, not the cluster crate
 
-`Quorum` is an array of `AtomicU64`s, one slot per node in the
-cluster. By convention slot 0 is the leader itself; slots `1..` are
-the peers in configuration order. The majority size —
-`(node_count / 2) + 1` — is computed at construction and never
-changes. A separate atomic caches the current majority-committed
-index for lock-free reads.
+There is no standalone `Quorum` slot-array in the cluster crate. Quorum and
+cluster-commit are owned by the **pure `RaftNode`** in the `raft` crate
+([ADR-0017]) — the consensus state machine has no async, no I/O, and no upward
+dependency on `ledger`. The cluster layer (`Consensus`, `consensus/state.rs`)
+holds the `RaftNode` behind a `Mutex` and only feeds it observations. The
+majority size — `(node_count / 2) + 1` — is a property of the RaftNode's peer
+set.
 
-### §30.2 `advance` publishes via `fetch_max`
+### §30.2 Two indexes: local and cluster
 
-`advance(slot, index)` writes the slot's atomic with `Release`,
-snapshots all slots with `Relaxed`, sorts the snapshot descending,
-takes the `(majority - 1)`-th element (the highest index acknowledged
-by a majority), and publishes it via `fetch_max(Release)` on the
-cached majority atomic. The `fetch_max` ensures the published majority
-never regresses, even when concurrent `advance` calls from different
-slots interleave. This is the lock-free property that lets every peer
-task call `advance` without coordination.
+The RaftNode tracks a *local* index (how far this node's own WAL has
+progressed) and a *cluster-commit* index (the highest `tx_id` a majority has
+acknowledged). `advance_local_index(new_local)` raises the local index (and the
+leader's own quorum contribution); `advance_cluster_index(new_cluster)` raises
+the cluster-commit index, clamped to the local index so a node never claims to
+have cluster-committed past what it holds. `cluster_commit_index()` is the
+lock-free read the wait paths (§34) consult. The leader's per-peer match indexes
+live in the RaftNode's `Replication` view, advanced by
+`replication().peer(id).append_result(...)` as acknowledgements arrive.
 
-### §30.3 Lock-free reads via `get`
+### §30.3 The leader's self-progress is fed reactively, not by a callback
 
-`Quorum::get()` is one `Acquire` load of the cached majority atomic.
-There is no allocation, no fast-path lock, no per-call computation.
-Client wait paths (§34.1) call `get()` repeatedly while polling for a
-target index; the cost per poll is one cache-line load.
+The leader's own contribution to quorum is fed **reactively off the
+snapshot-index watch**, not by an `on_commit` hook. `run_cluster_commit_driver`
+parks on the ledger's snapshot `IndexWatch` (§14.2) and, on every advance, calls
+`self_advance` → `advance_local_index(ledger.last_snapshot_id())`, then
+publishes the resulting `cluster_commit_index()` into the waiter's
+`cluster_commit` watch. This is what advances cluster-commit for a singleton
+(no peers) and keeps the leader's self-progress fresh without polling. It runs
+for every role; on a follower `self_advance` is a no-op on quorum. The legacy
+`on_commit` callback path is gone (§14.2).
 
-### §30.4 The leader's slot is fed by the on-commit hook
+### §30.4 Peer acknowledgements advance the leader's view
 
-On `Leader` bring-up, the leader registers an `on_commit` callback
-with the Ledger. The callback fires every time the local commit index
-advances and calls `advance(self_slot, ledger.last_commit_id())`.
-Without this callback the leader's own progress would be invisible to
-the quorum calculation and the cached majority would be stuck at the
-slowest peer. The hook is the reason the leader counts toward its own
-quorum.
-
-### §30.5 `reset_peers` zeros peer slots on bring-up
-
-When a leader is freshly elected, the prior leader's match-index
-state may still be reflected in the slots; carrying it forward could
-let a stale peer slot inflate the new leader's perceived majority.
-`reset_peers(leader_slot)` is called as part of `Leader` bring-up and
-zeros every slot except the leader's own. The next `advance` call
-from each peer task republishes from a clean baseline.
-[ADR-0015 decisions 3, 5; ADR-0016 §3]
+Each peer's match index advances when an `IndexUpdate` arrives from that
+follower over the replication stream (§31): the leader applies
+`append_result(Success { term, last_commit_id })` to the peer's `Replication`
+slot and then calls `self_advance`, which recomputes `cluster_commit_index()`
+and republishes it. A freshly-elected leader seeds each peer's match index from
+the handshake response (`last_term_curr_tx_id`) rather than carrying stale
+state forward, so quorum is always recomputed from a clean per-session baseline.
+[ADR-0016 §3, ADR-0017]
 
 ---
 
-## §31 Leader replication tasks
+## §31 Replication driver and per-peer streams
 
-### §31.1 One task per peer
+### §31.1 One driver, two long-lived loops
 
-A `Leader` spawns one `tokio` task per peer (`PeerReplication`). The
-leader owns these tasks directly — there is no per-peer-supervisor
-indirection — and they all share the leader's `Arc<Quorum>`,
-`Arc<AtomicBool> running` shutdown flag, and a transition channel for
-out-of-band signals. Spawning is part of `Leader::run_role_tasks`;
-joining is part of `LeaderHandles::drop`.
+Replication is not "one RPC per heartbeat." `run_replication_driver` spawns two
+long-lived loops that live for the node's whole lifetime, regardless of role:
 
-### §31.2 Each task's private state
+- `replication_stream_loop` — the **follower** side: it accepts inbound
+  `Replication` streams handed in by the gRPC handler (§35.2) and runs a
+  follower session per stream.
+- `replication_push_loop` — the **leader** side: it subscribes to role changes
+  and, on becoming `Leader`, spawns one `run_peer_push` task per peer
+  (`spawn_peer_pushers`); on losing leadership it cancels them. There is no
+  `PeerReplication` struct and no `LeaderHandles` — task lifetime is governed
+  by `CancellationToken`s, not an RAII handles bundle.
 
-Each peer task owns: a `WalTailer` cursor seeded from the leader's
-ledger (§23.1); a tonic Node-service client connected to the peer;
-the peer's slot index in `Quorum`; and two watermarks — `from_tx_id`
-(Raft's `nextIndex`, the next `tx_id` to ship) and `peer_last_tx`
-(Raft's `matchIndex` snapshot, the highest `tx_id` the peer
-acknowledged). Nothing else is shared between peer tasks.
+### §31.2 Each peer pusher's session
 
-### §31.3 The replication loop
+A peer pusher (`run_peer_push`) opens **one bidirectional `Replication` stream**
+to the peer, sends a single `Handshake` frame, and waits for the
+`HandshakeResponse`. On accept it seeds the peer's match index from the
+response's `last_term_curr_tx_id` (§30.4) and runs a `run_peer_session`, which
+splits into two parallel tasks over the *same* stream:
 
-Each iteration: call `tailer.tail(from_tx_id, &mut buf)`; if it
-returns zero bytes, send an empty `AppendEntries` heartbeat carrying
-only `leader_commit_tx_id`, then park until the commit index advances
-(reactive) or the raft heartbeat interval elapses, whichever comes
-first; if it returns bytes, call the ship-until-accepted path which retries on
-transport failures and observes higher-term replies. On a successful
-non-empty reply the task advances `from_tx_id` past the shipped
-batch's last `tx_id`, updates `peer_last_tx`, and calls
-`quorum.advance(slot, peer_last_tx)`.
+- a **sender** (`run_peer_sender`) owning a `WalTailer` pre-positioned just
+  after the handshake anchor; and
+- a **receiver** (`run_peer_receiver`) consuming the follower's `IndexUpdate`
+  frames.
 
-### §31.4 Lagged single-phase replication
+On a rejected handshake the pusher records the follower's reported
+`last_term_curr_tx_id` as an anchor override and reconnects; transient
+connect/stream failures back off and retry.
 
-A successful `AppendEntries` returns the follower's *current*
-fsynced `last_commit_id` — *not* a fresh fsync of the shipped batch.
-The follower queues the bytes and replies immediately; its WAL stage
-fsyncs on its own schedule (§7.7) and the next RPC's reply reflects
-the result. Replies are therefore one batch stale relative to the
-shipped data, which is harmless for quorum tracking because the gap
-closes on the next reply. The model avoids blocking the network RPC
-on disk latency. [ADR-0015]
+### §31.3 The sender loop (streaming, not request/reply)
 
-### §31.5 Idle heartbeats close the staleness gap
+The sender does not wait for a per-batch ack. Each pass it calls `tailer.tail`
+into a fixed buffer: if bytes come back it sends a `WalUpdate` frame (the raw
+WAL bytes plus the leader's current `cluster_commit_id`) and, while the buffer
+keeps filling, stays tight (`yield_now`, no park) so leader→follower throughput
+is not artificially capped; if the WAL is drained (partial buffer) or empty it
+sends a `Heartbeat` frame carrying only `cluster_commit_id`, then parks. The
+park is reactive: it waits on the `commit` `IndexWatch` to reach
+`last_sent_tx_id + 1` (new durable bytes to ship) or on the raft heartbeat
+interval, whichever fires first — never a fixed sleep while WAL is pending.
 
-Without idle heartbeats, the leader's last knowledge of a peer's
-commit progress would be the reply to the previous shipment — itself
-one batch stale. After the writer goes idle, the peer's true commit
-watermark would never be observed. Sending an empty `AppendEntries`
-every raft heartbeat interval fixes this: the reply carries the peer's
-now-fsynced `last_commit_id`, which advances the peer's quorum slot.
-Transport errors on heartbeats are intentionally swallowed — the
-next interval retries; a heartbeat is purely observational, not a
-durability event.
+### §31.4 Acks are a separate, reactive stream
 
-### §31.6 Step-down on higher-term reply
+Acknowledgement is decoupled from sending. On the follower side the session
+splits into a *receiver* (applies leader frames to the ledger, no inline ack)
+and an *acker* (`run_follower_acker`) that parks on the follower's snapshot
+`IndexWatch` and emits an `IndexUpdate(local_commit_id)` each time it advances —
+reporting the follower's *true* post-fsync applied index, not a stale read taken
+at enqueue. The leader's receiver feeds each `IndexUpdate` into the peer's match
+index and calls `self_advance` (§30.4). Because applying never blocks on the ack
+and the ack reflects real durability, quorum tracking is both live and accurate.
 
-A peer reply whose `term` is higher than the leader's current term
-triggers an immediate step-down: the peer task posts a step-down
-transition to the supervisor and returns. The supervisor drains all
-peer tasks (drops `LeaderHandles`), observes the higher term, clears
-`voted_for`, and re-enters `Initializing`. The write side is also
-drained: any in-flight client submit returns the error generated by
-the dropping handler. [ADR-0015, ADR-0016 §3]
+### §31.5 Idle heartbeats keep cluster-commit fresh
+
+When the WAL is idle the sender still emits a `Heartbeat` every raft heartbeat
+interval, carrying the leader's `cluster_commit_id`; a data `WalUpdate` resets
+the timer (a data frame counts as the heartbeat, per Raft). Followers mirror the
+carried `cluster_commit_id` via `advance_cluster_index` (clamped to their own
+local commit). Transport errors tear down the stream and the pusher reconnects;
+a heartbeat is observational, not a durability event.
+
+### §31.6 Step-down on higher term
+
+A higher term observed anywhere in the consensus state machine drives the node
+out of `Leader`; the role-change watch then fires and `replication_push_loop`
+cancels every peer pusher (§31.1). The write side is drained the same way it is
+on any role transition (§27.3): in-flight client submits return the error
+generated by the rebuilt handler. [ADR-0016 §3, ADR-0017]
 
 ---
 
@@ -2239,60 +2295,62 @@ the dropping handler. [ADR-0015, ADR-0016 §3]
 
 ### §32.1 Raft naming map
 
-The Roda cluster module uses Raft's terminology where possible:
-`from_tx_id` is `nextIndex`; `peer_last_tx` and the `Quorum` peer
-slot together correspond to `matchIndex`. The `tx_id` stream is the
-Raft log; the term boundary records in `term.log` (§28) supply the
-term for any historical `tx_id`. This mapping is documented so a
-reader who knows Raft can navigate the implementation without
-re-deriving the correspondence.
+The Roda cluster module uses Raft's terminology where possible: the sender's
+`WalTailer` cursor is `nextIndex`; the peer's match index in the RaftNode's
+`Replication` view is `matchIndex` (§30.4). The `tx_id` stream is the Raft log;
+the term boundary records in `term.log` (§28) supply the term for any historical
+`tx_id`. This mapping is documented so a reader who knows Raft can navigate the
+implementation without re-deriving the correspondence.
 
-### §32.2 `prev_tx_id` and `prev_term` consistency check
+### §32.2 The consistency anchor lives in the handshake, once per stream
 
-Every `AppendEntries` request carries `prev_tx_id` (the `tx_id`
-immediately before the batch) and `prev_term` (the term of that
-`tx_id`). The follower validates: it has `prev_tx_id` durably on
-disk, and the term covering `prev_tx_id` matches `prev_term`. If the
-follower's log is shorter, the reply carries `REJECT_PREV_MISMATCH`
-with the follower's own `last_commit_id`. If the follower's log has
-the `tx_id` but with a different term, the reply also carries
-`REJECT_PREV_MISMATCH` and divergence handling kicks in (§33).
+Roda does **not** carry a `prev_tx_id`/`prev_term` precondition on every
+appended batch. The Log-Matching anchor is sent **once, in the `Handshake`
+frame** that opens a replication stream (§35.2): the leader sets
+`prev_log_tx_id = local_commit_index` and `prev_log_term = term_at_tx(that)`,
+plus `leader_term`, `leader_term_first_tx_id`, and `leader_commit`. The follower
+validates the anchor in `validate_handshake`; once accepted, every subsequent
+`WalUpdate` on that stream is appended in order with no per-frame precondition.
+If the leader's term changes, a fresh stream (and fresh handshake) is
+established. This is the central difference from textbook AppendEntries:
+consistency is a per-*session* check, not a per-*message* one.
 
-### §32.3 The first RPC
+### §32.3 The handshake decision
 
-For the first `AppendEntries` against an empty follower (or a
-fully-replicated follower starting a fresh batch from `tx_id = 0`),
-both `prev_tx_id` and `prev_term` are zero. The follower treats
-`(0, 0)` as "no precondition" and accepts. Subsequent RPCs use the
-actual preceding `tx_id` and its covering term.
+`validate_handshake` returns `Accept` or `Reject { reason, truncate_after }`.
+Accept seeds the leader's match index from the response and lets the WAL stream
+flow. Reject maps to a `RejectReason` on the `HandshakeResponse`: `TermBehind`
+→ `REJECT_TERM_STALE` (leader term below the follower's), `LogMismatch` →
+`REJECT_PREV_MISMATCH` (the anchor is not in the follower's log, or sits at a
+different term — divergence, §33). On a `LogMismatch` carrying a
+`truncate_after`, the follower reseeds its ledger to that watermark *before*
+replying, so the leader's first `WalUpdate` lands on the truncated state.
 
-### §32.4 Reject reasons are explicit
+### §32.4 The follower reports its anchor back
 
-`AppendEntriesResponse` carries an enum reject reason rather than a
-bare bool. The four currently emitted reasons are: `TERM_STALE`
-(request's term is below the follower's current term),
-`PREV_MISMATCH` (consistency check failed — see §33), `CRC_FAILED`
-(the bytes did not parse), `WAL_APPEND_FAILED` (the follower's WAL
-stage rejected the queued bytes). The leader uses the reject reason
-to decide whether to step down (`TERM_STALE`), trigger a divergence
-path on the follower side (`PREV_MISMATCH`), or log and continue.
+A rejected handshake is not a dead end: the `HandshakeResponse` carries the
+follower's own `last_term`, `last_term_first_tx_id`, and `last_term_curr_tx_id`.
+The leader's pusher records `last_term_curr_tx_id` as an anchor override and
+reopens the stream from there (§31.2), walking back until the handshake is
+accepted. The remaining `RejectReason` variants in the proto
+(`REJECT_CRC_FAILED`, `REJECT_SEQUENCE_INVALID`, `REJECT_WAL_APPEND_FAILED`,
+`REJECT_NOT_FOLLOWER`) are reserved for append-side and role failures.
 
 ### §32.5 Batch sizing is exact
 
-WAL records are exactly 40 bytes (§18.1), so the leader's per-RPC
-byte cap is always a clean multiple of 40 — there is no padding, no
-partial record at the end of a batch. The configured
-`append_entries_max_bytes` is rounded down to the nearest multiple of
-40 at startup.
+WAL records are exactly 40 bytes (§18.1), so the leader's per-frame byte cap is
+always a clean multiple of 40 — there is no padding, no partial record at the
+end of a `WalUpdate`. The configured `append_entries_max_bytes` (still the knob
+name) is rounded down to the nearest multiple of 40 at startup and sizes the
+sender's tail buffer.
 
 ### §32.6 gRPC message-size override
 
-Tonic's default decoding/encoding limit of 4 MiB would otherwise
-reject batches sized at exactly `append_entries_max_bytes`. The Node
-server and client both raise `max_decoding_message_size` and
-`max_encoding_message_size` to `append_entries_max_bytes × 2 + 4 KiB`
-to cover both the WAL byte payload and protobuf framing overhead with
-margin. [ADR-0015, ADR-0016 §8]
+Tonic's default decoding/encoding limit of 4 MiB would otherwise reject
+`WalUpdate` frames sized at exactly `append_entries_max_bytes`. The Node server
+and client both raise `max_decoding_message_size` and `max_encoding_message_size`
+to `append_entries_max_bytes × 2 + 4 KiB` to cover both the WAL byte payload and
+protobuf framing overhead with margin. [ADR-0016 §8, ADR-0017]
 
 ---
 
@@ -2309,26 +2367,26 @@ divergence path (§33.3) achieves truncation by *restarting the
 Ledger*, which lets the Recover path do the truncation safely against
 a quiescent disk.
 
-### §33.2 Divergence detection on the follower
+### §33.2 Divergence detection at the handshake
 
-When `AppendEntries` arrives with a `prev_tx_id` that the follower
-has on disk but with a `prev_term` that disagrees with the follower's
-own term covering that `tx_id`, the follower has diverged from the
-new leader's history. The follower stashes `leader_commit_tx_id` from
-the request as the *recovery watermark* and replies
-`REJECT_PREV_MISMATCH`. The supervisor's divergence watcher reads the
-stashed watermark and triggers the reseed.
+Divergence is detected when a replication **handshake** arrives whose anchor —
+`prev_log_tx_id`/`prev_log_term` (§32.2) — the follower has on disk but at a
+disagreeing term. `validate_handshake` returns `Reject { reason: LogMismatch,
+truncate_after }`, where `truncate_after` is the highest `tx_id` the follower
+may keep. This is a per-session decision, not a per-message one: there is no
+`AppendEntries` carrying a precondition on each batch.
 
-### §33.3 Reseed sequence
+### §33.3 Reseed sequence (inline in the handshake handler)
 
-The supervisor: drops the current `FollowerHandles` (so all tasks
-holding the `Arc<Ledger>` are gone); calls a `LedgerSlot::replace`
-with a freshly-built `Ledger::start_with_recovery_until(watermark)`,
-which gives the slot a new `Arc<Ledger>` and returns the old one for
-asynchronous drop on a background task; brings up a fresh
-`FollowerHandles` over the new Ledger. The next `AppendEntries` from
-the leader either resumes cleanly (`prev_tx_id ≤ watermark`) or
-triggers a normal catch-up backfill from the leader.
+The reseed happens **inline in `replication_follower_handshake`, before the
+handshake response is sent** (so the leader's first `WalUpdate` lands on the
+truncated state). On a `LogMismatch` carrying a `truncate_after`, the handler
+calls `LedgerSlot::reseed(after)`, which builds a fresh
+`Ledger::start_with_recovery_until(after)` and atomically swaps it into the slot
+via `ArcSwap` (the old `Arc<Ledger>` drops once outstanding handlers release it,
+§33.6). The follower then reports its post-reseed anchor in the handshake
+response; the leader resumes streaming from there (§32.4). There is no separate
+`FollowerHandles` to drop — the session simply runs against the reseeded slot.
 
 ### §33.4 `start_with_recovery_until` semantics
 
@@ -2353,14 +2411,14 @@ knows how to reconstruct balances from a WAL prefix.
 ### §33.6 `LedgerSlot` is the indirection that lets handlers survive
 
 A reseed swaps the Ledger out from under the gRPC handlers without
-restarting the gRPC servers. The mechanism is `LedgerSlot`: an atomic
-swap of `Arc<Ledger>`. Every handler reads the current Arc on every
-call (`slot.ledger()`) and never retains it across operations. The
-swap is lock-free; the old Arc's strong count drops to zero on a
-background task that joins the old Ledger's pipeline threads
-synchronously, which never blocks a gRPC request because gRPC handlers
-have already released their reference. The supervisor is the sole
-writer of the slot. [ADR-0016 §9, §10]
+restarting the gRPC servers. The mechanism is `LedgerSlot` —
+`Arc<ArcSwap<Ledger>>`. Every handler reads the current Arc on every call
+(`slot.current()`) and never retains it across operations. The swap is
+lock-free; the old Arc's strong count drops to zero once outstanding handlers
+release it, joining the old Ledger's pipeline threads on drop, which never
+blocks a gRPC request because handlers have already released their reference.
+The single ledger `IndexHook` is registered through the slot so it survives the
+swap (§26.2). [ADR-0016 §9, §10]
 
 ---
 
@@ -2368,39 +2426,43 @@ writer of the slot. [ADR-0016 §9, §10]
 
 ### §34.1 A fifth wait level
 
-Stage 1 introduces four wait levels (§14.1). The cluster adds a
-fifth: `cluster_commit` blocks the submitter until
-`quorum.get() ≥ tx_id`. The handler driving the wait is the same
-shared wait strategy (§13.2) used for the in-process levels; the only
-difference is which atomic the predicate reads.
+Stage 1 introduces four wait levels (§14.1). The cluster adds a fifth:
+`cluster_commit`. It is reactive like the rest (§14.2): the waiter awaits the
+**`commit`, `snapshot`, and `cluster_commit` `IndexWatch`es in turn** —
+requiring the tx to be locally durable *and* locally queryable *and*
+quorum-replicated, completing when the last of the three crosses `tx_id`. There
+is no spin/poll on a quorum atomic; the `cluster_commit` watch is fed from the
+RaftNode's `cluster_commit_index()` at every advance site
+(`publish_cluster_commit`).
 
-### §34.2 The leader feeds its own slot
+### §34.2 The leader feeds its own progress reactively
 
-The leader's slot in `Quorum` is advanced by the on-commit hook
-(§30.4); each peer task advances its peer's slot on every successful
-`AppendEntries`. Both contributions are required for the majority to
-move forward — without the leader's own contribution the cached
-majority would be stuck at the slowest peer's progress.
+The leader's contribution to quorum is not a callback-driven slot write. The
+snapshot-index driver (§30.3) calls `self_advance` on each snapshot advance,
+raising the RaftNode's local index and republishing `cluster_commit_index()`;
+each peer's `IndexUpdate` advances that peer's match index and triggers another
+`self_advance` (§30.4). Both contributions are required for the cluster-commit
+index to move — without the leader's own progress it would be stuck at the
+slowest peer.
 
 ### §34.3 Local commit is independent of quorum
 
-The leader's *own* `commit_index` (§2.5) advances from its local WAL
-stage as soon as the local `fdatasync` returns, independent of any
-peer's progress. Only the client's wait choice determines the
-guarantee: a client that picks `wal` sees the local commit; a client
-that picks `cluster_commit` waits for quorum. The two indexes coexist
-in the same pipeline; nothing about cluster mode slows down the local
-commit path. [ADR-0015 decision 5]
+The leader's *own* `commit_index` (§2.5) advances from its local WAL stage as
+soon as the local `fdatasync` returns, independent of any peer's progress. Only
+the client's wait choice determines the guarantee: a client that picks `wal`
+sees the local commit; a client that picks `cluster_commit` waits for quorum.
+The two indexes coexist in the same pipeline; nothing about cluster mode slows
+down the local commit path. [ADR-0017]
 
-### §34.4 Followers do not durably track cluster commit
+### §34.4 Followers mirror, but do not own, cluster commit
 
-`leader_commit_tx_id` arrives on every `AppendEntries` (including
-heartbeats) but the follower does not persist it. Its only consumer
-on the follower side is divergence handling (§33.2), where it is
-captured as the recovery watermark. A follower's view of "cluster
-commit" is not authoritative — only the leader's `Quorum::get()` is.
-Reads from a follower that need cluster-commit semantics are out of
-scope for this implementation.
+`cluster_commit_id` arrives on every `WalUpdate` and `Heartbeat` (§31.5). The
+follower mirrors it via `advance_cluster_index`, clamped to its own local commit
+index, so a follower can answer `cluster_commit`-level waits for transactions it
+has both applied and seen acknowledged — but its view is derived from the
+leader's stream, not authoritative on its own. The leader's
+`cluster_commit_index()` remains the source of truth. A divergent handshake also
+carries a `truncate_after` watermark used to reseed the follower (§32.3, §33.2).
 
 ---
 
@@ -2416,12 +2478,18 @@ default; without the mutex, two concurrent `RequestVote` handlers
 could race on `vote.log` and grant the same term to two candidates.
 [ADR-0016 §7]
 
-### §35.2 `AppendEntries`
+### §35.2 `Replication` (bidirectional stream)
 
-An empty `wal_bytes` is a valid heartbeat: the follower runs the
-consistency check and returns its commit id without queueing any
-records. The reply's `last_tx_id` carries the follower's *current*
-fsynced commit id, which lags the shipped batch by one round (§31.4).
+There is no unary `AppendEntries` RPC. Peer replication is a single
+**bidirectional streaming** RPC, `Replication(stream
+ReplicationLeaderMessage) returns (stream ReplicationFollowerMessage)`. The
+leader→follower stream carries one `Handshake` (the consistency anchor, §32.2)
+followed by an open-ended sequence of `WalUpdate` (raw WAL bytes +
+`cluster_commit_id`) and `Heartbeat` (`cluster_commit_id` only) frames. The
+follower→leader stream carries one `HandshakeResponse` followed by `IndexUpdate`
+frames reporting the follower's applied commit id (§31.4). The handler hands the
+inbound stream to the replication driver (§31.1), which runs the per-session
+loops; a term change opens a fresh stream rather than mutating an existing one.
 
 ### §35.3 `RequestVote`
 
@@ -2549,12 +2617,13 @@ indirection (§33.6).
 
 ### §38.2 Supervisor boot
 
-The role supervisor builds the long-lived shared resources: `Quorum`
-(sized to `peers + 1`), the cooperative `running: Arc<AtomicBool>`,
-and the transition channel. It then spawns the client-facing gRPC
-server, the peer-facing gRPC server, the divergence watcher, and the
-role driver loop. The two gRPC servers are bound for the entire
-lifetime of the process; they never restart on a role transition.
+The supervisor builds the long-lived shared resources: the `Consensus` wrapping
+the pure `RaftNode` (which owns quorum/cluster-commit state, §30), the shared
+`Waiter` (§14.2), and a node-wide `CancellationToken`. It then spawns the
+client-facing gRPC server, the peer-facing gRPC server, the replication driver
+(§31.1), the cluster-commit driver (§30.3), and the role-driver loop. The two
+gRPC servers are bound for the entire lifetime of the process; they never
+restart on a role transition.
 
 ### §38.3 Initial role
 
@@ -2568,21 +2637,20 @@ election timer to expire before becoming a candidate.
 
 The driver awaits the appropriate signal per role: an election-timer
 expiry while in `Initializing` or `Follower`; the candidate round's
-outcome while in `Candidate`; a transition-channel message while in
-`Leader`. Each transition drops the previous role's `Handles` (which
-joins or aborts every owned task) before constructing the next role's
-`Handles`. The driver itself owns no role-specific state; it is purely
+outcome while in `Candidate`; loss of leader contact while in `Leader`. Each
+transition publishes the new role on the watch channel (§27.1); the long-lived
+replication driver reacts by cancelling and respawning the per-role tasks
+(§27.3, §31.1). The driver itself owns no role-specific task state; it is purely
 the coordinator that decides which role to bring up next.
 
 ### §38.5 Shutdown ordering
 
-Shutdown flips `running` to `false`, sends a `Shutdown` transition
-message (which wakes the role driver if it is parked), and aborts
-every spawned task in order — the role driver first, the divergence
-watcher, the peer-facing server, the client-facing server. Peer
-replication tasks observe `running` at the top of their loop and exit
-cleanly; the gRPC servers run their tonic shutdown protocol before
-the abort takes effect.
+Shutdown cancels the node-wide `CancellationToken`, which every spawned task
+selects on (§31). Lifecycle is RAII: dropping `ClusterNode` triggers the cancel
+and then *awaits* the tasks cooperatively rather than aborting them — the
+replication driver tears down its child sessions, the drivers exit their select
+loops, and the gRPC servers run their tonic graceful-shutdown protocol. No
+`running: AtomicBool` flag and no abort-in-order step is involved.
 
 ---
 
@@ -2592,8 +2660,8 @@ the abort takes effect.
 
 When the configuration has no `[cluster]` section, `ClusterNode` does
 not invoke the supervisor at all. It constructs a single client-facing
-`Server` task with a hardcoded `Role::Leader` posture, no `RoleFlag`,
-no Node gRPC server, no `Term`, no `Vote`, no `Quorum`, no peer tasks.
+`Server` task with a hardcoded `Role::Leader` posture, no role watch,
+no Node gRPC server, no `Term`, no `Vote`, no `RaftNode`, no peer tasks.
 The deployment is identical in observable behaviour to a single-node
 cluster but pays none of the supervisor's coordination cost. This is
 the configuration `roda` ships with by default.
@@ -2601,13 +2669,13 @@ the configuration `roda` ships with by default.
 ### §39.2 Single-node cluster (`peers.len() == 1`)
 
 A cluster whose configuration lists exactly one peer (itself) runs
-the full supervisor infrastructure: a `RoleFlag`, a `Term`, a `Vote`,
-a single-slot `Quorum`. The node boots as `Leader` (§38.3) and the
-replication loop has zero peers to fan out to; every `on_commit` hook
-firing immediately advances the cluster watermark since there is no
-one to wait for. This mode exercises the cluster code path against a
-trivial cluster shape and is the one used by most cluster integration
-tests.
+the full supervisor infrastructure: a role watch, a `Term`, a `Vote`, and the
+`RaftNode` (with a peer-less quorum). The node boots as `Leader` (§38.3) and the
+replication push loop has zero peers to fan out to; the cluster-commit driver
+(§30.3) advances cluster-commit purely from the leader's own snapshot-index
+advances, since there is no one else to wait for. This mode exercises the
+cluster code path against a trivial cluster shape and is the one used by most
+cluster integration tests.
 
 ### §39.3 Multi-node cluster
 

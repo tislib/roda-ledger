@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-06-08
-**Author:** Taleh
+**Author:** Taleh Ibrahimli
 
 **Amends:**
 - ADR-001 — Entries-Based Execution Model: adds three account-layout WAL record kinds; transactor rollback extends to account-layout mutations.
