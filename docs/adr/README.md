@@ -11,7 +11,7 @@ This section contains Architecture Decision Records (ADRs) documenting significa
 | [ADR-005](0005-pressure-manager.md)              | Adaptive Pipeline Execution Mode | Postponed |
 | [ADR-006](0006-wal-snapshot-durability.md)       | WAL, Snapshot, and Seal Durability | Accepted |
 | [ADR-007](0007-cli-tools.md)                     | CLI Operational Tools | Proposed |
-| [ADR-008](0008-transaction-account-index.md)     | Transaction Index and Query Serving | Accepted |
+| [ADR-008](0008-transaction-account-index.md)     | Transaction Index and Query Serving | Accepted · superseded in part by [ADR-022](0022-account-layouts-and-program-defined-accounts.md) |
 | [ADR-009](0009-tx-link-dedup-reversal.md)        | Transaction Links, Deduplication, and Reversal | Accepted |
 | [ADR-010](0010-sync-submit.md)                  | Sync Submit | Proposed |
 | [ADR-011](0011-wal-write-commit-separation.md)  | WAL Write/Commit Separation | Accepted |

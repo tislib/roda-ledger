@@ -117,7 +117,7 @@ Four operation types cover both common financial workflows and arbitrary user-de
 
 ## Programmable ledger
 
-A registered WASM function becomes a first-class `Operation::Function` — sequenced, executed atomically by the Transactor, durably logged, and recoverable across restarts. The runtime exposes a deliberately narrow host API (`credit`, `debit`, `get_balance`) so every execution is deterministic: no clocks, no I/O, no randomness, no threads. This is the property that makes the runtime fit for future Raft replication — followers apply the leader's WAL entries directly, with no re-execution.
+A registered WASM function becomes a first-class `Operation::Function` — sequenced, executed atomically by the Transactor, durably logged, and recoverable across restarts. The runtime exposes a deliberately narrow host API (`credit`, `debit`, `get_balance`) so every execution is deterministic: no clocks, no I/O, no randomness, no threads. This is the property that makes the runtime fit for Raft replication — followers apply the leader's WAL entries directly, with no re-execution.
 
 ```bash
 # Register a compiled WASM module
@@ -148,8 +148,8 @@ Functions can be written in Rust, AssemblyScript, or hand-written WAT. Registrat
 
 roda-ledger is a specialized engine. It is deliberately not general-purpose.
 
-- **Single node** — no replication today. Raft-based multi-node is planned.
-- **Fixed account space** — `max_accounts` is pre-allocated at startup. O(1) balance access always, memory committed upfront.
+- **Multi-node still stabilizing** — Raft replication is implemented and under active development; single-node is the stable configuration today. See [Architecture](docs/03-architecture.md).
+- **Explicit account creation** — accounts must be opened before use ([ADR-022](docs/adr/0022-account-layouts-and-program-defined-accounts.md)). Balance access is O(1); storage grows on demand.
 - **No query language** — balance lookup by account ID only. No ad-hoc reads.
 - **No auth** — no authentication or authorization today. mTLS is planned. roda-ledger trusts its caller; access control belongs in the layer above it.
 
@@ -170,7 +170,7 @@ Full documentation: [tislib.net/roda-ledger](https://tislib.net/roda-ledger/)
 
 ## Roadmap
 
-- Raft-based multi-node replication
+- Multi-node cluster — stabilization and GA
 - mTLS authentication
 - Account hierarchies and sub-account structures
 - Per-function CPU / memory metering and quotas
